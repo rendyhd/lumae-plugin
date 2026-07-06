@@ -1,0 +1,114 @@
+name: Build plugins
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - 'plugins/**'
+      - '.github/workflows/build.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-plugins
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build zips and print manifest entries
+        env:
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import hashlib, json, os, zipfile
+          from datetime import datetime, timezone
+
+          repo = os.environ["REPO"]
+          branch = os.environ["BRANCH"]
+          raw = f"https://raw.githubusercontent.com/{repo}/{branch}"
+          plugins_dir, dist_dir = "plugins", "dist"
+          now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          def build_zip(src, out):
+              os.makedirs(os.path.dirname(out), exist_ok=True)
+              members = []
+              for root, _d, names in os.walk(src):
+                  if "__pycache__" in root:
+                      continue
+                  for name in names:
+                      if name.endswith(".pyc"):
+                          continue
+                      full = os.path.join(root, name)
+                      arc = os.path.relpath(full, src).replace(os.sep, "/")
+                      members.append((full, arc))
+              members.sort(key=lambda m: m[1])
+              with zipfile.ZipFile(out, "w", zipfile.ZIP_DEFLATED) as z:
+                  for full, arc in members:
+                      info = zipfile.ZipInfo(arc, date_time=(1980, 1, 1, 0, 0, 0))
+                      info.compress_type = zipfile.ZIP_DEFLATED
+                      info.external_attr = 0o644 << 16
+                      with open(full, "rb") as fh:
+                          z.writestr(info, fh.read())
+
+          for folder in sorted(os.listdir(plugins_dir)):
+              meta_path = os.path.join(plugins_dir, folder, "plugin.json")
+              if not os.path.isfile(meta_path):
+                  continue
+              with open(meta_path, encoding="utf-8") as fh:
+                  meta = json.load(fh)
+              pid = meta["id"]
+              version = str(meta["version"])
+              zip_name = f"{pid}_{version}.zip"
+              out = os.path.join(dist_dir, pid, zip_name)
+              build_zip(os.path.join(plugins_dir, folder), out)
+              checksum = hashlib.md5(open(out, "rb").read()).hexdigest()
+              entry = {
+                  "id": pid,
+                  "name": meta.get("name", pid),
+                  "description": meta.get("description", ""),
+                  "author": meta.get("author", ""),
+                  "imageUrl": meta.get("imageUrl", ""),
+                  "versions": [{
+                      "version": version,
+                      "changelog": meta.get("changelog", ""),
+                      "min_core_version": meta.get("min_core_version", ""),
+                      "sourceUrl": f"{raw}/{dist_dir}/{pid}/{zip_name}",
+                      "checksum": checksum,
+                      "timestamp": now,
+                  }],
+              }
+              block = json.dumps(entry, indent=2)
+              print(f"\n===== manifest entry for '{pid}' (paste into the plugins array of manifest.json) =====")
+              print(block)
+              if summary:
+                  with open(summary, "a", encoding="utf-8") as fh:
+                      fh.write(f"### manifest entry for `{pid}` {version}\n\n")
+                      fh.write("Copy this object into the `plugins` array of `manifest.json`:\n\n")
+                      fh.write("```json\n" + block + "\n```\n")
+          PY
+
+      - name: Commit built zips
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add dist
+          if git diff --cached --quiet; then
+            echo "No zip changes to commit."
+          else
+            git commit -m "Build plugin zips [skip ci]"
+            git push
+          fi
