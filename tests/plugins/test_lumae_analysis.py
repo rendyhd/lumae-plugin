@@ -323,6 +323,22 @@ class FakeDb:
         self.commits += 1
 
 
+class LimitAwareCursor(FakeCursor):
+    def fetchall(self):
+        if not self.executed:
+            return self.rows
+        _, params = self.executed[-1]
+        if params:
+            return self.rows[: int(params[0])]
+        return self.rows
+
+
+class LimitAwareDb(FakeDb):
+    def __init__(self, rows=None):
+        self.cursor_obj = LimitAwareCursor(rows)
+        self.commits = 0
+
+
 def test_analyze_one_track_marks_missing_file(monkeypatch):
     mod = load_plugin()
     monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=[]))
@@ -400,6 +416,41 @@ def test_find_backfill_ids_includes_missing_old_and_signature_changed_but_not_fa
         "old-analyzer",
         "changed-media",
     ]
+
+
+def test_find_backfill_ids_includes_explicit_stale_rows(monkeypatch, tmp_path):
+    mod = load_plugin()
+    current = tmp_path / "current.wav"
+    current.write_bytes(b"new media")
+    rows = [
+        ("stale-track", str(current), "same-sig", mod.ANALYZER_VERSION, "stale"),
+        ("failed-once", str(current), "same-sig", mod.ANALYZER_VERSION, "failed"),
+        ("skipped-once", str(current), "same-sig", mod.ANALYZER_VERSION, "skipped_no_file"),
+    ]
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    assert mod.find_backfill_ids(limit=25) == ["stale-track"]
+
+
+def test_find_backfill_ids_applies_limit_after_eligibility_filtering(monkeypatch, tmp_path):
+    mod = load_plugin()
+    current = tmp_path / "current.wav"
+    current.write_bytes(b"new media")
+    sig = mod.media_signature(str(current))
+    rows = [
+        ("ready-current-1", str(current), sig, mod.ANALYZER_VERSION, "ready"),
+        ("failed-once", str(current), "old-sig", mod.ANALYZER_VERSION, "failed"),
+        ("skipped-once", str(current), None, mod.ANALYZER_VERSION, "skipped_no_file"),
+        ("eligible-missing", str(current), None, None, None),
+        ("eligible-stale", str(current), sig, mod.ANALYZER_VERSION, "stale"),
+        ("eligible-old", str(current), sig, 0, "ready"),
+    ]
+    db = LimitAwareDb(rows=rows)
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    assert mod.find_backfill_ids(limit=2) == ["eligible-missing", "eligible-stale"]
 
 
 def test_backfill_uses_configured_batch_size(monkeypatch):

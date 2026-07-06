@@ -314,7 +314,21 @@ def analyze_tracks_task(ids):
     }
 
 
+def is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
+    current_sig = media_signature(file_path)
+    if analyzer_ver is None:
+        return True
+    if int(analyzer_ver) < ANALYZER_VERSION:
+        return True
+    if status == "stale":
+        return True
+    if status == "ready" and current_sig and stored_sig and current_sig != stored_sig:
+        return True
+    return False
+
+
 def find_backfill_ids(limit=25):
+    batch_limit = int(limit or configured_backfill_limit())
     db = get_db()
     cur = db.cursor()
     cur.execute(
@@ -323,21 +337,14 @@ def find_backfill_ids(limit=25):
           FROM score s
           LEFT JOIN {profiles_table()} p ON p.track_id = s.item_id
          WHERE s.file_path IS NOT NULL
-         LIMIT %s
-        """,
-        (int(limit or configured_backfill_limit()),),
+        """
     )
     ids = []
     for item_id, file_path, stored_sig, analyzer_ver, status in cur.fetchall():
-        current_sig = media_signature(file_path)
-        if analyzer_ver is None:
+        if is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
             ids.append(str(item_id))
-        elif int(analyzer_ver) < ANALYZER_VERSION:
-            ids.append(str(item_id))
-        elif status == "stale":
-            ids.append(str(item_id))
-        elif status == "ready" and current_sig and stored_sig and current_sig != stored_sig:
-            ids.append(str(item_id))
+            if len(ids) >= batch_limit:
+                break
     cur.close()
     return ids
 
