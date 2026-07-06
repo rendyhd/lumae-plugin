@@ -101,14 +101,12 @@ def _scan_backward(relative_db):
 def analyze_buffer(audio, sample_rate):
     channels = _as_channels(audio)
     chunk_size = max(1, int(sample_rate * CHUNK_DURATION_MS / 1000))
-    chunks = channels.shape[1] // chunk_size
-    if chunks <= 0:
+    if channels.shape[1] <= 0:
         raise SilentAudioError("silent or sub-gate")
 
     weighted = np.stack([_k_weight(channels[i]) for i in range(channels.shape[0])])
     chunk_lufs = []
-    for i in range(chunks):
-        start = i * chunk_size
+    for start in range(0, weighted.shape[1], chunk_size):
         end = min(start + chunk_size, weighted.shape[1])
         window = weighted[:, start:end]
         ms = float(np.mean(window * window))

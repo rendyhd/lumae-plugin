@@ -168,6 +168,92 @@ def test_analyze_buffer_produces_waveform_profile():
     assert result.end_ramp_blob
 
 
+def test_analyze_buffer_uses_100ms_chunks_and_expected_ramp_encoding(monkeypatch):
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    monkeypatch.setattr(
+        loudness,
+        "_k_weight",
+        lambda channel: channel.astype(np.float64, copy=False),
+    )
+    monkeypatch.setattr(loudness, "_integrated_lufs", lambda chunk_lufs: -20.0)
+
+    audio = np.array([0.0, 0.1, 0.31622777, 1.0, 1.9952623], dtype=np.float32)
+
+    result = loudness.analyze_buffer(audio, 10)
+
+    assert result.sample_rate == 10
+    assert result.duration_ms == 500
+    assert result.start_ramp == [
+        (-90, 1),
+        (-60, 1),
+        (-40, 1),
+        (-30, 1),
+        (-24, 1),
+        (-21, 1),
+        (-18, 1),
+        (-15, 1),
+        (-12, 1),
+        (-9, 1),
+        (-6, 1),
+        (-3, 1),
+        (0, 2),
+        (3, 2),
+        (6, 2),
+    ]
+    assert result.end_ramp == [
+        (-90, 0),
+        (-60, 0),
+        (-40, 0),
+        (-30, 0),
+        (-24, 0),
+        (-21, 0),
+        (-18, 0),
+        (-15, 0),
+        (-12, 0),
+        (-9, 0),
+        (-6, 0),
+        (-3, 0),
+        (0, 0),
+        (3, 0),
+        (6, 0),
+    ]
+    assert result.start_ramp_blob == bytes(
+        [
+            166, 1, 0, 196, 1, 0, 216, 1, 0, 226, 1, 0, 232, 1, 0,
+            235, 1, 0, 238, 1, 0, 241, 1, 0, 244, 1, 0, 247, 1, 0,
+            250, 1, 0, 253, 1, 0, 0, 2, 0, 3, 2, 0, 6, 2, 0,
+        ]
+    )
+    assert result.end_ramp_blob == bytes(
+        [
+            166, 0, 0, 196, 0, 0, 216, 0, 0, 226, 0, 0, 232, 0, 0,
+            235, 0, 0, 238, 0, 0, 241, 0, 0, 244, 0, 0, 247, 0, 0,
+            250, 0, 0, 253, 0, 0, 0, 0, 0, 3, 0, 0, 6, 0, 0,
+        ]
+    )
+
+
+def test_analyze_buffer_includes_final_partial_chunk(monkeypatch):
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    monkeypatch.setattr(
+        loudness,
+        "_k_weight",
+        lambda channel: channel.astype(np.float64, copy=False),
+    )
+    monkeypatch.setattr(loudness, "_integrated_lufs", lambda chunk_lufs: -20.0)
+
+    audio = np.array([0.0, 0.0, 0.1, 0.1, 1.9952623], dtype=np.float32)
+
+    result = loudness.analyze_buffer(audio, 20)
+
+    assert result.duration_ms == 250
+    assert result.start_ramp[-3:] == [(0, 2), (3, 2), (6, 2)]
+    assert result.end_ramp[:3] == [(-90, 0), (-60, 0), (-40, 0)]
+    assert result.end_ramp[-3:] == [(0, 0), (3, 0), (6, 0)]
+
+
 def test_analyze_buffer_rejects_silent_audio():
     from plugins.LumaeAnalysis.loudness import SilentAudioError, analyze_buffer
 
@@ -179,3 +265,28 @@ def test_analyze_buffer_rejects_silent_audio():
         assert "silent or sub-gate" in str(exc)
     else:
         raise AssertionError("silent audio should fail")
+
+
+def test_analyze_file_loads_audio_and_delegates_to_buffer(monkeypatch):
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    captured = {}
+    audio = np.array([0.25, -0.25], dtype=np.float32)
+    sentinel = object()
+
+    def fake_load(path, sr=None, mono=False):
+        captured["load"] = (path, sr, mono)
+        return audio, 44100
+
+    def fake_analyze_buffer(buffer, sample_rate):
+        captured["analyze"] = (buffer, sample_rate)
+        return sentinel
+
+    monkeypatch.setattr(loudness.librosa, "load", fake_load)
+    monkeypatch.setattr(loudness, "analyze_buffer", fake_analyze_buffer)
+
+    result = loudness.analyze_file("fixture.wav")
+
+    assert result is sentinel
+    assert captured["load"] == ("fixture.wav", None, False)
+    assert captured["analyze"] == (audio, 44100)
