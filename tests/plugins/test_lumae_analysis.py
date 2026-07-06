@@ -31,6 +31,14 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["min_core_version"] == "2.5.0"
+    assert manifest["capabilities"] == {
+        "lumae_analysis_profiles": {
+            "schema_version": 1,
+            "analyzer_version": 1,
+            "profile_source": "waveform",
+            "features": ["loudness", "mix_ramp"],
+        },
+    }
 
 
 def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):

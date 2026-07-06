@@ -5,5 +5,13 @@
   "min_core_version": "2.5.0",
   "author": "Lumae",
   "description": "Precomputes Lumae loudness and MixRamp profiles for server-side volume normalization and SmoothFade.",
+  "capabilities": {
+    "lumae_analysis_profiles": {
+      "schema_version": 1,
+      "analyzer_version": 1,
+      "profile_source": "waveform",
+      "features": ["loudness", "mix_ramp"]
+    }
+  },
   "requirements": []
 }
