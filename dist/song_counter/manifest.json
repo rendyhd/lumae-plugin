@@ -10,8 +10,8 @@
       "changelog": "Saving settings returns to the Manage Plugins page.",
       "min_core_version": "2.5.0",
       "sourceUrl": "https://raw.githubusercontent.com/NeptuneHub/AudioMuse-AI-plugins/main/dist/song_counter/song_counter_1.3.0.zip",
-      "checksum": "af45022df84136efb33f55c772cbb52f",
-      "timestamp": "2026-07-06T10:50:34Z"
+      "checksum": "62a40a9487e3f25bd28f1cd02269d6c8",
+      "timestamp": "2026-07-06T11:28:16Z"
     },
     {
       "version": "1.1.0",
