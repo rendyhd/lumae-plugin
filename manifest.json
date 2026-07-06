@@ -1,3 +1,19 @@
 {
-  "plugins": []
+  "plugins": [{
+  "id": "song_counter",
+  "name": "SongCounter",
+  "description": "Shows how many songs have been analyzed.",
+  "author": "NeptuneHub",
+  "imageUrl": "",
+  "versions": [
+    {
+      "version": "1.0.0",
+      "changelog": "Initial release.",
+      "min_core_version": "2.5.0",
+      "sourceUrl": "https://raw.githubusercontent.com/NeptuneHub/AudioMuse-AI-plugins/main/dist/song_counter/song_counter_1.0.0.zip",
+      "checksum": "2406cadad045d78073c14a9aeff9fd0e",
+      "timestamp": "2026-07-06T09:25:50Z"
+    }
+  ]
+}]
 }
