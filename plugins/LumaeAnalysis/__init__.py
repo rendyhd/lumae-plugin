@@ -1,8 +1,12 @@
 import base64
+import os
+from datetime import datetime, timezone
 
 from flask import Blueprint, jsonify, request
 
-from plugin.api import enqueue, get_db, logger, table
+from plugin.api import enqueue, get_db, get_setting, logger, render_page, set_setting, table
+
+from .loudness import SilentAudioError, analyze_file
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
@@ -12,6 +16,27 @@ bp = Blueprint("lumae_analysis", __name__)
 
 def profiles_table():
     return table("profiles")
+
+
+def utc_now_iso():
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def media_signature(path):
+    try:
+        stat = os.stat(path)
+    except OSError:
+        return None
+    return f"{path}|{stat.st_size}|{int(stat.st_mtime)}"
+
+
+def configured_backfill_limit():
+    raw = get_setting("backfill_batch_size", 25)
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return 25
+    return min(max(value, 1), 250)
 
 
 def migrate(db):
@@ -136,6 +161,70 @@ def mark_pending(ids):
     cur.close()
 
 
+def load_track_file(track_id):
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        "SELECT item_id, file_path, size_bytes, source_suffix FROM score WHERE item_id = %s",
+        (track_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    if not row:
+        return None
+    item_id, file_path, size_bytes, source_suffix = row
+    if not file_path or not os.path.exists(file_path):
+        return None
+    return {
+        "track_id": str(item_id),
+        "file_path": file_path,
+        "media_signature": media_signature(file_path),
+        "size_bytes": size_bytes,
+        "source_suffix": source_suffix,
+    }
+
+
+def upsert_profile(track_id, result, status, last_error=None, media_sig=None):
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        INSERT INTO {profiles_table()}
+            (track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
+             analyzer_ver, profile_schema_ver, media_signature, analyzed_at, status, last_error)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+        ON CONFLICT (track_id) DO UPDATE SET
+            sample_rate = EXCLUDED.sample_rate,
+            duration_ms = EXCLUDED.duration_ms,
+            ref_lufs = EXCLUDED.ref_lufs,
+            start_ramp = EXCLUDED.start_ramp,
+            end_ramp = EXCLUDED.end_ramp,
+            analyzer_ver = EXCLUDED.analyzer_ver,
+            profile_schema_ver = EXCLUDED.profile_schema_ver,
+            media_signature = EXCLUDED.media_signature,
+            analyzed_at = EXCLUDED.analyzed_at,
+            status = EXCLUDED.status,
+            last_error = EXCLUDED.last_error
+        """,
+        (
+            track_id,
+            int(getattr(result, "sample_rate", 0)),
+            int(getattr(result, "duration_ms", 0)),
+            float(getattr(result, "ref_lufs", 0.0)),
+            getattr(result, "start_ramp_blob", b""),
+            getattr(result, "end_ramp_blob", b""),
+            ANALYZER_VERSION,
+            SCHEMA_VERSION,
+            media_sig,
+            utc_now_iso(),
+            status,
+            last_error,
+        ),
+    )
+    db.commit()
+    cur.close()
+
+
 @bp.get("/api/health")
 def health():
     return jsonify(
@@ -197,18 +286,94 @@ def analyze():
     ), 202
 
 
+def analyze_one_track(track_id):
+    info = load_track_file(track_id)
+    if info is None:
+        upsert_profile(track_id, object(), "skipped_no_file", "missing file path", None)
+        return {"track_id": track_id, "status": "skipped_no_file"}
+    try:
+        result = analyze_file(info["file_path"])
+        upsert_profile(track_id, result, "ready", None, info["media_signature"])
+        return {"track_id": track_id, "status": "ready"}
+    except SilentAudioError as exc:
+        upsert_profile(track_id, object(), "failed", str(exc), info["media_signature"])
+        return {"track_id": track_id, "status": "failed"}
+    except Exception as exc:
+        logger.exception("lumae_analysis failed for %s", track_id)
+        upsert_profile(track_id, object(), "failed", str(exc), info["media_signature"])
+        return {"track_id": track_id, "status": "failed"}
+
+
 def analyze_tracks_task(ids):
-    logger.info("lumae_analysis analyze_tracks_task scaffold received %d ids", len(ids or []))
-    return {"accepted": len(ids or [])}
+    ids = parse_ids(",".join(ids or []))
+    results = [analyze_one_track(track_id) for track_id in ids]
+    return {
+        "ready": sum(1 for result in results if result["status"] == "ready"),
+        "failed": sum(1 for result in results if result["status"] == "failed"),
+        "skipped": sum(1 for result in results if result["status"].startswith("skipped")),
+    }
 
 
-def backfill_missing_profiles():
-    logger.info("lumae_analysis backfill scaffold started")
-    return {"analyzed": 0}
+def find_backfill_ids(limit=25):
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT s.item_id, s.file_path, p.media_signature, p.analyzer_ver, p.status
+          FROM score s
+          LEFT JOIN {profiles_table()} p ON p.track_id = s.item_id
+         WHERE s.file_path IS NOT NULL
+         LIMIT %s
+        """,
+        (int(limit or configured_backfill_limit()),),
+    )
+    ids = []
+    for item_id, file_path, stored_sig, analyzer_ver, status in cur.fetchall():
+        current_sig = media_signature(file_path)
+        if analyzer_ver is None:
+            ids.append(str(item_id))
+        elif int(analyzer_ver) < ANALYZER_VERSION:
+            ids.append(str(item_id))
+        elif status == "stale":
+            ids.append(str(item_id))
+        elif status == "ready" and current_sig and stored_sig and current_sig != stored_sig:
+            ids.append(str(item_id))
+    cur.close()
+    return ids
 
 
+def backfill_missing_profiles(limit=None):
+    ids = find_backfill_ids(limit or configured_backfill_limit())
+    return analyze_tracks_task(ids)
+
+
+@bp.route("/settings", methods=["GET", "POST"])
 def settings():
-    return "Lumae Analysis"
+    if request.method == "POST":
+        try:
+            batch_size = int(request.form.get("backfill_batch_size") or 25)
+        except (TypeError, ValueError):
+            batch_size = 25
+        set_setting("backfill_batch_size", min(max(batch_size, 1), 250))
+        schedule = (request.form.get("backfill_schedule") or "manual").strip().lower()
+        if schedule not in {"manual", "daily", "weekly"}:
+            schedule = "manual"
+        set_setting("backfill_schedule", schedule)
+        return "", 204
+
+    batch_size = configured_backfill_limit()
+    schedule = get_setting("backfill_schedule", "manual")
+    return render_page(
+        f"""
+        <form method="post">
+          <label>Backfill batch size <input name="backfill_batch_size" value="{batch_size}"></label>
+          <label>Backfill schedule <input name="backfill_schedule" value="{schedule}"></label>
+          <button type="submit">Save</button>
+        </form>
+        <p>Create the actual daily or weekly run from Administration &gt; Scheduled Tasks using task type plugin.lumae_analysis.backfill.</p>
+        """,
+        title="Lumae Analysis",
+    )
 
 
 def register(ctx):

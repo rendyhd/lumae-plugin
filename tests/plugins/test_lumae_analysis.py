@@ -290,3 +290,127 @@ def test_analyze_file_loads_audio_and_delegates_to_buffer(monkeypatch):
     assert result is sentinel
     assert captured["load"] == ("fixture.wav", None, False)
     assert captured["analyze"] == (audio, 44100)
+
+
+class FakeCursor:
+    def __init__(self, rows=None):
+        self.rows = rows or []
+        self.description = [("item_id",), ("file_path",), ("size_bytes",), ("source_suffix",)]
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return self.rows
+
+    def close(self):
+        pass
+
+
+class FakeDb:
+    def __init__(self, rows=None):
+        self.cursor_obj = FakeCursor(rows)
+        self.commits = 0
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commits += 1
+
+
+def test_analyze_one_track_marks_missing_file(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=[]))
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    result = mod.analyze_one_track("missing")
+
+    assert result == {"track_id": "missing", "status": "skipped_no_file"}
+
+
+def test_analyze_one_track_persists_ready_profile(monkeypatch, tmp_path):
+    mod = load_plugin()
+    audio = tmp_path / "song.wav"
+    audio.write_bytes(b"not really decoded in this test")
+    db = FakeDb(rows=[("track-a", str(audio), 100, "wav")])
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    class Result:
+        sample_rate = 48000
+        duration_ms = 1000
+        ref_lufs = -14.0
+        start_ramp_blob = b"\xe9\x03\x00"
+        end_ramp_blob = b"\xe9\x04\x00"
+
+    monkeypatch.setattr(mod, "analyze_file", lambda path: Result())
+
+    result = mod.analyze_one_track("track-a")
+
+    assert result == {"track_id": "track-a", "status": "ready"}
+    assert db.commits == 1
+    sql, params = db.cursor_obj.executed[-1]
+    assert "INSERT INTO" in sql
+    assert params[0] == "track-a"
+    assert params[1] == 48000
+    assert params[6] == mod.ANALYZER_VERSION
+    assert params[7] == mod.SCHEMA_VERSION
+    assert params[10] == "ready"
+
+
+def test_analyze_one_track_persists_failed_profile(monkeypatch, tmp_path):
+    mod = load_plugin()
+    audio = tmp_path / "song.wav"
+    audio.write_bytes(b"x")
+    db = FakeDb(rows=[("track-a", str(audio), 100, "wav")])
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "analyze_file", lambda path: (_ for _ in ()).throw(RuntimeError("decode failed")))
+
+    result = mod.analyze_one_track("track-a")
+
+    assert result == {"track_id": "track-a", "status": "failed"}
+    assert db.cursor_obj.executed[-1][1][-1] == "decode failed"
+
+
+def test_find_backfill_ids_includes_missing_old_and_signature_changed_but_not_failed(monkeypatch, tmp_path):
+    mod = load_plugin()
+    current = tmp_path / "current.wav"
+    current.write_bytes(b"new media")
+    unchanged = tmp_path / "unchanged.wav"
+    unchanged.write_bytes(b"same media")
+    unchanged_sig = mod.media_signature(str(unchanged))
+    rows = [
+        ("missing-profile", str(current), None, None, None),
+        ("old-analyzer", str(current), "old-sig", 0, "ready"),
+        ("changed-media", str(current), "old-sig", mod.ANALYZER_VERSION, "ready"),
+        ("failed-once", str(current), "old-sig", mod.ANALYZER_VERSION, "failed"),
+        ("unchanged-ready", str(unchanged), unchanged_sig, mod.ANALYZER_VERSION, "ready"),
+    ]
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    assert mod.find_backfill_ids(limit=25) == [
+        "missing-profile",
+        "old-analyzer",
+        "changed-media",
+    ]
+
+
+def test_backfill_uses_configured_batch_size(monkeypatch):
+    mod = load_plugin()
+    seen_limits = []
+    monkeypatch.setattr(
+        mod,
+        "get_setting",
+        lambda key, default=None: 7 if key == "backfill_batch_size" else default,
+    )
+    monkeypatch.setattr(mod, "find_backfill_ids", lambda limit: seen_limits.append(limit) or [])
+
+    assert mod.backfill_missing_profiles() == {"ready": 0, "failed": 0, "skipped": 0}
+    assert seen_limits == [7]
