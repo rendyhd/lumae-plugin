@@ -295,7 +295,7 @@ def test_analyze_file_loads_audio_and_delegates_to_buffer(monkeypatch):
 class FakeCursor:
     def __init__(self, rows=None):
         self.rows = rows or []
-        self.description = [("item_id",), ("file_path",), ("size_bytes",), ("source_suffix",)]
+        self.description = [("item_id",), ("file_path",)]
         self.executed = []
 
     def execute(self, sql, params=None):
@@ -349,11 +349,11 @@ def test_analyze_one_track_marks_missing_file(monkeypatch):
     assert result == {"track_id": "missing", "status": "skipped_no_file"}
 
 
-def test_analyze_one_track_persists_ready_profile(monkeypatch, tmp_path):
+def test_analyze_one_track_persists_ready_profile_with_pr721_score_shape(monkeypatch, tmp_path):
     mod = load_plugin()
     audio = tmp_path / "song.wav"
     audio.write_bytes(b"not really decoded in this test")
-    db = FakeDb(rows=[("track-a", str(audio), 100, "wav")])
+    db = FakeDb(rows=[("track-a", str(audio))])
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
 
@@ -364,11 +364,19 @@ def test_analyze_one_track_persists_ready_profile(monkeypatch, tmp_path):
         start_ramp_blob = b"\xe9\x03\x00"
         end_ramp_blob = b"\xe9\x04\x00"
 
-    monkeypatch.setattr(mod, "analyze_file", lambda path: Result())
+    seen = {}
+
+    def fake_analyze_file(path):
+        seen["path"] = path
+        return Result()
+
+    monkeypatch.setattr(mod, "analyze_file", fake_analyze_file)
 
     result = mod.analyze_one_track("track-a")
 
     assert result == {"track_id": "track-a", "status": "ready"}
+    assert seen["path"] == str(audio)
+    assert db.cursor_obj.executed[0][0] == "SELECT item_id, file_path FROM score WHERE item_id = %s"
     assert db.commits == 1
     sql, params = db.cursor_obj.executed[-1]
     assert "INSERT INTO" in sql
@@ -383,7 +391,7 @@ def test_analyze_one_track_persists_failed_profile(monkeypatch, tmp_path):
     mod = load_plugin()
     audio = tmp_path / "song.wav"
     audio.write_bytes(b"x")
-    db = FakeDb(rows=[("track-a", str(audio), 100, "wav")])
+    db = FakeDb(rows=[("track-a", str(audio))])
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
     monkeypatch.setattr(mod, "analyze_file", lambda path: (_ for _ in ()).throw(RuntimeError("decode failed")))

@@ -165,22 +165,20 @@ def load_track_file(track_id):
     db = get_db()
     cur = db.cursor()
     cur.execute(
-        "SELECT item_id, file_path, size_bytes, source_suffix FROM score WHERE item_id = %s",
+        "SELECT item_id, file_path FROM score WHERE item_id = %s",
         (track_id,),
     )
     row = cur.fetchone()
     cur.close()
     if not row:
         return None
-    item_id, file_path, size_bytes, source_suffix = row
+    item_id, file_path = row
     if not file_path or not os.path.exists(file_path):
         return None
     return {
         "track_id": str(item_id),
         "file_path": file_path,
         "media_signature": media_signature(file_path),
-        "size_bytes": size_bytes,
-        "source_suffix": source_suffix,
     }
 
 
