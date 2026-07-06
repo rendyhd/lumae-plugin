@@ -1,6 +1,6 @@
-from flask import Blueprint, request, redirect, url_for
+from flask import Blueprint, request, redirect
 
-from plugin.api import get_db, get_setting, set_setting, render_page
+from plugin.api import get_db, get_setting, set_setting, render_page, manage_plugins_url
 
 bp = Blueprint('song_counter', __name__)
 
@@ -34,10 +34,7 @@ def home():
         f'<li style="margin:.3rem 0;"><strong>{label}:</strong> {count}</li>'
         for label, count in rows
     )
-    body = (
-        f'<ul style="list-style:none;padding:0;font-size:1.2rem;">{items}</ul>'
-        f'<p style="margin-top:1rem;"><a href="{url_for("song_counter.settings")}">Settings</a></p>'
-    )
+    body = f'<ul style="list-style:none;padding:0;font-size:1.2rem;">{items}</ul>'
     return render_page(body, title='SongCounter')
 
 
@@ -46,7 +43,7 @@ def settings():
     if request.method == 'POST':
         chosen = [key for key, _label, _table in SOURCES if request.form.get(key)]
         set_setting('sources', chosen)
-        return redirect(url_for('song_counter.home'))
+        return redirect(manage_plugins_url())
     selected = get_setting('sources', [])
     checks = ''
     for key, label, _table in SOURCES:
@@ -68,4 +65,3 @@ def settings():
 def register(ctx):
     ctx.add_blueprint(bp)
     ctx.add_menu_item('SongCounter', 'song_counter.home')
-    ctx.add_menu_item('SongCounter Settings', 'song_counter.settings')
