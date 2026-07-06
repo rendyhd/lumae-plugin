@@ -27,13 +27,13 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Build zips and print manifest entries
+      - name: Build zips, per-plugin manifests, and the catalog
         env:
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
         run: |
           python - <<'PY'
-          import hashlib, json, os, zipfile
+          import hashlib, json, os, re, zipfile
           from datetime import datetime, timezone
 
           repo = os.environ["REPO"]
@@ -41,7 +41,23 @@ jobs:
           raw = f"https://raw.githubusercontent.com/{repo}/{branch}"
           plugins_dir, dist_dir = "plugins", "dist"
           now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-          summary = os.environ.get("GITHUB_STEP_SUMMARY")
+
+          def parse_version(value):
+              nums = [int(re.match(r"\d+", p).group()) if re.match(r"\d+", p) else 0
+                      for p in re.split(r"[.\-+]", str(value or "").lstrip("vV"))]
+              return tuple(nums) if nums else (0,)
+
+          def load_json(path):
+              if os.path.isfile(path):
+                  with open(path, encoding="utf-8") as fh:
+                      return json.load(fh)
+              return {}
+
+          def write_json(path, obj):
+              os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+              with open(path, "w", encoding="utf-8", newline="\n") as fh:
+                  json.dump(obj, fh, indent=2)
+                  fh.write("\n")
 
           def build_zip(src, out):
               os.makedirs(os.path.dirname(out), exist_ok=True)
@@ -64,6 +80,7 @@ jobs:
                       with open(full, "rb") as fh:
                           z.writestr(info, fh.read())
 
+          catalog = []
           for folder in sorted(os.listdir(plugins_dir)):
               meta_path = os.path.join(plugins_dir, folder, "plugin.json")
               if not os.path.isfile(meta_path):
@@ -76,39 +93,53 @@ jobs:
               out = os.path.join(dist_dir, pid, zip_name)
               build_zip(os.path.join(plugins_dir, folder), out)
               checksum = hashlib.md5(open(out, "rb").read()).hexdigest()
-              entry = {
+
+              manifest_path = os.path.join(dist_dir, pid, "manifest.json")
+              existing = load_json(manifest_path)
+              versions = {str(v.get("version")): v for v in existing.get("versions", [])}
+              prev = versions.get(version)
+              timestamp = prev["timestamp"] if prev and prev.get("checksum") == checksum else now
+              versions[version] = {
+                  "version": version,
+                  "changelog": meta.get("changelog", ""),
+                  "min_core_version": meta.get("min_core_version", ""),
+                  "sourceUrl": f"{raw}/{dist_dir}/{pid}/{zip_name}",
+                  "checksum": checksum,
+                  "timestamp": timestamp,
+              }
+              ordered = sorted(versions.values(), key=lambda v: parse_version(v["version"]), reverse=True)
+              write_json(manifest_path, {
                   "id": pid,
                   "name": meta.get("name", pid),
                   "description": meta.get("description", ""),
                   "author": meta.get("author", ""),
                   "imageUrl": meta.get("imageUrl", ""),
-                  "versions": [{
-                      "version": version,
-                      "changelog": meta.get("changelog", ""),
-                      "min_core_version": meta.get("min_core_version", ""),
-                      "sourceUrl": f"{raw}/{dist_dir}/{pid}/{zip_name}",
-                      "checksum": checksum,
-                      "timestamp": now,
-                  }],
-              }
-              block = json.dumps(entry, indent=2)
-              print(f"\n===== manifest entry for '{pid}' (paste into the plugins array of manifest.json) =====")
-              print(block)
-              if summary:
-                  with open(summary, "a", encoding="utf-8") as fh:
-                      fh.write(f"### manifest entry for `{pid}` {version}\n\n")
-                      fh.write("Copy this object into the `plugins` array of `manifest.json`:\n\n")
-                      fh.write("```json\n" + block + "\n```\n")
+                  "versions": ordered,
+              })
+
+              catalog.append({
+                  "id": pid,
+                  "name": meta.get("name", pid),
+                  "description": meta.get("description", ""),
+                  "author": meta.get("author", ""),
+                  "imageUrl": meta.get("imageUrl", ""),
+                  "manifestUrl": f"{raw}/{dist_dir}/{pid}/manifest.json",
+              })
+              print(f"built {zip_name} (md5 {checksum}); updated {manifest_path}")
+
+          catalog.sort(key=lambda e: e["id"])
+          write_json("manifest.json", {"plugins": catalog})
+          print(f"updated manifest.json (catalog) with {len(catalog)} plugin(s)")
           PY
 
-      - name: Commit built zips
+      - name: Commit catalog, zips, and manifests
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add dist
+          git add dist manifest.json
           if git diff --cached --quiet; then
-            echo "No zip changes to commit."
+            echo "Catalog already up to date; nothing to commit."
           else
-            git commit -m "Build plugin zips [skip ci]"
+            git commit -m "Build plugin catalog [skip ci]"
             git push
           fi
