@@ -2,6 +2,9 @@ import importlib
 import json
 import pathlib
 import sys
+import math
+
+import numpy as np
 
 from flask import Flask
 
@@ -139,3 +142,40 @@ def test_analyze_endpoint_enqueues_only_missing_or_stale_ids(monkeypatch):
         ("mark_pending", ["stale-1", "missing-1"], "default"),
         ("analyze_tracks_task", ["stale-1", "missing-1"], "default"),
     ]
+
+
+def test_encode_ramp_matches_lumae_byte_layout():
+    from plugins.LumaeAnalysis.ramp_codec import encode_ramp
+
+    assert encode_ramp([(-17, 3), (0, 513)]) == bytes([239, 3, 0, 0, 1, 2])
+
+
+def test_analyze_buffer_produces_waveform_profile():
+    from plugins.LumaeAnalysis.loudness import analyze_buffer
+
+    sr = 48000
+    t = np.arange(sr * 2, dtype=np.float32) / sr
+    audio = np.sin(2 * np.pi * 440 * t).astype(np.float32) * 0.25
+
+    result = analyze_buffer(audio, sr)
+
+    assert result.sample_rate == sr
+    assert result.duration_ms == 2000
+    assert math.isfinite(result.ref_lufs)
+    assert result.start_ramp
+    assert result.end_ramp
+    assert result.start_ramp_blob
+    assert result.end_ramp_blob
+
+
+def test_analyze_buffer_rejects_silent_audio():
+    from plugins.LumaeAnalysis.loudness import SilentAudioError, analyze_buffer
+
+    audio = np.zeros(48000, dtype=np.float32)
+
+    try:
+        analyze_buffer(audio, 48000)
+    except SilentAudioError as exc:
+        assert "silent or sub-gate" in str(exc)
+    else:
+        raise AssertionError("silent audio should fail")
