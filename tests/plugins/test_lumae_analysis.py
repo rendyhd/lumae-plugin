@@ -347,6 +347,21 @@ class LimitAwareDb(FakeDb):
         self.commits = 0
 
 
+class CronCursor(FakeCursor):
+    def __init__(self, existing=None):
+        super().__init__(rows=[])
+        self.existing = existing
+
+    def fetchone(self):
+        return self.existing
+
+
+class CronDb(FakeDb):
+    def __init__(self, existing=None):
+        self.cursor_obj = CronCursor(existing)
+        self.commits = 0
+
+
 def test_analyze_one_track_marks_missing_file(monkeypatch):
     mod = load_plugin()
     monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=[]))
@@ -481,3 +496,102 @@ def test_backfill_uses_configured_batch_size(monkeypatch):
 
     assert mod.backfill_missing_profiles() == {"ready": 0, "failed": 0, "skipped": 0}
     assert seen_limits == [7]
+
+
+def test_analysis_status_counts_current_pending_failed_and_needed(monkeypatch, tmp_path):
+    mod = load_plugin()
+    current = tmp_path / "current.wav"
+    current.write_bytes(b"new media")
+    unchanged = tmp_path / "unchanged.wav"
+    unchanged.write_bytes(b"same media")
+    unchanged_sig = mod.media_signature(str(unchanged))
+    rows = [
+        ("ready-current", str(unchanged), unchanged_sig, mod.ANALYZER_VERSION, "ready"),
+        ("missing-profile", str(current), None, None, None),
+        ("old-analyzer", str(current), "old-sig", 0, "ready"),
+        ("changed-media", str(current), "old-sig", mod.ANALYZER_VERSION, "ready"),
+        ("pending-track", str(current), None, mod.ANALYZER_VERSION, "pending"),
+        ("failed-track", str(current), None, mod.ANALYZER_VERSION, "failed"),
+        ("skipped-track", str(current), None, mod.ANALYZER_VERSION, "skipped_no_file"),
+    ]
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    assert mod.analysis_status_counts() == {
+        "total_with_files": 7,
+        "ready_current": 1,
+        "pending": 1,
+        "failed": 1,
+        "skipped": 1,
+        "needs_analysis": 3,
+    }
+
+
+def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch):
+    mod = load_plugin()
+    calls = []
+
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 3)
+    monkeypatch.setattr(mod, "find_backfill_ids", lambda limit: calls.append(("find", limit)) or ["a", "b"])
+    monkeypatch.setattr(mod, "mark_pending", lambda ids: calls.append(("mark_pending", ids)))
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda func, ids, queue="default": calls.append((func.__name__, ids, queue)),
+    )
+
+    assert mod.queue_backfill_batch() == {"queued": 2, "limit": 3}
+    assert calls == [
+        ("find", 3),
+        ("mark_pending", ["a", "b"]),
+        ("analyze_tracks_task", ["a", "b"], "default"),
+    ]
+
+
+def test_save_backfill_schedule_updates_existing_plugin_cron_row(monkeypatch):
+    mod = load_plugin()
+    db = CronDb(existing=(12,))
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+
+    mod.save_backfill_schedule(True, "*/15 * * * *")
+
+    assert db.commits == 1
+    assert db.cursor_obj.executed == [
+        (
+            "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
+            (mod.BACKFILL_TASK_TYPE,),
+        ),
+        (
+            "UPDATE cron SET name=%s, task_type=%s, cron_expr=%s, enabled=%s WHERE id=%s",
+            ("Lumae Analysis Backfill", mod.BACKFILL_TASK_TYPE, "*/15 * * * *", True, 12),
+        ),
+    ]
+
+
+def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 250)
+    monkeypatch.setattr(mod, "get_backfill_schedule", lambda: {"cron_expr": "0 3 * * *", "enabled": False, "last_run": None})
+    monkeypatch.setattr(
+        mod,
+        "analysis_status_counts",
+        lambda: {
+            "total_with_files": 16000,
+            "ready_current": 100,
+            "pending": 2,
+            "failed": 1,
+            "skipped": 3,
+            "needs_analysis": 15894,
+        },
+    )
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+    client = plugin_client(mod)
+
+    response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "Catch Up Now" in body
+    assert "Needs analysis" in body
+    assert "15894" in body
+    assert "Scheduled Tasks" not in body

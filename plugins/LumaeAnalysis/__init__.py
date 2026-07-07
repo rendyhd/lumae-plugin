@@ -1,6 +1,7 @@
 import base64
 import os
 from datetime import datetime, timezone
+from html import escape
 
 from flask import Blueprint, jsonify, request
 
@@ -10,6 +11,9 @@ from .loudness import SilentAudioError, analyze_file
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
+BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
+BACKFILL_TASK_NAME = "Lumae Analysis Backfill"
+DEFAULT_BACKFILL_CRON = "0 3 * * *"
 
 bp = Blueprint("lumae_analysis", __name__)
 
@@ -32,11 +36,26 @@ def media_signature(path):
 
 def configured_backfill_limit():
     raw = get_setting("backfill_batch_size", 25)
+    return normalize_backfill_limit(raw)
+
+
+def normalize_backfill_limit(raw):
     try:
         value = int(raw)
     except (TypeError, ValueError):
         return 25
     return min(max(value, 1), 250)
+
+
+def normalize_cron_expr(raw):
+    cron_expr = (raw or DEFAULT_BACKFILL_CRON).strip()
+    if len(cron_expr.split()) != 5:
+        raise ValueError("Cron expression must have five fields.")
+    return " ".join(cron_expr.split())
+
+
+def form_checked(value):
+    return str(value or "").lower() in {"1", "true", "yes", "on"}
 
 
 def migrate(db):
@@ -313,6 +332,8 @@ def analyze_tracks_task(ids):
 
 
 def is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
+    if status == "pending":
+        return False
     current_sig = media_signature(file_path)
     if analyzer_ver is None:
         return True
@@ -325,8 +346,7 @@ def is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
     return False
 
 
-def find_backfill_ids(limit=25):
-    batch_limit = int(limit or configured_backfill_limit())
+def fetch_analysis_rows():
     db = get_db()
     cur = db.cursor()
     cur.execute(
@@ -337,14 +357,55 @@ def find_backfill_ids(limit=25):
          WHERE s.file_path IS NOT NULL
         """
     )
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
+def find_backfill_ids(limit=25):
+    batch_limit = normalize_backfill_limit(limit or configured_backfill_limit())
     ids = []
-    for item_id, file_path, stored_sig, analyzer_ver, status in cur.fetchall():
+    for item_id, file_path, stored_sig, analyzer_ver, status in fetch_analysis_rows():
         if is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
             ids.append(str(item_id))
             if len(ids) >= batch_limit:
                 break
-    cur.close()
     return ids
+
+
+def analysis_status_counts():
+    counts = {
+        "total_with_files": 0,
+        "ready_current": 0,
+        "pending": 0,
+        "failed": 0,
+        "skipped": 0,
+        "needs_analysis": 0,
+    }
+    for _item_id, file_path, stored_sig, analyzer_ver, status in fetch_analysis_rows():
+        counts["total_with_files"] += 1
+        if status == "pending":
+            counts["pending"] += 1
+        elif status == "failed":
+            counts["failed"] += 1
+        elif status == "skipped_no_file":
+            counts["skipped"] += 1
+        elif is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
+            counts["needs_analysis"] += 1
+        elif status == "ready":
+            counts["ready_current"] += 1
+        else:
+            counts["needs_analysis"] += 1
+    return counts
+
+
+def queue_backfill_batch(limit=None):
+    batch_limit = normalize_backfill_limit(limit or configured_backfill_limit())
+    ids = find_backfill_ids(batch_limit)
+    if ids:
+        mark_pending(ids)
+        enqueue(analyze_tracks_task, ids, queue="default")
+    return {"queued": len(ids), "limit": batch_limit}
 
 
 def backfill_missing_profiles(limit=None):
@@ -352,33 +413,106 @@ def backfill_missing_profiles(limit=None):
     return analyze_tracks_task(ids)
 
 
-@bp.route("/settings", methods=["GET", "POST"])
-def settings():
-    if request.method == "POST":
-        try:
-            batch_size = int(request.form.get("backfill_batch_size") or 25)
-        except (TypeError, ValueError):
-            batch_size = 25
-        set_setting("backfill_batch_size", min(max(batch_size, 1), 250))
-        schedule = (request.form.get("backfill_schedule") or "manual").strip().lower()
-        if schedule not in {"manual", "daily", "weekly"}:
-            schedule = "manual"
-        set_setting("backfill_schedule", schedule)
-        return "", 204
+def get_backfill_schedule():
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        "SELECT id, cron_expr, enabled, last_run FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
+        (BACKFILL_TASK_TYPE,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    if not row:
+        return {"cron_expr": DEFAULT_BACKFILL_CRON, "enabled": False, "last_run": None}
+    return {
+        "id": row[0],
+        "cron_expr": row[1],
+        "enabled": bool(row[2]),
+        "last_run": row[3],
+    }
 
+
+def save_backfill_schedule(enabled, cron_expr):
+    normalized = normalize_cron_expr(cron_expr)
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
+        (BACKFILL_TASK_TYPE,),
+    )
+    existing = cur.fetchone()
+    if existing:
+        cur.execute(
+            "UPDATE cron SET name=%s, task_type=%s, cron_expr=%s, enabled=%s WHERE id=%s",
+            (BACKFILL_TASK_NAME, BACKFILL_TASK_TYPE, normalized, bool(enabled), existing[0]),
+        )
+    else:
+        cur.execute(
+            "INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s,%s,%s,%s)",
+            (BACKFILL_TASK_NAME, BACKFILL_TASK_TYPE, normalized, bool(enabled)),
+        )
+    db.commit()
+    cur.close()
+    return {"cron_expr": normalized, "enabled": bool(enabled)}
+
+
+def render_settings(message=None, error=None):
     batch_size = configured_backfill_limit()
-    schedule = get_setting("backfill_schedule", "manual")
+    schedule = get_backfill_schedule()
+    counts = analysis_status_counts()
+    checked = " checked" if schedule.get("enabled") else ""
+    cron_expr = escape(schedule.get("cron_expr") or DEFAULT_BACKFILL_CRON)
+    last_run = escape(str(schedule.get("last_run") or "Never"))
+    message_html = f"<p>{escape(message)}</p>" if message else ""
+    error_html = f"<p><strong>{escape(error)}</strong></p>" if error else ""
     return render_page(
         f"""
+        {message_html}
+        {error_html}
+        <table>
+          <tbody>
+            <tr><th>Total tracks with files</th><td>{counts["total_with_files"]}</td></tr>
+            <tr><th>Ready/current</th><td>{counts["ready_current"]}</td></tr>
+            <tr><th>Needs analysis</th><td>{counts["needs_analysis"]}</td></tr>
+            <tr><th>Pending</th><td>{counts["pending"]}</td></tr>
+            <tr><th>Failed</th><td>{counts["failed"]}</td></tr>
+            <tr><th>Skipped</th><td>{counts["skipped"]}</td></tr>
+            <tr><th>Last scheduled run</th><td>{last_run}</td></tr>
+          </tbody>
+        </table>
         <form method="post">
-          <label>Backfill batch size <input name="backfill_batch_size" value="{batch_size}"></label>
-          <label>Backfill schedule <input name="backfill_schedule" value="{schedule}"></label>
-          <button type="submit">Save</button>
+          <label>Backfill batch size <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric"></label>
+          <label><input type="checkbox" name="schedule_enabled" value="1"{checked}> Enable scheduled catch-up</label>
+          <label>Cron expression <input name="backfill_cron_expr" value="{cron_expr}"></label>
+          <button type="submit" name="action" value="save">Save</button>
+          <button type="submit" name="action" value="catch_up">Catch Up Now</button>
         </form>
-        <p>Create the actual daily or weekly run from Administration &gt; Scheduled Tasks using task type plugin.lumae_analysis.backfill.</p>
+        <p>Batch size is tracks per run. Catch-up only queues tracks that are missing, stale, or changed.</p>
         """,
         title="Lumae Analysis",
     )
+
+
+@bp.route("/settings", methods=["GET", "POST"])
+def settings():
+    message = None
+    error = None
+    if request.method == "POST":
+        try:
+            batch_size = normalize_backfill_limit(request.form.get("backfill_batch_size") or 25)
+            set_setting("backfill_batch_size", batch_size)
+            schedule_enabled = form_checked(request.form.get("schedule_enabled"))
+            cron_expr = request.form.get("backfill_cron_expr") or DEFAULT_BACKFILL_CRON
+            save_backfill_schedule(schedule_enabled, cron_expr)
+            if request.form.get("action") == "catch_up":
+                result = queue_backfill_batch(batch_size)
+                message = f"Queued {result['queued']} tracks for Lumae analysis."
+            else:
+                message = "Lumae analysis settings saved."
+        except ValueError as exc:
+            error = str(exc)
+
+    return render_settings(message=message, error=error)
 
 
 def register(ctx):
