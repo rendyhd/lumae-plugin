@@ -548,6 +548,51 @@ def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch)
     ]
 
 
+def test_migrate_creates_enabled_default_backfill_schedule(monkeypatch):
+    mod = load_plugin()
+    db = CronDb(existing=None)
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    mod.migrate(db)
+
+    assert db.commits == 1
+    assert db.cursor_obj.executed[-2:] == [
+        (
+            "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
+            (mod.BACKFILL_TASK_TYPE,),
+        ),
+        (
+            "INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s,%s,%s,%s)",
+            (mod.BACKFILL_TASK_NAME, mod.BACKFILL_TASK_TYPE, "*/15 * * * *", True),
+        ),
+    ]
+
+
+def test_migrate_keeps_existing_backfill_schedule(monkeypatch):
+    mod = load_plugin()
+    db = CronDb(existing=(12,))
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    mod.migrate(db)
+
+    assert db.commits == 1
+    assert db.cursor_obj.executed[-1] == (
+        "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
+        (mod.BACKFILL_TASK_TYPE,),
+    )
+
+
+def test_get_backfill_schedule_defaults_to_enabled_when_missing(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "get_db", lambda: CronDb(existing=None))
+
+    assert mod.get_backfill_schedule() == {
+        "cron_expr": "*/15 * * * *",
+        "enabled": True,
+        "last_run": None,
+    }
+
+
 def test_save_backfill_schedule_updates_existing_plugin_cron_row(monkeypatch):
     mod = load_plugin()
     db = CronDb(existing=(12,))

@@ -13,7 +13,7 @@ SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 BACKFILL_TASK_NAME = "Lumae Analysis Backfill"
-DEFAULT_BACKFILL_CRON = "0 3 * * *"
+DEFAULT_BACKFILL_CRON = "*/15 * * * *"
 
 bp = Blueprint("lumae_analysis", __name__)
 
@@ -58,6 +58,21 @@ def form_checked(value):
     return str(value or "").lower() in {"1", "true", "yes", "on"}
 
 
+def ensure_default_backfill_schedule(db):
+    cur = db.cursor()
+    cur.execute(
+        "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
+        (BACKFILL_TASK_TYPE,),
+    )
+    existing = cur.fetchone()
+    if not existing:
+        cur.execute(
+            "INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s,%s,%s,%s)",
+            (BACKFILL_TASK_NAME, BACKFILL_TASK_TYPE, DEFAULT_BACKFILL_CRON, True),
+        )
+    cur.close()
+
+
 def migrate(db):
     cur = db.cursor()
     cur.execute(
@@ -78,8 +93,9 @@ def migrate(db):
         )
         """
     )
-    db.commit()
     cur.close()
+    ensure_default_backfill_schedule(db)
+    db.commit()
 
 
 def parse_ids(value):
@@ -423,7 +439,7 @@ def get_backfill_schedule():
     row = cur.fetchone()
     cur.close()
     if not row:
-        return {"cron_expr": DEFAULT_BACKFILL_CRON, "enabled": False, "last_run": None}
+        return {"cron_expr": DEFAULT_BACKFILL_CRON, "enabled": True, "last_run": None}
     return {
         "id": row[0],
         "cron_expr": row[1],
