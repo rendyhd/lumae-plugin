@@ -27,20 +27,18 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Build zips, per-plugin manifests, and the catalog
+      - name: Build zips, plugin.json files, and the catalog
         env:
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
         run: |
           python - <<'PY'
           import hashlib, json, os, re, zipfile
-          from datetime import datetime, timezone
 
           repo = os.environ["REPO"]
           branch = os.environ["BRANCH"]
           raw = f"https://raw.githubusercontent.com/{repo}/{branch}"
           plugins_dir, dist_dir = "plugins", "dist"
-          now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
           def parse_version(value):
               nums = [int(re.match(r"\d+", p).group()) if re.match(r"\d+", p) else 0
@@ -94,45 +92,42 @@ jobs:
               build_zip(os.path.join(plugins_dir, folder), out)
               checksum = hashlib.md5(open(out, "rb").read()).hexdigest()
 
-              manifest_path = os.path.join(dist_dir, pid, "manifest.json")
-              existing = load_json(manifest_path)
+              plugin_json_path = os.path.join(dist_dir, pid, "plugin.json")
+              existing = load_json(plugin_json_path)
               versions = {str(v.get("version")): v for v in existing.get("versions", [])}
-              prev = versions.get(version)
-              timestamp = prev["timestamp"] if prev and prev.get("checksum") == checksum else now
               versions[version] = {
                   "version": version,
-                  "changelog": meta.get("changelog", ""),
                   "min_core_version": meta.get("min_core_version", ""),
+                  "changelog": meta.get("changelog", ""),
+                  "imageUrl": meta.get("imageUrl", ""),
                   "sourceUrl": f"{raw}/{dist_dir}/{pid}/{zip_name}",
                   "checksum": checksum,
-                  "timestamp": timestamp,
               }
               ordered = sorted(versions.values(), key=lambda v: parse_version(v["version"]), reverse=True)
-              write_json(manifest_path, {
+              write_json(plugin_json_path, {
                   "id": pid,
                   "name": meta.get("name", pid),
-                  "description": meta.get("description", ""),
                   "author": meta.get("author", ""),
-                  "imageUrl": meta.get("imageUrl", ""),
+                  "targets": meta.get("targets", []),
+                  "requirements": meta.get("requirements", []),
                   "versions": ordered,
               })
 
               catalog.append({
                   "id": pid,
                   "name": meta.get("name", pid),
-                  "description": meta.get("description", ""),
                   "author": meta.get("author", ""),
-                  "imageUrl": meta.get("imageUrl", ""),
-                  "manifestUrl": f"{raw}/{dist_dir}/{pid}/manifest.json",
+                  "description": meta.get("description", ""),
+                  "pluginUrl": f"{raw}/{dist_dir}/{pid}/plugin.json",
               })
-              print(f"built {zip_name} (md5 {checksum}); updated {manifest_path}")
+              print(f"built {zip_name} (md5 {checksum}); wrote {plugin_json_path}")
 
           catalog.sort(key=lambda e: e["id"])
           write_json("manifest.json", {"plugins": catalog})
           print(f"updated manifest.json (catalog) with {len(catalog)} plugin(s)")
           PY
 
-      - name: Commit catalog, zips, and manifests
+      - name: Commit catalog, zips, and plugin.json files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
