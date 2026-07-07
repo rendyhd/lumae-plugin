@@ -5,7 +5,7 @@ from html import escape
 
 from flask import Blueprint, jsonify, request
 
-from plugin.api import enqueue, get_db, get_setting, logger, render_page, set_setting, table
+from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
 
 from .loudness import SilentAudioError, analyze_file
 
@@ -16,6 +16,10 @@ BACKFILL_TASK_NAME = "Lumae Analysis Backfill"
 DEFAULT_BACKFILL_CRON = "*/15 * * * *"
 
 bp = Blueprint("lumae_analysis", __name__)
+
+
+class MediaDownloadError(Exception):
+    pass
 
 
 def profiles_table():
@@ -32,6 +36,52 @@ def media_signature(path):
     except OSError:
         return None
     return f"{path}|{stat.st_size}|{int(stat.st_mtime)}"
+
+
+def media_server_download_available():
+    fields_by_type = getattr(config, "MEDIASERVER_FIELDS_BY_TYPE", {})
+    media_type = str(getattr(config, "MEDIASERVER_TYPE", "") or "").lower()
+    required_fields = fields_by_type.get(media_type)
+    if not required_fields:
+        return False
+    return all(str(getattr(config, field, "") or "").strip() for field in required_fields)
+
+
+def media_server_item(item_id, file_path=None, title=None, author=None):
+    track_id = str(item_id)
+    path = str(file_path or "")
+    name = str(title or track_id)
+    item = {
+        "id": track_id,
+        "Id": track_id,
+        "title": name,
+        "Name": name,
+        "path": path,
+        "Path": path,
+        "FilePath": path,
+    }
+    if author:
+        item["artist"] = str(author)
+        item["AlbumArtist"] = str(author)
+    suffix = os.path.splitext(path)[1].lstrip(".")
+    if suffix:
+        item["suffix"] = suffix
+    return item
+
+
+def download_track_to_temp(item):
+    from tasks.mediaserver import download_track
+
+    return download_track(config.TEMP_DIR, item)
+
+
+def remove_downloaded_file(path):
+    if not path:
+        return
+    try:
+        os.remove(path)
+    except OSError:
+        logger.warning("lumae_analysis could not remove temporary analysis file %s", path)
 
 
 def configured_backfill_limit():
@@ -200,20 +250,42 @@ def load_track_file(track_id):
     db = get_db()
     cur = db.cursor()
     cur.execute(
-        "SELECT item_id, file_path FROM score WHERE item_id = %s",
+        "SELECT item_id, file_path, title, author FROM score WHERE item_id = %s",
         (track_id,),
     )
     row = cur.fetchone()
     cur.close()
     if not row:
         return None
-    item_id, file_path = row
-    if not file_path or not os.path.exists(file_path):
+    item_id = row[0]
+    file_path = row[1] if len(row) > 1 else None
+    title = row[2] if len(row) > 2 else None
+    author = row[3] if len(row) > 3 else None
+    if file_path and os.path.exists(file_path):
+        return {
+            "track_id": str(item_id),
+            "file_path": file_path,
+            "media_signature": media_signature(file_path),
+            "cleanup_path": None,
+        }
+
+    if not media_server_download_available():
         return None
+
+    try:
+        item = media_server_item(item_id, file_path, title, author)
+        downloaded_path = download_track_to_temp(item)
+    except Exception as exc:
+        logger.warning("lumae_analysis could not download %s for analysis: %s", track_id, exc)
+        raise MediaDownloadError("media server download failed") from exc
+
+    if not downloaded_path or not os.path.exists(downloaded_path):
+        raise MediaDownloadError("media server download failed")
     return {
         "track_id": str(item_id),
-        "file_path": file_path,
-        "media_signature": media_signature(file_path),
+        "file_path": downloaded_path,
+        "media_signature": media_signature(downloaded_path),
+        "cleanup_path": downloaded_path,
     }
 
 
@@ -320,7 +392,11 @@ def analyze():
 
 
 def analyze_one_track(track_id):
-    info = load_track_file(track_id)
+    try:
+        info = load_track_file(track_id)
+    except MediaDownloadError as exc:
+        upsert_profile(track_id, object(), "failed", str(exc), None)
+        return {"track_id": track_id, "status": "failed"}
     if info is None:
         upsert_profile(track_id, object(), "skipped_no_file", "missing file path", None)
         return {"track_id": track_id, "status": "skipped_no_file"}
@@ -335,6 +411,8 @@ def analyze_one_track(track_id):
         logger.exception("lumae_analysis failed for %s", track_id)
         upsert_profile(track_id, object(), "failed", str(exc), info["media_signature"])
         return {"track_id": track_id, "status": "failed"}
+    finally:
+        remove_downloaded_file(info.get("cleanup_path"))
 
 
 def analyze_tracks_task(ids):
@@ -351,6 +429,8 @@ def is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
     if status == "pending":
         return False
     current_sig = media_signature(file_path)
+    if status == "skipped_no_file":
+        return bool(current_sig or media_server_download_available())
     if analyzer_ver is None:
         return True
     if int(analyzer_ver) < ANALYZER_VERSION:
@@ -404,10 +484,10 @@ def analysis_status_counts():
             counts["pending"] += 1
         elif status == "failed":
             counts["failed"] += 1
-        elif status == "skipped_no_file":
-            counts["skipped"] += 1
         elif is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
             counts["needs_analysis"] += 1
+        elif status == "skipped_no_file":
+            counts["skipped"] += 1
         elif status == "ready":
             counts["ready_current"] += 1
         else:

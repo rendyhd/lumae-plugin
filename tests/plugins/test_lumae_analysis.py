@@ -372,6 +372,84 @@ def test_analyze_one_track_marks_missing_file(monkeypatch):
     assert result == {"track_id": "missing", "status": "skipped_no_file"}
 
 
+def test_analyze_one_track_downloads_from_media_server_when_local_file_missing(monkeypatch, tmp_path):
+    mod = load_plugin()
+    library_path = tmp_path / "not-mounted" / "album" / "song.flac"
+    downloaded = tmp_path / "downloaded.flac"
+    downloaded.write_bytes(b"downloaded media")
+    db = FakeDb(rows=[("track-a", str(library_path), "Song Title", "Artist Name")])
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "media_server_download_available", lambda: True, raising=False)
+
+    class Result:
+        sample_rate = 48000
+        duration_ms = 1000
+        ref_lufs = -14.0
+        start_ramp_blob = b"\xe9\x03\x00"
+        end_ramp_blob = b"\xe9\x04\x00"
+
+    downloaded_items = []
+    seen = {}
+
+    def fake_download_track_to_temp(item):
+        downloaded_items.append(item)
+        return str(downloaded)
+
+    def fake_analyze_file(path):
+        seen["path"] = path
+        return Result()
+
+    monkeypatch.setattr(mod, "download_track_to_temp", fake_download_track_to_temp, raising=False)
+    monkeypatch.setattr(mod, "analyze_file", fake_analyze_file)
+
+    result = mod.analyze_one_track("track-a")
+
+    assert result == {"track_id": "track-a", "status": "ready"}
+    assert seen["path"] == str(downloaded)
+    assert downloaded_items[0]["id"] == "track-a"
+    assert downloaded_items[0]["Id"] == "track-a"
+    assert downloaded_items[0]["path"] == str(library_path)
+    assert downloaded_items[0]["Path"] == str(library_path)
+    assert downloaded_items[0]["Name"] == "Song Title"
+    assert downloaded_items[0]["suffix"] == "flac"
+    assert not downloaded.exists()
+
+
+def test_analyze_one_track_marks_media_server_download_failure_as_failed(monkeypatch, tmp_path):
+    mod = load_plugin()
+    library_path = tmp_path / "not-mounted" / "song.flac"
+    db = FakeDb(rows=[("track-a", str(library_path), "Song Title", "Artist Name")])
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "media_server_download_available", lambda: True, raising=False)
+    monkeypatch.setattr(mod, "download_track_to_temp", lambda item: None, raising=False)
+
+    result = mod.analyze_one_track("track-a")
+
+    assert result == {"track_id": "track-a", "status": "failed"}
+    assert db.cursor_obj.executed[-1][1][-1] == "media server download failed"
+
+
+def test_analyze_one_track_cleans_downloaded_file_when_analysis_fails(monkeypatch, tmp_path):
+    mod = load_plugin()
+    library_path = tmp_path / "not-mounted" / "song.flac"
+    downloaded = tmp_path / "downloaded.flac"
+    downloaded.write_bytes(b"downloaded media")
+    db = FakeDb(rows=[("track-a", str(library_path), "Song Title", "Artist Name")])
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "media_server_download_available", lambda: True, raising=False)
+    monkeypatch.setattr(mod, "download_track_to_temp", lambda item: str(downloaded), raising=False)
+    monkeypatch.setattr(mod, "analyze_file", lambda path: (_ for _ in ()).throw(RuntimeError("decode failed")))
+
+    result = mod.analyze_one_track("track-a")
+
+    assert result == {"track_id": "track-a", "status": "failed"}
+    assert db.cursor_obj.executed[-1][1][-1] == "decode failed"
+    assert not downloaded.exists()
+
+
 def test_analyze_one_track_persists_ready_profile_with_pr721_score_shape(monkeypatch, tmp_path):
     mod = load_plugin()
     audio = tmp_path / "song.wav"
@@ -399,7 +477,8 @@ def test_analyze_one_track_persists_ready_profile_with_pr721_score_shape(monkeyp
 
     assert result == {"track_id": "track-a", "status": "ready"}
     assert seen["path"] == str(audio)
-    assert db.cursor_obj.executed[0][0] == "SELECT item_id, file_path FROM score WHERE item_id = %s"
+    select_sql = " ".join(db.cursor_obj.executed[0][0].split())
+    assert select_sql == "SELECT item_id, file_path, title, author FROM score WHERE item_id = %s"
     assert db.commits == 1
     sql, params = db.cursor_obj.executed[-1]
     assert "INSERT INTO" in sql
@@ -453,26 +532,56 @@ def test_find_backfill_ids_includes_explicit_stale_rows(monkeypatch, tmp_path):
     mod = load_plugin()
     current = tmp_path / "current.wav"
     current.write_bytes(b"new media")
+    missing = tmp_path / "not-mounted.wav"
     rows = [
         ("stale-track", str(current), "same-sig", mod.ANALYZER_VERSION, "stale"),
         ("failed-once", str(current), "same-sig", mod.ANALYZER_VERSION, "failed"),
-        ("skipped-once", str(current), "same-sig", mod.ANALYZER_VERSION, "skipped_no_file"),
+        ("skipped-once", str(missing), "same-sig", mod.ANALYZER_VERSION, "skipped_no_file"),
     ]
     monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "media_server_download_available", lambda: False, raising=False)
 
     assert mod.find_backfill_ids(limit=25) == ["stale-track"]
+
+
+def test_find_backfill_ids_retries_skipped_no_file_when_downloader_configured(monkeypatch, tmp_path):
+    mod = load_plugin()
+    missing = tmp_path / "not-mounted.wav"
+    rows = [
+        ("skipped-once", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
+    ]
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "media_server_download_available", lambda: True, raising=False)
+
+    assert mod.find_backfill_ids(limit=25) == ["skipped-once"]
+
+
+def test_find_backfill_ids_retries_skipped_no_file_when_local_file_appears(monkeypatch, tmp_path):
+    mod = load_plugin()
+    current = tmp_path / "current.wav"
+    current.write_bytes(b"new media")
+    rows = [
+        ("skipped-once", str(current), None, mod.ANALYZER_VERSION, "skipped_no_file"),
+    ]
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "media_server_download_available", lambda: False, raising=False)
+
+    assert mod.find_backfill_ids(limit=25) == ["skipped-once"]
 
 
 def test_find_backfill_ids_applies_limit_after_eligibility_filtering(monkeypatch, tmp_path):
     mod = load_plugin()
     current = tmp_path / "current.wav"
     current.write_bytes(b"new media")
+    missing = tmp_path / "not-mounted.wav"
     sig = mod.media_signature(str(current))
     rows = [
         ("ready-current-1", str(current), sig, mod.ANALYZER_VERSION, "ready"),
         ("failed-once", str(current), "old-sig", mod.ANALYZER_VERSION, "failed"),
-        ("skipped-once", str(current), None, mod.ANALYZER_VERSION, "skipped_no_file"),
+        ("skipped-once", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
         ("eligible-missing", str(current), None, None, None),
         ("eligible-stale", str(current), sig, mod.ANALYZER_VERSION, "stale"),
         ("eligible-old", str(current), sig, 0, "ready"),
@@ -480,6 +589,7 @@ def test_find_backfill_ids_applies_limit_after_eligibility_filtering(monkeypatch
     db = LimitAwareDb(rows=rows)
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "media_server_download_available", lambda: False, raising=False)
 
     assert mod.find_backfill_ids(limit=2) == ["eligible-missing", "eligible-stale"]
 
@@ -502,6 +612,7 @@ def test_analysis_status_counts_current_pending_failed_and_needed(monkeypatch, t
     mod = load_plugin()
     current = tmp_path / "current.wav"
     current.write_bytes(b"new media")
+    missing = tmp_path / "not-mounted.wav"
     unchanged = tmp_path / "unchanged.wav"
     unchanged.write_bytes(b"same media")
     unchanged_sig = mod.media_signature(str(unchanged))
@@ -512,10 +623,11 @@ def test_analysis_status_counts_current_pending_failed_and_needed(monkeypatch, t
         ("changed-media", str(current), "old-sig", mod.ANALYZER_VERSION, "ready"),
         ("pending-track", str(current), None, mod.ANALYZER_VERSION, "pending"),
         ("failed-track", str(current), None, mod.ANALYZER_VERSION, "failed"),
-        ("skipped-track", str(current), None, mod.ANALYZER_VERSION, "skipped_no_file"),
+        ("skipped-track", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
     ]
     monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "media_server_download_available", lambda: False, raising=False)
 
     assert mod.analysis_status_counts() == {
         "total_with_files": 7,
@@ -524,6 +636,26 @@ def test_analysis_status_counts_current_pending_failed_and_needed(monkeypatch, t
         "failed": 1,
         "skipped": 1,
         "needs_analysis": 3,
+    }
+
+
+def test_analysis_status_counts_treats_retryable_skipped_rows_as_needed(monkeypatch, tmp_path):
+    mod = load_plugin()
+    missing = tmp_path / "not-mounted.wav"
+    rows = [
+        ("skipped-track", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
+    ]
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(mod, "media_server_download_available", lambda: True, raising=False)
+
+    assert mod.analysis_status_counts() == {
+        "total_with_files": 1,
+        "ready_current": 0,
+        "pending": 0,
+        "failed": 0,
+        "skipped": 0,
+        "needs_analysis": 1,
     }
 
 
