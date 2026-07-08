@@ -41,10 +41,12 @@ def _bar_chart(labels, values):
 
 def migrate(db):
     cur = db.cursor()
+    stats = table('hook_stats')
     cur.execute(
-        "CREATE TABLE IF NOT EXISTS " + table('hook_stats') +
-        " (id INTEGER PRIMARY KEY, analyzed_count INTEGER NOT NULL DEFAULT 0, last_song TEXT)"
+        "CREATE TABLE IF NOT EXISTS " + stats +
+        " (id INTEGER PRIMARY KEY, run_id TEXT, analyzed_count INTEGER NOT NULL DEFAULT 0, last_song TEXT)"
     )
+    cur.execute("ALTER TABLE " + stats + " ADD COLUMN IF NOT EXISTS run_id TEXT")
     db.commit()
     cur.close()
 
@@ -59,6 +61,7 @@ def _summarize(song):
             return 'present'
     return {
         'item_id': song.get('item_id'),
+        'run_id': song.get('run_id'),
         'audio_path': song.get('audio_path'),
         'metadata': song.get('metadata'),
         'analysis': song.get('analysis'),
@@ -73,10 +76,12 @@ def on_analyzed(song):
     cur = db.cursor()
     stats = table('hook_stats')
     cur.execute(
-        "INSERT INTO " + stats + " (id, analyzed_count, last_song) VALUES (1, 1, %s) "
-        "ON CONFLICT (id) DO UPDATE SET analyzed_count = " + stats + ".analyzed_count + 1, "
-        "last_song = EXCLUDED.last_song",
-        (json.dumps(_summarize(song)),),
+        "INSERT INTO " + stats + " (id, run_id, analyzed_count, last_song) VALUES (1, %s, 1, %s) "
+        "ON CONFLICT (id) DO UPDATE SET "
+        "analyzed_count = CASE WHEN " + stats + ".run_id IS DISTINCT FROM EXCLUDED.run_id "
+        "THEN 1 ELSE " + stats + ".analyzed_count + 1 END, "
+        "run_id = EXCLUDED.run_id, last_song = EXCLUDED.last_song",
+        (song.get('run_id'), json.dumps(_summarize(song))),
     )
     db.commit()
     cur.close()
@@ -113,7 +118,7 @@ def _hook_html():
     analyzed, last = _hook_stats()
     html_out = (
         '<h3 style="margin-top:1.5rem;">Live analysis (on_song_analyzed hook)</h3>'
-        f'<p><strong>Songs analyzed so far:</strong> {analyzed}</p>'
+        f'<p><strong>Songs analyzed in the latest run:</strong> {analyzed}</p>'
     )
     if not last:
         return html_out + '<p>No song analyzed yet. Start an analysis to watch this update.</p>'
