@@ -1,31 +1,37 @@
-# AudioMuse-AI Third Party Plugin Catalog
+# Lumae AudioMuse-AI Plugin Catalog
 
-This repository contains a community maintained catalog of third party plugins for **AudioMuse-AI**. The catalog is provided through the `manifest.json` file that is automatically imported from AudioMuse-AI to discover and install additional plugins.
+This repository publishes the Lumae Analysis plugin for **AudioMuse-AI**.
 
-All the content of this catalog are **THIRD PARTY** plugin.
+The catalog is exposed through `manifest.json`. AudioMuse-AI reads that catalog, follows the Lumae `pluginUrl`, downloads the versioned code-only zip from `dist/lumae_analysis/`, and verifies the published checksum.
 
-## Adding a Plugin
+## Plugin
 
-Plugin developers are welcome to open a Pull Request to request the inclusion of their plugin in this catalog. Alternatively, you can create and maintain your own catalog that users can import manually.
+Lumae Analysis precomputes loudness and MixRamp profiles server-side so Lumae can use volume normalization and SmoothFade without doing that work on the phone.
 
-To be considered for inclusion, a plugin must:
+The plugin provides:
 
-* Be licensed under the AGPLv3 license.
-* Follow the AudioMuse-AI plugin specification.
-* Be suitable for public distribution.
+* a health endpoint for app setup checks;
+* profile read/request API endpoints for the Lumae app;
+* an analysis hook that reuses AudioMuse's per-track analysis audio;
+* a catch-up settings page for existing libraries;
+* a Queue Whole Library action that chunks large libraries into worker jobs.
 
-For more information about plugin development, see the AudioMuse-AI documentation:
+## Layout
 
-https://github.com/NeptuneHub/AudioMuse-AI/tree/main/docs
+* `manifest.json` - the AudioMuse plugin catalog.
+* `plugins/LumaeAnalysis/plugin.json` - the plugin metadata and release list.
+* `plugins/LumaeAnalysis/*.py` - the plugin code.
+* `dist/lumae_analysis/` - published Lumae release zip files.
+* `tests/plugins/test_lumae_analysis.py` - local regression tests.
 
-## Catalog Policy
+## Development
 
-This catalog is privately maintained.
+The latest AudioMuse plugin documentation is here:
 
-Submitting a Pull Request does **not** guarantee that a plugin will be accepted. The maintainer may reject, remove, or delist any plugin at any time, for any reason, with or without notice.
+https://github.com/NeptuneHub/AudioMuse-AI/blob/main/docs/PLUGIN.md
 
-## Disclaimer
+The release zip must contain code only: `__init__.py` and helper files, with no `plugin.json` inside the zip. The GitHub workflow rebuilds the zip, fills the release `sourceUrl` and `checksum`, and regenerates `manifest.json`.
 
-All plugins included in this catalog are developed, maintained, and distributed by their respective authors. Each plugin author is solely responsible for the content, functionality, security, licensing, maintenance, and legal compliance of their plugin.
+## License
 
-The maintainer of this catalog does not review, certify, endorse, or guarantee any plugin listed here and accepts no responsibility or liability for any third party plugin. Users install and use plugins entirely at their own risk.
+This repository is licensed under the AGPLv3 license. See `LICENSE`.
