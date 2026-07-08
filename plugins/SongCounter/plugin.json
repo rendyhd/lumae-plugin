@@ -13,7 +13,7 @@
       "changelog": "Fix the last-song detail table overflowing the page: fixed table layout with a pinned key column and wrapping values.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/NeptuneHub/AudioMuse-AI-plugins/main/dist/song_counter/song_counter_1.6.1.zip",
-      "checksum": "574cbc28b59603edd1772f95fdf5e22f"
+      "checksum": "72296001009bf9d42c6aa6913166ecec"
     },
     {
       "version": "1.6.0",
