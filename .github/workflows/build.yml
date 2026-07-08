@@ -27,31 +27,23 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Build zips, per-plugin manifests, and the catalog
+      - name: Build zips, fill plugin.json, and the catalog
         env:
           REPO: ${{ github.repository }}
           BRANCH: ${{ github.ref_name }}
         run: |
           python - <<'PY'
           import hashlib, json, os, re, zipfile
-          from datetime import datetime, timezone
 
           repo = os.environ["REPO"]
           branch = os.environ["BRANCH"]
           raw = f"https://raw.githubusercontent.com/{repo}/{branch}"
           plugins_dir, dist_dir = "plugins", "dist"
-          now = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
           def parse_version(value):
               nums = [int(re.match(r"\d+", p).group()) if re.match(r"\d+", p) else 0
                       for p in re.split(r"[.\-+]", str(value or "").lstrip("vV"))]
               return tuple(nums) if nums else (0,)
-
-          def load_json(path):
-              if os.path.isfile(path):
-                  with open(path, encoding="utf-8") as fh:
-                      return json.load(fh)
-              return {}
 
           def write_json(path, obj):
               os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
@@ -60,13 +52,17 @@ jobs:
                   fh.write("\n")
 
           def build_zip(src, out):
+              # Code-only package: plugin.json is deliberately excluded so the zip (and
+              # its md5) never depends on the sourceUrl/checksum CI writes back into
+              # plugin.json. The installer reads the plugin's metadata from the hosted
+              # plugin.json the catalog points at, not from inside the zip.
               os.makedirs(os.path.dirname(out), exist_ok=True)
               members = []
               for root, _d, names in os.walk(src):
                   if "__pycache__" in root:
                       continue
                   for name in names:
-                      if name.endswith(".pyc"):
+                      if name.endswith(".pyc") or (root == src and name == "plugin.json"):
                           continue
                       full = os.path.join(root, name)
                       arc = os.path.relpath(full, src).replace(os.sep, "/")
@@ -87,56 +83,45 @@ jobs:
                   continue
               with open(meta_path, encoding="utf-8") as fh:
                   meta = json.load(fh)
+              versions = meta.get("versions") or []
+              if not versions:
+                  print(f"skip {folder}: plugin.json has no versions[] list")
+                  continue
+              versions.sort(key=lambda v: parse_version(v.get("version")), reverse=True)
               pid = meta["id"]
-              version = str(meta["version"])
+              latest = versions[0]
+              version = str(latest["version"])
               zip_name = f"{pid}_{version}.zip"
               out = os.path.join(dist_dir, pid, zip_name)
               build_zip(os.path.join(plugins_dir, folder), out)
               checksum = hashlib.md5(open(out, "rb").read()).hexdigest()
 
-              manifest_path = os.path.join(dist_dir, pid, "manifest.json")
-              existing = load_json(manifest_path)
-              versions = {str(v.get("version")): v for v in existing.get("versions", [])}
-              prev = versions.get(version)
-              timestamp = prev["timestamp"] if prev and prev.get("checksum") == checksum else now
-              versions[version] = {
-                  "version": version,
-                  "changelog": meta.get("changelog", ""),
-                  "min_core_version": meta.get("min_core_version", ""),
-                  "sourceUrl": f"{raw}/{dist_dir}/{pid}/{zip_name}",
-                  "checksum": checksum,
-                  "timestamp": timestamp,
-              }
-              ordered = sorted(versions.values(), key=lambda v: parse_version(v["version"]), reverse=True)
-              write_json(manifest_path, {
-                  "id": pid,
-                  "name": meta.get("name", pid),
-                  "description": meta.get("description", ""),
-                  "author": meta.get("author", ""),
-                  "imageUrl": meta.get("imageUrl", ""),
-                  "versions": ordered,
-              })
+              # Fill this release's download link and checksum back into the plugin's
+              # own plugin.json (in place). Older releases keep their existing values.
+              latest["sourceUrl"] = f"{raw}/{dist_dir}/{pid}/{zip_name}"
+              latest["checksum"] = checksum
+              meta["versions"] = versions
+              write_json(meta_path, meta)
 
               catalog.append({
                   "id": pid,
                   "name": meta.get("name", pid),
-                  "description": meta.get("description", ""),
                   "author": meta.get("author", ""),
-                  "imageUrl": meta.get("imageUrl", ""),
-                  "manifestUrl": f"{raw}/{dist_dir}/{pid}/manifest.json",
+                  "description": meta.get("description", ""),
+                  "pluginUrl": f"{raw}/{plugins_dir}/{folder}/plugin.json",
               })
-              print(f"built {zip_name} (md5 {checksum}); updated {manifest_path}")
+              print(f"built {zip_name} (md5 {checksum}); updated {meta_path}")
 
           catalog.sort(key=lambda e: e["id"])
           write_json("manifest.json", {"plugins": catalog})
           print(f"updated manifest.json (catalog) with {len(catalog)} plugin(s)")
           PY
 
-      - name: Commit catalog, zips, and manifests
+      - name: Commit catalog, zips, and updated plugin.json files
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add dist manifest.json
+          git add dist plugins manifest.json
           if git diff --cached --quiet; then
             echo "Catalog already up to date; nothing to commit."
           else

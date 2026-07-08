@@ -1,13 +1,11 @@
 import base64
+import html
 import io
+import json
 
 from flask import Blueprint, request, redirect
 
-import matplotlib
-matplotlib.use('Agg')
-import matplotlib.pyplot as plt
-
-from plugin.api import get_db, get_setting, set_setting, render_page, manage_plugins_url
+from plugin.api import get_db, get_setting, set_setting, table, render_page, manage_plugins_url
 
 bp = Blueprint('song_counter', __name__)
 
@@ -28,6 +26,9 @@ def _count(table_name):
 
 
 def _bar_chart(labels, values):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
     fig, ax = plt.subplots(figsize=(6, 3))
     ax.bar(labels, values, color='#2563eb')
     ax.set_ylabel('songs')
@@ -36,6 +37,185 @@ def _bar_chart(labels, values):
     fig.savefig(buf, format='png', dpi=100)
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode('ascii')
+
+
+def migrate(db):
+    cur = db.cursor()
+    stats = table('hook_stats')
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS " + stats +
+        " (id INTEGER PRIMARY KEY, run_id TEXT, analyzed_count INTEGER NOT NULL DEFAULT 0, last_song TEXT)"
+    )
+    cur.execute("ALTER TABLE " + stats + " ADD COLUMN IF NOT EXISTS run_id TEXT")
+    log = table('index_log')
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS " + log +
+        " (id SERIAL PRIMARY KEY, logged_at TEXT, musicnn INTEGER, dclap INTEGER, gte INTEGER)"
+    )
+    cur.execute(
+        "INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s, %s, %s, FALSE) "
+        "ON CONFLICT (task_type) DO NOTHING",
+        ('plugin.song_counter.index_log', 'plugin.song_counter.index_log', '0 * * * *'),
+    )
+    db.commit()
+    cur.close()
+
+
+def index_snapshot():
+    db = get_db()
+    cur = db.cursor()
+    log = table('index_log')
+    counts = [_count(table_name) for _key, _label, table_name in SOURCES]
+    cur.execute(
+        "INSERT INTO " + log + " (logged_at, musicnn, dclap, gte) "
+        "VALUES (to_char(now(), 'DD-MM-YYYY HH24:MI:SS'), %s, %s, %s)",
+        counts,
+    )
+    cur.execute(
+        "DELETE FROM " + log + " WHERE id NOT IN "
+        "(SELECT id FROM " + log + " ORDER BY id DESC LIMIT 10)"
+    )
+    db.commit()
+    cur.close()
+
+
+def _summarize(song):
+    def shape(vector):
+        if vector is None:
+            return None
+        try:
+            return f'{len(vector)}-dim vector'
+        except TypeError:
+            return 'present'
+    return {
+        'item_id': song.get('item_id'),
+        'run_id': song.get('run_id'),
+        'audio_path': song.get('audio_path'),
+        'metadata': song.get('metadata'),
+        'analysis': song.get('analysis'),
+        'top_moods': song.get('top_moods'),
+        'musicnn_embedding': shape(song.get('musicnn_embedding')),
+        'clap_embedding': shape(song.get('clap_embedding')),
+    }
+
+
+def on_analyzed(song):
+    db = get_db()
+    cur = db.cursor()
+    stats = table('hook_stats')
+    cur.execute(
+        "INSERT INTO " + stats + " (id, run_id, analyzed_count, last_song) VALUES (1, %s, 1, %s) "
+        "ON CONFLICT (id) DO UPDATE SET "
+        "analyzed_count = CASE WHEN " + stats + ".run_id IS DISTINCT FROM EXCLUDED.run_id "
+        "THEN 1 ELSE " + stats + ".analyzed_count + 1 END, "
+        "run_id = EXCLUDED.run_id, last_song = EXCLUDED.last_song",
+        (song.get('run_id'), json.dumps(_summarize(song))),
+    )
+    db.commit()
+    cur.close()
+
+
+def _hook_stats():
+    db = get_db()
+    try:
+        cur = db.cursor()
+        cur.execute("SELECT analyzed_count, last_song FROM " + table('hook_stats') + " WHERE id = 1")
+        row = cur.fetchone()
+        cur.close()
+    except Exception:
+        db.rollback()
+        return 0, None
+    if not row:
+        return 0, None
+    total, last_json = row
+    return total, (json.loads(last_json) if last_json else None)
+
+
+def _last_song_rows(last):
+    rows = []
+    for key, value in last.items():
+        if isinstance(value, dict):
+            for sub_key, sub_value in value.items():
+                rows.append((f'{key}.{sub_key}', sub_value))
+        else:
+            rows.append((key, value))
+    return rows
+
+
+def _fmt_value(value):
+    if isinstance(value, dict):
+        return '\n'.join(
+            f'{k}: {v:.4f}' if isinstance(v, float) else f'{k}: {v}'
+            for k, v in value.items()
+        )
+    if isinstance(value, float):
+        return f'{value:.4f}'
+    return str(value)
+
+
+def _hook_html():
+    analyzed, last = _hook_stats()
+    html_out = (
+        '<h3 style="margin-top:1.5rem;">Live analysis (on_song_analyzed hook)</h3>'
+        f'<p><strong>Songs analyzed in the latest run:</strong> {analyzed}</p>'
+    )
+    if not last:
+        return html_out + '<p>No song analyzed yet. Start an analysis to watch this update.</p>'
+    detail = ''.join(
+        '<tr>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;vertical-align:top;"><strong>{html.escape(str(key))}</strong></td>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;white-space:pre-wrap;word-break:break-word;overflow-wrap:anywhere;">{html.escape(_fmt_value(value))}</td>'
+        '</tr>'
+        for key, value in _last_song_rows(last)
+    )
+    return html_out + (
+        '<p style="margin-top:1rem;">Last analyzed song (everything the hook passed):</p>'
+        '<table style="border-collapse:collapse;font-size:.95rem;width:100%;max-width:100%;table-layout:fixed;">'
+        '<colgroup><col style="width:230px"><col></colgroup>'
+        f'{detail}</table>'
+    )
+
+
+def _index_log_html():
+    db = get_db()
+    try:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT logged_at, musicnn, dclap, gte FROM " + table('index_log') +
+            " ORDER BY id DESC LIMIT 10"
+        )
+        rows = cur.fetchall()
+        cur.close()
+    except Exception:
+        db.rollback()
+        rows = []
+    html_out = '<h3 style="margin-top:1.5rem;">Index log (hourly cron task)</h3>'
+    if not rows:
+        return html_out + (
+            '<p>No snapshot yet. Enable the plugin.song_counter.index_log schedule in '
+            'Administration &gt; Scheduled Tasks, or press its Run now button.</p>'
+        )
+    header = (
+        '<tr>'
+        '<th style="padding:.2rem .6rem;text-align:left;">When</th>'
+        '<th style="padding:.2rem .6rem;text-align:right;">Musicnn</th>'
+        '<th style="padding:.2rem .6rem;text-align:right;">DCLAP</th>'
+        '<th style="padding:.2rem .6rem;text-align:right;">GTE lyrics</th>'
+        '</tr>'
+    )
+    detail = ''.join(
+        '<tr>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;">{html.escape(str(logged_at))}</td>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;text-align:right;">{musicnn}</td>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;text-align:right;">{dclap}</td>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;text-align:right;">{gte}</td>'
+        '</tr>'
+        for logged_at, musicnn, dclap, gte in rows
+    )
+    return html_out + (
+        '<p>The last 10 snapshots of the index sizes, newest first (older ones are deleted).</p>'
+        f'<table style="border-collapse:collapse;font-size:.95rem;">{header}{detail}</table>'
+    )
 
 
 @bp.route('/')
@@ -56,6 +236,8 @@ def home():
     body = (
         f'<img src="data:image/png;base64,{chart}" alt="Song counts" style="max-width:100%;height:auto;">'
         f'<ul style="list-style:none;padding:0;font-size:1.1rem;margin-top:1rem;">{items}</ul>'
+        f'{_hook_html()}'
+        f'{_index_log_html()}'
     )
     return render_page(body, title='SongCounter')
 
@@ -85,5 +267,8 @@ def settings():
 
 
 def register(ctx):
+    ctx.on_install(migrate)
     ctx.add_blueprint(bp)
     ctx.add_menu_item('SongCounter', 'song_counter.home')
+    ctx.on_song_analyzed(on_analyzed)
+    ctx.add_cron_task('index_log', index_snapshot)
