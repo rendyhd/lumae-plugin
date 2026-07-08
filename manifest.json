@@ -1,6 +1,13 @@
 {
   "plugins": [
     {
+      "id": "lumae_analysis",
+      "name": "Lumae Analysis",
+      "author": "Lumae",
+      "description": "Precomputes Lumae loudness and MixRamp profiles for server-side volume normalization and SmoothFade.",
+      "pluginUrl": "https://raw.githubusercontent.com/NeptuneHub/AudioMuse-AI-plugins/main/plugins/LumaeAnalysis/plugin.json"
+    },
+    {
       "id": "song_counter",
       "name": "SongCounter",
       "author": "NeptuneHub",

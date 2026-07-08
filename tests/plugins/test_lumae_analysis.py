@@ -30,7 +30,9 @@ def test_plugin_manifest_has_lumae_identity():
 
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
-    assert manifest["min_core_version"] == "2.5.0"
+    assert manifest["requirements"] == []
+    assert manifest["versions"][0]["version"] == "0.2.0"
+    assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"] == {
         "lumae_analysis_profiles": {
             "schema_version": 1,
@@ -150,6 +152,48 @@ def test_analyze_endpoint_enqueues_only_missing_or_stale_ids(monkeypatch):
         ("mark_pending", ["stale-1", "missing-1"], "default"),
         ("analyze_tracks_task", ["stale-1", "missing-1"], "default"),
     ]
+
+
+def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypatch, tmp_path):
+    mod = load_plugin()
+    audio = tmp_path / "analysis-hook.flac"
+    audio.write_bytes(b"hook audio")
+    db = FakeDb(rows=[])
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    class Result:
+        sample_rate = 44100
+        duration_ms = 2500
+        ref_lufs = -15.5
+        start_ramp_blob = b"\x01\x02\x03"
+        end_ramp_blob = b"\x04\x05\x06"
+
+    seen = {}
+
+    def fake_analyze_file(path):
+        seen["path"] = path
+        return Result()
+
+    monkeypatch.setattr(mod, "analyze_file", fake_analyze_file)
+
+    result = mod.analyze_song_hook(
+        {
+            "item_id": "track-a",
+            "audio_path": str(audio),
+            "metadata": {"file_path": "/metadata/path.flac"},
+            "media_item": {"Id": "raw-track", "FilePath": "/music/raw-song.flac"},
+        }
+    )
+
+    assert result == {"track_id": "track-a", "status": "ready"}
+    assert seen["path"] == str(audio)
+    assert audio.exists()
+    params = db.cursor_obj.executed[-1][1]
+    assert params[0] == "track-a"
+    assert params[1] == 44100
+    assert params[8].startswith("analysis-hook|track-a|/music/raw-song.flac|")
+    assert params[10] == "ready"
 
 
 def test_encode_ramp_matches_lumae_byte_layout():
@@ -360,6 +404,30 @@ class CronDb(FakeDb):
     def __init__(self, existing=None):
         self.cursor_obj = CronCursor(existing)
         self.commits = 0
+
+
+class FakeCtx:
+    def __init__(self):
+        self.blueprints = []
+        self.settings_endpoint = None
+        self.install_hooks = []
+        self.song_hooks = []
+        self.cron_tasks = []
+
+    def add_blueprint(self, blueprint):
+        self.blueprints.append(blueprint)
+
+    def set_settings_page(self, endpoint):
+        self.settings_endpoint = endpoint
+
+    def on_install(self, func):
+        self.install_hooks.append(func)
+
+    def on_song_analyzed(self, func):
+        self.song_hooks.append(func)
+
+    def add_cron_task(self, name, func, queue="default"):
+        self.cron_tasks.append((name, func, queue))
 
 
 def test_analyze_one_track_marks_missing_file(monkeypatch):
@@ -680,7 +748,7 @@ def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch)
     ]
 
 
-def test_migrate_creates_enabled_default_backfill_schedule(monkeypatch):
+def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     mod = load_plugin()
     db = CronDb(existing=None)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
@@ -688,67 +756,29 @@ def test_migrate_creates_enabled_default_backfill_schedule(monkeypatch):
     mod.migrate(db)
 
     assert db.commits == 1
-    assert db.cursor_obj.executed[-2:] == [
-        (
-            "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
-            (mod.BACKFILL_TASK_TYPE,),
-        ),
-        (
-            "INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s,%s,%s,%s)",
-            (mod.BACKFILL_TASK_NAME, mod.BACKFILL_TASK_TYPE, "*/15 * * * *", True),
-        ),
-    ]
-
-
-def test_migrate_keeps_existing_backfill_schedule(monkeypatch):
-    mod = load_plugin()
-    db = CronDb(existing=(12,))
-    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
-
-    mod.migrate(db)
-
-    assert db.commits == 1
     assert db.cursor_obj.executed[-1] == (
-        "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
+        "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
     )
+    assert all("INSERT INTO cron" not in sql for sql, _params in db.cursor_obj.executed)
 
 
-def test_get_backfill_schedule_defaults_to_enabled_when_missing(monkeypatch):
+def test_register_uses_analysis_hook_without_default_cron(monkeypatch):
     mod = load_plugin()
-    monkeypatch.setattr(mod, "get_db", lambda: CronDb(existing=None))
+    ctx = FakeCtx()
 
-    assert mod.get_backfill_schedule() == {
-        "cron_expr": "*/15 * * * *",
-        "enabled": True,
-        "last_run": None,
-    }
+    mod.register(ctx)
 
-
-def test_save_backfill_schedule_updates_existing_plugin_cron_row(monkeypatch):
-    mod = load_plugin()
-    db = CronDb(existing=(12,))
-    monkeypatch.setattr(mod, "get_db", lambda: db)
-
-    mod.save_backfill_schedule(True, "*/15 * * * *")
-
-    assert db.commits == 1
-    assert db.cursor_obj.executed == [
-        (
-            "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
-            (mod.BACKFILL_TASK_TYPE,),
-        ),
-        (
-            "UPDATE cron SET name=%s, task_type=%s, cron_expr=%s, enabled=%s WHERE id=%s",
-            ("Lumae Analysis Backfill", mod.BACKFILL_TASK_TYPE, "*/15 * * * *", True, 12),
-        ),
-    ]
+    assert ctx.blueprints == [mod.bp]
+    assert ctx.settings_endpoint == "lumae_analysis.settings"
+    assert ctx.install_hooks == [mod.migrate]
+    assert ctx.song_hooks == [mod.analyze_song_hook]
+    assert ctx.cron_tasks == []
 
 
 def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     mod = load_plugin()
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 250)
-    monkeypatch.setattr(mod, "get_backfill_schedule", lambda: {"cron_expr": "0 3 * * *", "enabled": False, "last_run": None})
     monkeypatch.setattr(
         mod,
         "analysis_status_counts",
@@ -771,4 +801,6 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     assert "Catch Up Now" in body
     assert "Needs analysis" in body
     assert "15894" in body
+    assert "Enable scheduled catch-up" not in body
+    assert "Cron expression" not in body
     assert "Scheduled Tasks" not in body

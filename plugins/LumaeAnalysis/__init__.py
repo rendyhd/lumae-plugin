@@ -12,8 +12,6 @@ from .loudness import SilentAudioError, analyze_file
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
-BACKFILL_TASK_NAME = "Lumae Analysis Backfill"
-DEFAULT_BACKFILL_CRON = "*/15 * * * *"
 
 bp = Blueprint("lumae_analysis", __name__)
 
@@ -97,29 +95,12 @@ def normalize_backfill_limit(raw):
     return min(max(value, 1), 250)
 
 
-def normalize_cron_expr(raw):
-    cron_expr = (raw or DEFAULT_BACKFILL_CRON).strip()
-    if len(cron_expr.split()) != 5:
-        raise ValueError("Cron expression must have five fields.")
-    return " ".join(cron_expr.split())
-
-
-def form_checked(value):
-    return str(value or "").lower() in {"1", "true", "yes", "on"}
-
-
-def ensure_default_backfill_schedule(db):
+def disable_legacy_backfill_schedule(db):
     cur = db.cursor()
     cur.execute(
-        "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
+        "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (BACKFILL_TASK_TYPE,),
     )
-    existing = cur.fetchone()
-    if not existing:
-        cur.execute(
-            "INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s,%s,%s,%s)",
-            (BACKFILL_TASK_NAME, BACKFILL_TASK_TYPE, DEFAULT_BACKFILL_CRON, True),
-        )
     cur.close()
 
 
@@ -144,7 +125,7 @@ def migrate(db):
         """
     )
     cur.close()
-    ensure_default_backfill_schedule(db)
+    disable_legacy_backfill_schedule(db)
     db.commit()
 
 
@@ -415,6 +396,56 @@ def analyze_one_track(track_id):
         remove_downloaded_file(info.get("cleanup_path"))
 
 
+def hook_track_id(song):
+    song = song or {}
+    media_item = song.get("media_item") or {}
+    track_id = song.get("item_id") or media_item.get("Id") or media_item.get("id")
+    return str(track_id) if track_id else ""
+
+
+def hook_source_path(song):
+    song = song or {}
+    media_item = song.get("media_item") or {}
+    metadata = song.get("metadata") or {}
+    return (
+        media_item.get("FilePath")
+        or media_item.get("Path")
+        or media_item.get("path")
+        or metadata.get("file_path")
+        or ""
+    )
+
+
+def hook_media_signature(song, audio_path):
+    track_id = hook_track_id(song)
+    source_path = hook_source_path(song)
+    audio_sig = media_signature(audio_path) or ""
+    return f"analysis-hook|{track_id}|{source_path}|{audio_sig}"
+
+
+def analyze_song_hook(song):
+    track_id = hook_track_id(song)
+    audio_path = (song or {}).get("audio_path")
+    if not track_id:
+        logger.warning("lumae_analysis song hook skipped payload without item_id")
+        return {"track_id": "", "status": "skipped_no_file"}
+    if not audio_path or not os.path.exists(audio_path):
+        upsert_profile(track_id, object(), "skipped_no_file", "missing analysis audio path", None)
+        return {"track_id": track_id, "status": "skipped_no_file"}
+    media_sig = hook_media_signature(song, audio_path)
+    try:
+        result = analyze_file(audio_path)
+        upsert_profile(track_id, result, "ready", None, media_sig)
+        return {"track_id": track_id, "status": "ready"}
+    except SilentAudioError as exc:
+        upsert_profile(track_id, object(), "failed", str(exc), media_sig)
+        return {"track_id": track_id, "status": "failed"}
+    except Exception as exc:
+        logger.exception("lumae_analysis hook failed for %s", track_id)
+        upsert_profile(track_id, object(), "failed", str(exc), media_sig)
+        return {"track_id": track_id, "status": "failed"}
+
+
 def analyze_tracks_task(ids):
     ids = parse_ids(",".join(ids or []))
     results = [analyze_one_track(track_id) for track_id in ids]
@@ -509,56 +540,9 @@ def backfill_missing_profiles(limit=None):
     return analyze_tracks_task(ids)
 
 
-def get_backfill_schedule():
-    db = get_db()
-    cur = db.cursor()
-    cur.execute(
-        "SELECT id, cron_expr, enabled, last_run FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
-        (BACKFILL_TASK_TYPE,),
-    )
-    row = cur.fetchone()
-    cur.close()
-    if not row:
-        return {"cron_expr": DEFAULT_BACKFILL_CRON, "enabled": True, "last_run": None}
-    return {
-        "id": row[0],
-        "cron_expr": row[1],
-        "enabled": bool(row[2]),
-        "last_run": row[3],
-    }
-
-
-def save_backfill_schedule(enabled, cron_expr):
-    normalized = normalize_cron_expr(cron_expr)
-    db = get_db()
-    cur = db.cursor()
-    cur.execute(
-        "SELECT id FROM cron WHERE task_type=%s ORDER BY id LIMIT 1",
-        (BACKFILL_TASK_TYPE,),
-    )
-    existing = cur.fetchone()
-    if existing:
-        cur.execute(
-            "UPDATE cron SET name=%s, task_type=%s, cron_expr=%s, enabled=%s WHERE id=%s",
-            (BACKFILL_TASK_NAME, BACKFILL_TASK_TYPE, normalized, bool(enabled), existing[0]),
-        )
-    else:
-        cur.execute(
-            "INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s,%s,%s,%s)",
-            (BACKFILL_TASK_NAME, BACKFILL_TASK_TYPE, normalized, bool(enabled)),
-        )
-    db.commit()
-    cur.close()
-    return {"cron_expr": normalized, "enabled": bool(enabled)}
-
-
 def render_settings(message=None, error=None):
     batch_size = configured_backfill_limit()
-    schedule = get_backfill_schedule()
     counts = analysis_status_counts()
-    checked = " checked" if schedule.get("enabled") else ""
-    cron_expr = escape(schedule.get("cron_expr") or DEFAULT_BACKFILL_CRON)
-    last_run = escape(str(schedule.get("last_run") or "Never"))
     message_html = f"<p>{escape(message)}</p>" if message else ""
     error_html = f"<p><strong>{escape(error)}</strong></p>" if error else ""
     return render_page(
@@ -573,17 +557,14 @@ def render_settings(message=None, error=None):
             <tr><th>Pending</th><td>{counts["pending"]}</td></tr>
             <tr><th>Failed</th><td>{counts["failed"]}</td></tr>
             <tr><th>Skipped</th><td>{counts["skipped"]}</td></tr>
-            <tr><th>Last scheduled run</th><td>{last_run}</td></tr>
           </tbody>
         </table>
         <form method="post">
           <label>Backfill batch size <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric"></label>
-          <label><input type="checkbox" name="schedule_enabled" value="1"{checked}> Enable scheduled catch-up</label>
-          <label>Cron expression <input name="backfill_cron_expr" value="{cron_expr}"></label>
           <button type="submit" name="action" value="save">Save</button>
           <button type="submit" name="action" value="catch_up">Catch Up Now</button>
         </form>
-        <p>Batch size is tracks per run. Catch-up only queues tracks that are missing, stale, or changed.</p>
+        <p>New songs are analyzed from AudioMuse's worker hook. Catch-up only queues older tracks that are missing, stale, or changed.</p>
         """,
         title="Lumae Analysis",
     )
@@ -597,9 +578,6 @@ def settings():
         try:
             batch_size = normalize_backfill_limit(request.form.get("backfill_batch_size") or 25)
             set_setting("backfill_batch_size", batch_size)
-            schedule_enabled = form_checked(request.form.get("schedule_enabled"))
-            cron_expr = request.form.get("backfill_cron_expr") or DEFAULT_BACKFILL_CRON
-            save_backfill_schedule(schedule_enabled, cron_expr)
             if request.form.get("action") == "catch_up":
                 result = queue_backfill_batch(batch_size)
                 message = f"Queued {result['queued']} tracks for Lumae analysis."
@@ -615,4 +593,4 @@ def register(ctx):
     ctx.add_blueprint(bp)
     ctx.set_settings_page("lumae_analysis.settings")
     ctx.on_install(migrate)
-    ctx.add_cron_task("backfill", backfill_missing_profiles, queue="default")
+    ctx.on_song_analyzed(analyze_song_hook)

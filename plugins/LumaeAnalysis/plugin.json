@@ -1,17 +1,28 @@
 {
   "id": "lumae_analysis",
   "name": "Lumae Analysis",
-  "version": "0.1.2",
-  "min_core_version": "2.5.0",
   "author": "Lumae",
   "description": "Precomputes Lumae loudness and MixRamp profiles for server-side volume normalization and SmoothFade.",
+  "requirements": [],
   "capabilities": {
     "lumae_analysis_profiles": {
       "schema_version": 1,
       "analyzer_version": 1,
       "profile_source": "waveform",
-      "features": ["loudness", "mix_ramp"]
+      "features": [
+        "loudness",
+        "mix_ramp"
+      ]
     }
   },
-  "requirements": []
+  "versions": [
+    {
+      "version": "0.2.0",
+      "min_core_version": "2.6.0",
+      "changelog": "Use AudioMuse-AI's on_song_analyzed worker hook to analyze the same temporary audio file used by core analysis, with manual Catch Up Now retained for older or missing profiles.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/NeptuneHub/AudioMuse-AI-plugins/main/dist/lumae_analysis/lumae_analysis_0.2.0.zip",
+      "checksum": "97b65359634d05f9c7e3aa5115c46aea"
+    }
+  ]
 }
