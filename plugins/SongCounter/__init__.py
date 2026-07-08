@@ -47,6 +47,34 @@ def migrate(db):
         " (id INTEGER PRIMARY KEY, run_id TEXT, analyzed_count INTEGER NOT NULL DEFAULT 0, last_song TEXT)"
     )
     cur.execute("ALTER TABLE " + stats + " ADD COLUMN IF NOT EXISTS run_id TEXT")
+    log = table('index_log')
+    cur.execute(
+        "CREATE TABLE IF NOT EXISTS " + log +
+        " (id SERIAL PRIMARY KEY, logged_at TEXT, musicnn INTEGER, dclap INTEGER, gte INTEGER)"
+    )
+    cur.execute(
+        "INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES (%s, %s, %s, FALSE) "
+        "ON CONFLICT (task_type) DO NOTHING",
+        ('plugin.song_counter.index_log', 'plugin.song_counter.index_log', '0 * * * *'),
+    )
+    db.commit()
+    cur.close()
+
+
+def index_snapshot():
+    db = get_db()
+    cur = db.cursor()
+    log = table('index_log')
+    counts = [_count(table_name) for _key, _label, table_name in SOURCES]
+    cur.execute(
+        "INSERT INTO " + log + " (logged_at, musicnn, dclap, gte) "
+        "VALUES (to_char(now(), 'DD-MM-YYYY HH24:MI:SS'), %s, %s, %s)",
+        counts,
+    )
+    cur.execute(
+        "DELETE FROM " + log + " WHERE id NOT IN "
+        "(SELECT id FROM " + log + " ORDER BY id DESC LIMIT 10)"
+    )
     db.commit()
     cur.close()
 
@@ -148,6 +176,48 @@ def _hook_html():
     )
 
 
+def _index_log_html():
+    db = get_db()
+    try:
+        cur = db.cursor()
+        cur.execute(
+            "SELECT logged_at, musicnn, dclap, gte FROM " + table('index_log') +
+            " ORDER BY id DESC LIMIT 10"
+        )
+        rows = cur.fetchall()
+        cur.close()
+    except Exception:
+        db.rollback()
+        rows = []
+    html_out = '<h3 style="margin-top:1.5rem;">Index log (hourly cron task)</h3>'
+    if not rows:
+        return html_out + (
+            '<p>No snapshot yet. Enable the plugin.song_counter.index_log schedule in '
+            'Administration &gt; Scheduled Tasks, or press its Run now button.</p>'
+        )
+    header = (
+        '<tr>'
+        '<th style="padding:.2rem .6rem;text-align:left;">When</th>'
+        '<th style="padding:.2rem .6rem;text-align:right;">Musicnn</th>'
+        '<th style="padding:.2rem .6rem;text-align:right;">DCLAP</th>'
+        '<th style="padding:.2rem .6rem;text-align:right;">GTE lyrics</th>'
+        '</tr>'
+    )
+    detail = ''.join(
+        '<tr>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;">{html.escape(str(logged_at))}</td>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;text-align:right;">{musicnn}</td>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;text-align:right;">{dclap}</td>'
+        f'<td style="padding:.2rem .6rem;border-top:1px solid #ccc;text-align:right;">{gte}</td>'
+        '</tr>'
+        for logged_at, musicnn, dclap, gte in rows
+    )
+    return html_out + (
+        '<p>The last 10 snapshots of the index sizes, newest first (older ones are deleted).</p>'
+        f'<table style="border-collapse:collapse;font-size:.95rem;">{header}{detail}</table>'
+    )
+
+
 @bp.route('/')
 def home():
     selected = get_setting('sources', [])
@@ -167,6 +237,7 @@ def home():
         f'<img src="data:image/png;base64,{chart}" alt="Song counts" style="max-width:100%;height:auto;">'
         f'<ul style="list-style:none;padding:0;font-size:1.1rem;margin-top:1rem;">{items}</ul>'
         f'{_hook_html()}'
+        f'{_index_log_html()}'
     )
     return render_page(body, title='SongCounter')
 
@@ -200,3 +271,4 @@ def register(ctx):
     ctx.add_blueprint(bp)
     ctx.add_menu_item('SongCounter', 'song_counter.home')
     ctx.on_song_analyzed(on_analyzed)
+    ctx.add_cron_task('index_log', index_snapshot)
