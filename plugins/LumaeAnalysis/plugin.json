@@ -22,7 +22,7 @@
       "changelog": "Add Queue Whole Library to enqueue every missing, stale, or changed Lumae profile in 250-track worker jobs while keeping Catch Up Now for one batch.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.2.1.zip",
-      "checksum": "c06ccc83f76cd8d914b778f0daebfcb9"
+      "checksum": "0b640a4cdd32bf96820d54e618d6e4ab"
     }
   ]
 }
