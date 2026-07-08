@@ -17,12 +17,12 @@
   },
   "versions": [
     {
-      "version": "0.2.0",
+      "version": "0.2.1",
       "min_core_version": "2.6.0",
-      "changelog": "Use AudioMuse-AI's on_song_analyzed worker hook to analyze the same temporary audio file used by core analysis, with manual Catch Up Now retained for older or missing profiles.",
+      "changelog": "Add Queue Whole Library to enqueue every missing, stale, or changed Lumae profile in 250-track worker jobs while keeping Catch Up Now for one batch.",
       "imageUrl": "",
-      "sourceUrl": "https://raw.githubusercontent.com/NeptuneHub/AudioMuse-AI-plugins/main/dist/lumae_analysis/lumae_analysis_0.2.0.zip",
-      "checksum": "97b65359634d05f9c7e3aa5115c46aea"
+      "sourceUrl": "https://raw.githubusercontent.com/NeptuneHub/AudioMuse-AI-plugins/main/dist/lumae_analysis/lumae_analysis_0.2.1.zip",
+      "checksum": "c06ccc83f76cd8d914b778f0daebfcb9"
     }
   ]
 }

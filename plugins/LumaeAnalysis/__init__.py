@@ -12,6 +12,7 @@ from .loudness import SilentAudioError, analyze_file
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
+WHOLE_LIBRARY_CHUNK_SIZE = 250
 
 bp = Blueprint("lumae_analysis", __name__)
 
@@ -500,6 +501,14 @@ def find_backfill_ids(limit=25):
     return ids
 
 
+def find_all_backfill_ids():
+    ids = []
+    for item_id, file_path, stored_sig, analyzer_ver, status in fetch_analysis_rows():
+        if is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
+            ids.append(str(item_id))
+    return ids
+
+
 def analysis_status_counts():
     counts = {
         "total_with_files": 0,
@@ -535,6 +544,19 @@ def queue_backfill_batch(limit=None):
     return {"queued": len(ids), "limit": batch_limit}
 
 
+def queue_whole_library():
+    ids = find_all_backfill_ids()
+    jobs = 0
+    for start in range(0, len(ids), WHOLE_LIBRARY_CHUNK_SIZE):
+        chunk = ids[start:start + WHOLE_LIBRARY_CHUNK_SIZE]
+        if not chunk:
+            continue
+        mark_pending(chunk)
+        enqueue(analyze_tracks_task, chunk, queue="default")
+        jobs += 1
+    return {"queued": len(ids), "jobs": jobs, "chunk_size": WHOLE_LIBRARY_CHUNK_SIZE}
+
+
 def backfill_missing_profiles(limit=None):
     ids = find_backfill_ids(limit or configured_backfill_limit())
     return analyze_tracks_task(ids)
@@ -560,11 +582,12 @@ def render_settings(message=None, error=None):
           </tbody>
         </table>
         <form method="post">
-          <label>Backfill batch size <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric"></label>
+          <label>Catch-up batch size <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric"></label>
           <button type="submit" name="action" value="save">Save</button>
           <button type="submit" name="action" value="catch_up">Catch Up Now</button>
+          <button type="submit" name="action" value="queue_all">Queue Whole Library</button>
         </form>
-        <p>New songs are analyzed from AudioMuse's worker hook. Catch-up only queues older tracks that are missing, stale, or changed.</p>
+        <p>New songs are analyzed from AudioMuse's worker hook. Catch-up queues one batch. Queue Whole Library queues every missing, stale, or changed track in 250-track jobs.</p>
         """,
         title="Lumae Analysis",
     )
@@ -581,6 +604,12 @@ def settings():
             if request.form.get("action") == "catch_up":
                 result = queue_backfill_batch(batch_size)
                 message = f"Queued {result['queued']} tracks for Lumae analysis."
+            elif request.form.get("action") == "queue_all":
+                result = queue_whole_library()
+                message = (
+                    f"Queued {result['queued']} tracks across {result['jobs']} jobs "
+                    "for Lumae analysis."
+                )
             else:
                 message = "Lumae analysis settings saved."
         except ValueError as exc:

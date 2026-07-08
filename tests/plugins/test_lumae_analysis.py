@@ -31,7 +31,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.2.0"
+    assert manifest["versions"][0]["version"] == "0.2.1"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"] == {
         "lumae_analysis_profiles": {
@@ -748,6 +748,46 @@ def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch)
     ]
 
 
+def test_queue_whole_library_splits_every_candidate_into_250_track_jobs(monkeypatch):
+    mod = load_plugin()
+    calls = []
+    ids = [f"track-{i}" for i in range(601)]
+
+    monkeypatch.setattr(mod, "find_all_backfill_ids", lambda: ids)
+    monkeypatch.setattr(mod, "mark_pending", lambda chunk: calls.append(("mark_pending", chunk)))
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda func, chunk, queue="default": calls.append((func.__name__, chunk, queue)),
+    )
+
+    assert mod.queue_whole_library() == {"queued": 601, "jobs": 3, "chunk_size": 250}
+    assert calls == [
+        ("mark_pending", ids[:250]),
+        ("analyze_tracks_task", ids[:250], "default"),
+        ("mark_pending", ids[250:500]),
+        ("analyze_tracks_task", ids[250:500], "default"),
+        ("mark_pending", ids[500:]),
+        ("analyze_tracks_task", ids[500:], "default"),
+    ]
+
+
+def test_queue_whole_library_does_not_enqueue_when_no_candidates(monkeypatch):
+    mod = load_plugin()
+    calls = []
+
+    monkeypatch.setattr(mod, "find_all_backfill_ids", lambda: [])
+    monkeypatch.setattr(mod, "mark_pending", lambda chunk: calls.append(("mark_pending", chunk)))
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda func, chunk, queue="default": calls.append((func.__name__, chunk, queue)),
+    )
+
+    assert mod.queue_whole_library() == {"queued": 0, "jobs": 0, "chunk_size": 250}
+    assert calls == []
+
+
 def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     mod = load_plugin()
     db = CronDb(existing=None)
@@ -799,8 +839,43 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     assert response.status_code == 200
     body = response.get_data(as_text=True)
     assert "Catch Up Now" in body
+    assert "Queue Whole Library" in body
     assert "Needs analysis" in body
     assert "15894" in body
     assert "Enable scheduled catch-up" not in body
     assert "Cron expression" not in body
     assert "Scheduled Tasks" not in body
+
+
+def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 250)
+    monkeypatch.setattr(
+        mod,
+        "analysis_status_counts",
+        lambda: {
+            "total_with_files": 16000,
+            "ready_current": 100,
+            "pending": 2,
+            "failed": 1,
+            "skipped": 3,
+            "needs_analysis": 15894,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "queue_whole_library",
+        lambda: {"queued": 15894, "jobs": 64, "chunk_size": 250},
+    )
+    monkeypatch.setattr(mod, "set_setting", lambda key, value: None)
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+    client = plugin_client(mod)
+
+    response = client.post(
+        "/settings",
+        data={"backfill_batch_size": "25", "action": "queue_all"},
+    )
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "Queued 15894 tracks across 64 jobs for Lumae analysis." in body
