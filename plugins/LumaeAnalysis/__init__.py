@@ -96,6 +96,16 @@ def normalize_backfill_limit(raw):
     return min(max(value, 1), 250)
 
 
+def format_count(value):
+    return f"{int(value):,}"
+
+
+def track_count_label(value):
+    count = int(value)
+    suffix = "track" if count == 1 else "tracks"
+    return f"{format_count(count)} {suffix}"
+
+
 def disable_legacy_backfill_schedule(db):
     cur = db.cursor()
     cur.execute(
@@ -565,29 +575,311 @@ def backfill_missing_profiles(limit=None):
 def render_settings(message=None, error=None):
     batch_size = configured_backfill_limit()
     counts = analysis_status_counts()
-    message_html = f"<p>{escape(message)}</p>" if message else ""
-    error_html = f"<p><strong>{escape(error)}</strong></p>" if error else ""
+    total = int(counts["total_with_files"])
+    ready = int(counts["ready_current"])
+    coverage = int(round((ready / total) * 100)) if total else 0
+    coverage = min(max(coverage, 0), 100)
+    queueable = int(counts["needs_analysis"])
+    status_cards = [
+        ("Needs analysis", queueable, "lumae-status-attention"),
+        ("Ready/current", ready, "lumae-status-ready"),
+        ("Pending", counts["pending"], "lumae-status-pending"),
+        ("Failed", counts["failed"], "lumae-status-failed"),
+        ("Skipped", counts["skipped"], "lumae-status-muted"),
+        ("Total with files", total, "lumae-status-muted"),
+    ]
+    cards_html = "\n".join(
+        f"""
+          <article class="lumae-status-card {state}">
+            <span>{escape(label)}</span>
+            <strong>{format_count(value)}</strong>
+          </article>
+        """
+        for label, value, state in status_cards
+    )
+    message_html = (
+        f"""
+        <div class="lumae-notice lumae-notice-success" role="status">
+          {escape(message)}
+        </div>
+        """
+        if message
+        else ""
+    )
+    error_html = (
+        f"""
+        <div class="lumae-notice lumae-notice-error" role="alert">
+          <strong>{escape(error)}</strong>
+        </div>
+        """
+        if error
+        else ""
+    )
     return render_page(
         f"""
-        {message_html}
-        {error_html}
-        <table>
-          <tbody>
-            <tr><th>Total tracks with files</th><td>{counts["total_with_files"]}</td></tr>
-            <tr><th>Ready/current</th><td>{counts["ready_current"]}</td></tr>
-            <tr><th>Needs analysis</th><td>{counts["needs_analysis"]}</td></tr>
-            <tr><th>Pending</th><td>{counts["pending"]}</td></tr>
-            <tr><th>Failed</th><td>{counts["failed"]}</td></tr>
-            <tr><th>Skipped</th><td>{counts["skipped"]}</td></tr>
-          </tbody>
-        </table>
-        <form method="post">
-          <label>Catch-up batch size <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric"></label>
-          <button type="submit" name="action" value="save">Save</button>
-          <button type="submit" name="action" value="catch_up">Catch Up Now</button>
-          <button type="submit" name="action" value="queue_all">Queue Whole Library</button>
-        </form>
-        <p>New songs are analyzed from AudioMuse's worker hook. Catch-up queues one batch. Queue Whole Library queues every missing, stale, or changed track in 250-track jobs.</p>
+        <style>
+          .lumae-analysis-settings {{
+            --lumae-ink: #17202a;
+            --lumae-muted: #5f6f7f;
+            --lumae-line: #d9e2ea;
+            --lumae-panel: #ffffff;
+            --lumae-soft: #f6f8fb;
+            --lumae-accent: #2f6fed;
+            --lumae-ready: #247a5a;
+            --lumae-warn: #b46b00;
+            --lumae-danger: #b42318;
+            color: var(--lumae-ink);
+            display: grid;
+            gap: 18px;
+            max-width: 920px;
+          }}
+
+          .lumae-hero {{
+            border-bottom: 1px solid var(--lumae-line);
+            display: grid;
+            gap: 10px;
+            padding-bottom: 18px;
+          }}
+
+          .lumae-kicker {{
+            color: var(--lumae-muted);
+            font-size: 0.78rem;
+            font-weight: 700;
+            letter-spacing: 0;
+            text-transform: uppercase;
+          }}
+
+          .lumae-hero h2 {{
+            font-size: clamp(1.5rem, 3vw, 2.15rem);
+            line-height: 1.1;
+            margin: 0;
+          }}
+
+          .lumae-hero p,
+          .lumae-action-copy,
+          .lumae-help {{
+            color: var(--lumae-muted);
+            line-height: 1.55;
+            margin: 0;
+          }}
+
+          .lumae-coverage {{
+            background: var(--lumae-soft);
+            border: 1px solid var(--lumae-line);
+            border-radius: 8px;
+            display: grid;
+            gap: 10px;
+            padding: 14px;
+          }}
+
+          .lumae-coverage-row {{
+            align-items: baseline;
+            display: flex;
+            gap: 12px;
+            justify-content: space-between;
+          }}
+
+          .lumae-coverage strong {{
+            font-size: 1.1rem;
+          }}
+
+          .lumae-meter {{
+            background: #dce5ed;
+            border-radius: 999px;
+            height: 10px;
+            overflow: hidden;
+          }}
+
+          .lumae-meter-fill {{
+            background: linear-gradient(90deg, var(--lumae-ready), var(--lumae-accent));
+            height: 100%;
+          }}
+
+          .lumae-status-grid {{
+            display: grid;
+            gap: 10px;
+            grid-template-columns: repeat(auto-fit, minmax(130px, 1fr));
+          }}
+
+          .lumae-status-card {{
+            background: var(--lumae-panel);
+            border: 1px solid var(--lumae-line);
+            border-radius: 8px;
+            display: grid;
+            gap: 8px;
+            min-height: 88px;
+            padding: 14px;
+          }}
+
+          .lumae-status-card span {{
+            color: var(--lumae-muted);
+            font-size: 0.82rem;
+            font-weight: 700;
+          }}
+
+          .lumae-status-card strong {{
+            font-size: 1.75rem;
+            line-height: 1;
+          }}
+
+          .lumae-status-attention {{
+            border-color: #f2c879;
+          }}
+
+          .lumae-status-attention strong {{
+            color: var(--lumae-warn);
+          }}
+
+          .lumae-status-ready strong {{
+            color: var(--lumae-ready);
+          }}
+
+          .lumae-status-pending strong {{
+            color: var(--lumae-accent);
+          }}
+
+          .lumae-status-failed strong {{
+            color: var(--lumae-danger);
+          }}
+
+          .lumae-status-muted strong {{
+            color: #405163;
+          }}
+
+          .lumae-panel {{
+            border-top: 1px solid var(--lumae-line);
+            display: grid;
+            gap: 14px;
+            padding-top: 18px;
+          }}
+
+          .lumae-panel h3 {{
+            font-size: 1rem;
+            margin: 0;
+          }}
+
+          .lumae-form {{
+            display: grid;
+            gap: 16px;
+          }}
+
+          .lumae-field {{
+            display: grid;
+            gap: 6px;
+            max-width: 260px;
+          }}
+
+          .lumae-field span {{
+            font-weight: 700;
+          }}
+
+          .lumae-field input {{
+            border: 1px solid var(--lumae-line);
+            border-radius: 8px;
+            font: inherit;
+            padding: 9px 10px;
+          }}
+
+          .lumae-actions {{
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+          }}
+
+          .lumae-actions button {{
+            border-radius: 8px;
+            cursor: pointer;
+            font-weight: 700;
+            min-height: 40px;
+            padding: 9px 14px;
+          }}
+
+          .lumae-button-primary {{
+            background: var(--lumae-accent);
+            border: 1px solid var(--lumae-accent);
+            color: #ffffff;
+          }}
+
+          .lumae-button-secondary {{
+            background: #ffffff;
+            border: 1px solid var(--lumae-line);
+            color: var(--lumae-ink);
+          }}
+
+          .lumae-button-caution {{
+            background: #fff8eb;
+            border: 1px solid #f2c879;
+            color: #6f4200;
+          }}
+
+          .lumae-action-notes {{
+            display: grid;
+            gap: 6px;
+          }}
+
+          .lumae-notice {{
+            border-radius: 8px;
+            font-weight: 700;
+            padding: 12px 14px;
+          }}
+
+          .lumae-notice-success {{
+            background: #e9f6ef;
+            border: 1px solid #a7d8bd;
+            color: #14543c;
+          }}
+
+          .lumae-notice-error {{
+            background: #fff0ed;
+            border: 1px solid #ffb4a8;
+            color: var(--lumae-danger);
+          }}
+        </style>
+
+        <section class="lumae-analysis-settings" aria-label="Lumae analysis settings">
+          {message_html}
+          {error_html}
+
+          <header class="lumae-hero">
+            <span class="lumae-kicker">Waveform profiles</span>
+            <h2>Lumae analysis is preparing tracks for smoother playback.</h2>
+            <p>New songs are analyzed automatically after AudioMuse processes them. Use these controls to catch up older library items.</p>
+          </header>
+
+          <section class="lumae-coverage" aria-label="Profile coverage">
+            <div class="lumae-coverage-row">
+              <strong>{coverage}% profile coverage</strong>
+              <span>{track_count_label(ready)} ready of {track_count_label(total)}</span>
+            </div>
+            <div class="lumae-meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{coverage}">
+              <div class="lumae-meter-fill" style="width: {coverage}%;"></div>
+            </div>
+          </section>
+
+          <section class="lumae-status-grid" aria-label="Analysis status">
+            {cards_html}
+          </section>
+
+          <section class="lumae-panel" aria-label="Catch-up controls">
+            <h3>Catch-up controls</h3>
+            <p class="lumae-action-copy">{track_count_label(queueable)} can be queued now.</p>
+            <form class="lumae-form" method="post">
+              <label class="lumae-field">
+                <span>Tracks per batch</span>
+                <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric">
+              </label>
+              <div class="lumae-actions">
+                <button class="lumae-button-secondary" type="submit" name="action" value="save">Save</button>
+                <button class="lumae-button-primary" type="submit" name="action" value="catch_up">Analyze next batch</button>
+                <button class="lumae-button-caution" type="submit" name="action" value="queue_all">Queue all missing tracks</button>
+              </div>
+            </form>
+            <div class="lumae-action-notes">
+              <p class="lumae-help">Runs one controlled batch using the current batch size.</p>
+              <p class="lumae-help">Queues all missing, stale, or changed tracks in 250-track jobs.</p>
+            </div>
+          </section>
+        </section>
         """,
         title="Lumae Analysis",
     )
@@ -603,11 +895,11 @@ def settings():
             set_setting("backfill_batch_size", batch_size)
             if request.form.get("action") == "catch_up":
                 result = queue_backfill_batch(batch_size)
-                message = f"Queued {result['queued']} tracks for Lumae analysis."
+                message = f"Queued {track_count_label(result['queued'])} for Lumae analysis."
             elif request.form.get("action") == "queue_all":
                 result = queue_whole_library()
                 message = (
-                    f"Queued {result['queued']} tracks across {result['jobs']} jobs "
+                    f"Queued {track_count_label(result['queued'])} across {format_count(result['jobs'])} jobs "
                     "for Lumae analysis."
                 )
             else:

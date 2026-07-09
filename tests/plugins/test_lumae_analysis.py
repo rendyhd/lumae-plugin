@@ -3,6 +3,7 @@ import json
 import pathlib
 import sys
 import math
+import types
 
 import numpy as np
 
@@ -10,6 +11,22 @@ from flask import Flask
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
+
+plugin_module = types.ModuleType("plugin")
+plugin_api_module = types.ModuleType("plugin.api")
+plugin_api_module.config = types.SimpleNamespace()
+plugin_api_module.enqueue = lambda *args, **kwargs: None
+plugin_api_module.get_db = lambda: None
+plugin_api_module.get_setting = lambda _key, default=None: default
+plugin_api_module.logger = types.SimpleNamespace(
+    warning=lambda *args, **kwargs: None,
+    exception=lambda *args, **kwargs: None,
+)
+plugin_api_module.render_page = lambda body, title=None: body
+plugin_api_module.set_setting = lambda _key, _value: None
+plugin_api_module.table = lambda name: f"plugin_lumae_analysis__{name}"
+sys.modules.setdefault("plugin", plugin_module)
+sys.modules.setdefault("plugin.api", plugin_api_module)
 
 PLUGIN_TABLE = "plugin_lumae_analysis__profiles"
 
@@ -334,7 +351,7 @@ def test_analyze_file_loads_audio_and_delegates_to_buffer(monkeypatch):
         captured["analyze"] = (buffer, sample_rate)
         return sentinel
 
-    monkeypatch.setattr(loudness.librosa, "load", fake_load)
+    monkeypatch.setattr(loudness, "librosa", types.SimpleNamespace(load=fake_load))
     monkeypatch.setattr(loudness, "analyze_buffer", fake_analyze_buffer)
 
     result = loudness.analyze_file("fixture.wav")
@@ -838,13 +855,45 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_data(as_text=True)
-    assert "Catch Up Now" in body
-    assert "Queue Whole Library" in body
+    assert 'class="lumae-status-grid"' in body
+    assert 'class="lumae-meter-fill" style="width: 1%;"' in body
+    assert "Analyze next batch" in body
+    assert "Queue all missing tracks" in body
+    assert "Tracks per batch" in body
     assert "Needs analysis" in body
-    assert "15894" in body
+    assert "15,894" in body
     assert "Enable scheduled catch-up" not in body
     assert "Cron expression" not in body
     assert "Scheduled Tasks" not in body
+
+
+def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 50)
+    monkeypatch.setattr(
+        mod,
+        "analysis_status_counts",
+        lambda: {
+            "total_with_files": 100,
+            "ready_current": 82,
+            "pending": 4,
+            "failed": 2,
+            "skipped": 1,
+            "needs_analysis": 11,
+        },
+    )
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+    client = plugin_client(mod)
+
+    response = client.get("/settings")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "82% profile coverage" in body
+    assert 'aria-valuenow="82"' in body
+    assert "11 tracks can be queued now." in body
+    assert "Runs one controlled batch using the current batch size." in body
+    assert "Queues all missing, stale, or changed tracks in 250-track jobs." in body
 
 
 def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(monkeypatch):
@@ -878,4 +927,5 @@ def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(mo
 
     assert response.status_code == 200
     body = response.get_data(as_text=True)
-    assert "Queued 15894 tracks across 64 jobs for Lumae analysis." in body
+    assert 'class="lumae-notice lumae-notice-success" role="status"' in body
+    assert "Queued 15,894 tracks across 64 jobs for Lumae analysis." in body
