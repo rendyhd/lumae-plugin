@@ -17,6 +17,14 @@
   },
   "versions": [
     {
+      "version": "0.2.2",
+      "min_core_version": "2.6.0",
+      "changelog": "Vectorize the BS.1770 biquad filter with SciPy so loudness and MixRamp profiles are ready before playback catches the analysis queue.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "0.2.1",
       "min_core_version": "2.6.0",
       "changelog": "Add Queue Whole Library to enqueue every missing, stale, or changed Lumae profile in 250-track worker jobs while keeping Catch Up Now for one batch.",

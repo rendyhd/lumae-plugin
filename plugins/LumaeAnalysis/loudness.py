@@ -2,6 +2,7 @@ from dataclasses import dataclass
 
 import librosa
 import numpy as np
+from scipy import signal as scipy_signal
 
 from .ramp_codec import encode_ramp
 
@@ -49,14 +50,10 @@ def _as_channels(audio):
 
 def _apply_biquad(channel, coefs):
     b0, b1, b2, a1, a2 = coefs
-    out = np.empty(channel.shape[0], dtype=np.float64)
-    x1 = x2 = y1 = y2 = 0.0
-    for i, x0 in enumerate(channel.astype(np.float64, copy=False)):
-        y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
-        out[i] = y0
-        x2, x1 = x1, x0
-        y2, y1 = y1, y0
-    return out
+    samples = channel.astype(np.float64, copy=False)
+    numerator = np.asarray([b0, b1, b2], dtype=np.float64)
+    denominator = np.asarray([1.0, a1, a2], dtype=np.float64)
+    return scipy_signal.lfilter(numerator, denominator, samples)
 
 
 def _k_weight(channel):

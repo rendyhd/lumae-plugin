@@ -48,7 +48,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.2.1"
+    assert manifest["versions"][0]["version"] == "0.2.2"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"] == {
         "lumae_analysis_profiles": {
@@ -235,6 +235,85 @@ def test_analyze_buffer_produces_waveform_profile():
     assert result.end_ramp
     assert result.start_ramp_blob
     assert result.end_ramp_blob
+
+
+def test_apply_biquad_uses_vectorized_scipy(monkeypatch):
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    calls = []
+
+    def fake_lfilter(b, a, samples):
+        calls.append((b, a, samples.copy()))
+        return np.asarray(samples, dtype=np.float64)
+
+    monkeypatch.setattr(loudness.scipy_signal, "lfilter", fake_lfilter)
+    samples = np.linspace(-0.5, 0.5, 32, dtype=np.float32)
+
+    result = loudness._apply_biquad(samples, loudness.KWEIGHT_STAGE1)
+
+    assert len(calls) == 1
+    assert result.dtype == np.float64
+
+
+def test_vectorized_biquad_matches_reference_recurrence():
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    samples = np.random.default_rng(42).normal(0, 0.2, 4096).astype(np.float32)
+    coefs = loudness.KWEIGHT_STAGE1
+    b0, b1, b2, a1, a2 = coefs
+    expected = np.empty(samples.shape[0], dtype=np.float64)
+    x1 = x2 = y1 = y2 = 0.0
+    for index, x0 in enumerate(samples.astype(np.float64, copy=False)):
+        y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+        expected[index] = y0
+        x2, x1 = x1, x0
+        y2, y1 = y1, y0
+
+    actual = loudness._apply_biquad(samples, coefs)
+
+    np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-11)
+
+
+def test_vectorized_analysis_matches_reference_profile(monkeypatch):
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    def reference_apply(channel, coefs):
+        b0, b1, b2, a1, a2 = coefs
+        output = np.empty(channel.shape[0], dtype=np.float64)
+        x1 = x2 = y1 = y2 = 0.0
+        for index, x0 in enumerate(channel.astype(np.float64, copy=False)):
+            y0 = b0 * x0 + b1 * x1 + b2 * x2 - a1 * y1 - a2 * y2
+            output[index] = y0
+            x2, x1 = x1, x0
+            y2, y1 = y1, y0
+        return output
+
+    def reference_k_weight(channel):
+        stage1 = reference_apply(channel, loudness.KWEIGHT_STAGE1)
+        return reference_apply(stage1, loudness.KWEIGHT_STAGE2)
+
+    sample_rate = 48000
+    seconds = 2
+    time_axis = np.arange(sample_rate * seconds, dtype=np.float32) / sample_rate
+    envelope = np.linspace(0.02, 0.5, time_axis.size, dtype=np.float32)
+    audio = np.stack(
+        [
+            envelope * np.sin(2 * np.pi * 220 * time_axis),
+            envelope[::-1] * np.sin(2 * np.pi * 440 * time_axis),
+        ]
+    ).astype(np.float32)
+
+    vectorized = loudness.analyze_buffer(audio, sample_rate)
+    monkeypatch.setattr(loudness, "_k_weight", reference_k_weight)
+    reference = loudness.analyze_buffer(audio, sample_rate)
+
+    assert vectorized.sample_rate == reference.sample_rate
+    assert vectorized.duration_ms == reference.duration_ms
+    assert math.isclose(vectorized.ref_lufs, reference.ref_lufs, rel_tol=0, abs_tol=1e-10)
+    assert vectorized.start_ramp == reference.start_ramp
+    assert vectorized.end_ramp == reference.end_ramp
+    assert vectorized.start_ramp_blob == reference.start_ramp_blob
+    assert vectorized.end_ramp_blob == reference.end_ramp_blob
 
 
 def test_analyze_buffer_uses_100ms_chunks_and_expected_ramp_encoding(monkeypatch):
