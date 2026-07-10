@@ -21,8 +21,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Vectorize the BS.1770 biquad filter with SciPy so loudness and MixRamp profiles are ready before playback catches the analysis queue.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.2.2.zip",
+      "checksum": "0e012bc730563741670d0bcd27fd6235"
     },
     {
       "version": "0.2.1",
