@@ -8,6 +8,13 @@ from flask import Blueprint, jsonify, request
 from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
 
 from .loudness import SilentAudioError, analyze_file
+from .collection_manager import (
+    COLLECTIONS_SCHEMA_VERSION,
+    collections_enabled,
+    migrate_collections,
+    register_collection_routes,
+    render_collections_settings_panel,
+)
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
@@ -15,6 +22,7 @@ BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 WHOLE_LIBRARY_CHUNK_SIZE = 250
 
 bp = Blueprint("lumae_analysis", __name__)
+register_collection_routes(bp)
 
 
 class MediaDownloadError(Exception):
@@ -136,6 +144,7 @@ def migrate(db):
         """
     )
     cur.close()
+    migrate_collections(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
 
@@ -329,6 +338,12 @@ def health():
             "plugin": "lumae_analysis",
             "schema_version": SCHEMA_VERSION,
             "analyzer_version": ANALYZER_VERSION,
+            "capabilities": {
+                "collections": {
+                    "schema_version": COLLECTIONS_SCHEMA_VERSION,
+                    "enabled": collections_enabled(),
+                }
+            },
             "status": "ok",
         }
     )
@@ -780,18 +795,32 @@ def render_settings(message=None, error=None):
             padding: 9px 10px;
           }}
 
+          .lumae-toggle {{
+            align-items: center;
+            display: flex;
+            gap: 10px;
+            font-weight: 700;
+          }}
+
+          .lumae-toggle input {{
+            height: 20px;
+            width: 20px;
+          }}
+
           .lumae-actions {{
             display: flex;
             flex-wrap: wrap;
             gap: 10px;
           }}
 
-          .lumae-actions button {{
+          .lumae-actions button,
+          .lumae-actions .lumae-button {{
             border-radius: 8px;
             cursor: pointer;
             font-weight: 700;
             min-height: 40px;
             padding: 9px 14px;
+            text-decoration: none;
           }}
 
           .lumae-button-primary {{
@@ -879,6 +908,7 @@ def render_settings(message=None, error=None):
               <p class="lumae-help">Queues all missing, stale, or changed tracks in 250-track jobs.</p>
             </div>
           </section>
+          {render_collections_settings_panel()}
         </section>
         """,
         title="Lumae Analysis",
@@ -891,18 +921,24 @@ def settings():
     error = None
     if request.method == "POST":
         try:
-            batch_size = normalize_backfill_limit(request.form.get("backfill_batch_size") or 25)
-            set_setting("backfill_batch_size", batch_size)
-            if request.form.get("action") == "catch_up":
+            action = request.form.get("action")
+            if action == "save_collections":
+                enabled = request.form.get("collection_manager_enabled") == "on"
+                set_setting("collection_manager_enabled", enabled)
+                message = f"Living Collections {'enabled' if enabled else 'disabled'}."
+            else:
+                batch_size = normalize_backfill_limit(request.form.get("backfill_batch_size") or 25)
+                set_setting("backfill_batch_size", batch_size)
+            if action == "catch_up":
                 result = queue_backfill_batch(batch_size)
                 message = f"Queued {track_count_label(result['queued'])} for Lumae analysis."
-            elif request.form.get("action") == "queue_all":
+            elif action == "queue_all":
                 result = queue_whole_library()
                 message = (
                     f"Queued {track_count_label(result['queued'])} across {format_count(result['jobs'])} jobs "
                     "for Lumae analysis."
                 )
-            else:
+            elif action != "save_collections":
                 message = "Lumae analysis settings saved."
         except ValueError as exc:
             error = str(exc)

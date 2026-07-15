@@ -13,9 +13,26 @@
         "loudness",
         "mix_ramp"
       ]
+    },
+    "living_collections": {
+      "schema_version": 1,
+      "features": [
+        "mixed_album_track_membership",
+        "per_user_storage",
+        "incremental_sync",
+        "web_manager"
+      ]
     }
   },
   "versions": [
+    {
+      "version": "0.3.0",
+      "min_core_version": "2.6.0",
+      "changelog": "Add opt-in Living Collections with mixed album and track membership, a responsive AudioMuse manager, per-user storage, revisions, idempotent mutations, and incremental sync.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.3.0.zip",
+      "checksum": "05af5204fd1ebd828f4313c359fb4daf"
+    },
     {
       "version": "0.2.2",
       "min_core_version": "2.6.0",

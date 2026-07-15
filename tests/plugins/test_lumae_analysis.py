@@ -7,7 +7,7 @@ import types
 
 import numpy as np
 
-from flask import Flask
+from flask import Flask, g
 
 
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
@@ -48,15 +48,22 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.2.2"
+    assert manifest["versions"][0]["version"] == "0.3.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
-    assert manifest["capabilities"] == {
-        "lumae_analysis_profiles": {
-            "schema_version": 1,
-            "analyzer_version": 1,
-            "profile_source": "waveform",
-            "features": ["loudness", "mix_ramp"],
-        },
+    assert manifest["capabilities"]["lumae_analysis_profiles"] == {
+        "schema_version": 1,
+        "analyzer_version": 1,
+        "profile_source": "waveform",
+        "features": ["loudness", "mix_ramp"],
+    }
+    assert manifest["capabilities"]["living_collections"] == {
+        "schema_version": 1,
+        "features": [
+            "mixed_album_track_membership",
+            "per_user_storage",
+            "incremental_sync",
+            "web_manager",
+        ],
     }
 
 
@@ -71,7 +78,84 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
         "plugin": "lumae_analysis",
         "schema_version": 1,
         "analyzer_version": 1,
+        "capabilities": {
+            "collections": {
+                "schema_version": 1,
+                "enabled": False,
+            }
+        },
         "status": "ok",
+    }
+
+
+def test_collections_api_is_hidden_until_enabled():
+    mod = load_plugin()
+    client = plugin_client(mod)
+
+    response = client.get("/api/collections")
+
+    assert response.status_code == 404
+    assert response.get_json() == {"error": "collection_manager_disabled"}
+
+
+def test_collection_principal_is_per_user_but_bearer_is_global():
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    app = Flask(__name__)
+    with app.test_request_context("/"):
+        g.auth_method = "session"
+        g.auth_user = "alice"
+        assert collections.current_principal() == "user:alice"
+        g.auth_method = "bearer"
+        g.auth_user = None
+        assert collections.current_principal() == collections.GLOBAL_PRINCIPAL
+
+
+def test_enabled_collections_api_lists_mixed_item_counts(monkeypatch):
+    mod = load_plugin()
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    db = FakeDb(
+        rows=[
+            (
+                "collection-1",
+                "Sunday Records",
+                "Slow mornings",
+                4,
+                "2026-07-15T10:00:00Z",
+                "2026-07-15T11:00:00Z",
+                None,
+                2,
+                3,
+            )
+        ]
+    )
+    db.cursor_obj.description = [
+        ("id",),
+        ("name",),
+        ("description",),
+        ("revision",),
+        ("created_at",),
+        ("updated_at",),
+        ("deleted_at",),
+        ("album_count",),
+        ("track_count",),
+    ]
+    monkeypatch.setattr(collections, "get_setting", lambda key, default=None: True)
+    monkeypatch.setattr(collections, "get_db", lambda: db)
+    client = plugin_client(mod)
+
+    response = client.get("/api/collections")
+
+    assert response.status_code == 200
+    assert response.get_json()["collections"][0] == {
+        "id": "collection-1",
+        "name": "Sunday Records",
+        "description": "Slow mornings",
+        "revision": 4,
+        "created_at": "2026-07-15T10:00:00Z",
+        "updated_at": "2026-07-15T11:00:00Z",
+        "deleted_at": None,
+        "album_count": 2,
+        "track_count": 3,
     }
 
 
@@ -897,6 +981,10 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         (mod.BACKFILL_TASK_TYPE,),
     )
     assert all("INSERT INTO cron" not in sql for sql, _params in db.cursor_obj.executed)
+    migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
+    assert "plugin_lumae_analysis__collections" in migration_sql
+    assert "plugin_lumae_analysis__collection_items" in migration_sql
+    assert "plugin_lumae_analysis__collection_changes" in migration_sql
 
 
 def test_register_uses_analysis_hook_without_default_cron(monkeypatch):
@@ -944,6 +1032,53 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     assert "Enable scheduled catch-up" not in body
     assert "Cron expression" not in body
     assert "Scheduled Tasks" not in body
+    assert "Living Collections" in body
+    assert "Enable the collection manager" in body
+
+
+def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypatch):
+    mod = load_plugin()
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    saved = []
+    monkeypatch.setattr(mod, "set_setting", lambda key, value: saved.append((key, value)))
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 25)
+    monkeypatch.setattr(
+        mod,
+        "analysis_status_counts",
+        lambda: {
+            "total_with_files": 0,
+            "ready_current": 0,
+            "pending": 0,
+            "failed": 0,
+            "skipped": 0,
+            "needs_analysis": 0,
+        },
+    )
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+    client = plugin_client(mod)
+
+    response = client.post(
+        "/settings",
+        data={"action": "save_collections", "collection_manager_enabled": "on"},
+    )
+
+    assert response.status_code == 200
+    assert saved == [("collection_manager_enabled", True)]
+    assert "Living Collections enabled." in response.get_data(as_text=True)
+
+    monkeypatch.setattr(collections, "get_setting", lambda key, default=None: True)
+    monkeypatch.setattr(collections, "render_page", lambda body, title=None: body)
+    enabled_response = client.get("/collections")
+    assert enabled_response.status_code == 200
+    body = enabled_response.get_data(as_text=True)
+    assert "Living Collections" in body
+    assert "New collection" in body
+    assert "Add selected" in body
+    assert "Duplicate" in body
+    assert 'id="undo-toast"' in body
+    assert 'data-move=' in body
+    assert "Move ${esc(i.title)} up" in body
+    assert "@media(max-width:700px)" in body
 
 
 def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
