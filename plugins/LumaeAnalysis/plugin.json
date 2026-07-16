@@ -35,7 +35,7 @@
       "changelog": "Replace the basic add dialog with an art-first Albums, Tracks, and Artists library workbench; add categorized search, artist and album drill-down, provider track/disc numbers, bulk collection management, cover art, and credential-safe audio previews.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.4.0.zip",
-      "checksum": ""
+      "checksum": "a057bb21ea9f550d1305a22810c85ba6"
     },
     {
       "version": "0.3.1",
