@@ -31,7 +31,7 @@
       "changelog": "Add opt-in Living Collections with mixed album and track membership, a responsive AudioMuse manager, per-user storage, revisions, idempotent mutations, and incremental sync.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.3.0.zip",
-      "checksum": "05af5204fd1ebd828f4313c359fb4daf"
+      "checksum": "b236274d1bb28e0c6261049f19ea1d40"
     },
     {
       "version": "0.2.2",
