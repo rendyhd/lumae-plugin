@@ -31,7 +31,7 @@
       "changelog": "Expose enabled Living Collections in the Plugins menu, restore opaque high-contrast dialogs, and fix Add music requests so selected albums and tracks are persisted with visible progress and errors.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.3.1.zip",
-      "checksum": ""
+      "checksum": "12b40c01f6b08777aea120711a0ef896"
     },
     {
       "version": "0.3.0",
