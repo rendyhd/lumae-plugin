@@ -713,10 +713,10 @@ def register_collection_routes(bp):
 def render_collections_settings_panel():
     enabled = collections_enabled()
     checked = "checked" if enabled else ""
-    manage = (
-        '<a class="lumae-button lumae-button-primary" href="collections">Manage collections</a>'
+    location = (
+        '<span class="lumae-help">Enabled. Open <strong>Living Collections</strong> from the Plugins menu.</span>'
         if enabled
-        else '<span class="lumae-help">Enable and save to open the collection manager.</span>'
+        else '<span class="lumae-help">Enable and save to add Living Collections to the Plugins menu.</span>'
     )
     return f"""
       <section class="lumae-panel" aria-label="Living Collections">
@@ -729,7 +729,7 @@ def render_collections_settings_panel():
           </label>
           <div class="lumae-actions">
             <button class="lumae-button-secondary" type="submit" name="action" value="save_collections">Save collection setting</button>
-            {manage}
+            {location}
           </div>
         </form>
       </section>
@@ -741,7 +741,8 @@ def render_collections_manager():
     return render_page(
         f"""
 <style>
-  .collections-app{{--ink:#efeae0;--muted:#9d9689;--gold:#d4a54a;--bg:#15130f;--panel:#1f1c17;--line:#3b352b;color:var(--ink);background:var(--bg);border-radius:16px;min-height:70vh;overflow:hidden}}
+  .collections-page{{--ink:#efeae0;--muted:#aaa296;--gold:#d4a54a;--bg:#15130f;--panel:#211e18;--control:#302a21;--line:#494135;color:var(--ink);color-scheme:dark}}
+  .collections-app{{color:var(--ink);background:var(--bg);border-radius:16px;min-height:70vh;overflow:hidden}}
   .collections-top{{display:flex;align-items:center;justify-content:space-between;padding:20px 22px;border-bottom:1px solid var(--line)}}
   .collections-top h2,.collection-detail h2{{margin:0}} .collections-top p,.muted{{color:var(--muted);margin:4px 0 0}}
   .collections-grid{{display:grid;grid-template-columns:minmax(230px,30%) 1fr;min-height:620px}}
@@ -752,21 +753,24 @@ def render_collections_manager():
   .collection-detail{{padding:clamp(18px,4vw,42px);min-width:0}} .detail-head{{display:flex;gap:18px;align-items:flex-start;justify-content:space-between}}
   .mosaic{{width:112px;height:112px;border-radius:14px;background:linear-gradient(135deg,#765d2e,#2b251b);display:grid;place-items:center;color:#f6d894;font-size:2rem;flex:none}}
   .detail-copy{{flex:1;min-width:0}} .detail-actions,.toolbar{{display:flex;gap:8px;flex-wrap:wrap}}
-  button,.button{{min-height:42px;border-radius:9px;border:1px solid var(--line);background:#29241d;color:var(--ink);padding:9px 14px;font-weight:700;cursor:pointer}}
-  button.primary,.button.primary{{background:var(--gold);border-color:var(--gold);color:#1a160f}} button.danger{{color:#ffb4a8}}
+  .collections-page button,.collections-page .button{{min-height:42px;border-radius:9px;border:1px solid var(--line);background:var(--control);color:var(--ink);padding:9px 14px;font-weight:700;cursor:pointer}}
+  .collections-page button:hover{{border-color:#716451;background:#3a3228}} .collections-page button:focus-visible,.collections-page input:focus-visible,.collections-page textarea:focus-visible{{outline:3px solid #d4a54a66;outline-offset:2px}}
+  .collections-page button.primary,.collections-page .button.primary{{background:var(--gold);border-color:var(--gold);color:#1a160f}} .collections-page button.primary:hover{{background:#e0b65d}} .collections-page button.danger{{color:#ffb4a8}}
   .section{{margin-top:32px}} .section-title{{display:flex;justify-content:space-between;align-items:baseline;border-bottom:1px solid var(--line);padding-bottom:10px}}
   .section-title h3{{margin:0}} .item-row{{display:flex;gap:12px;align-items:center;border-bottom:1px solid #2d2821}}
   .item-art{{width:48px;height:48px;border-radius:7px;background:linear-gradient(135deg,#66512b,#29231a);display:grid;place-items:center;color:var(--gold);flex:none}}
   .item-copy{{flex:1;min-width:0}} .item-copy strong,.item-copy span{{display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}} .item-copy span{{color:var(--muted);font-size:.84rem;margin-top:3px}}
-  .item-controls{{display:flex;gap:4px;align-items:center}} .item-controls button{{min-width:42px;padding:7px}} button:disabled{{opacity:.38;cursor:not-allowed}}
-  dialog{{width:min(720px,calc(100vw - 24px));border:1px solid var(--line);border-radius:16px;background:var(--panel);color:var(--ink);padding:0}} dialog::backdrop{{background:#000a}}
-  .dialog-head,.dialog-foot{{display:flex;align-items:center;justify-content:space-between;padding:16px;border-bottom:1px solid var(--line)}} .dialog-foot{{border:0;border-top:1px solid var(--line)}}
-  .dialog-body{{padding:16px}} input,textarea{{width:100%;box-sizing:border-box;background:#17140f;color:var(--ink);border:1px solid var(--line);border-radius:9px;padding:11px;font:inherit}}
+  .item-controls{{display:flex;gap:4px;align-items:center}} .item-controls button{{min-width:42px;padding:7px}} .collections-page button:disabled{{opacity:.45;cursor:not-allowed}}
+  .collections-page dialog{{width:min(720px,calc(100vw - 24px));max-height:min(82vh,760px);overflow:auto;border:1px solid var(--line);border-radius:16px;background:var(--panel);color:var(--ink);padding:0;box-shadow:0 24px 80px #000c}}
+  .collections-page dialog::backdrop{{background:rgba(0,0,0,.72);backdrop-filter:blur(2px)}} .collections-page dialog form{{margin:0}}
+  .dialog-head,.dialog-foot{{display:flex;align-items:center;justify-content:space-between;gap:12px;padding:16px;background:var(--panel);border-bottom:1px solid var(--line)}} .dialog-foot{{border:0;border-top:1px solid var(--line)}}
+  .dialog-body{{padding:16px;background:var(--panel)}} .dialog-body label{{display:grid;gap:6px;margin-bottom:14px;color:var(--ink)}} .collections-page input,.collections-page textarea{{width:100%;box-sizing:border-box;background:#17140f;color:var(--ink);border:1px solid #5b5143;border-radius:9px;padding:11px;font:inherit}}
   .tabs{{display:flex;gap:8px;margin-bottom:12px}} .search-results{{max-height:45vh;overflow:auto;margin-top:12px}} .search-choice{{display:flex;gap:12px;align-items:center;padding:10px;border-bottom:1px solid var(--line)}} .search-choice input{{width:auto}}
-  .empty{{color:var(--muted);padding:36px 10px;text-align:center}} .mobile-back{{display:none}}
+  .dialog-status{{min-height:1.4em;margin-top:10px;color:var(--muted)}} .dialog-status.error{{color:#ffb4a8}} .empty{{color:var(--muted);padding:36px 10px;text-align:center}} .mobile-back{{display:none}}
   .undo-toast{{position:fixed;z-index:20;left:50%;bottom:24px;transform:translateX(-50%);width:min(440px,calc(100vw - 28px));display:flex;align-items:center;justify-content:space-between;gap:12px;background:#2b251d;border:1px solid var(--line);border-radius:12px;padding:12px 14px;box-shadow:0 14px 40px #0008}} .undo-toast[hidden]{{display:none}}
   @media(max-width:700px){{.collections-grid{{display:block}}.collection-list{{border:0}}.collection-detail{{display:none}}.collections-app.detail-open .collection-list{{display:none}}.collections-app.detail-open .collection-detail{{display:block}}.mobile-back{{display:inline-flex}}.detail-head{{flex-wrap:wrap}}.mosaic{{width:88px;height:88px}}}}
 </style>
+<div class="collections-page">
 <section class="collections-app" id="collections-app">
   <header class="collections-top"><div><h2>Living Collections</h2><p>{escape(principal_label)}</p></div><button class="primary" id="new-collection">New collection</button></header>
   <div class="collections-grid">
@@ -775,15 +779,16 @@ def render_collections_manager():
   </div>
 </section>
 <dialog id="edit-dialog"><form method="dialog"><header class="dialog-head"><strong id="edit-title">New collection</strong><button value="cancel" aria-label="Close">×</button></header><div class="dialog-body"><label>Name<input id="collection-name" maxlength="120" required></label><label>Description<textarea id="collection-description" maxlength="1000" rows="3"></textarea></label></div><footer class="dialog-foot"><span></span><button class="primary" id="save-collection" value="cancel">Save</button></footer></form></dialog>
-<dialog id="add-dialog"><header class="dialog-head"><strong>Add music</strong><button id="close-add" aria-label="Close">×</button></header><div class="dialog-body"><div class="tabs"><button data-kind="album" class="primary">Albums</button><button data-kind="track">Tracks</button></div><input id="music-search" placeholder="Search albums and tracks" autocomplete="off"><div class="search-results" id="search-results"><p class="empty">Search your analyzed library.</p></div></div><footer class="dialog-foot"><span id="selected-count">0 selected</span><button class="primary" id="add-selected" disabled>Add selected</button></footer></dialog>
+<dialog id="add-dialog"><header class="dialog-head"><strong>Add music</strong><button type="button" id="close-add" aria-label="Close">×</button></header><div class="dialog-body"><div class="tabs"><button type="button" data-kind="album" class="primary">Albums</button><button type="button" data-kind="track">Tracks</button></div><input id="music-search" placeholder="Search albums and tracks" autocomplete="off"><div class="dialog-status" id="add-status" role="status" aria-live="polite"></div><div class="search-results" id="search-results"><p class="empty">Search your analyzed library.</p></div></div><footer class="dialog-foot"><span id="selected-count">0 selected</span><button type="button" class="primary" id="add-selected" disabled>Add selected</button></footer></dialog>
 <div class="undo-toast" id="undo-toast" role="status" hidden><span id="undo-label">Item removed</span><button id="undo-remove">Undo</button></div>
 <script>
 (()=>{{
 const api='api/collections', app=document.getElementById('collections-app'), list=document.getElementById('collection-list'), detail=document.getElementById('collection-detail');
-const edit=document.getElementById('edit-dialog'), add=document.getElementById('add-dialog'),undoToast=document.getElementById('undo-toast'); let collections=[],current=null,items=[],editMode='new',kind='album',results=[],selected=new Set(),timer,undoItem=null,undoTimer;
+const edit=document.getElementById('edit-dialog'),add=document.getElementById('add-dialog'),addStatus=document.getElementById('add-status'),addButton=document.getElementById('add-selected'),undoToast=document.getElementById('undo-toast'); let collections=[],current=null,items=[],editMode='new',kind='album',results=[],selected=new Set(),timer,undoItem=null,undoTimer,searchGeneration=0,searchController=null;
 const esc=s=>String(s??'').replace(/[&<>"']/g,c=>({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
-async function req(url,opts={{}}){{const r=await fetch(url,{{headers:{{'Content-Type':'application/json',...(opts.headers||{{}})}},...opts}});const b=await r.json();if(!r.ok)throw Object.assign(new Error(b.error||'Request failed'),{{body:b,status:r.status}});return b}}
+async function req(url,opts={{}}){{const headers=opts.headers||{{}},rest={{...opts}};delete rest.headers;const r=await fetch(url,{{...rest,headers:{{'Content-Type':'application/json',...headers}}}});let b;try{{b=await r.json()}}catch(_err){{b={{error:`Request failed (${{r.status}})`}}}}if(!r.ok)throw Object.assign(new Error(b.error||'Request failed'),{{body:b,status:r.status}});return b}}
 function initials(s){{return String(s||'?').split(/\\s+/).slice(0,2).map(x=>x[0]).join('').toUpperCase()}}
+function mutationKey(){{return globalThis.crypto?.randomUUID?.()||`${{Date.now()}}-${{Math.random().toString(16).slice(2)}}`}}
 async function loadList(selectId){{const b=await req(api);collections=b.collections;list.innerHTML=collections.length?collections.map(c=>`<button class="collection-button ${{current?.id===c.id?'active':''}}" data-id="${{esc(c.id)}}"><strong>${{esc(c.name)}}</strong><span>${{c.album_count}} albums · ${{c.track_count}} tracks</span></button>`).join(''):'<p class="empty">No collections yet.<br>Create one for records, tracks, or both.</p>';list.querySelectorAll('[data-id]').forEach(x=>x.onclick=()=>openCollection(x.dataset.id));if(selectId)await openCollection(selectId)}}
 async function openCollection(id){{const b=await req(`${{api}}/${{encodeURIComponent(id)}}`);current=b.collection;items=b.items;app.classList.add('detail-open');renderDetail();await loadList()}}
 function renderSection(itemKind,title){{const rows=items.filter(i=>i.kind===itemKind);return `<section class="section"><div class="section-title"><h3>${{title}}</h3><span class="muted">${{rows.length}}</span></div>${{rows.length?rows.map((i,n)=>`<div class="item-row"><div class="item-art">${{esc(initials(i.title))}}</div><div class="item-copy"><strong>${{esc(i.title||'Untitled')}}</strong><span>${{esc(i.artist)}}${{i.album?' · '+esc(i.album):''}}</span></div><div class="item-controls"><button data-move="${{esc(i.id)}}" data-direction="-1" aria-label="Move ${{esc(i.title)}} up" ${{n===0?'disabled':''}}>↑</button><button data-move="${{esc(i.id)}}" data-direction="1" aria-label="Move ${{esc(i.title)}} down" ${{n===rows.length-1?'disabled':''}}>↓</button><button data-remove="${{esc(i.id)}}" aria-label="Remove ${{esc(i.title)}}">Remove</button></div></div>`).join(''):`<p class="empty">No ${{title.toLowerCase()}} yet.</p>`}}</section>`}}
@@ -796,14 +801,16 @@ async function moveItem(id,direction){{const moving=items.find(i=>i.id===id),row
 function showUndo(item){{undoItem=item;document.getElementById('undo-label').textContent=`Removed ${{item.title||'item'}}`;undoToast.hidden=false;clearTimeout(undoTimer);undoTimer=setTimeout(()=>{{undoToast.hidden=true;undoItem=null}},7000)}}
 async function removeItem(id){{const removed=items.find(i=>i.id===id);await req(`${{api}}/${{current.id}}/items/${{id}}`,{{method:'DELETE',headers:{{'If-Match':String(current.revision)}}}});await openCollection(current.id);if(removed)showUndo(removed)}}
 async function undoRemove(){{if(!undoItem)return;const item=undoItem;undoItem=null;undoToast.hidden=true;clearTimeout(undoTimer);await req(`${{api}}/${{current.id}}/items/${{item.id}}`,{{method:'PUT',headers:{{'If-Match':String(current.revision)}},body:JSON.stringify(item)}});await openCollection(current.id)}}
-function openAdd(){{kind='album';selected.clear();results=[];document.getElementById('music-search').value='';document.getElementById('search-results').innerHTML='<p class="empty">Search your analyzed library.</p>';updateSelected();setTab();add.showModal()}}
-function setTab(){{document.querySelectorAll('[data-kind]').forEach(x=>x.classList.toggle('primary',x.dataset.kind===kind))}}
-async function search(){{const q=document.getElementById('music-search').value.trim();if(q.length<2)return;const b=await req(`${{api}}/search?q=${{encodeURIComponent(q)}}&kind=${{kind}}`);results=b.results;selected.clear();document.getElementById('search-results').innerHTML=results.length?results.map((r,n)=>`<label class="search-choice"><input type="checkbox" data-result="${{n}}"><span><strong>${{esc(r.title)}}</strong><br><span class="muted">${{esc(r.artist)}}${{r.album?' · '+esc(r.album):''}}</span></span></label>`).join(''):'<p class="empty">No matches.</p>';document.querySelectorAll('[data-result]').forEach(x=>x.onchange=()=>{{x.checked?selected.add(Number(x.dataset.result)):selected.delete(Number(x.dataset.result));updateSelected()}});updateSelected()}}
-function updateSelected(){{document.getElementById('selected-count').textContent=`${{selected.size}} selected`;document.getElementById('add-selected').disabled=!selected.size}}
-async function addSelected(){{const chosen=[...selected].map(n=>results[n]);await req(`${{api}}/${{current.id}}/items/batch`,{{method:'POST',headers:{{'If-Match':String(current.revision)}},body:JSON.stringify({{items:chosen}})}});add.close();await openCollection(current.id)}}
-document.getElementById('new-collection').onclick=()=>openEdit('new');document.getElementById('save-collection').onclick=saveCollection;document.getElementById('close-add').onclick=()=>add.close();document.getElementById('music-search').oninput=()=>{{clearTimeout(timer);timer=setTimeout(search,250)}};document.querySelectorAll('[data-kind]').forEach(x=>x.onclick=()=>{{kind=x.dataset.kind;setTab();search()}});document.getElementById('add-selected').onclick=addSelected;document.getElementById('undo-remove').onclick=undoRemove;loadList().catch(e=>list.innerHTML=`<p class="empty">${{esc(e.message)}}</p>`);
+function setAddStatus(message='',isError=false){{addStatus.textContent=message;addStatus.classList.toggle('error',isError)}}
+function openAdd(){{clearTimeout(timer);searchController?.abort();searchController=null;kind='album';selected.clear();results=[];searchGeneration+=1;document.getElementById('music-search').value='';document.getElementById('search-results').innerHTML='<p class="empty">Search your analyzed library.</p>';setAddStatus();updateSelected();setTab();add.showModal();setTimeout(()=>document.getElementById('music-search').focus(),0)}}
+function setTab(){{add.querySelectorAll('[data-kind]').forEach(x=>x.classList.toggle('primary',x.dataset.kind===kind))}}
+async function search(){{const q=document.getElementById('music-search').value.trim(),generation=++searchGeneration;if(q.length<3){{searchController?.abort();searchController=null;results=[];selected.clear();document.getElementById('search-results').innerHTML='<p class="empty">Type at least three characters.</p>';setAddStatus();updateSelected();return}}searchController?.abort();const controller=new AbortController();searchController=controller;setAddStatus('Searching…');try{{const b=await req(`${{api}}/search?q=${{encodeURIComponent(q)}}&kind=${{kind}}`,{{signal:controller.signal}});if(generation!==searchGeneration)return;results=b.results;selected.clear();document.getElementById('search-results').innerHTML=results.length?results.map((r,n)=>`<label class="search-choice"><input type="checkbox" data-result="${{n}}"><span><strong>${{esc(r.title)}}</strong><br><span class="muted">${{esc(r.artist)}}${{r.album?' · '+esc(r.album):''}}</span></span></label>`).join(''):'<p class="empty">No matches.</p>';add.querySelectorAll('[data-result]').forEach(x=>x.onchange=()=>{{x.checked?selected.add(Number(x.dataset.result)):selected.delete(Number(x.dataset.result));updateSelected()}});setAddStatus();updateSelected()}}catch(err){{if(err.name==='AbortError'||generation!==searchGeneration)return;results=[];selected.clear();document.getElementById('search-results').innerHTML='<p class="empty">Search unavailable.</p>';setAddStatus(err.message,true);updateSelected()}}finally{{if(searchController===controller)searchController=null}}}}
+function updateSelected(){{document.getElementById('selected-count').textContent=`${{selected.size}} selected`;addButton.disabled=!selected.size}}
+async function addSelected(){{if(!selected.size||!current)return;const chosen=[...selected].map(n=>results[n]).filter(Boolean);if(!chosen.length)return;addButton.disabled=true;addButton.textContent=chosen.length===1?'Adding…':`Adding ${{chosen.length}}…`;setAddStatus('Saving to collection…');try{{await req(`${{api}}/${{current.id}}/items/batch`,{{method:'POST',headers:{{'If-Match':String(current.revision),'Idempotency-Key':mutationKey()}},body:JSON.stringify({{items:chosen}})}});add.close();await openCollection(current.id)}}catch(err){{setAddStatus(err.status===409?'This collection changed elsewhere. Close and reopen Add music, then try again.':err.message,true);if(err.status===409)await openCollection(current.id)}}finally{{addButton.textContent='Add selected';updateSelected()}}}}
+document.getElementById('new-collection').onclick=()=>openEdit('new');document.getElementById('save-collection').onclick=saveCollection;document.getElementById('close-add').onclick=()=>{{clearTimeout(timer);searchGeneration+=1;searchController?.abort();searchController=null;add.close()}};document.getElementById('music-search').oninput=()=>{{clearTimeout(timer);timer=setTimeout(search,450)}};add.querySelectorAll('[data-kind]').forEach(x=>x.onclick=()=>{{kind=x.dataset.kind;setTab();search()}});addButton.onclick=addSelected;document.getElementById('undo-remove').onclick=undoRemove;loadList().catch(e=>list.innerHTML=`<p class="empty">${{esc(e.message)}}</p>`);
 }})();
 </script>
+</div>
         """,
         title="Living Collections",
     )

@@ -20,9 +20,38 @@ SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 WHOLE_LIBRARY_CHUNK_SIZE = 250
+COLLECTIONS_MENU_LABEL = "Living Collections"
+COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
 
 bp = Blueprint("lumae_analysis", __name__)
 register_collection_routes(bp)
+
+
+def sync_collections_menu(enabled, manager=None):
+    """Apply the collection page's enabled state to the live Plugins menu."""
+    if manager is None:
+        try:
+            from plugin.manager import plugin_manager as manager
+        except (ImportError, AttributeError):
+            return False
+    record = getattr(manager, "records", {}).get("lumae_analysis")
+    if record is None:
+        return False
+    items = [
+        item
+        for item in record.get("menu_items", [])
+        if item.get("endpoint") != COLLECTIONS_MENU_ENDPOINT
+    ]
+    if enabled:
+        items.append(
+            {
+                "label": COLLECTIONS_MENU_LABEL,
+                "endpoint": COLLECTIONS_MENU_ENDPOINT,
+                "admin_only": False,
+            }
+        )
+    record["menu_items"] = items
+    return True
 
 
 class MediaDownloadError(Exception):
@@ -925,6 +954,7 @@ def settings():
             if action == "save_collections":
                 enabled = request.form.get("collection_manager_enabled") == "on"
                 set_setting("collection_manager_enabled", enabled)
+                sync_collections_menu(enabled)
                 message = f"Living Collections {'enabled' if enabled else 'disabled'}."
             else:
                 batch_size = normalize_backfill_limit(request.form.get("backfill_batch_size") or 25)
@@ -949,5 +979,7 @@ def settings():
 def register(ctx):
     ctx.add_blueprint(bp)
     ctx.set_settings_page("lumae_analysis.settings")
+    if collections_enabled():
+        ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
     ctx.on_install(migrate)
     ctx.on_song_analyzed(analyze_song_hook)

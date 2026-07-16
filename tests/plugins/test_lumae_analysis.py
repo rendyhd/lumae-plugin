@@ -48,7 +48,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.3.0"
+    assert manifest["versions"][0]["version"] == "0.3.1"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -593,12 +593,18 @@ class FakeCtx:
         self.install_hooks = []
         self.song_hooks = []
         self.cron_tasks = []
+        self.menu_items = []
 
     def add_blueprint(self, blueprint):
         self.blueprints.append(blueprint)
 
     def set_settings_page(self, endpoint):
         self.settings_endpoint = endpoint
+
+    def add_menu_item(self, label, endpoint, admin_only=False):
+        self.menu_items.append(
+            {"label": label, "endpoint": endpoint, "admin_only": admin_only}
+        )
 
     def on_install(self, func):
         self.install_hooks.append(func)
@@ -998,6 +1004,51 @@ def test_register_uses_analysis_hook_without_default_cron(monkeypatch):
     assert ctx.install_hooks == [mod.migrate]
     assert ctx.song_hooks == [mod.analyze_song_hook]
     assert ctx.cron_tasks == []
+    assert ctx.menu_items == []
+
+
+def test_register_exposes_enabled_collections_in_plugins_menu(monkeypatch):
+    mod = load_plugin()
+    ctx = FakeCtx()
+    monkeypatch.setattr(mod, "collections_enabled", lambda: True)
+
+    mod.register(ctx)
+
+    assert ctx.menu_items == [
+        {
+            "label": "Living Collections",
+            "endpoint": "lumae_analysis.collection_manager_page",
+            "admin_only": False,
+        }
+    ]
+
+
+def test_sync_collections_menu_updates_live_plugin_record():
+    mod = load_plugin()
+    manager = types.SimpleNamespace(
+        records={
+            "lumae_analysis": {
+                "menu_items": [
+                    {"label": "Other", "endpoint": "lumae_analysis.other", "admin_only": True}
+                ]
+            }
+        }
+    )
+
+    assert mod.sync_collections_menu(True, manager) is True
+    assert manager.records["lumae_analysis"]["menu_items"] == [
+        {"label": "Other", "endpoint": "lumae_analysis.other", "admin_only": True},
+        {
+            "label": "Living Collections",
+            "endpoint": "lumae_analysis.collection_manager_page",
+            "admin_only": False,
+        },
+    ]
+
+    assert mod.sync_collections_menu(False, manager) is True
+    assert manager.records["lumae_analysis"]["menu_items"] == [
+        {"label": "Other", "endpoint": "lumae_analysis.other", "admin_only": True}
+    ]
 
 
 def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
@@ -1040,7 +1091,9 @@ def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypa
     mod = load_plugin()
     collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
     saved = []
+    menu_states = []
     monkeypatch.setattr(mod, "set_setting", lambda key, value: saved.append((key, value)))
+    monkeypatch.setattr(mod, "sync_collections_menu", lambda enabled: menu_states.append(enabled))
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 25)
     monkeypatch.setattr(
         mod,
@@ -1064,6 +1117,7 @@ def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypa
 
     assert response.status_code == 200
     assert saved == [("collection_manager_enabled", True)]
+    assert menu_states == [True]
     assert "Living Collections enabled." in response.get_data(as_text=True)
 
     monkeypatch.setattr(collections, "get_setting", lambda key, default=None: True)
@@ -1079,6 +1133,15 @@ def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypa
     assert 'data-move=' in body
     assert "Move ${esc(i.title)} up" in body
     assert "@media(max-width:700px)" in body
+    assert 'class="collections-page"' in body
+    assert ".collections-page dialog" in body
+    assert 'id="add-status"' in body
+    assert "delete rest.headers" in body
+    assert "'Content-Type':'application/json',...headers" in body
+    assert "new AbortController()" in body
+    assert "searchController?.abort()" in body
+    assert "timer=setTimeout(search,450)" in body
+    assert "Saving to collection" in body
 
 
 def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):

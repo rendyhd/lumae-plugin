@@ -26,6 +26,14 @@
   },
   "versions": [
     {
+      "version": "0.3.1",
+      "min_core_version": "2.6.0",
+      "changelog": "Expose enabled Living Collections in the Plugins menu, restore opaque high-contrast dialogs, and fix Add music requests so selected albums and tracks are persisted with visible progress and errors.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.3.1.zip",
+      "checksum": ""
+    },
+    {
       "version": "0.3.0",
       "min_core_version": "2.6.0",
       "changelog": "Add opt-in Living Collections with mixed album and track membership, a responsive AudioMuse manager, per-user storage, revisions, idempotent mutations, and incremental sync.",
