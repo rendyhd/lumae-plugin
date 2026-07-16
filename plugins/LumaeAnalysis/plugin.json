@@ -35,7 +35,7 @@
       "changelog": "Fix the collection library track query on PostgreSQL by sorting on the source author column instead of a nested SELECT alias, restoring initial browsing and search.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.4.1.zip",
-      "checksum": ""
+      "checksum": "99c83d3250ca6140b6254051b5ad4176"
     },
     {
       "version": "0.4.0",
