@@ -48,7 +48,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.4.0"
+    assert manifest["versions"][0]["version"] == "0.4.1"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -250,6 +250,30 @@ def test_collection_library_rejects_broad_partial_queries_before_database_work(m
         "tracks": {"items": [], "total": 0},
         "artists": {"items": [], "total": 0},
     }
+
+
+def test_collection_track_sorts_use_source_columns_not_nested_select_aliases():
+    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
+
+    class CaptureCursor:
+        description = []
+
+        def __init__(self):
+            self.queries = []
+
+        def execute(self, sql, params):
+            self.queries.append(sql)
+
+        def fetchall(self):
+            return []
+
+    cursor = CaptureCursor()
+    for sort in library.LIBRARY_SORTS:
+        library._browse_tracks(cursor, "", None, sort, 12, 0)
+
+    orders = [sql.split("ORDER BY", 1)[1].split("LIMIT", 1)[0] for sql in cursor.queries]
+    assert all("lower(artist)" not in order for order in orders)
+    assert all("author" in order for order in orders)
 
 
 def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch):

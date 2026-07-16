@@ -110,9 +110,12 @@ def _browse_albums(cur, query, artist, sort, limit, offset):
 def _browse_tracks(cur, query, artist, sort, limit, offset):
     filters, params = _library_filters(query, artist)
     order = {
-        "title": "lower(title), lower(artist), lower(COALESCE(album, ''))",
-        "artist": "lower(artist), lower(COALESCE(album, '')), lower(title)",
-        "year": "year DESC NULLS LAST, lower(artist), lower(title)",
+        # `artist` is a SELECT alias below. PostgreSQL permits a bare output
+        # alias in ORDER BY, but not one nested inside lower(...), so sort on
+        # the source column here rather than raising UndefinedColumn at runtime.
+        "title": "lower(title), lower(COALESCE(author, '')), lower(COALESCE(album, ''))",
+        "artist": "lower(COALESCE(author, '')), lower(COALESCE(album, '')), lower(title)",
+        "year": "year DESC NULLS LAST, lower(COALESCE(author, '')), lower(title)",
     }[sort]
     cur.execute(
         f"""
