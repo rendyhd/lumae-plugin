@@ -20,11 +20,23 @@
         "mixed_album_track_membership",
         "per_user_storage",
         "incremental_sync",
-        "web_manager"
+        "web_manager",
+        "library_browser",
+        "album_track_numbers",
+        "preview_playback",
+        "bulk_management"
       ]
     }
   },
   "versions": [
+    {
+      "version": "0.4.0",
+      "min_core_version": "2.6.0",
+      "changelog": "Replace the basic add dialog with an art-first Albums, Tracks, and Artists library workbench; add categorized search, artist and album drill-down, provider track/disc numbers, bulk collection management, cover art, and credential-safe audio previews.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.4.0.zip",
+      "checksum": ""
+    },
     {
       "version": "0.3.1",
       "min_core_version": "2.6.0",

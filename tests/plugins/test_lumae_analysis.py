@@ -48,7 +48,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.3.1"
+    assert manifest["versions"][0]["version"] == "0.4.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -63,6 +63,10 @@ def test_plugin_manifest_has_lumae_identity():
             "per_user_storage",
             "incremental_sync",
             "web_manager",
+            "library_browser",
+            "album_track_numbers",
+            "preview_playback",
+            "bulk_management",
         ],
     }
 
@@ -108,6 +112,276 @@ def test_collection_principal_is_per_user_but_bearer_is_global():
         g.auth_method = "bearer"
         g.auth_user = None
         assert collections.current_principal() == collections.GLOBAL_PRINCIPAL
+
+
+def test_collection_library_normalizes_live_track_and_disc_numbers():
+    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
+
+    track = library._normalize_provider_track(
+        {
+            "Id": "track-7",
+            "Name": "Reckoner",
+            "AlbumArtist": "Radiohead",
+            "Album": "In Rainbows",
+            "IndexNumber": 7,
+            "ParentIndexNumber": 2,
+            "RunTimeTicks": 310_000_000,
+        }
+    )
+
+    assert track["track_id"] == "track-7"
+    assert track["track_number"] == 7
+    assert track["disc_number"] == 2
+    assert track["duration_seconds"] == 31
+
+
+def test_album_detail_prefers_media_server_order_and_marks_analyzed_tracks(monkeypatch):
+    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
+    mediaserver = types.ModuleType("tasks.mediaserver")
+    mediaserver.get_tracks_from_album = lambda album_id, provider_type=None: [
+        {
+            "Id": "track-2",
+            "Name": "Second",
+            "AlbumArtist": "Artist",
+            "Album": "Album",
+            "IndexNumber": 2,
+            "ParentIndexNumber": 1,
+        },
+        {
+            "Id": "track-1",
+            "Name": "First",
+            "AlbumArtist": "Artist",
+            "Album": "Album",
+            "IndexNumber": 1,
+            "ParentIndexNumber": 1,
+        },
+    ]
+    tasks = types.ModuleType("tasks")
+    tasks.mediaserver = mediaserver
+    monkeypatch.setitem(sys.modules, "tasks", tasks)
+    monkeypatch.setitem(sys.modules, "tasks.mediaserver", mediaserver)
+    monkeypatch.setattr(library.config, "MEDIASERVER_TYPE", "navidrome", raising=False)
+    monkeypatch.setattr(library, "_analyzed_track_ids", lambda ids: {"track-1"})
+
+    detail = library.album_detail("Album", "Artist", provider_album_id="album-1")
+
+    assert detail["metadata_source"] == "media_server"
+    assert detail["album"]["provider_album_id"] == "album-1"
+    assert [track["track_id"] for track in detail["tracks"]] == ["track-1", "track-2"]
+    assert detail["tracks"][0]["track_number"] == 1
+    assert detail["tracks"][0]["analyzed"] is True
+    assert detail["tracks"][1]["analyzed"] is False
+
+
+def test_lyrion_album_detail_requests_documented_track_and_disc_order(monkeypatch):
+    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
+    calls = []
+    lyrion = types.ModuleType("tasks.mediaserver.lyrion")
+    lyrion._jsonrpc_request = lambda command, params: calls.append((command, params)) or {
+        "titles_loop": [{"id": "7", "title": "Track", "track": 3, "disc": 2}]
+    }
+    lyrion._lyrion_is_remote = lambda row: False
+    mediaserver = types.ModuleType("tasks.mediaserver")
+    mediaserver.lyrion = lyrion
+    tasks = types.ModuleType("tasks")
+    tasks.mediaserver = mediaserver
+    monkeypatch.setitem(sys.modules, "tasks", tasks)
+    monkeypatch.setitem(sys.modules, "tasks.mediaserver", mediaserver)
+    monkeypatch.setitem(sys.modules, "tasks.mediaserver.lyrion", lyrion)
+
+    rows = library._provider_album_tracks("lyrion", "album-4")
+
+    assert rows[0]["track"] == 3
+    assert rows[0]["disc"] == 2
+    assert calls == [
+        (
+            "titles",
+            [
+                0,
+                999999,
+                "album_id:album-4",
+                "tags:galduAyRJ",
+                "sort:tracknum",
+            ],
+        )
+    ]
+
+
+def test_collection_library_route_forwards_scope_search_sort_and_artist(monkeypatch):
+    mod = load_plugin()
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
+    captured = {}
+
+    def fake_browse(**kwargs):
+        captured.update(kwargs)
+        return {"sections": {"albums": {"items": [], "total": 0}}}
+
+    monkeypatch.setattr(collections, "get_setting", lambda key, default=None: True)
+    monkeypatch.setattr(library, "browse_library", fake_browse)
+    response = plugin_client(mod).get(
+        "/api/collections/library?scope=albums&q=rain&artist=Radiohead&sort=year&page=2&limit=24"
+    )
+
+    assert response.status_code == 200
+    assert captured == {
+        "scope": "albums",
+        "query": "rain",
+        "artist": "Radiohead",
+        "sort": "year",
+        "page": "2",
+        "limit": "24",
+    }
+
+
+def test_collection_library_rejects_broad_partial_queries_before_database_work(monkeypatch):
+    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
+    monkeypatch.setattr(
+        library,
+        "get_db",
+        lambda: (_ for _ in ()).throw(AssertionError("short searches must not query score")),
+    )
+
+    result = library.browse_library(scope="all", query="ra")
+
+    assert result["query"] == "ra"
+    assert result["sections"] == {
+        "albums": {"items": [], "total": 0},
+        "tracks": {"items": [], "total": 0},
+        "artists": {"items": [], "total": 0},
+    }
+
+
+def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch):
+    mod = load_plugin()
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+
+    class BatchDeleteCursor:
+        def __init__(self):
+            self.description = []
+            self.rows = []
+            self.collection_reads = 0
+
+        def execute(self, sql, params=None):
+            if "SELECT c.id, c.name" in sql:
+                self.collection_reads += 1
+                self.description = [
+                    ("id",),
+                    ("name",),
+                    ("description",),
+                    ("revision",),
+                    ("created_at",),
+                    ("updated_at",),
+                    ("deleted_at",),
+                    ("album_count",),
+                    ("track_count",),
+                ]
+                revision = 1 if self.collection_reads == 1 else 2
+                self.rows = [
+                    (
+                        "collection-1",
+                        "Test",
+                        None,
+                        revision,
+                        "created",
+                        "updated",
+                        None,
+                        0,
+                        0,
+                    )
+                ]
+            elif "DELETE FROM" in sql and "id = ANY" in sql:
+                self.rows = [("item-1",), ("item-2",)]
+                self.description = [("id",)]
+            else:
+                self.rows = []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
+
+        def fetchall(self):
+            return list(self.rows)
+
+        def close(self):
+            pass
+
+    class BatchDeleteDb:
+        def __init__(self):
+            self.cursor_obj = BatchDeleteCursor()
+            self.commits = 0
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def commit(self):
+            self.commits += 1
+
+    db = BatchDeleteDb()
+    monkeypatch.setattr(collections, "get_setting", lambda key, default=None: True)
+    monkeypatch.setattr(collections, "get_db", lambda: db)
+
+    response = plugin_client(mod).delete(
+        "/api/collections/collection-1/items/batch",
+        json={"item_ids": ["item-1", "item-2"], "base_revision": 1},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["deleted"] == ["item-1", "item-2"]
+    assert response.get_json()["collection"]["revision"] == 2
+    assert db.commits == 1
+
+
+def test_collection_batch_remove_rejects_non_list_ids(monkeypatch):
+    mod = load_plugin()
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    monkeypatch.setattr(collections, "get_setting", lambda key, default=None: True)
+
+    response = plugin_client(mod).delete(
+        "/api/collections/collection-1/items/batch",
+        json={"item_ids": "item-1"},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "item_ids must be a list"}
+
+
+def test_collection_preview_target_keeps_provider_credentials_server_side(monkeypatch):
+    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
+    monkeypatch.setattr(library.config, "MEDIASERVER_TYPE", "jellyfin", raising=False)
+    monkeypatch.setattr(library.config, "JELLYFIN_URL", "https://music.example", raising=False)
+    monkeypatch.setattr(
+        library.config,
+        "HEADERS",
+        {"Authorization": 'MediaBrowser Token="secret"'},
+        raising=False,
+    )
+
+    target, error = library._resolve_stream_target("track-1")
+
+    assert error is None
+    assert target[0] == "https://music.example/Items/track-1/Download"
+    assert target[1] == {"Authorization": 'MediaBrowser Token="secret"'}
+    assert "secret" not in target[0]
+
+
+def test_collection_preview_uses_emby_base_url_without_legacy_prefix(monkeypatch):
+    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
+    monkeypatch.setattr(library.config, "MEDIASERVER_TYPE", "emby", raising=False)
+    monkeypatch.setattr(library.config, "EMBY_URL", "https://emby.example", raising=False)
+    monkeypatch.setattr(
+        library.config,
+        "HEADERS",
+        {"X-Emby-Token": "server-secret"},
+        raising=False,
+    )
+
+    target, error = library._resolve_stream_target("track-2")
+    art_target = library._resolve_art_target("track-2", 480)
+
+    assert error is None
+    assert target[0] == "https://emby.example/Items/track-2/Download"
+    assert art_target[0] == "https://emby.example/Items/track-2/Images/Primary"
+    assert target[1] == {"X-Emby-Token": "server-secret"}
 
 
 def test_enabled_collections_api_lists_mixed_item_counts(monkeypatch):
@@ -1129,19 +1403,26 @@ def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypa
     assert "New collection" in body
     assert "Add selected" in body
     assert "Duplicate" in body
-    assert 'id="undo-toast"' in body
-    assert 'data-move=' in body
-    assert "Move ${esc(i.title)} up" in body
-    assert "@media(max-width:700px)" in body
+    assert 'id="collection-toast"' in body
+    assert 'data-move-item=' in body
+    assert "@media(max-width:760px)" in body
     assert 'class="collections-page"' in body
     assert ".collections-page dialog" in body
-    assert 'id="add-status"' in body
+    assert 'id="library-dialog"' in body
+    assert 'id="preview-player"' in body
+    assert ".collections-page [hidden]{display:none!important}" in body
+    assert 'data-scope="artists"' in body
+    assert "Track and disc numbers loaded from your media server" in body
+    assert "Type at least three characters to search" in body
     assert "delete rest.headers" in body
     assert "'Content-Type':'application/json',...headers" in body
     assert "new AbortController()" in body
-    assert "searchController?.abort()" in body
-    assert "timer=setTimeout(search,450)" in body
-    assert "Saving to collection" in body
+    assert "browser.controller?.abort()" in body
+    assert "searchTimer=setTimeout(()=>loadBrowser(),450)" in body
+    assert "clearTimeout(searchTimer);browser.controller?.abort()" in body
+    assert "if(event.key==='Escape'){event.preventDefault();closeLibrary()}" in body
+    assert "Adding ${count}" in body
+    assert "const copies=items.map(({id,collection_id,added_at,updated_at,...item})=>item)" in body
 
 
 def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
