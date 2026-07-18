@@ -37,7 +37,7 @@
       "changelog": "Make personal versus shared collection scope explicit and add principal-scoped, checksummed JSON backups with full-library and per-collection export plus safe additive restore in the web manager.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.5.0.zip",
-      "checksum": ""
+      "checksum": "12deb0c82e5514dae16ea38d89e8cc54"
     },
     {
       "version": "0.4.1",
