@@ -9,6 +9,7 @@ from plugin.api import config, enqueue, get_db, get_setting, logger, render_page
 
 from .loudness import SilentAudioError, analyze_file
 from .core_compat import SUPPORTED_CORE_RANGE, detect_core, sanitized_server_summaries
+from .catalog import ensure_catalog_sources, migrate_catalog
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -195,6 +196,8 @@ def migrate(db):
         """
     )
     cur.close()
+    migrate_catalog(db)
+    ensure_catalog_sources(db)
     migrate_collections(db)
     disable_legacy_backfill_schedule(db)
     db.commit()

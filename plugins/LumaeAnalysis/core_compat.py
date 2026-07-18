@@ -168,3 +168,19 @@ def sanitized_server_summaries(compatibility, api_module=None, config_obj=None):
             }
         )
     return summaries
+
+
+def get_core_adapter(compatibility=None):
+    """Instantiate the selected adapter after compatibility has been proven."""
+    selected = compatibility or detect_core()
+    if not selected.supported:
+        raise RuntimeError(selected.reason or selected.status)
+    if selected.adapter == "v2_single_server":
+        from .core_v2 import AudioMuseV2Adapter
+
+        return AudioMuseV2Adapter()
+    if selected.adapter == "v3_registry":
+        from .core_v3 import AudioMuseV3Adapter
+
+        return AudioMuseV3Adapter()
+    raise RuntimeError(f"No Lumae core adapter for {selected.adapter!r}")

@@ -1632,6 +1632,147 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     assert "plugin_lumae_analysis__collections" in migration_sql
     assert "plugin_lumae_analysis__collection_items" in migration_sql
     assert "plugin_lumae_analysis__collection_changes" in migration_sql
+    for table_name in (
+        "catalog_sources",
+        "catalog_state",
+        "catalog_libraries",
+        "catalog_artists",
+        "catalog_albums",
+        "catalog_tracks",
+        "catalog_track_artists",
+        "catalog_album_artists",
+        "catalog_entity_libraries",
+        "catalog_changes",
+        "catalog_scans",
+        "stream_bootstrap_sessions",
+        "analysis_state",
+        "analysis_items",
+        "track_analysis_links",
+        "analysis_changes",
+    ):
+        assert f"plugin_lumae_analysis__{table_name}" in migration_sql
+
+
+def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch):
+    mod = load_plugin()
+    db = CronDb(existing=None)
+    monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+
+    mod.migrate(db)
+    first_sql = [sql for sql, _params in db.cursor_obj.executed]
+    mod.migrate(db)
+
+    assert db.commits == 2
+    assert all("DROP TABLE" not in sql.upper() for sql, _params in db.cursor_obj.executed)
+    assert sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql, _ in db.cursor_obj.executed) == (
+        2 * sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql in first_sql)
+    )
+
+
+def test_core_adapters_normalize_equivalent_v2_and_v3_analysis_events(monkeypatch):
+    from plugins.LumaeAnalysis.core_v2 import AudioMuseV2Adapter
+    from plugins.LumaeAnalysis.core_v3 import AudioMuseV3Adapter
+
+    v2 = AudioMuseV2Adapter().normalize_analysis_hook({"item_id": "provider-track"})
+    v3 = AudioMuseV3Adapter().normalize_analysis_hook(
+        {"item_id": "provider-track", "server_id": "server-a"}
+    )
+
+    assert v2["provider_track_id"] == v3["provider_track_id"] == "provider-track"
+    assert v2["server_id"] == "legacy-default"
+    assert v3["server_id"] == "server-a"
+
+
+def test_provider_bridge_never_exposes_credentials_or_urls():
+    from plugins.LumaeAnalysis.catalog_providers import ProviderCatalogBridge
+
+    class Adapter:
+        def list_servers(self):
+            return [
+                {
+                    "server_id": "one",
+                    "name": "Private",
+                    "provider_type": "navidrome",
+                    "is_default": True,
+                    "url": "https://secret.invalid",
+                    "creds": {"token": "secret"},
+                }
+            ]
+
+    assert ProviderCatalogBridge(Adapter()).list_servers() == [
+        {
+            "server_id": "one",
+            "name": "Private",
+            "provider_type": "navidrome",
+            "is_default": True,
+            "supported": True,
+        }
+    ]
+
+
+class RebindCursor(FakeCursor):
+    def __init__(self, source_rows, selected_source=None):
+        super().__init__(source_rows)
+        self.source_rows = source_rows
+        self.selected_source = selected_source
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        if "FOR UPDATE" in sql:
+            self.rows = [self.selected_source] if self.selected_source else []
+        elif "SELECT catalog_instance_id" in sql:
+            self.rows = self.source_rows
+
+
+class RebindDb(FakeDb):
+    def __init__(self, source_rows, selected_source=None):
+        self.cursor_obj = RebindCursor(source_rows, selected_source)
+        self.commits = 0
+
+
+def test_v2_source_requires_proven_continuity_before_v3_rebind(monkeypatch):
+    from plugins.LumaeAnalysis.catalog import accept_legacy_rebind, ensure_catalog_sources
+
+    source_id = "stable-catalog-id"
+    db = RebindDb(
+        [(source_id, "legacy-default", "navidrome", "active")],
+        selected_source=("legacy-default", "rebind_required"),
+    )
+
+    class V3Bridge:
+        def list_servers(self):
+            return [
+                {
+                    "server_id": "server-a",
+                    "name": "Same server",
+                    "provider_type": "navidrome",
+                    "is_default": True,
+                }
+            ]
+
+    sources = ensure_catalog_sources(db, bridge=V3Bridge())
+    assert sources[0]["catalog_instance_id"] == source_id
+    assert sources[0]["candidate_core_server_id"] == "server-a"
+
+    with pytest.raises(ValueError, match="continuity evidence"):
+        accept_legacy_rebind(db, source_id, "server-a", {"provider_type": True})
+
+    accepted = accept_legacy_rebind(
+        db,
+        source_id,
+        "server-a",
+        {
+            "provider_type": True,
+            "provider_instance": True,
+            "library_scope": True,
+            "provider_sample": True,
+        },
+    )
+    assert accepted is True
+    assert any(
+        params == ("server-a", source_id) and "catalog_sources" in sql
+        for sql, params in db.cursor_obj.executed
+    )
 
 
 def test_register_uses_analysis_hook_without_default_cron(monkeypatch):
