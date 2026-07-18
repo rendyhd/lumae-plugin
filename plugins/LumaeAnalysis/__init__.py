@@ -15,6 +15,7 @@ from .core_compat import (
     sanitized_server_summaries,
 )
 from .catalog import (
+    attempt_legacy_rebind,
     CatalogScanError,
     bootstrap_page,
     create_bootstrap_session,
@@ -25,6 +26,7 @@ from .catalog import (
     refresh_catalog,
     release_bootstrap_session,
     resolve_catalog_source,
+    verify_library_scope,
 )
 from .catalog_analysis import (
     dedup_policy,
@@ -641,6 +643,48 @@ def catalog_refresh_api():
         )
     except (KeyError, ValueError, CatalogScanError) as exc:
         return _catalog_error("invalid_refresh", str(exc), 400)
+
+
+@bp.post("/api/catalog/rebind")
+def catalog_rebind_api():
+    """Prove and accept an exact v2-to-v3 source continuity match."""
+    try:
+        body = _json_body()
+        catalog_instance_id = str(body.get("catalog_instance_id") or "").strip()
+        server_id = str(body.get("server_id") or "").strip()
+        if not catalog_instance_id or not server_id:
+            return _catalog_error(
+                "identity_required", "Catalogue instance and candidate server are required.", 400
+            )
+        result = attempt_legacy_rebind(get_db(), catalog_instance_id, server_id)
+        if result["status"] != "active":
+            return _catalog_error(
+                "continuity_not_proven",
+                "The v3 provider catalogue does not exactly match the stored v2 source.",
+                409,
+            )
+        return _private_json(result)
+    except KeyError:
+        return _catalog_error("source_not_found", "Catalogue source was not found.", 404)
+    except (ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_rebind", str(exc), 409)
+
+
+@bp.post("/api/catalog/verify-scope")
+def catalog_verify_scope_api():
+    try:
+        body = _json_body()
+        catalog_instance_id = str(body.get("catalog_instance_id") or "").strip()
+        if not catalog_instance_id:
+            return _catalog_error("identity_required", "Catalogue instance is required.", 400)
+        result = verify_library_scope(
+            get_db(), catalog_instance_id, body.get("library_ids")
+        )
+        return _private_json(result)
+    except KeyError:
+        return _catalog_error("source_not_found", "Catalogue source was not found.", 404)
+    except ValueError as exc:
+        return _catalog_error("invalid_scope", str(exc), 400)
 
 
 @bp.post("/api/catalog/bootstrap-sessions")

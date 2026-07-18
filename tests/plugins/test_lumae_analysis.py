@@ -1883,6 +1883,118 @@ def test_v2_source_requires_proven_continuity_before_v3_rebind(monkeypatch):
     )
 
 
+def test_catalog_scope_evidence_is_order_independent_and_scope_sensitive():
+    from plugins.LumaeAnalysis.catalog import catalog_scope_evidence, verify_library_scope
+
+    first = {
+        "libraries": [{"library_id": "library-b"}, {"library_id": "library-a"}],
+        "tracks": [{"track_id": "track-2"}, {"track_id": "track-1"}],
+        "entity_libraries": [
+            {"entity_type": "track", "entity_id": "track-2", "library_id": "library-b"},
+            {"entity_type": "track", "entity_id": "track-1", "library_id": "library-a"},
+        ],
+    }
+    reordered = {
+        "libraries": list(reversed(first["libraries"])),
+        "tracks": list(reversed(first["tracks"])),
+        "entity_libraries": list(reversed(first["entity_libraries"])),
+    }
+    changed_scope = {**reordered, "entity_libraries": [*reordered["entity_libraries"]]}
+    changed_scope["entity_libraries"][0] = {
+        "entity_type": "track",
+        "entity_id": "track-1",
+        "library_id": "library-b",
+    }
+
+    expected = catalog_scope_evidence(first, "navidrome")
+    assert catalog_scope_evidence(reordered, "navidrome") == expected
+    assert catalog_scope_evidence(changed_scope, "navidrome")["library_scope_fp"] != expected[
+        "library_scope_fp"
+    ]
+    assert "track-1" not in str(expected)
+    assert "library-a" not in str(expected)
+
+    db = FakeDb([(expected["scope_summary"],)])
+    assert verify_library_scope(db, "catalog-a", ["library-b", "library-a"]) == {
+        "verified": True,
+        "expected_count": 2,
+        "submitted_count": 2,
+        "evidence_available": True,
+    }
+    assert verify_library_scope(db, "catalog-a", ["library-a"])["verified"] is False
+
+
+def test_automatic_rebind_accepts_only_an_exact_provider_projection(monkeypatch):
+    import plugins.LumaeAnalysis.catalog as catalog
+
+    raw = {
+        "libraries": [{"id": "library-1", "name": "Music"}],
+        "tracks": [{"id": "track-1", "title": "Song", "musicFolderId": "library-1"}],
+    }
+    normalized = catalog.normalize_provider_catalog(raw, "navidrome")
+    stored = catalog.catalog_scope_evidence(normalized, "navidrome")
+
+    class AttemptCursor(FakeCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if "SELECT current_core_server_id" in sql:
+                self.rows = [("legacy-default", "server-a", "navidrome", "rebind_required")]
+            else:
+                self.rows = []
+
+    class AttemptDb(FakeDb):
+        def __init__(self):
+            self.cursor_obj = AttemptCursor()
+            self.commits = 0
+
+    class Bridge:
+        def require_server(self, server_id):
+            assert server_id == "server-a"
+            return {"server_id": server_id, "provider_type": "navidrome"}
+
+        def fetch_catalog(self, server_id):
+            assert server_id == "server-a"
+            return raw
+
+    accepted = []
+    monkeypatch.setattr(catalog, "_persisted_scope_evidence", lambda _db, _id: stored)
+    monkeypatch.setattr(
+        catalog,
+        "accept_legacy_rebind",
+        lambda _db, source_id, server_id, evidence: accepted.append(
+            (source_id, server_id, evidence)
+        )
+        or True,
+    )
+    db = AttemptDb()
+
+    result = catalog.attempt_legacy_rebind(db, "catalog-a", "server-a", bridge=Bridge())
+
+    assert result == {
+        "status": "active",
+        "rebound": True,
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+    }
+    assert all(accepted[0][2].values())
+    assert db.commits == 1
+
+    changed = catalog.catalog_scope_evidence(
+        catalog.normalize_provider_catalog(
+            {**raw, "tracks": [*raw["tracks"], {"id": "track-2", "title": "New"}]},
+            "navidrome",
+        ),
+        "navidrome",
+    )
+    monkeypatch.setattr(catalog, "_persisted_scope_evidence", lambda _db, _id: changed)
+    accepted.clear()
+    blocked = catalog.attempt_legacy_rebind(
+        AttemptDb(), "catalog-a", "server-a", bridge=Bridge()
+    )
+    assert blocked["status"] == "rebind_required"
+    assert accepted == []
+
+
 @pytest.mark.parametrize(
     ("provider_type", "track"),
     [

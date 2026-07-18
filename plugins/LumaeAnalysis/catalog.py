@@ -344,6 +344,75 @@ def normalize_provider_catalog(raw_catalog, provider_type):
     }
 
 
+def catalog_scope_evidence(normalized, provider_type):
+    """Build non-reversible continuity evidence from provider occurrence IDs.
+
+    AudioMuse v3's analysis de-duplication is deliberately not involved: these
+    fingerprints describe the provider catalogue and its visible library
+    memberships, not AudioMuse score rows or fuzzy analysis identities.
+    """
+    track_ids = sorted(str(row["track_id"]) for row in normalized["tracks"])
+    memberships = sorted(
+        (str(row["entity_id"]), str(row["library_id"]))
+        for row in normalized["entity_libraries"]
+        if row.get("entity_type") == "track"
+    )
+    visible_library_ids = sorted(str(row["library_id"]) for row in normalized["libraries"])
+    scoped_library_ids = sorted({library_id for _track_id, library_id in memberships})
+    library_ids = scoped_library_ids or visible_library_ids
+    sample_ids = list(dict.fromkeys(track_ids[:64] + track_ids[-64:]))
+    library_ids_fp = fingerprint({"library_ids": library_ids})
+    provider_sample_fp = fingerprint({"track_ids": sample_ids})
+    return {
+        "provider_instance_fp": fingerprint(
+            {"provider_type": str(provider_type), "track_ids": track_ids}
+        ),
+        "library_scope_fp": fingerprint(
+            {"library_ids": library_ids, "track_memberships": memberships}
+        ),
+        "scope_summary": {
+            "library_count": len(library_ids),
+            "track_count": len(track_ids),
+            "mapped_track_count": len({track_id for track_id, _library_id in memberships}),
+            "library_ids_fp": library_ids_fp,
+            "provider_sample_fp": provider_sample_fp,
+        },
+    }
+
+
+def verify_library_scope(db, catalog_instance_id, library_ids):
+    """Compare client-visible provider library IDs without returning stored IDs."""
+    if not isinstance(library_ids, list) or not 1 <= len(library_ids) <= 1000:
+        raise ValueError("One to 1000 provider library IDs are required")
+    normalized_ids = sorted(
+        {
+            unicodedata.normalize("NFC", str(value)).strip()
+            for value in library_ids
+            if str(value).strip()
+        }
+    )
+    if not normalized_ids:
+        raise ValueError("At least one provider library ID is required")
+    cur = db.cursor()
+    cur.execute(
+        f"SELECT scope_summary FROM {t('catalog_state')} WHERE catalog_instance_id=%s",
+        (catalog_instance_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
+        raise KeyError("Unknown catalogue instance")
+    summary = _state_counts(row[0])
+    expected_fp = summary.get("library_ids_fp")
+    actual_fp = fingerprint({"library_ids": normalized_ids})
+    return {
+        "verified": bool(expected_fp) and hmac.compare_digest(str(expected_fp), actual_fp),
+        "expected_count": int(summary.get("library_count", 0) or 0),
+        "submitted_count": len(normalized_ids),
+        "evidence_available": bool(expected_fp),
+    }
+
+
 def migrate_catalog(db):
     """Create the complete v2 catalogue/analysis storage idempotently."""
     cur = db.cursor()
@@ -895,6 +964,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 ),
             )
         coverage = _coverage(normalized)
+        scope = catalog_scope_evidence(normalized, server["provider_type"])
         field_support = {
             name: "observed" if value["present"] else "not_observed"
             for name, value in coverage.items()
@@ -904,7 +974,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             UPDATE {t('catalog_state')}
                SET published_generation=%s, catalog_head_seq=%s, status='complete',
                    entity_counts=%s::jsonb, field_support=%s::jsonb,
-                   field_coverage=%s::jsonb, completed_at=now(), last_error=NULL,
+                   field_coverage=%s::jsonb, scope_summary=%s::jsonb,
+                   completed_at=now(), last_error=NULL,
                    updated_at=now()
              WHERE catalog_instance_id=%s
             """,
@@ -914,6 +985,16 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 _json_param(counts),
                 _json_param(field_support),
                 _json_param(coverage),
+                _json_param(scope["scope_summary"]),
+                catalog_instance_id,
+            ),
+        )
+        cur.execute(
+            f"UPDATE {t('catalog_sources')} SET provider_instance_fp=%s, "
+            "library_scope_fp=%s, updated_at=now() WHERE catalog_instance_id=%s",
+            (
+                scope["provider_instance_fp"],
+                scope["library_scope_fp"],
                 catalog_instance_id,
             ),
         )
@@ -931,6 +1012,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             "cursor": {"epoch": str(epoch), "seq": next_seq},
             "counts": counts,
             "field_coverage": coverage,
+            "scope_summary": scope["scope_summary"],
             "changes": len(ordered_changes),
         }
     except Exception as exc:
@@ -987,7 +1069,9 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    c.field_coverage, c.started_at, c.completed_at, c.last_error,
                    a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
                    a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
-                   a.completed_at, a.last_error
+                   a.completed_at, a.last_error, s.continuity_from,
+                   s.candidate_core_server_id, s.provider_instance_fp,
+                   s.library_scope_fp, c.scope_summary
               FROM {t('catalog_sources')} s
               JOIN {t('catalog_state')} c USING (catalog_instance_id)
               LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
@@ -1005,7 +1089,9 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    c.field_coverage, c.started_at, c.completed_at, c.last_error,
                    a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
                    a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
-                   a.completed_at, a.last_error
+                   a.completed_at, a.last_error, s.continuity_from,
+                   s.candidate_core_server_id, s.provider_instance_fp,
+                   s.library_scope_fp, c.scope_summary
               FROM {t('catalog_sources')} s
               JOIN {t('catalog_state')} c USING (catalog_instance_id)
               LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
@@ -1023,7 +1109,9 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    c.field_coverage, c.started_at, c.completed_at, c.last_error,
                    a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
                    a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
-                   a.completed_at, a.last_error
+                   a.completed_at, a.last_error, s.continuity_from,
+                   s.candidate_core_server_id, s.provider_instance_fp,
+                   s.library_scope_fp, c.scope_summary
               FROM {t('catalog_sources')} s
               JOIN {t('catalog_state')} c USING (catalog_instance_id)
               LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
@@ -1055,6 +1143,11 @@ def _source_dto(row):
         "name": row[3],
         "is_default": bool(row[4]),
         "rebind_status": row[5],
+        "continuity_from": row[26] if len(row) > 26 else None,
+        "candidate_server_id": row[27] if len(row) > 27 else None,
+        "provider_instance_fp": row[28] if len(row) > 28 else None,
+        "library_scope_fp": row[29] if len(row) > 29 else None,
+        "scope_summary": _state_counts(row[30]) if len(row) > 30 else {},
         "catalog": {
             "generation": int(row[6]),
             "epoch": str(row[7]),
@@ -1551,3 +1644,127 @@ def accept_legacy_rebind(db, catalog_instance_id, core_server_id, evidence):
     )
     cur.close()
     return True
+
+
+def _persisted_scope_evidence(db, catalog_instance_id):
+    """Read stored evidence, deriving it from the last v2 generation if needed."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT s.provider_type, s.provider_instance_fp, s.library_scope_fp,
+               c.scope_summary, c.published_generation
+          FROM {t('catalog_sources')} s
+          JOIN {t('catalog_state')} c USING (catalog_instance_id)
+         WHERE s.catalog_instance_id=%s
+        """,
+        (catalog_instance_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        cur.close()
+        raise KeyError("Unknown catalogue instance")
+    provider_type, provider_fp, scope_fp, raw_summary, generation = row
+    summary = _state_counts(raw_summary)
+    if provider_fp and scope_fp and summary.get("provider_sample_fp"):
+        cur.close()
+        return {
+            "provider_instance_fp": str(provider_fp),
+            "library_scope_fp": str(scope_fp),
+            "scope_summary": summary,
+        }
+
+    cur.execute(
+        f"SELECT library_id FROM {t('catalog_libraries')} "
+        "WHERE catalog_instance_id=%s AND published_generation=%s AND available=TRUE",
+        (catalog_instance_id, generation),
+    )
+    libraries = [{"library_id": str(item[0])} for item in cur.fetchall()]
+    cur.execute(
+        f"SELECT track_id FROM {t('catalog_tracks')} "
+        "WHERE catalog_instance_id=%s AND published_generation=%s AND available=TRUE",
+        (catalog_instance_id, generation),
+    )
+    tracks = [{"track_id": str(item[0])} for item in cur.fetchall()]
+    cur.execute(
+        f"SELECT entity_id, library_id FROM {t('catalog_entity_libraries')} "
+        "WHERE catalog_instance_id=%s AND published_generation=%s AND entity_type='track'",
+        (catalog_instance_id, generation),
+    )
+    memberships = [
+        {"entity_type": "track", "entity_id": str(item[0]), "library_id": str(item[1])}
+        for item in cur.fetchall()
+    ]
+    cur.close()
+    return catalog_scope_evidence(
+        {"libraries": libraries, "tracks": tracks, "entity_libraries": memberships},
+        provider_type,
+    )
+
+
+def attempt_legacy_rebind(db, catalog_instance_id, core_server_id, bridge=None):
+    """Rebind only when the v3 provider projection exactly matches stored v2 scope."""
+    provider_bridge = bridge or ProviderCatalogBridge()
+    cur = db.cursor()
+    cur.execute(
+        f"SELECT current_core_server_id, candidate_core_server_id, provider_type, "
+        f"rebind_status FROM {t('catalog_sources')} WHERE catalog_instance_id=%s",
+        (catalog_instance_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
+        raise KeyError("Unknown catalogue instance")
+    current_server_id, candidate_server_id, provider_type, rebind_status = row
+    if current_server_id == core_server_id and rebind_status == "active":
+        return {"status": "active", "rebound": False, "catalog_instance_id": catalog_instance_id}
+    if (
+        current_server_id != "legacy-default"
+        or rebind_status != "rebind_required"
+        or str(candidate_server_id or "") != str(core_server_id)
+    ):
+        raise ValueError("Catalogue instance is not awaiting this v2-to-v3 rebind")
+    candidate = provider_bridge.require_server(core_server_id)
+    if candidate["provider_type"] != provider_type:
+        raise ValueError("Provider type changed during AudioMuse upgrade")
+
+    stored = _persisted_scope_evidence(db, catalog_instance_id)
+    normalized = normalize_provider_catalog(
+        provider_bridge.fetch_catalog(core_server_id), candidate["provider_type"]
+    )
+    incoming = catalog_scope_evidence(normalized, candidate["provider_type"])
+    evidence = {
+        "provider_type": True,
+        "provider_instance": stored["provider_instance_fp"] == incoming["provider_instance_fp"],
+        "library_scope": stored["library_scope_fp"] == incoming["library_scope_fp"],
+        "provider_sample": stored["scope_summary"].get("provider_sample_fp")
+        == incoming["scope_summary"].get("provider_sample_fp"),
+    }
+    if not all(evidence.values()):
+        return {
+            "status": "rebind_required",
+            "rebound": False,
+            "catalog_instance_id": catalog_instance_id,
+            "evidence": evidence,
+        }
+    changed = accept_legacy_rebind(
+        db, catalog_instance_id, core_server_id, evidence
+    )
+    cur = db.cursor()
+    cur.execute(
+        f"UPDATE {t('catalog_sources')} SET provider_instance_fp=%s, library_scope_fp=%s, "
+        "updated_at=now() WHERE catalog_instance_id=%s",
+        (incoming["provider_instance_fp"], incoming["library_scope_fp"], catalog_instance_id),
+    )
+    cur.execute(
+        f"UPDATE {t('catalog_state')} SET scope_summary=%s::jsonb, updated_at=now() "
+        "WHERE catalog_instance_id=%s",
+        (_json_param(incoming["scope_summary"]), catalog_instance_id),
+    )
+    cur.close()
+    db.commit()
+    return {
+        "status": "active",
+        "rebound": changed,
+        "catalog_instance_id": catalog_instance_id,
+        "server_id": core_server_id,
+    }
