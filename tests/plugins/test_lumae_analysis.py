@@ -2257,7 +2257,13 @@ def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypat
     monkeypatch.setattr(mod, "get_db", lambda: object())
     header = b'{"format":"lumae-f32le-v1"}'
     binary = struct.pack("<I", len(header)) + header + struct.pack("<2f", 0.1, 0.2)
-    monkeypatch.setattr(mod, "vector_batch", lambda *_args, **_kwargs: binary)
+    captured = {}
+
+    def vector_batch(*_args, **kwargs):
+        captured.update(kwargs)
+        return binary
+
+    monkeypatch.setattr(mod, "vector_batch", vector_batch)
 
     response = plugin_client(mod).post(
         "/api/catalog/analysis/vectors",
@@ -2265,6 +2271,7 @@ def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypat
             "catalog_instance_id": "catalog-a",
             "analysis_ids": ["canonical-1"],
             "family": "musicnn",
+            "generation": 4,
         },
     )
 
@@ -2272,6 +2279,7 @@ def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypat
     assert response.mimetype == "application/vnd.lumae.f32le-v1"
     assert response.data == binary
     assert response.headers["Cache-Control"] == "private, no-store"
+    assert captured == {"family": "musicnn", "generation": 4}
 
 
 def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):

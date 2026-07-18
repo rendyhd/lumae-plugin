@@ -762,9 +762,12 @@ def analysis_vectors_api():
         catalog_instance_id = str(body.get("catalog_instance_id") or "")
         ids = body.get("analysis_ids") or []
         family = str(body.get("family") or "musicnn")
+        generation = body.get("generation")
         if not catalog_instance_id or not isinstance(ids, list):
             raise ValueError("catalog_instance_id and analysis_ids are required")
-        payload = vector_batch(get_db(), catalog_instance_id, ids, family=family)
+        payload = vector_batch(
+            get_db(), catalog_instance_id, ids, family=family, generation=generation
+        )
         response = Response(payload, mimetype="application/vnd.lumae.f32le-v1")
         response.headers["Cache-Control"] = "private, no-store"
         response.headers["Vary"] = "Authorization, Cookie"

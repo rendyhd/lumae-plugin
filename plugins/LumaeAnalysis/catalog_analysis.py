@@ -463,14 +463,17 @@ def scalar_batch(db, catalog_instance_id, provider_track_ids):
     ]
 
 
-def vector_batch(db, catalog_instance_id, analysis_ids, family="musicnn"):
+def vector_batch(db, catalog_instance_id, analysis_ids, family="musicnn", generation=None):
     ids = list(dict.fromkeys(str(value) for value in analysis_ids))
     if len(ids) > 250:
         raise ValueError("At most 250 analysis IDs are allowed")
     if family not in ("musicnn", "clap"):
         raise ValueError("Unknown vector family")
     source = resolve_catalog_source(db, catalog_instance_id=catalog_instance_id)[0]
-    generation = source["analysis"]["generation"]
+    current_generation = source["analysis"]["generation"]
+    generation = int(generation) if generation is not None else current_generation
+    if generation < 0 or generation > current_generation:
+        raise ValueError("Unknown analysis generation")
     column = "musicnn_vector" if family == "musicnn" else "clap_vector"
     dimensions_column = "musicnn_dimensions" if family == "musicnn" else "clap_dimensions"
     checksum_column = "musicnn_fp" if family == "musicnn" else "clap_fp"

@@ -1255,10 +1255,13 @@ def bootstrap_page(
             "provider_track_id",
             "projection_generation",
         )
+    vector_exclusions = (
+        " - 'musicnn_vector' - 'clap_vector'" if stream == "analysis" and entity_type == "item" else ""
+    )
     cur.execute(
         f"""
         SELECT {id_column},
-               to_jsonb(entity_row) - 'catalog_instance_id' - '{generation_column}' AS dto
+               to_jsonb(entity_row) - 'catalog_instance_id' - '{generation_column}'{vector_exclusions} AS dto
           FROM {t(table_name)} entity_row
          WHERE catalog_instance_id=%s AND {generation_column}=%s
            AND {id_column} > %s
