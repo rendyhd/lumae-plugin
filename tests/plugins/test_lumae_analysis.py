@@ -580,37 +580,24 @@ def test_collection_library_normalizes_live_track_and_disc_numbers():
     assert track["duration_seconds"] == 31
 
 
-def test_album_detail_prefers_media_server_order_and_marks_analyzed_tracks(monkeypatch):
+def test_album_detail_uses_provider_catalog_order_and_analysis_links(monkeypatch):
     library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
-    mediaserver = types.ModuleType("tasks.mediaserver")
-    mediaserver.get_tracks_from_album = lambda album_id, provider_type=None: [
+    monkeypatch.setattr(library, "_score_album_tracks", lambda *args, **kwargs: [
         {
-            "Id": "track-2",
-            "Name": "Second",
-            "AlbumArtist": "Artist",
-            "Album": "Album",
-            "IndexNumber": 2,
-            "ParentIndexNumber": 1,
+            "track_id": "track-2", "title": "Second", "artist": "Artist",
+            "album": "Album", "track_number": 2, "disc_number": 1,
+            "analyzed": False, "album_id": "album-1", "provider_type": "navidrome",
         },
         {
-            "Id": "track-1",
-            "Name": "First",
-            "AlbumArtist": "Artist",
-            "Album": "Album",
-            "IndexNumber": 1,
-            "ParentIndexNumber": 1,
+            "track_id": "track-1", "title": "First", "artist": "Artist",
+            "album": "Album", "track_number": 1, "disc_number": 1,
+            "analyzed": True, "album_id": "album-1", "provider_type": "navidrome",
         },
-    ]
-    tasks = types.ModuleType("tasks")
-    tasks.mediaserver = mediaserver
-    monkeypatch.setitem(sys.modules, "tasks", tasks)
-    monkeypatch.setitem(sys.modules, "tasks.mediaserver", mediaserver)
-    monkeypatch.setattr(library.config, "MEDIASERVER_TYPE", "navidrome", raising=False)
-    monkeypatch.setattr(library, "_analyzed_track_ids", lambda ids: {"track-1"})
+    ])
 
     detail = library.album_detail("Album", "Artist", provider_album_id="album-1")
 
-    assert detail["metadata_source"] == "media_server"
+    assert detail["metadata_source"] == "provider_catalog"
     assert detail["album"]["provider_album_id"] == "album-1"
     assert [track["track_id"] for track in detail["tracks"]] == ["track-1", "track-2"]
     assert detail["tracks"][0]["track_number"] == 1
@@ -716,7 +703,7 @@ def test_collection_track_sorts_use_source_columns_not_nested_select_aliases():
     for sort in library.LIBRARY_SORTS:
         library._browse_tracks(cursor, "", None, sort, 12, 0)
 
-    orders = [sql.split("ORDER BY", 1)[1].split("LIMIT", 1)[0] for sql in cursor.queries]
+    orders = [sql.rsplit("ORDER BY", 1)[1].split("LIMIT", 1)[0] for sql in cursor.queries]
     assert all("lower(artist)" not in order for order in orders)
     assert all("author" in order for order in orders)
 
@@ -1479,7 +1466,8 @@ def test_analyze_one_track_persists_ready_profile_with_pr721_score_shape(monkeyp
     assert result == {"track_id": "track-a", "status": "ready"}
     assert seen["path"] == str(audio)
     select_sql = " ".join(db.cursor_obj.executed[0][0].split())
-    assert select_sql == "SELECT item_id, file_path, title, author FROM score WHERE item_id = %s"
+    assert "catalog_tracks" in select_sql
+    assert "FROM score" not in select_sql
     assert db.commits == 1
     sql, params = db.cursor_obj.executed[-1]
     assert "INSERT INTO" in sql

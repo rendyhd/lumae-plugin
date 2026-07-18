@@ -11,7 +11,7 @@ from flask import Response, abort, g, jsonify, request
 
 from plugin.api import get_db, get_setting, render_page, table
 
-from .collection_library import register_collection_library_routes
+from .collection_library import catalog_track_view_sql, register_collection_library_routes
 from .collection_ui import render_collection_workbench
 
 
@@ -1012,11 +1012,11 @@ def register_collection_routes(bp):
         cur = db.cursor()
         if kind == "album":
             cur.execute(
-                """
+                f"""
                 SELECT MIN(item_id) AS cover_item_id, album,
                        COALESCE(NULLIF(album_artist, ''), author) AS artist,
                        COUNT(*)::INTEGER AS track_count
-                  FROM score
+                  FROM ({catalog_track_view_sql()}) score
                  WHERE album IS NOT NULL
                    AND (album ILIKE %s OR album_artist ILIKE %s OR author ILIKE %s)
                  GROUP BY album, COALESCE(NULLIF(album_artist, ''), author)
@@ -1036,10 +1036,10 @@ def register_collection_routes(bp):
                 )
         else:
             cur.execute(
-                """
+                f"""
                 SELECT item_id AS track_id, title, author AS artist, album,
                        item_id AS cover_item_id
-                  FROM score
+                  FROM ({catalog_track_view_sql()}) score
                  WHERE title ILIKE %s OR author ILIKE %s OR album ILIKE %s
                  ORDER BY lower(title) LIMIT 50
                 """,

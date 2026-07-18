@@ -7,13 +7,59 @@ from urllib.parse import quote
 import requests as http_requests
 from flask import Response, jsonify, request, stream_with_context
 
-from plugin.api import config, get_db, logger
+from plugin.api import config, get_db, logger, table
 
 
 LIBRARY_SCOPES = {"all", "albums", "tracks", "artists"}
 LIBRARY_SORTS = {"title", "artist", "year"}
 _ITEM_ID_RE = re.compile(r"[A-Za-z0-9._~-]{1,256}")
 _REQUEST_TIMEOUT = (10, 60)
+
+
+def catalog_track_view_sql():
+    """Current provider catalogue rows with analysis as an optional link."""
+    sources = table("catalog_sources")
+    state = table("catalog_state")
+    tracks = table("catalog_tracks")
+    albums = table("catalog_albums")
+    analysis_state = table("analysis_state")
+    links = table("track_analysis_links")
+    return f"""
+        WITH selected_source AS (
+            SELECT s.catalog_instance_id, s.provider_type, c.published_generation,
+                   COALESCE(a.projection_generation, 0) AS projection_generation
+              FROM {sources} s
+              JOIN {state} c USING (catalog_instance_id)
+              LEFT JOIN {analysis_state} a USING (catalog_instance_id)
+             WHERE s.rebind_status='active' AND c.status='complete'
+             ORDER BY s.is_default DESC, s.server_name, s.catalog_instance_id
+             LIMIT 1
+        )
+        SELECT t.track_id AS item_id, t.title,
+               t.artist_display AS author, al.name AS album,
+               t.album_artist_display AS album_artist,
+               NULL::INTEGER AS year, NULL::INTEGER AS rating,
+               t.track_id AS cover_item_id, t.album_id,
+               t.track_number, t.disc_number, t.duration_ms,
+               t.content_kind, t.release_type, t.cover_art_id,
+               l.status AS analysis_status,
+               lower(concat_ws(' ', t.title, t.artist_display,
+                               t.album_artist_display, al.name)) AS search_u,
+               source.provider_type
+          FROM selected_source source
+          JOIN {tracks} t
+            ON t.catalog_instance_id=source.catalog_instance_id
+           AND t.published_generation=source.published_generation
+           AND t.available=TRUE
+          LEFT JOIN {albums} al
+            ON al.catalog_instance_id=t.catalog_instance_id
+           AND al.published_generation=t.published_generation
+           AND al.album_id=t.album_id AND al.available=TRUE
+          LEFT JOIN {links} l
+            ON l.catalog_instance_id=t.catalog_instance_id
+           AND l.projection_generation=source.projection_generation
+           AND l.provider_track_id=t.track_id
+    """
 
 
 def _bounded_int(value, default, minimum, maximum):
@@ -84,7 +130,7 @@ def _browse_albums(cur, query, artist, sort, limit, offset):
                    COUNT(*)::INTEGER AS track_count,
                    MIN(year)::INTEGER AS year,
                    MAX(rating)::INTEGER AS rating
-              FROM score
+              FROM ({catalog_track_view_sql()}) score
              WHERE NULLIF(album, '') IS NOT NULL {filters}
              GROUP BY album, COALESCE(NULLIF(album_artist, ''), author)
           ) albums
@@ -123,7 +169,7 @@ def _browse_tracks(cur, query, artist, sort, limit, offset):
                COALESCE(NULLIF(album_artist, ''), author) AS album_artist,
                year, rating, item_id AS cover_item_id,
                COUNT(*) OVER()::INTEGER AS total_count
-          FROM score
+          FROM ({catalog_track_view_sql()}) score
          WHERE NULLIF(title, '') IS NOT NULL {filters}
          ORDER BY {order}
          LIMIT %s OFFSET %s
@@ -157,7 +203,7 @@ def _browse_artists(cur, query, sort, limit, offset):
                    COUNT(*)::INTEGER AS track_count,
                    MIN(year)::INTEGER AS first_year,
                    MAX(year)::INTEGER AS latest_year
-              FROM score
+              FROM ({catalog_track_view_sql()}) score
              WHERE NULLIF(COALESCE(NULLIF(album_artist, ''), author), '') IS NOT NULL
                    {filters}
              GROUP BY COALESCE(NULLIF(album_artist, ''), author)
@@ -229,7 +275,7 @@ def library_stats():
     cur = db.cursor()
     try:
         cur.execute(
-            """
+            f"""
             SELECT COUNT(*)::INTEGER AS track_count,
                    COUNT(DISTINCT (
                      lower(COALESCE(NULLIF(album_artist, ''), author)) || E'\\x1f' ||
@@ -237,7 +283,7 @@ def library_stats():
                    )) FILTER (WHERE NULLIF(album, '') IS NOT NULL)::INTEGER AS album_count,
                    COUNT(DISTINCT lower(COALESCE(NULLIF(album_artist, ''), author)))::INTEGER
                      AS artist_count
-              FROM score
+              FROM ({catalog_track_view_sql()}) score
             """
         )
         row = cur.fetchone() or (0, 0, 0)
@@ -319,21 +365,26 @@ def _normalize_provider_track(item, index=0):
     }
 
 
-def _score_album_tracks(title, artist):
+def _score_album_tracks(title, artist, provider_album_id=None):
     db = get_db()
     cur = db.cursor()
     try:
         cur.execute(
-            """
+            f"""
             SELECT item_id AS track_id, title, author AS artist, album,
                    COALESCE(NULLIF(album_artist, ''), author) AS album_artist,
-                   year, rating, item_id AS cover_item_id
-              FROM score
-             WHERE lower(album) = lower(%s)
-               AND lower(COALESCE(NULLIF(album_artist, ''), author)) = lower(%s)
+                   year, rating, item_id AS cover_item_id, album_id,
+                   track_number, disc_number,
+                   CASE WHEN duration_ms IS NULL THEN NULL ELSE round(duration_ms / 1000.0) END
+                     AS duration_seconds,
+                   analysis_status, provider_type
+              FROM ({catalog_track_view_sql()}) score
+             WHERE ((%s IS NOT NULL AND album_id=%s) OR
+                    (%s IS NULL AND lower(album) = lower(%s)
+                     AND lower(COALESCE(NULLIF(album_artist, ''), author)) = lower(%s)))
              ORDER BY lower(title), item_id
             """,
-            (title, artist),
+            (provider_album_id, provider_album_id, provider_album_id, title, artist),
         )
         rows = _all_dicts(cur)
     finally:
@@ -342,10 +393,7 @@ def _score_album_tracks(title, artist):
         row.update(
             {
                 "kind": "track",
-                "track_number": None,
-                "disc_number": None,
-                "duration_seconds": None,
-                "analyzed": True,
+                "analyzed": row.pop("analysis_status", None) in {"ready", "suspect"},
                 "provider_index": index,
             }
         )
@@ -359,7 +407,11 @@ def _analyzed_track_ids(track_ids):
     db = get_db()
     cur = db.cursor()
     try:
-        cur.execute("SELECT item_id FROM score WHERE item_id = ANY(%s)", (ids,))
+        cur.execute(
+            f"SELECT item_id FROM ({catalog_track_view_sql()}) score "
+            "WHERE item_id = ANY(%s) AND analysis_status IN ('ready', 'suspect')",
+            (ids,),
+        )
         return {str(row[0]) for row in cur.fetchall()}
     finally:
         cur.close()
@@ -412,49 +464,28 @@ def _provider_album_tracks(provider_type, album_id):
 
 
 def album_detail(title, artist, provider_album_id=None):
-    """Load provider track/disc numbers, falling back to analyzed score rows."""
-    match = None
-    if provider_album_id:
-        match = {"id": str(provider_album_id), "name": title, "artist": artist}
-    else:
-        match = resolve_provider_album(str(title), str(artist))
-    provider_type = str(getattr(config, "MEDIASERVER_TYPE", "") or "").lower()
-    provider_tracks = []
-    if match and match.get("id"):
-        try:
-            raw_tracks = _provider_album_tracks(provider_type, str(match["id"]))
-            provider_tracks = [
-                _normalize_provider_track(item, index)
-                for index, item in enumerate(raw_tracks or [])
-            ]
-            provider_tracks = [item for item in provider_tracks if item.get("track_id")]
-        except Exception:
-            logger.exception(
-                "Living Collections could not load provider album %s", match.get("id")
-            )
-    if provider_tracks:
-        analyzed = _analyzed_track_ids(item["track_id"] for item in provider_tracks)
-        for item in provider_tracks:
-            item["analyzed"] = item["track_id"] in analyzed
-        provider_tracks.sort(
-            key=lambda item: (
-                item.get("disc_number") or 1,
-                item.get("track_number") if item.get("track_number") is not None else 1_000_000,
-                item.get("provider_index", 0),
-            )
+    """Load provider-authoritative order and metadata from the published mirror."""
+    tracks = _score_album_tracks(title, artist, provider_album_id=provider_album_id)
+    tracks.sort(
+        key=lambda item: (
+            item.get("disc_number") or 1,
+            item.get("track_number") if item.get("track_number") is not None else 1_000_000,
+            item.get("provider_index", 0),
         )
-        tracks = provider_tracks
-        metadata_source = "media_server"
-    else:
-        tracks = _score_album_tracks(title, artist)
-        metadata_source = "analysis_database"
+    )
+    resolved_album_id = provider_album_id or next(
+        (item.get("album_id") for item in tracks if item.get("album_id")), None
+    )
+    provider_type = next(
+        (item.get("provider_type") for item in tracks if item.get("provider_type")), "unknown"
+    )
     album = {
         "kind": "album",
         "title": title,
         "artist": artist,
         "album_key": _album_key(title, artist),
-        "provider_album_id": str(match.get("id")) if match and match.get("id") else None,
-        "year": (match or {}).get("year"),
+        "provider_album_id": str(resolved_album_id) if resolved_album_id else None,
+        "year": next((item.get("year") for item in tracks if item.get("year")), None),
         "track_count": len(tracks),
         "cover_item_id": next(
             (item.get("cover_item_id") or item.get("track_id") for item in tracks), None
@@ -463,7 +494,7 @@ def album_detail(title, artist, provider_album_id=None):
     return {
         "album": album,
         "tracks": tracks,
-        "metadata_source": metadata_source,
+        "metadata_source": "provider_catalog",
         "provider_type": provider_type,
     }
 

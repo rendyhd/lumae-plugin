@@ -88,6 +88,17 @@ class ProviderCatalogBridge:
             }[server["provider_type"]]
             return fetcher(module, self.core, server_id)
 
+    def download_track(self, server_id, temp_dir, item):
+        self.require_server(server_id)
+        with self.core.bind(server_id):
+            module = self.core.provider_module(
+                self.require_server(server_id)["provider_type"]
+            )
+            downloader = getattr(module, "download_track", None)
+            if not callable(downloader):
+                raise CatalogProviderError("Provider does not support track downloads")
+            return downloader(temp_dir, item)
+
 
 def _coerce_catalog_result(result, libraries):
     if isinstance(result, dict):

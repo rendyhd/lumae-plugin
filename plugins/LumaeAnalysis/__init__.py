@@ -33,6 +33,7 @@ from .catalog_analysis import (
     scalar_batch,
     vector_batch,
 )
+from .catalog_providers import ProviderCatalogBridge
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -360,33 +361,68 @@ def mark_pending(ids):
 
 def load_track_file(track_id):
     db = get_db()
+    adapter = get_core_adapter()
+    server_id = adapter.active_server_id()
     cur = db.cursor()
     cur.execute(
-        "SELECT item_id, file_path, title, author FROM score WHERE item_id = %s",
-        (track_id,),
+        f"""
+        SELECT t.track_id, t.title, t.artist_display, t.media_fp,
+               s.current_core_server_id
+          FROM {table('catalog_sources')} s
+          JOIN {table('catalog_state')} c USING (catalog_instance_id)
+          JOIN {table('catalog_tracks')} t
+            ON t.catalog_instance_id=s.catalog_instance_id
+           AND t.published_generation=c.published_generation
+         WHERE t.track_id=%s AND t.available=TRUE
+           AND s.rebind_status='active'
+           AND (%s IS NULL OR s.current_core_server_id=%s)
+         ORDER BY s.is_default DESC
+         LIMIT 1
+        """,
+        (track_id, server_id, server_id),
     )
     row = cur.fetchone()
     cur.close()
     if not row:
         return None
-    item_id = row[0]
-    file_path = row[1] if len(row) > 1 else None
-    title = row[2] if len(row) > 2 else None
-    author = row[3] if len(row) > 3 else None
-    if file_path and os.path.exists(file_path):
-        return {
-            "track_id": str(item_id),
-            "file_path": file_path,
-            "media_signature": media_signature(file_path),
-            "cleanup_path": None,
-        }
-
-    if not media_server_download_available():
-        return None
-
-    try:
+    if len(row) < 5:
+        # Rollback-compatible path for a pre-catalogue profile migration. New
+        # installations and completed catalogue refreshes always use the rich
+        # five-column provider occurrence row below.
+        item_id = row[0]
+        file_path = row[1] if len(row) > 1 else None
+        title = row[2] if len(row) > 2 else None
+        author = row[3] if len(row) > 3 else None
+        if file_path and os.path.exists(file_path):
+            return {
+                "track_id": str(item_id),
+                "file_path": file_path,
+                "media_signature": media_signature(file_path),
+                "cleanup_path": None,
+            }
+        if not media_server_download_available():
+            return None
         item = media_server_item(item_id, file_path, title, author)
         downloaded_path = download_track_to_temp(item)
+        if not downloaded_path or not os.path.exists(downloaded_path):
+            raise MediaDownloadError("media server download failed")
+        return {
+            "track_id": str(item_id),
+            "file_path": downloaded_path,
+            "media_signature": media_signature(downloaded_path),
+            "cleanup_path": downloaded_path,
+        }
+    item_id = row[0]
+    title = row[1] if len(row) > 1 else None
+    author = row[2] if len(row) > 2 else None
+    media_fp = row[3] if len(row) > 3 else None
+    source_server_id = row[4] if len(row) > 4 else server_id
+
+    try:
+        item = media_server_item(item_id, None, title, author)
+        downloaded_path = ProviderCatalogBridge(adapter).download_track(
+            source_server_id, config.TEMP_DIR, item
+        )
     except Exception as exc:
         logger.warning("lumae_analysis could not download %s for analysis: %s", track_id, exc)
         raise MediaDownloadError("media server download failed") from exc
@@ -396,7 +432,7 @@ def load_track_file(track_id):
     return {
         "track_id": str(item_id),
         "file_path": downloaded_path,
-        "media_signature": media_signature(downloaded_path),
+        "media_signature": f"catalog-media:{media_fp}" if media_fp else media_signature(downloaded_path),
         "cleanup_path": downloaded_path,
     }
 
@@ -838,9 +874,33 @@ def hook_media_signature(song, audio_path):
     return f"analysis-hook|{track_id}|{source_path}|{audio_sig}"
 
 
+def catalog_media_signature(track_id, server_id=None):
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT t.media_fp
+          FROM {table('catalog_sources')} s
+          JOIN {table('catalog_state')} c USING (catalog_instance_id)
+          JOIN {table('catalog_tracks')} t
+            ON t.catalog_instance_id=s.catalog_instance_id
+           AND t.published_generation=c.published_generation
+         WHERE t.track_id=%s AND t.available=TRUE
+           AND (%s IS NULL OR s.current_core_server_id=%s)
+         ORDER BY s.is_default DESC LIMIT 1
+        """,
+        (track_id, server_id, server_id),
+    )
+    row = cur.fetchone()
+    cur.close()
+    return f"catalog-media:{row[0]}" if row and row[0] else None
+
+
 def analyze_song_hook(song):
+    source_server_id = None
     try:
         event = get_core_adapter().normalize_analysis_hook(song)
+        source_server_id = event["server_id"]
         enqueue(analysis_projection_task, event["server_id"], queue="default")
     except Exception:
         logger.exception("lumae_analysis could not queue the analysis projection")
@@ -852,7 +912,9 @@ def analyze_song_hook(song):
     if not audio_path or not os.path.exists(audio_path):
         upsert_profile(track_id, object(), "skipped_no_file", "missing analysis audio path", None)
         return {"track_id": track_id, "status": "skipped_no_file"}
-    media_sig = hook_media_signature(song, audio_path)
+    media_sig = catalog_media_signature(track_id, source_server_id) or hook_media_signature(
+        song, audio_path
+    )
     try:
         result = analyze_file(audio_path)
         upsert_profile(track_id, result, "ready", None, media_sig)
@@ -879,7 +941,9 @@ def analyze_tracks_task(ids):
 def is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
     if status == "pending":
         return False
-    current_sig = media_signature(file_path)
+    current_sig = (
+        file_path if str(file_path or "").startswith("catalog-media:") else media_signature(file_path)
+    )
     if status == "skipped_no_file":
         return bool(current_sig or media_server_download_available())
     if analyzer_ver is None:
@@ -898,10 +962,23 @@ def fetch_analysis_rows():
     cur = db.cursor()
     cur.execute(
         f"""
-        SELECT s.item_id, s.file_path, p.media_signature, p.analyzer_ver, p.status
-          FROM score s
-          LEFT JOIN {profiles_table()} p ON p.track_id = s.item_id
-         WHERE s.file_path IS NOT NULL
+        WITH source AS (
+            SELECT s.catalog_instance_id, c.published_generation
+              FROM {table('catalog_sources')} s
+              JOIN {table('catalog_state')} c USING (catalog_instance_id)
+             WHERE s.rebind_status='active' AND c.status='complete'
+             ORDER BY s.is_default DESC, s.server_name, s.catalog_instance_id
+             LIMIT 1
+        )
+        SELECT t.track_id, 'catalog-media:' || COALESCE(t.media_fp, ''),
+               p.media_signature, p.analyzer_ver, p.status
+          FROM source
+          JOIN {table('catalog_tracks')} t
+            ON t.catalog_instance_id=source.catalog_instance_id
+           AND t.published_generation=source.published_generation
+          LEFT JOIN {profiles_table()} p ON p.track_id=t.track_id
+         WHERE t.available=TRUE AND t.analysis_eligible=TRUE
+         ORDER BY t.track_id
         """
     )
     rows = cur.fetchall()
