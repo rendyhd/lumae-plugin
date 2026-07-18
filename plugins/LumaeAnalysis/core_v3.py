@@ -32,6 +32,12 @@ class AudioMuseV3Adapter:
             )
         return servers
 
+    def active_server_id(self):
+        import plugin.api as api
+
+        value = api.active_server_id()
+        return str(value) if value else None
+
     def bind(self, server_id):
         if not server_id:
             raise ValueError("AudioMuse 3 provider work requires an explicit server_id")

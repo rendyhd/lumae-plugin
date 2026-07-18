@@ -18,6 +18,9 @@ class AudioMuseV2Adapter:
             }
         ]
 
+    def active_server_id(self):
+        return "legacy-default"
+
     def bind(self, server_id):
         if server_id not in (None, "legacy-default"):
             raise KeyError(f"Unknown AudioMuse 2.6 server: {server_id}")

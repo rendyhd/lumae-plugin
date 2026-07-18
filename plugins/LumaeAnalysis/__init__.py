@@ -8,8 +8,13 @@ from flask import Blueprint, jsonify, request
 from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
 
 from .loudness import SilentAudioError, analyze_file
-from .core_compat import SUPPORTED_CORE_RANGE, detect_core, sanitized_server_summaries
-from .catalog import ensure_catalog_sources, migrate_catalog
+from .core_compat import (
+    SUPPORTED_CORE_RANGE,
+    detect_core,
+    get_core_adapter,
+    sanitized_server_summaries,
+)
+from .catalog import ensure_catalog_sources, migrate_catalog, refresh_catalog
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -42,6 +47,7 @@ CATALOG_FEATURES = (
     "binary_vectors",
 )
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
+CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
 WHOLE_LIBRARY_CHUNK_SIZE = 250
 COLLECTIONS_MENU_LABEL = "Living Collections"
 COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
@@ -175,6 +181,21 @@ def disable_legacy_backfill_schedule(db):
     cur.close()
 
 
+def ensure_catalog_refresh_schedule(db):
+    cur = db.cursor()
+    cur.execute(
+        "INSERT INTO cron (name, task_type, cron_expr, enabled) "
+        "VALUES (%s, %s, %s, FALSE) ON CONFLICT (task_type) DO NOTHING",
+        (CATALOG_REFRESH_TASK_TYPE, CATALOG_REFRESH_TASK_TYPE, "17 */6 * * *"),
+    )
+    cur.close()
+
+
+def catalog_refresh_task():
+    adapter = get_core_adapter()
+    return refresh_catalog(server_id=adapter.active_server_id())
+
+
 def migrate(db):
     cur = db.cursor()
     cur.execute(
@@ -199,6 +220,7 @@ def migrate(db):
     migrate_catalog(db)
     ensure_catalog_sources(db)
     migrate_collections(db)
+    ensure_catalog_refresh_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
 
@@ -1061,3 +1083,4 @@ def register(ctx):
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
     ctx.on_install(migrate)
     ctx.on_song_analyzed(analyze_song_hook)
+    ctx.add_cron_task("catalog_refresh", catalog_refresh_task, queue="default")

@@ -1,6 +1,10 @@
 """Plugin-owned provider catalogue schema and source identity management."""
 
 from datetime import datetime, timezone
+import hashlib
+import json
+import re
+import unicodedata
 import uuid
 
 from plugin.api import table
@@ -18,6 +22,323 @@ def t(name):
 
 def utc_now():
     return datetime.now(timezone.utc)
+
+
+ENTITY_ORDER = ("library", "artist", "album", "track")
+ENTITY_TABLES = {
+    "library": ("catalog_libraries", "library_id"),
+    "artist": ("catalog_artists", "artist_id"),
+    "album": ("catalog_albums", "album_id"),
+    "track": ("catalog_tracks", "track_id"),
+}
+ENTITY_COLLECTIONS = {
+    "library": "libraries",
+    "artist": "artists",
+    "album": "albums",
+    "track": "tracks",
+}
+_PRIVATE_FIELD = re.compile(
+    r"(?:password|token|credential|secret|authorization|userdata|playcount|lastplayed|favorite|rating)",
+    re.IGNORECASE,
+)
+_PATH_FIELD = re.compile(r"^(?:path|filepath|url|streamurl|downloadurl)$", re.IGNORECASE)
+
+
+class CatalogScanError(RuntimeError):
+    pass
+
+
+def _value(row, *names, default=None):
+    for name in names:
+        if isinstance(row, dict) and row.get(name) is not None:
+            return row[name]
+    return default
+
+
+def _text(value):
+    if value is None:
+        return None
+    return unicodedata.normalize("NFC", str(value)).strip() or None
+
+
+def _integer(value):
+    if value in (None, ""):
+        return None
+    try:
+        return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _duration_ms(row):
+    ticks = _integer(_value(row, "RunTimeTicks", "runTimeTicks"))
+    if ticks is not None:
+        return max(0, ticks // 10_000)
+    milliseconds = _integer(_value(row, "duration_ms", "durationMs"))
+    if milliseconds is not None:
+        return max(0, milliseconds)
+    seconds = _value(row, "duration", "Duration", "duration_seconds")
+    try:
+        return max(0, round(float(seconds) * 1000)) if seconds is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _safe_payload(value):
+    if isinstance(value, dict):
+        return {
+            _text(key): _safe_payload(item)
+            for key, item in value.items()
+            if not _PRIVATE_FIELD.search(str(key)) and not _PATH_FIELD.match(str(key))
+        }
+    if isinstance(value, (list, tuple)):
+        return [_safe_payload(item) for item in value]
+    if isinstance(value, bytes):
+        return None
+    if isinstance(value, float) and (value != value or value in (float("inf"), float("-inf"))):
+        return None
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return _text(value) if isinstance(value, str) else value
+    return _text(value)
+
+
+def canonical_json(value):
+    return json.dumps(
+        _safe_payload(value),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def fingerprint(value):
+    return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
+
+
+def _artist_rows(row, fallback_name=None):
+    raw_items = _value(row, "ArtistItems", "artistItems")
+    if not raw_items:
+        names = _value(row, "Artists", "artists")
+        if isinstance(names, str):
+            names = [names]
+        if names:
+            raw_items = [{"Name": name} for name in names]
+    if not raw_items:
+        name = _value(row, "artist", "Artist", "AlbumArtist", "albumartist", default=fallback_name)
+        artist_id = _value(row, "artistId", "ArtistId", "albumArtistId")
+        raw_items = [{"Id": artist_id, "Name": name}] if name else []
+    result = []
+    for position, item in enumerate(raw_items or []):
+        if not isinstance(item, dict):
+            item = {"Name": item}
+        name = _text(_value(item, "Name", "name"))
+        if not name:
+            continue
+        native_id = _text(_value(item, "Id", "id"))
+        provenance = "provider_id" if native_id else "derived_display_name"
+        artist_id = native_id or f"derived:{fingerprint({'name': name.casefold()})[:24]}"
+        result.append(
+            {
+                "artist_id": artist_id,
+                "name": name,
+                "position": position,
+                "identity_provenance": provenance,
+            }
+        )
+    return result
+
+
+def _media_payload(row):
+    sources = _value(row, "MediaSources", "mediaSources", default=[]) or []
+    source = sources[0] if sources and isinstance(sources[0], dict) else {}
+    return {
+        "duration_ms": _duration_ms(row),
+        "container": _text(
+            _value(row, "suffix", "contentType", "ContentType", "container", default=source.get("Container"))
+        ),
+        "bit_rate": _integer(_value(row, "bitRate", "Bitrate", default=source.get("Bitrate"))),
+        "sample_rate": _integer(_value(row, "sampleRate", "SampleRate")),
+        "bit_depth": _integer(_value(row, "bitDepth", "BitDepth")),
+        "channels": _integer(_value(row, "channelCount", "Channels")),
+        "size": _integer(_value(row, "size", "Size", default=source.get("Size"))),
+    }
+
+
+def _art_payload(row):
+    return {
+        "cover_art_id": _text(
+            _value(row, "coverArt", "CoverArt", "coverArtId", "PrimaryImageItemId")
+        ),
+        "image_tags": _safe_payload(_value(row, "ImageTags", "imageTags", default={})),
+    }
+
+
+def _content_kind(row):
+    raw = _text(_value(row, "content_kind", "mediaType", "MediaType", "Type", "type"))
+    lowered = (raw or "music").lower()
+    if "podcast" in lowered:
+        return "podcast"
+    if "audio" in lowered or lowered in ("music", "song", "track"):
+        return "music"
+    if "video" in lowered:
+        return "video"
+    return lowered
+
+
+def normalize_provider_catalog(raw_catalog, provider_type):
+    """Normalize provider occurrences without consulting AudioMuse score rows."""
+    raw_catalog = raw_catalog or {}
+    libraries = []
+    for raw in raw_catalog.get("libraries") or []:
+        library_id = _text(_value(raw, "id", "Id", "ItemId"))
+        name = _text(_value(raw, "name", "Name"))
+        if not library_id or not name:
+            continue
+        payload = _safe_payload(raw)
+        libraries.append(
+            {
+                "library_id": library_id,
+                "name": name,
+                "sort_name": _text(_value(raw, "sortName", "SortName")),
+                "display_order": _integer(_value(raw, "displayOrder", "DisplayOrder")),
+                "payload": payload,
+                "metadata_fp": fingerprint(payload),
+            }
+        )
+
+    albums_by_id = {}
+    artists_by_id = {}
+    album_artists = []
+    for raw in raw_catalog.get("albums") or []:
+        album_id = _text(_value(raw, "id", "Id", "albumId", "AlbumId", "album_id"))
+        name = _text(_value(raw, "name", "Name", "title", "album"))
+        if not album_id or not name:
+            continue
+        artists = _artist_rows(raw, fallback_name=_value(raw, "AlbumArtist", "albumartist"))
+        for artist in artists:
+            artists_by_id.setdefault(artist["artist_id"], artist)
+            album_artists.append({"album_id": album_id, **artist})
+        art = _art_payload(raw)
+        metadata = {
+            "name": name,
+            "sort_name": _text(_value(raw, "SortName", "sortName")),
+            "album_artist_display": _text(_value(raw, "AlbumArtist", "albumArtist", "albumartist")),
+            "added_at": _text(_value(raw, "created", "DateCreated", "added_at")),
+            "release_type": _text(_value(raw, "releaseTypes", "ReleaseType", "albumType")),
+            "content_kind": _content_kind(raw),
+            "year": _integer(_value(raw, "year", "ProductionYear")),
+            "genres": _safe_payload(_value(raw, "genre", "Genres", "genres", default=[])),
+            "provider_ids": _safe_payload(_value(raw, "ProviderIds", "providerIds", default={})),
+        }
+        payload = _safe_payload(raw)
+        albums_by_id[album_id] = {
+            "album_id": album_id,
+            **metadata,
+            **art,
+            "payload": payload,
+            "metadata_fp": fingerprint(metadata),
+            "artwork_fp": fingerprint(art),
+        }
+
+    tracks = []
+    track_artists = []
+    entity_libraries = []
+    seen_track_ids = set()
+    for raw in raw_catalog.get("tracks") or []:
+        track_id = _text(_value(raw, "id", "Id", "track_id"))
+        title = _text(_value(raw, "title", "Name", "name"))
+        if not track_id or not title:
+            raise CatalogScanError("Provider track is missing its stable ID or title")
+        if track_id in seen_track_ids:
+            raise CatalogScanError(f"Provider returned duplicate track ID {track_id}")
+        seen_track_ids.add(track_id)
+        album_id = _text(
+            _value(raw, "albumId", "AlbumId", "album_id", "albumid", "ParentId")
+        )
+        album_name = _text(_value(raw, "album", "Album"))
+        if album_name and not album_id:
+            raise CatalogScanError(f"Album-backed track {track_id} has no provider album identity")
+        if album_id and album_id not in albums_by_id:
+            inferred = {
+                "id": album_id,
+                "name": album_name or "Unknown Album",
+                "AlbumArtist": _value(raw, "AlbumArtist", "albumArtist", "albumartist"),
+                "year": _value(raw, "year", "ProductionYear"),
+                "coverArt": _value(raw, "coverArt", "PrimaryImageItemId"),
+            }
+            nested = normalize_provider_catalog({"albums": [inferred]}, provider_type)
+            albums_by_id[album_id] = nested["albums"][0]
+            for artist in nested["artists"]:
+                artists_by_id.setdefault(artist["artist_id"], artist)
+            album_artists.extend(nested["album_artists"])
+        artists = _artist_rows(raw)
+        for artist in artists:
+            artists_by_id.setdefault(artist["artist_id"], artist)
+            track_artists.append({"track_id": track_id, **artist})
+        media = _media_payload(raw)
+        art = _art_payload(raw)
+        kind = _content_kind(raw)
+        metadata = {
+            "album_id": album_id,
+            "title": title,
+            "artist_display": _text(_value(raw, "artist", "Artist", "AlbumArtist")),
+            "album_artist_display": _text(
+                _value(raw, "albumArtist", "AlbumArtist", "albumartist")
+            ),
+            "disc_number": _integer(
+                _value(raw, "discNumber", "ParentIndexNumber", "disc", "discnumber")
+            ),
+            "track_number": _integer(
+                _value(raw, "track", "trackNumber", "IndexNumber", "tracknum")
+            ),
+            "duration_ms": media["duration_ms"],
+            "content_kind": kind,
+            "release_type": _text(_value(raw, "releaseType", "albumType")),
+            "cover_art_id": art["cover_art_id"],
+            "streamable": bool(_value(raw, "streamable", "IsPlayable", default=True)),
+            "downloadable": bool(_value(raw, "downloadable", default=True)),
+            "analysis_eligible": kind == "music",
+            "provider_type": provider_type,
+        }
+        payload = _safe_payload(raw)
+        tracks.append(
+            {
+                "track_id": track_id,
+                **metadata,
+                "payload": payload,
+                "metadata_fp": fingerprint(metadata),
+                "media_fp": fingerprint(media),
+                "artwork_fp": fingerprint(art),
+            }
+        )
+        library_id = _text(_value(raw, "musicFolderId", "LibraryId", "library_id"))
+        if library_id:
+            entity_libraries.append(
+                {"entity_type": "track", "entity_id": track_id, "library_id": library_id}
+            )
+
+    artists = []
+    for artist in artists_by_id.values():
+        metadata = {
+            "name": artist["name"],
+            "identity_provenance": artist["identity_provenance"],
+        }
+        artists.append(
+            {
+                **artist,
+                "payload": metadata,
+                "metadata_fp": fingerprint(metadata),
+            }
+        )
+    return {
+        "libraries": sorted(libraries, key=lambda row: row["library_id"]),
+        "artists": sorted(artists, key=lambda row: row["artist_id"]),
+        "albums": sorted(albums_by_id.values(), key=lambda row: row["album_id"]),
+        "tracks": sorted(tracks, key=lambda row: row["track_id"]),
+        "track_artists": track_artists,
+        "album_artists": album_artists,
+        "entity_libraries": entity_libraries,
+    }
 
 
 def migrate_catalog(db):
@@ -278,6 +599,357 @@ def migrate_catalog(db):
     cur.close()
 
 
+def _chunks(rows, size=1000):
+    for offset in range(0, len(rows), size):
+        yield rows[offset : offset + size]
+
+
+def _json_param(value):
+    return canonical_json(value)
+
+
+def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, rows, now):
+    table_name, id_column = ENTITY_TABLES[entity_type]
+    common = ["catalog_instance_id", "published_generation", id_column]
+    if entity_type == "library":
+        fields = ["name", "sort_name", "display_order", "metadata_fp", "payload"]
+    elif entity_type == "artist":
+        fields = [
+            "name", "sort_name", "identity_provenance", "cover_art_id", "metadata_fp", "payload"
+        ]
+    elif entity_type == "album":
+        fields = [
+            "name", "sort_name", "album_artist_display", "added_at", "release_type",
+            "content_kind", "cover_art_id", "metadata_fp", "artwork_fp", "payload",
+        ]
+    else:
+        fields = [
+            "album_id", "title", "artist_display", "album_artist_display", "disc_number",
+            "track_number", "duration_ms", "content_kind", "release_type", "cover_art_id",
+            "streamable", "downloadable", "analysis_eligible", "metadata_fp", "media_fp",
+            "artwork_fp", "payload",
+        ]
+    columns = common + fields + ["available", "first_seen_at", "last_seen_at", "deleted_at"]
+    placeholders = ["%s"] * len(columns)
+    placeholders[columns.index("payload")] = "%s::jsonb"
+    sql = f"INSERT INTO {t(table_name)} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
+    params = []
+    for row in rows:
+        values = [catalog_instance_id, generation, row[id_column]]
+        for field in fields:
+            value = row.get(field)
+            values.append(_json_param(value) if field == "payload" else value)
+        values.extend([True, now, now, None])
+        params.append(tuple(values))
+    for batch in _chunks(params):
+        cur.executemany(sql, batch)
+
+
+def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
+    relations = (
+        (
+            "catalog_track_artists",
+            normalized["track_artists"],
+            ("track_id", "position", "artist_id", "name", "identity_provenance"),
+            "artist",
+        ),
+        (
+            "catalog_album_artists",
+            normalized["album_artists"],
+            ("album_id", "position", "artist_id", "name", "identity_provenance"),
+            "album_artist",
+        ),
+    )
+    for table_name, rows, fields, role in relations:
+        if not rows:
+            continue
+        entity_id, position, artist_id, display_name, provenance = fields
+        sql = f"""
+            INSERT INTO {t(table_name)}
+                (catalog_instance_id, published_generation, {entity_id}, position,
+                 artist_id, display_name, role, identity_provenance, payload)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+        """
+        params = [
+            (
+                catalog_instance_id,
+                generation,
+                row[entity_id],
+                row[position],
+                row.get(artist_id),
+                row[display_name],
+                role,
+                row.get(provenance),
+                "{}",
+            )
+            for row in rows
+        ]
+        for batch in _chunks(params):
+            cur.executemany(sql, batch)
+    membership = normalized["entity_libraries"]
+    if membership:
+        sql = f"""
+            INSERT INTO {t('catalog_entity_libraries')}
+                (catalog_instance_id, published_generation, entity_type, entity_id, library_id)
+            VALUES (%s, %s, %s, %s, %s)
+        """
+        cur.executemany(
+            sql,
+            [
+                (
+                    catalog_instance_id,
+                    generation,
+                    row["entity_type"],
+                    row["entity_id"],
+                    row["library_id"],
+                )
+                for row in membership
+            ],
+        )
+
+
+def _published_fingerprints(cur, entity_type, catalog_instance_id, generation):
+    table_name, id_column = ENTITY_TABLES[entity_type]
+    fp_columns = "metadata_fp"
+    if entity_type == "album":
+        fp_columns += ", artwork_fp"
+    elif entity_type == "track":
+        fp_columns += ", media_fp, artwork_fp"
+    cur.execute(
+        f"SELECT {id_column}, {fp_columns} FROM {t(table_name)} "
+        "WHERE catalog_instance_id=%s AND published_generation=%s AND available=TRUE",
+        (catalog_instance_id, generation),
+    )
+    return {str(row[0]): tuple(row[1:]) for row in cur.fetchall()}
+
+
+def _row_fingerprints(entity_type, row):
+    values = [row["metadata_fp"]]
+    if entity_type == "album":
+        values.append(row["artwork_fp"])
+    elif entity_type == "track":
+        values.extend((row["media_fp"], row["artwork_fp"]))
+    return tuple(values)
+
+
+def _coverage(normalized):
+    fields = {
+        "track_number": "track_number",
+        "disc_number": "disc_number",
+        "duration_ms": "duration_ms",
+        "media_type": "content_kind",
+        "release_type": "release_type",
+        "cover_art_id": "cover_art_id",
+        "artist_credits": None,
+        "library_membership": None,
+    }
+    total = len(normalized["tracks"])
+    result = {}
+    for public_name, field in fields.items():
+        if public_name == "artist_credits":
+            count = len({row["track_id"] for row in normalized["track_artists"]})
+        elif public_name == "library_membership":
+            count = len(
+                {
+                    row["entity_id"]
+                    for row in normalized["entity_libraries"]
+                    if row["entity_type"] == "track"
+                }
+            )
+        else:
+            count = sum(row.get(field) is not None for row in normalized["tracks"])
+        result[public_name] = {
+            "present": count,
+            "total": total,
+            "ratio": round(count / total, 6) if total else 0.0,
+        }
+    return result
+
+
+def _state_counts(value):
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return {}
+    return {}
+
+
+def refresh_catalog(server_id=None, db=None, bridge=None):
+    """Fetch, validate, and atomically publish one provider catalogue generation."""
+    if db is None:
+        from plugin.api import get_db
+
+        db = get_db()
+    provider_bridge = bridge or ProviderCatalogBridge()
+    servers = provider_bridge.list_servers()
+    if not server_id:
+        if len(servers) != 1:
+            raise CatalogScanError("An explicit server_id is required when multiple servers are configured")
+        server_id = servers[0]["server_id"]
+    server = provider_bridge.require_server(server_id)
+    ensure_catalog_sources(db, bridge=provider_bridge)
+    cur = db.cursor()
+    cur.execute(
+        f"SELECT catalog_instance_id FROM {t('catalog_sources')} "
+        "WHERE current_core_server_id=%s AND rebind_status='active'",
+        (server_id,),
+    )
+    source = cur.fetchone()
+    if source is None:
+        cur.close()
+        raise CatalogScanError("Catalogue source is not initialized or is awaiting continuity review")
+    catalog_instance_id = str(source[0])
+    scan_id = str(uuid.uuid4())
+    cur.execute(
+        f"SELECT published_generation, catalog_epoch, catalog_head_seq, entity_counts "
+        f"FROM {t('catalog_state')} WHERE catalog_instance_id=%s FOR UPDATE",
+        (catalog_instance_id,),
+    )
+    state = cur.fetchone()
+    if state is None:
+        cur.close()
+        raise CatalogScanError("Catalogue state is missing")
+    previous_generation, epoch, head_seq, previous_counts = state
+    cur.execute(
+        f"INSERT INTO {t('catalog_scans')} "
+        "(scan_id, catalog_instance_id, core_server_id, status, progress) "
+        "VALUES (%s, %s, %s, 'scanning', '{}'::jsonb)",
+        (scan_id, catalog_instance_id, server_id),
+    )
+    cur.execute(
+        f"UPDATE {t('catalog_state')} SET status='scanning', started_at=now(), "
+        "last_error=NULL, updated_at=now() WHERE catalog_instance_id=%s",
+        (catalog_instance_id,),
+    )
+    cur.close()
+    db.commit()
+
+    try:
+        raw = provider_bridge.fetch_catalog(server_id)
+        normalized = normalize_provider_catalog(raw, server["provider_type"])
+        counts = {
+            entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER
+        }
+        old_track_count = int(_state_counts(previous_counts).get("track", 0) or 0)
+        if old_track_count and counts["track"] == 0:
+            raise CatalogScanError("Refusing to replace a non-empty catalogue with an empty scan")
+
+        cur = db.cursor()
+        cur.execute(
+            f"SELECT published_generation, catalog_epoch, catalog_head_seq "
+            f"FROM {t('catalog_state')} WHERE catalog_instance_id=%s FOR UPDATE",
+            (catalog_instance_id,),
+        )
+        locked_generation, locked_epoch, locked_head = cur.fetchone()
+        if int(locked_generation) != int(previous_generation) or str(locked_epoch) != str(epoch):
+            raise CatalogScanError("Catalogue publication moved while this scan was running")
+        generation = int(previous_generation) + 1
+        now = utc_now()
+        changes = []
+        for entity_type in ENTITY_ORDER:
+            rows = normalized[ENTITY_COLLECTIONS[entity_type]]
+            old = _published_fingerprints(
+                cur, entity_type, catalog_instance_id, previous_generation
+            )
+            current = {row[ENTITY_TABLES[entity_type][1]]: row for row in rows}
+            for entity_id, row in current.items():
+                if old.get(entity_id) != _row_fingerprints(entity_type, row):
+                    changes.append((entity_type, entity_id, "upsert", row))
+            _insert_generation_rows(
+                cur, entity_type, catalog_instance_id, generation, rows, now
+            )
+            for entity_id in sorted(set(old) - set(current)):
+                changes.append((entity_type, entity_id, "delete", None))
+        _insert_relationship_rows(cur, catalog_instance_id, generation, normalized)
+
+        ordered_changes = [c for c in changes if c[2] == "upsert"]
+        ordered_changes.sort(key=lambda c: (ENTITY_ORDER.index(c[0]), c[1]))
+        deletes = [c for c in changes if c[2] == "delete"]
+        deletes.sort(key=lambda c: (-ENTITY_ORDER.index(c[0]), c[1]))
+        ordered_changes.extend(deletes)
+        next_seq = int(locked_head)
+        for entity_type, entity_id, operation, payload in ordered_changes:
+            next_seq += 1
+            cur.execute(
+                f"""
+                INSERT INTO {t('catalog_changes')}
+                    (catalog_instance_id, epoch, seq, generation, entity_type,
+                     entity_id, operation, payload)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                """,
+                (
+                    catalog_instance_id,
+                    epoch,
+                    next_seq,
+                    generation,
+                    entity_type,
+                    entity_id,
+                    operation,
+                    _json_param(payload) if payload is not None else None,
+                ),
+            )
+        coverage = _coverage(normalized)
+        field_support = {
+            name: "observed" if value["present"] else "not_observed"
+            for name, value in coverage.items()
+        }
+        cur.execute(
+            f"""
+            UPDATE {t('catalog_state')}
+               SET published_generation=%s, catalog_head_seq=%s, status='complete',
+                   entity_counts=%s::jsonb, field_support=%s::jsonb,
+                   field_coverage=%s::jsonb, completed_at=now(), last_error=NULL,
+                   updated_at=now()
+             WHERE catalog_instance_id=%s
+            """,
+            (
+                generation,
+                next_seq,
+                _json_param(counts),
+                _json_param(field_support),
+                _json_param(coverage),
+                catalog_instance_id,
+            ),
+        )
+        cur.execute(
+            f"UPDATE {t('catalog_scans')} SET status='complete', completed_at=now(), "
+            "progress=%s::jsonb WHERE scan_id=%s",
+            (_json_param(counts), scan_id),
+        )
+        cur.close()
+        db.commit()
+        return {
+            "catalog_instance_id": catalog_instance_id,
+            "server_id": server_id,
+            "generation": generation,
+            "cursor": {"epoch": str(epoch), "seq": next_seq},
+            "counts": counts,
+            "field_coverage": coverage,
+            "changes": len(ordered_changes),
+        }
+    except Exception as exc:
+        rollback = getattr(db, "rollback", None)
+        if callable(rollback):
+            rollback()
+        cur = db.cursor()
+        cur.execute(
+            f"UPDATE {t('catalog_state')} SET status='failed', last_error=%s, "
+            "updated_at=now() WHERE catalog_instance_id=%s",
+            (str(exc)[:1000], catalog_instance_id),
+        )
+        cur.execute(
+            f"UPDATE {t('catalog_scans')} SET status='failed', completed_at=now(), "
+            "last_error=%s WHERE scan_id=%s",
+            (str(exc)[:1000], scan_id),
+        )
+        cur.close()
+        db.commit()
+        raise
+
+
 def _entity_table_sql(
     table_name,
     id_column,
@@ -441,4 +1113,3 @@ def accept_legacy_rebind(db, catalog_instance_id, core_server_id, evidence):
     )
     cur.close()
     return True
-

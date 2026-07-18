@@ -1627,7 +1627,16 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
     )
-    assert all("INSERT INTO cron" not in sql for sql, _params in db.cursor_obj.executed)
+    cron_inserts = [
+        params for sql, params in db.cursor_obj.executed if "INSERT INTO cron" in sql
+    ]
+    assert cron_inserts == [
+        (
+            mod.CATALOG_REFRESH_TASK_TYPE,
+            mod.CATALOG_REFRESH_TASK_TYPE,
+            "17 */6 * * *",
+        )
+    ]
     migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
     assert "plugin_lumae_analysis__collections" in migration_sql
     assert "plugin_lumae_analysis__collection_items" in migration_sql
@@ -1775,7 +1784,274 @@ def test_v2_source_requires_proven_continuity_before_v3_rebind(monkeypatch):
     )
 
 
-def test_register_uses_analysis_hook_without_default_cron(monkeypatch):
+@pytest.mark.parametrize(
+    ("provider_type", "track"),
+    [
+        (
+            "navidrome",
+            {
+                "id": "track-1",
+                "title": "Song",
+                "albumId": "album-1",
+                "album": "Record",
+                "artistId": "artist-1",
+                "artist": "Artist",
+                "track": 4,
+                "discNumber": 2,
+                "duration": 201.25,
+                "suffix": "flac",
+                "musicFolderId": "library-1",
+                "path": "/never/send/this.flac",
+            },
+        ),
+        (
+            "jellyfin",
+            {
+                "Id": "track-1",
+                "Name": "Song",
+                "AlbumId": "album-1",
+                "Album": "Record",
+                "ArtistItems": [{"Id": "artist-1", "Name": "Artist"}],
+                "IndexNumber": 4,
+                "ParentIndexNumber": 2,
+                "RunTimeTicks": 2_012_500_000,
+                "MediaSources": [{"Container": "flac"}],
+                "LibraryId": "library-1",
+                "Path": "C:\\never-send\\this.flac",
+                "UserData": {"PlayCount": 99},
+            },
+        ),
+        (
+            "emby",
+            {
+                "Id": "track-1",
+                "Name": "Song",
+                "ParentId": "album-1",
+                "Album": "Record",
+                "Artists": ["Artist"],
+                "IndexNumber": 4,
+                "ParentIndexNumber": 2,
+                "RunTimeTicks": 2_012_500_000,
+                "LibraryId": "library-1",
+            },
+        ),
+        (
+            "lyrion",
+            {
+                "id": "track-1",
+                "title": "Song",
+                "album_id": "album-1",
+                "album": "Record",
+                "artist": "Artist",
+                "tracknum": 4,
+                "discnumber": 2,
+                "duration": 201.25,
+                "url": "file:///never/send/this.flac",
+            },
+        ),
+    ],
+)
+def test_provider_catalog_normalization_keeps_rich_order_and_strips_private_fields(
+    provider_type, track
+):
+    from plugins.LumaeAnalysis.catalog import canonical_json, normalize_provider_catalog
+
+    normalized = normalize_provider_catalog(
+        {
+            "libraries": [{"id": "library-1", "name": "Music"}],
+            "albums": [{"id": "album-1", "name": "Record", "AlbumArtist": "Artist"}],
+            "tracks": [track],
+        },
+        provider_type,
+    )
+    row = normalized["tracks"][0]
+    assert row["track_id"] == "track-1"
+    assert row["album_id"] == "album-1"
+    assert row["track_number"] == 4
+    assert row["disc_number"] == 2
+    assert row["duration_ms"] == 201250
+    assert row["content_kind"] == "music"
+    assert "never-send" not in canonical_json(row["payload"])
+    assert "PlayCount" not in canonical_json(row["payload"])
+
+
+def test_catalog_fingerprints_separate_metadata_media_and_artwork_changes():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    base = {
+        "id": "track-1",
+        "title": "Song",
+        "albumId": "album-1",
+        "album": "Record",
+        "duration": 100,
+        "suffix": "flac",
+        "coverArt": "cover-a",
+    }
+
+    def normalized(**changes):
+        track = {**base, **changes}
+        return normalize_provider_catalog({"tracks": [track]}, "navidrome")["tracks"][0]
+
+    original = normalized()
+    title_edit = normalized(title="Song (Edit)")
+    media_edit = normalized(duration=101)
+    art_edit = normalized(coverArt="cover-b")
+
+    assert title_edit["metadata_fp"] != original["metadata_fp"]
+    assert title_edit["media_fp"] == original["media_fp"]
+    assert media_edit["media_fp"] != original["media_fp"]
+    assert media_edit["artwork_fp"] == original["artwork_fp"]
+    assert art_edit["artwork_fp"] != original["artwork_fp"]
+    assert art_edit["media_fp"] == original["media_fp"]
+
+
+def test_catalog_keeps_distinct_provider_occurrences_with_identical_media():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    tracks = [
+        {
+            "id": "occurrence-a",
+            "title": "Same Audio",
+            "albumId": "album-a",
+            "album": "Edition A",
+            "duration": 180,
+        },
+        {
+            "id": "occurrence-b",
+            "title": "Same Audio",
+            "albumId": "album-b",
+            "album": "Edition B",
+            "duration": 180,
+        },
+    ]
+    normalized = normalize_provider_catalog({"tracks": tracks}, "navidrome")
+
+    assert [row["track_id"] for row in normalized["tracks"]] == [
+        "occurrence-a",
+        "occurrence-b",
+    ]
+    assert normalized["tracks"][0]["media_fp"] == normalized["tracks"][1]["media_fp"]
+
+
+class RefreshCursor(FakeCursor):
+    def __init__(self, db):
+        super().__init__([])
+        self.db = db
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        self.db.executed.append((sql, params))
+        if "SELECT catalog_instance_id, current_core_server_id" in sql:
+            self.rows = [("catalog-a", "server-a", "navidrome", "active")]
+        elif "SELECT catalog_instance_id FROM" in sql and "catalog_sources" in sql:
+            self.rows = [("catalog-a",)]
+        elif "published_generation, catalog_epoch, catalog_head_seq, entity_counts" in sql:
+            self.rows = [(0, "epoch-a", 0, self.db.previous_counts)]
+        elif "published_generation, catalog_epoch, catalog_head_seq" in sql:
+            self.rows = [(0, "epoch-a", 0)]
+        elif sql.lstrip().startswith("SELECT") and "available=TRUE" in sql:
+            self.rows = []
+        else:
+            self.rows = []
+
+    def executemany(self, sql, params):
+        materialized = list(params)
+        self.db.executed.append((sql, materialized))
+
+
+class RefreshDb:
+    def __init__(self, previous_counts=None):
+        self.previous_counts = previous_counts or {}
+        self.executed = []
+        self.commits = 0
+        self.rollbacks = 0
+
+    def cursor(self):
+        return RefreshCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+class RefreshBridge:
+    def __init__(self, payload=None, error=None):
+        self.payload = payload or {"tracks": []}
+        self.error = error
+
+    def list_servers(self):
+        return [self.require_server("server-a")]
+
+    def require_server(self, server_id):
+        assert server_id == "server-a"
+        return {
+            "server_id": "server-a",
+            "name": "Server",
+            "provider_type": "navidrome",
+            "is_default": True,
+            "supported": True,
+        }
+
+    def fetch_catalog(self, server_id):
+        if self.error:
+            raise self.error
+        return self.payload
+
+
+def test_refresh_catalog_publishes_complete_generation_and_coverage():
+    from plugins.LumaeAnalysis.catalog import refresh_catalog
+
+    db = RefreshDb()
+    bridge = RefreshBridge(
+        {
+            "libraries": [{"id": "library-1", "name": "Music"}],
+            "tracks": [
+                {
+                    "id": "track-1",
+                    "title": "Song",
+                    "track": 1,
+                    "discNumber": 1,
+                    "duration": 123,
+                    "musicFolderId": "library-1",
+                }
+            ],
+        }
+    )
+
+    result = refresh_catalog("server-a", db=db, bridge=bridge)
+
+    assert result["generation"] == 1
+    assert result["counts"] == {"library": 1, "artist": 0, "album": 0, "track": 1}
+    assert result["field_coverage"]["track_number"]["ratio"] == 1.0
+    assert db.commits == 2
+    assert db.rollbacks == 0
+    assert any("catalog_changes" in sql for sql, _params in db.executed)
+
+
+def test_refresh_catalog_failure_keeps_prior_generation_and_records_error():
+    from plugins.LumaeAnalysis.catalog import refresh_catalog
+
+    db = RefreshDb(previous_counts={"track": 3})
+    bridge = RefreshBridge(error=RuntimeError("provider unavailable"))
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        refresh_catalog("server-a", db=db, bridge=bridge)
+
+    assert db.rollbacks == 1
+    assert db.commits == 2
+    assert not any(
+        "SET published_generation" in sql for sql, _params in db.executed
+    )
+    assert any(
+        "status='failed'" in sql and params[0] == "provider unavailable"
+        for sql, params in db.executed
+        if params
+    )
+
+
+def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     mod = load_plugin()
     ctx = FakeCtx()
 
@@ -1785,7 +2061,7 @@ def test_register_uses_analysis_hook_without_default_cron(monkeypatch):
     assert ctx.settings_endpoint == "lumae_analysis.settings"
     assert ctx.install_hooks == [mod.migrate]
     assert ctx.song_hooks == [mod.analyze_song_hook]
-    assert ctx.cron_tasks == []
+    assert ctx.cron_tasks == [("catalog_refresh", mod.catalog_refresh_task, "default")]
     assert ctx.menu_items == []
 
 
