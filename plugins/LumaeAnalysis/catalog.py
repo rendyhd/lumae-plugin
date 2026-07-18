@@ -1183,6 +1183,7 @@ def create_bootstrap_session(
         "server_id": source["server_id"],
         "generation": generation,
         "snapshot_cursor": opaque_cursor(source["catalog_instance_id"], epoch, seq),
+        "snapshot_seq": seq,
         "totals": totals,
         "expires_in_seconds": max(5, min(int(lifetime_minutes), 60)) * 60,
     }
