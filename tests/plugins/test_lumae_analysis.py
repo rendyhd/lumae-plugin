@@ -266,7 +266,11 @@ def test_catalog_refresh_coalesces_to_selected_source(monkeypatch):
             {
                 "server_id": "server-a",
                 "catalog_instance_id": "catalog-a",
-                "catalog": {"generation": 3, "status": "complete", "completed_at": None},
+                "catalog": {
+                    "generation": 3,
+                    "status": "complete",
+                    "completed_at": None,
+                },
             }
         ],
     )
@@ -292,9 +296,7 @@ def test_catalog_refresh_coalesces_to_selected_source(monkeypatch):
     ("version", "expected_status"),
     [("v2.5.0", "core_too_old"), ("v4.0.0", "core_untested")],
 )
-def test_catalog_health_rejects_unsupported_core_before_server_work(
-    monkeypatch, version, expected_status
-):
+def test_catalog_health_rejects_unsupported_core_before_server_work(monkeypatch, version, expected_status):
     mod = load_plugin()
     monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", version)
 
@@ -441,7 +443,9 @@ def test_collection_backup_routes_are_scoped_to_the_authenticated_user(monkeypat
     assert seen == [("user:alice", None), ("user:alice", "collection-7")]
 
 
-def test_collection_restore_route_validates_checksum_and_uses_current_principal(monkeypatch):
+def test_collection_restore_route_validates_checksum_and_uses_current_principal(
+    monkeypatch,
+):
     mod = load_plugin()
     collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
     restored = []
@@ -449,12 +453,14 @@ def test_collection_restore_route_validates_checksum_and_uses_current_principal(
     monkeypatch.setattr(
         collections,
         "_restore_principal_collections",
-        lambda principal, payload: restored.append((principal, payload))
-        or {
-            "collections": [{"id": "restored-1", "name": payload[0]["name"]}],
-            "collection_count": 1,
-            "item_count": 1,
-        },
+        lambda principal, payload: (
+            restored.append((principal, payload))
+            or {
+                "collections": [{"id": "restored-1", "name": payload[0]["name"]}],
+                "collection_count": 1,
+                "item_count": 1,
+            }
+        ),
     )
     app = Flask(__name__)
 
@@ -481,7 +487,9 @@ def test_collection_restore_route_validates_checksum_and_uses_current_principal(
     assert len(restored) == 1
 
 
-def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(monkeypatch):
+def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(
+    monkeypatch,
+):
     collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
 
     class RestoreCursor:
@@ -512,9 +520,7 @@ def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(
     monkeypatch.setattr(
         collections,
         "_upsert_item",
-        lambda cur, principal, collection_id, item: upserts.append(
-            (principal, collection_id, item.copy())
-        ),
+        lambda cur, principal, collection_id, item: upserts.append((principal, collection_id, item.copy())),
     )
     monkeypatch.setattr(
         collections,
@@ -582,18 +588,34 @@ def test_collection_library_normalizes_live_track_and_disc_numbers():
 
 def test_album_detail_uses_provider_catalog_order_and_analysis_links(monkeypatch):
     library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
-    monkeypatch.setattr(library, "_score_album_tracks", lambda *args, **kwargs: [
-        {
-            "track_id": "track-2", "title": "Second", "artist": "Artist",
-            "album": "Album", "track_number": 2, "disc_number": 1,
-            "analyzed": False, "album_id": "album-1", "provider_type": "navidrome",
-        },
-        {
-            "track_id": "track-1", "title": "First", "artist": "Artist",
-            "album": "Album", "track_number": 1, "disc_number": 1,
-            "analyzed": True, "album_id": "album-1", "provider_type": "navidrome",
-        },
-    ])
+    monkeypatch.setattr(
+        library,
+        "_score_album_tracks",
+        lambda *args, **kwargs: [
+            {
+                "track_id": "track-2",
+                "title": "Second",
+                "artist": "Artist",
+                "album": "Album",
+                "track_number": 2,
+                "disc_number": 1,
+                "analyzed": False,
+                "album_id": "album-1",
+                "provider_type": "navidrome",
+            },
+            {
+                "track_id": "track-1",
+                "title": "First",
+                "artist": "Artist",
+                "album": "Album",
+                "track_number": 1,
+                "disc_number": 1,
+                "analyzed": True,
+                "album_id": "album-1",
+                "provider_type": "navidrome",
+            },
+        ],
+    )
 
     detail = library.album_detail("Album", "Artist", provider_album_id="album-1")
 
@@ -609,9 +631,9 @@ def test_lyrion_album_detail_requests_documented_track_and_disc_order(monkeypatc
     library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
     calls = []
     lyrion = types.ModuleType("tasks.mediaserver.lyrion")
-    lyrion._jsonrpc_request = lambda command, params: calls.append((command, params)) or {
-        "titles_loop": [{"id": "7", "title": "Track", "track": 3, "disc": 2}]
-    }
+    lyrion._jsonrpc_request = lambda command, params: (
+        calls.append((command, params)) or {"titles_loop": [{"id": "7", "title": "Track", "track": 3, "disc": 2}]}
+    )
     lyrion._lyrion_is_remote = lambda row: False
     mediaserver = types.ModuleType("tasks.mediaserver")
     mediaserver.lyrion = lyrion
@@ -666,7 +688,9 @@ def test_collection_library_route_forwards_scope_search_sort_and_artist(monkeypa
     }
 
 
-def test_collection_library_rejects_broad_partial_queries_before_database_work(monkeypatch):
+def test_collection_library_rejects_broad_partial_queries_before_database_work(
+    monkeypatch,
+):
     library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
     monkeypatch.setattr(
         library,
@@ -1182,16 +1206,100 @@ def test_analyze_buffer_uses_100ms_chunks_and_expected_ramp_encoding(monkeypatch
     ]
     assert result.start_ramp_blob == bytes(
         [
-            166, 1, 0, 196, 1, 0, 216, 1, 0, 226, 1, 0, 232, 1, 0,
-            235, 1, 0, 238, 1, 0, 241, 1, 0, 244, 1, 0, 247, 1, 0,
-            250, 1, 0, 253, 1, 0, 0, 2, 0, 3, 2, 0, 6, 2, 0,
+            166,
+            1,
+            0,
+            196,
+            1,
+            0,
+            216,
+            1,
+            0,
+            226,
+            1,
+            0,
+            232,
+            1,
+            0,
+            235,
+            1,
+            0,
+            238,
+            1,
+            0,
+            241,
+            1,
+            0,
+            244,
+            1,
+            0,
+            247,
+            1,
+            0,
+            250,
+            1,
+            0,
+            253,
+            1,
+            0,
+            0,
+            2,
+            0,
+            3,
+            2,
+            0,
+            6,
+            2,
+            0,
         ]
     )
     assert result.end_ramp_blob == bytes(
         [
-            166, 0, 0, 196, 0, 0, 216, 0, 0, 226, 0, 0, 232, 0, 0,
-            235, 0, 0, 238, 0, 0, 241, 0, 0, 244, 0, 0, 247, 0, 0,
-            250, 0, 0, 253, 0, 0, 0, 0, 0, 3, 0, 0, 6, 0, 0,
+            166,
+            0,
+            0,
+            196,
+            0,
+            0,
+            216,
+            0,
+            0,
+            226,
+            0,
+            0,
+            232,
+            0,
+            0,
+            235,
+            0,
+            0,
+            238,
+            0,
+            0,
+            241,
+            0,
+            0,
+            244,
+            0,
+            0,
+            247,
+            0,
+            0,
+            250,
+            0,
+            0,
+            253,
+            0,
+            0,
+            0,
+            0,
+            0,
+            3,
+            0,
+            0,
+            6,
+            0,
+            0,
         ]
     )
 
@@ -1333,9 +1441,7 @@ class FakeCtx:
         self.settings_endpoint = endpoint
 
     def add_menu_item(self, label, endpoint, admin_only=False):
-        self.menu_items.append(
-            {"label": label, "endpoint": endpoint, "admin_only": admin_only}
-        )
+        self.menu_items.append({"label": label, "endpoint": endpoint, "admin_only": admin_only})
 
     def on_install(self, func):
         self.install_hooks.append(func)
@@ -1429,7 +1535,11 @@ def test_analyze_one_track_cleans_downloaded_file_when_analysis_fails(monkeypatc
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
     monkeypatch.setattr(mod, "media_server_download_available", lambda: True, raising=False)
     monkeypatch.setattr(mod, "download_track_to_temp", lambda item: str(downloaded), raising=False)
-    monkeypatch.setattr(mod, "analyze_file", lambda path: (_ for _ in ()).throw(RuntimeError("decode failed")))
+    monkeypatch.setattr(
+        mod,
+        "analyze_file",
+        lambda path: (_ for _ in ()).throw(RuntimeError("decode failed")),
+    )
 
     result = mod.analyze_one_track("track-a")
 
@@ -1485,7 +1595,11 @@ def test_analyze_one_track_persists_failed_profile(monkeypatch, tmp_path):
     db = FakeDb(rows=[("track-a", str(audio))])
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
-    monkeypatch.setattr(mod, "analyze_file", lambda path: (_ for _ in ()).throw(RuntimeError("decode failed")))
+    monkeypatch.setattr(
+        mod,
+        "analyze_file",
+        lambda path: (_ for _ in ()).throw(RuntimeError("decode failed")),
+    )
 
     result = mod.analyze_one_track("track-a")
 
@@ -1505,7 +1619,13 @@ def test_find_backfill_ids_includes_missing_old_and_signature_changed_but_not_fa
         ("old-analyzer", str(current), "old-sig", 0, "ready"),
         ("changed-media", str(current), "old-sig", mod.ANALYZER_VERSION, "ready"),
         ("failed-once", str(current), "old-sig", mod.ANALYZER_VERSION, "failed"),
-        ("unchanged-ready", str(unchanged), unchanged_sig, mod.ANALYZER_VERSION, "ready"),
+        (
+            "unchanged-ready",
+            str(unchanged),
+            unchanged_sig,
+            mod.ANALYZER_VERSION,
+            "ready",
+        ),
     ]
     monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
@@ -1525,7 +1645,13 @@ def test_find_backfill_ids_includes_explicit_stale_rows(monkeypatch, tmp_path):
     rows = [
         ("stale-track", str(current), "same-sig", mod.ANALYZER_VERSION, "stale"),
         ("failed-once", str(current), "same-sig", mod.ANALYZER_VERSION, "failed"),
-        ("skipped-once", str(missing), "same-sig", mod.ANALYZER_VERSION, "skipped_no_file"),
+        (
+            "skipped-once",
+            str(missing),
+            "same-sig",
+            mod.ANALYZER_VERSION,
+            "skipped_no_file",
+        ),
     ]
     monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
@@ -1653,7 +1779,11 @@ def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch)
     calls = []
 
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 3)
-    monkeypatch.setattr(mod, "find_backfill_ids", lambda limit: calls.append(("find", limit)) or ["a", "b"])
+    monkeypatch.setattr(
+        mod,
+        "find_backfill_ids",
+        lambda limit: calls.append(("find", limit)) or ["a", "b"],
+    )
     monkeypatch.setattr(mod, "mark_pending", lambda ids: calls.append(("mark_pending", ids)))
     monkeypatch.setattr(
         mod,
@@ -1721,9 +1851,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
     )
-    cron_inserts = [
-        params for sql, params in db.cursor_obj.executed if "INSERT INTO cron" in sql
-    ]
+    cron_inserts = [params for sql, params in db.cursor_obj.executed if "INSERT INTO cron" in sql]
     assert cron_inserts == [
         (
             mod.CATALOG_REFRESH_TASK_TYPE,
@@ -1782,9 +1910,7 @@ def test_core_adapters_normalize_equivalent_v2_and_v3_analysis_events(monkeypatc
     from plugins.LumaeAnalysis.core_v3 import AudioMuseV3Adapter
 
     v2 = AudioMuseV2Adapter().normalize_analysis_hook({"item_id": "provider-track"})
-    v3 = AudioMuseV3Adapter().normalize_analysis_hook(
-        {"item_id": "provider-track", "server_id": "server-a"}
-    )
+    v3 = AudioMuseV3Adapter().normalize_analysis_hook({"item_id": "provider-track", "server_id": "server-a"})
 
     assert v2["provider_track_id"] == v3["provider_track_id"] == "provider-track"
     assert v2["server_id"] == "legacy-default"
@@ -1839,7 +1965,10 @@ class RebindDb(FakeDb):
 
 
 def test_v2_source_requires_proven_continuity_before_v3_rebind(monkeypatch):
-    from plugins.LumaeAnalysis.catalog import accept_legacy_rebind, ensure_catalog_sources
+    from plugins.LumaeAnalysis.catalog import (
+        accept_legacy_rebind,
+        ensure_catalog_sources,
+    )
 
     source_id = "stable-catalog-id"
     db = RebindDb(
@@ -1877,14 +2006,14 @@ def test_v2_source_requires_proven_continuity_before_v3_rebind(monkeypatch):
         },
     )
     assert accepted is True
-    assert any(
-        params == ("server-a", source_id) and "catalog_sources" in sql
-        for sql, params in db.cursor_obj.executed
-    )
+    assert any(params == ("server-a", source_id) and "catalog_sources" in sql for sql, params in db.cursor_obj.executed)
 
 
 def test_catalog_scope_evidence_is_order_independent_and_scope_sensitive():
-    from plugins.LumaeAnalysis.catalog import catalog_scope_evidence, verify_library_scope
+    from plugins.LumaeAnalysis.catalog import (
+        catalog_scope_evidence,
+        verify_library_scope,
+    )
 
     first = {
         "libraries": [{"library_id": "library-b"}, {"library_id": "library-a"}],
@@ -1908,9 +2037,7 @@ def test_catalog_scope_evidence_is_order_independent_and_scope_sensitive():
 
     expected = catalog_scope_evidence(first, "navidrome")
     assert catalog_scope_evidence(reordered, "navidrome") == expected
-    assert catalog_scope_evidence(changed_scope, "navidrome")["library_scope_fp"] != expected[
-        "library_scope_fp"
-    ]
+    assert catalog_scope_evidence(changed_scope, "navidrome")["library_scope_fp"] != expected["library_scope_fp"]
     assert "track-1" not in str(expected)
     assert "library-a" not in str(expected)
 
@@ -1961,10 +2088,7 @@ def test_automatic_rebind_accepts_only_an_exact_provider_projection(monkeypatch)
     monkeypatch.setattr(
         catalog,
         "accept_legacy_rebind",
-        lambda _db, source_id, server_id, evidence: accepted.append(
-            (source_id, server_id, evidence)
-        )
-        or True,
+        lambda _db, source_id, server_id, evidence: accepted.append((source_id, server_id, evidence)) or True,
     )
     db = AttemptDb()
 
@@ -1988,9 +2112,7 @@ def test_automatic_rebind_accepts_only_an_exact_provider_projection(monkeypatch)
     )
     monkeypatch.setattr(catalog, "_persisted_scope_evidence", lambda _db, _id: changed)
     accepted.clear()
-    blocked = catalog.attempt_legacy_rebind(
-        AttemptDb(), "catalog-a", "server-a", bridge=Bridge()
-    )
+    blocked = catalog.attempt_legacy_rebind(AttemptDb(), "catalog-a", "server-a", bridge=Bridge())
     assert blocked["status"] == "rebind_required"
     assert accepted == []
 
@@ -2062,9 +2184,7 @@ def test_automatic_rebind_accepts_only_an_exact_provider_projection(monkeypatch)
         ),
     ],
 )
-def test_provider_catalog_normalization_keeps_rich_order_and_strips_private_fields(
-    provider_type, track
-):
+def test_provider_catalog_normalization_keeps_rich_order_and_strips_private_fields(provider_type, track):
     from plugins.LumaeAnalysis.catalog import canonical_json, normalize_provider_catalog
 
     normalized = normalize_provider_catalog(
@@ -2084,6 +2204,149 @@ def test_provider_catalog_normalization_keeps_rich_order_and_strips_private_fiel
     assert row["content_kind"] == "music"
     assert "never-send" not in canonical_json(row["payload"])
     assert "PlayCount" not in canonical_json(row["payload"])
+
+
+def test_provider_catalog_publishes_relationships_and_rich_enrichment_in_stream_payloads():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    normalized = normalize_provider_catalog(
+        {
+            "libraries": [{"id": "library-1", "name": "Music"}],
+            "albums": [
+                {
+                    "id": "album-1",
+                    "name": "Record",
+                    "AlbumArtist": "Artist",
+                    "ProductionYear": 2026,
+                    "Genres": ["Ambient"],
+                }
+            ],
+            "tracks": [
+                {
+                    "id": "track-1",
+                    "title": "Song",
+                    "albumId": "album-1",
+                    "album": "Record",
+                    "ArtistItems": [{"Id": "artist-1", "Name": "Artist"}],
+                    "musicFolderId": "library-1",
+                    "tracknum": 7,
+                    "discnumber": 2,
+                    "discTitle": "Bonus Disc",
+                    "trackTotal": 9,
+                    "discTotal": 2,
+                    "suffix": "flac",
+                    "bitRate": 921000,
+                    "sampleRate": 48000,
+                    "bitDepth": 24,
+                    "channelCount": 2,
+                    "replayGain": {
+                        "trackGain": -4.25,
+                        "trackPeak": 0.91,
+                        "albumGain": -3.75,
+                    },
+                    "musicBrainzId": "mb-track-1",
+                    "isExplicit": True,
+                }
+            ],
+        },
+        "navidrome",
+    )
+
+    track = normalized["tracks"][0]
+    rich = track["payload"]["_lumae"]
+    assert track["track_number"] == 7
+    assert track["disc_number"] == 2
+    assert rich["disc_title"] == "Bonus Disc"
+    assert rich["track_total"] == 9
+    assert rich["disc_total"] == 2
+    assert rich["audio_properties"] == {
+        "duration_ms": None,
+        "container": "flac",
+        "bit_rate": 921000,
+        "sample_rate": 48000,
+        "bit_depth": 24,
+        "channels": 2,
+        "size": None,
+    }
+    assert rich["replay_gain"]["track_gain_db"] == -4.25
+    assert rich["replay_gain"]["track_peak"] == 0.91
+    assert rich["external_ids"]["musicbrainz"] == "mb-track-1"
+    assert rich["track_total"] == 9
+    assert normalized["albums"][0]["payload"]["_lumae"]["track_count"] == 1
+    assert rich["artist_credits"][0]["artist_id"] == "artist-1"
+    assert rich["library_ids"] == ["library-1"]
+    assert normalized["albums"][0]["payload"]["_lumae"]["library_ids"] == ["library-1"]
+    assert any(
+        row == {"entity_type": "track", "entity_id": "track-1", "library_id": "library-1"}
+        for row in normalized["entity_libraries"]
+    )
+
+
+def test_relationship_only_catalogue_edits_change_metadata_fingerprint():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    def normalized(library_id, artist_id):
+        return normalize_provider_catalog(
+            {
+                "tracks": [
+                    {
+                        "id": "track-1",
+                        "title": "Song",
+                        "ArtistItems": [{"Id": artist_id, "Name": "Artist"}],
+                        "musicFolderId": library_id,
+                    }
+                ]
+            },
+            "navidrome",
+        )["tracks"][0]
+
+    original = normalized("library-1", "artist-1")
+    moved_library = normalized("library-2", "artist-1")
+    rebound_artist = normalized("library-1", "artist-2")
+    assert moved_library["metadata_fp"] != original["metadata_fp"]
+    assert rebound_artist["metadata_fp"] != original["metadata_fp"]
+    assert moved_library["media_fp"] == original["media_fp"]
+
+
+def test_jellyfin_nested_audio_stream_properties_are_normalized():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    track = normalize_provider_catalog(
+        {
+            "tracks": [
+                {
+                    "Id": "track-1",
+                    "Name": "Song",
+                    "MediaSources": [
+                        {
+                            "Container": "flac",
+                            "Size": 123456,
+                            "MediaStreams": [
+                                {
+                                    "Type": "Audio",
+                                    "SampleRate": 96000,
+                                    "BitDepth": 24,
+                                    "Channels": 2,
+                                    "BitRate": 1800000,
+                                }
+                            ],
+                        }
+                    ],
+                }
+            ]
+        },
+        "jellyfin",
+    )["tracks"][0]
+
+    assert track["audio_properties"] == {
+        "duration_ms": None,
+        "container": "flac",
+        "bit_rate": 1800000,
+        "sample_rate": 96000,
+        "bit_depth": 24,
+        "channels": 2,
+        "size": 123456,
+    }
 
 
 def test_catalog_fingerprints_separate_metadata_media_and_artwork_changes():
@@ -2236,6 +2499,8 @@ def test_refresh_catalog_publishes_complete_generation_and_coverage():
     assert result["generation"] == 1
     assert result["counts"] == {"library": 1, "artist": 0, "album": 0, "track": 1}
     assert result["field_coverage"]["track_number"]["ratio"] == 1.0
+    assert "replay_gain" in result["field_coverage"]
+    assert "sample_rate" in result["field_coverage"]
     assert db.commits == 2
     assert db.rollbacks == 0
     assert any("catalog_changes" in sql for sql, _params in db.executed)
@@ -2252,13 +2517,9 @@ def test_refresh_catalog_failure_keeps_prior_generation_and_records_error():
 
     assert db.rollbacks == 1
     assert db.commits == 2
-    assert not any(
-        "SET published_generation" in sql for sql, _params in db.executed
-    )
+    assert not any("SET published_generation" in sql for sql, _params in db.executed)
     assert any(
-        "status='failed'" in sql and params[0] == "provider unavailable"
-        for sql, params in db.executed
-        if params
+        "status='failed'" in sql and params[0] == "provider unavailable" for sql, params in db.executed if params
     )
 
 
@@ -2273,11 +2534,32 @@ class ProjectionCursor(FakeCursor):
         if "JOIN plugin_lumae_analysis__catalog_state" in sql:
             self.rows = [
                 (
-                    "catalog-a", "server-a", "navidrome", "Server", True, "active",
-                    1, "catalog-epoch", 0, 0, "complete", {"track": 2}, {}, {},
-                    None, None, None,
-                    0, "analysis-epoch", 0, 0, "not_initialized", 0, 0,
-                    None, None,
+                    "catalog-a",
+                    "server-a",
+                    "navidrome",
+                    "Server",
+                    True,
+                    "active",
+                    1,
+                    "catalog-epoch",
+                    0,
+                    0,
+                    "complete",
+                    {"track": 2},
+                    {},
+                    {},
+                    None,
+                    None,
+                    None,
+                    0,
+                    "analysis-epoch",
+                    0,
+                    0,
+                    "not_initialized",
+                    0,
+                    0,
+                    None,
+                    None,
                 )
             ]
         elif "FROM plugin_lumae_analysis__catalog_tracks" in sql:
@@ -2293,8 +2575,15 @@ class ProjectionCursor(FakeCursor):
         elif "FROM score s" in sql:
             self.rows = [
                 (
-                    "canonical-1", 120.0, "C", "major", "happy:0.8", 0.08,
-                    "danceable:0.7", struct.pack("<2f", 0.1, 0.2), None,
+                    "canonical-1",
+                    120.0,
+                    "C",
+                    "major",
+                    "happy:0.8",
+                    0.08,
+                    "danceable:0.7",
+                    struct.pack("<2f", 0.1, 0.2),
+                    None,
                 )
             ]
         elif "FROM map_projection_data" in sql:
@@ -2326,10 +2615,7 @@ class ProjectionAdapter:
         return "server-a"
 
     def analysis_mapping_sql(self):
-        return (
-            "SELECT provider_track_id, analysis_id, match_tier "
-            "FROM fake_mapping WHERE server_id=%s"
-        )
+        return "SELECT provider_track_id, analysis_id, match_tier FROM fake_mapping WHERE server_id=%s"
 
 
 def test_analysis_projection_reuses_one_vector_for_two_provider_occurrences():
@@ -2351,8 +2637,18 @@ def test_analysis_projection_marks_contradictory_dedup_group_suspect():
     from plugins.LumaeAnalysis.catalog_analysis import _suspect_analysis_ids
 
     tracks = {
-        "a": {"title": "Song A", "artist": "Artist A", "duration_ms": 180000, "payload": {}},
-        "b": {"title": "Song B", "artist": "Artist B", "duration_ms": 240000, "payload": {}},
+        "a": {
+            "title": "Song A",
+            "artist": "Artist A",
+            "duration_ms": 180000,
+            "payload": {},
+        },
+        "b": {
+            "title": "Song B",
+            "artist": "Artist B",
+            "duration_ms": 240000,
+            "payload": {},
+        },
     }
     links = {
         "a": {"analysis_id": "canonical-1"},
@@ -2434,7 +2730,11 @@ def test_sync_collections_menu_updates_live_plugin_record():
         records={
             "lumae_analysis": {
                 "menu_items": [
-                    {"label": "Other", "endpoint": "lumae_analysis.other", "admin_only": True}
+                    {
+                        "label": "Other",
+                        "endpoint": "lumae_analysis.other",
+                        "admin_only": True,
+                    }
                 ]
             }
         }
@@ -2544,7 +2844,7 @@ def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypa
     assert "Add selected" in body
     assert "Duplicate" in body
     assert 'id="collection-toast"' in body
-    assert 'data-move-item=' in body
+    assert "data-move-item=" in body
     assert "@media(max-width:760px)" in body
     assert 'class="collections-page"' in body
     assert ".collections-page dialog" in body
@@ -2594,7 +2894,9 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
     assert "Queues all missing, stale, or changed tracks in 250-track jobs." in body
 
 
-def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(monkeypatch):
+def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(
+    monkeypatch,
+):
     mod = load_plugin()
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 250)
     monkeypatch.setattr(

@@ -73,6 +73,23 @@ def _integer(value):
         return None
 
 
+def _number(value):
+    if value in (None, ""):
+        return None
+    try:
+        result = float(value)
+        return result if result == result and result not in (float("inf"), float("-inf")) else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _string_list(value):
+    if value in (None, ""):
+        return []
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    return [item for item in (_text(raw) for raw in values) if item]
+
+
 def _duration_ms(row):
     ticks = _integer(_value(row, "RunTimeTicks", "runTimeTicks"))
     if ticks is not None:
@@ -118,7 +135,7 @@ def fingerprint(value):
     return hashlib.sha256(canonical_json(value).encode("utf-8")).hexdigest()
 
 
-def _artist_rows(row, fallback_name=None):
+def _artist_rows(row, fallback_name=None, default_role="artist"):
     raw_items = _value(row, "ArtistItems", "artistItems")
     if not raw_items:
         names = _value(row, "Artists", "artists")
@@ -146,6 +163,7 @@ def _artist_rows(row, fallback_name=None):
                 "name": name,
                 "position": position,
                 "identity_provenance": provenance,
+                "role": _text(_value(item, "Role", "role")) or default_role,
             }
         )
     return result
@@ -154,24 +172,117 @@ def _artist_rows(row, fallback_name=None):
 def _media_payload(row):
     sources = _value(row, "MediaSources", "mediaSources", default=[]) or []
     source = sources[0] if sources and isinstance(sources[0], dict) else {}
+    streams = (
+        _value(source, "MediaStreams", "mediaStreams", default=[])
+        or _value(row, "MediaStreams", "mediaStreams", default=[])
+        or []
+    )
+    audio_stream = next(
+        (
+            stream
+            for stream in streams
+            if isinstance(stream, dict) and str(_value(stream, "Type", "type", default="audio")).lower() == "audio"
+        ),
+        {},
+    )
     return {
         "duration_ms": _duration_ms(row),
         "container": _text(
-            _value(row, "suffix", "contentType", "ContentType", "container", default=source.get("Container"))
+            _value(
+                row,
+                "suffix",
+                "contentType",
+                "ContentType",
+                "container",
+                default=source.get("Container"),
+            )
         ),
-        "bit_rate": _integer(_value(row, "bitRate", "Bitrate", default=source.get("Bitrate"))),
-        "sample_rate": _integer(_value(row, "sampleRate", "SampleRate")),
-        "bit_depth": _integer(_value(row, "bitDepth", "BitDepth")),
-        "channels": _integer(_value(row, "channelCount", "Channels")),
+        "bit_rate": _integer(
+            _value(
+                row,
+                "bitRate",
+                "Bitrate",
+                default=_value(
+                    source,
+                    "Bitrate",
+                    default=_value(audio_stream, "BitRate", "Bitrate"),
+                ),
+            )
+        ),
+        "sample_rate": _integer(
+            _value(
+                row,
+                "sampleRate",
+                "SampleRate",
+                default=_value(audio_stream, "SampleRate"),
+            )
+        ),
+        "bit_depth": _integer(_value(row, "bitDepth", "BitDepth", default=_value(audio_stream, "BitDepth"))),
+        "channels": _integer(
+            _value(
+                row,
+                "channelCount",
+                "Channels",
+                default=_value(audio_stream, "Channels"),
+            )
+        ),
         "size": _integer(_value(row, "size", "Size", default=source.get("Size"))),
     }
 
 
+def _replay_gain_payload(row):
+    nested = _value(row, "replayGain", "ReplayGain", default={}) or {}
+    return {
+        "track_gain_db": _number(
+            _value(
+                row,
+                "replayGainTrackGain",
+                "ReplayGainTrackGain",
+                default=_value(nested, "trackGain", "TrackGain"),
+            )
+        ),
+        "track_peak": _number(
+            _value(
+                row,
+                "replayGainTrackPeak",
+                "ReplayGainTrackPeak",
+                default=_value(nested, "trackPeak", "TrackPeak"),
+            )
+        ),
+        "album_gain_db": _number(
+            _value(
+                row,
+                "replayGainAlbumGain",
+                "ReplayGainAlbumGain",
+                default=_value(nested, "albumGain", "AlbumGain"),
+            )
+        ),
+        "album_peak": _number(
+            _value(
+                row,
+                "replayGainAlbumPeak",
+                "ReplayGainAlbumPeak",
+                default=_value(nested, "albumPeak", "AlbumPeak"),
+            )
+        ),
+    }
+
+
+def _external_ids(row):
+    result = dict(_safe_payload(_value(row, "ProviderIds", "providerIds", default={})) or {})
+    for key, names in {
+        "musicbrainz": ("musicBrainzId", "MusicBrainzId"),
+        "isrc": ("isrc", "ISRC"),
+    }.items():
+        found = _text(_value(row, *names))
+        if found:
+            result.setdefault(key, found)
+    return result
+
+
 def _art_payload(row):
     return {
-        "cover_art_id": _text(
-            _value(row, "coverArt", "CoverArt", "coverArtId", "PrimaryImageItemId")
-        ),
+        "cover_art_id": _text(_value(row, "coverArt", "CoverArt", "coverArtId", "PrimaryImageItemId")),
         "image_tags": _safe_payload(_value(row, "ImageTags", "imageTags", default={})),
     }
 
@@ -217,7 +328,11 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         name = _text(_value(raw, "name", "Name", "title", "album"))
         if not album_id or not name:
             continue
-        artists = _artist_rows(raw, fallback_name=_value(raw, "AlbumArtist", "albumartist"))
+        artists = _artist_rows(
+            raw,
+            fallback_name=_value(raw, "AlbumArtist", "albumartist"),
+            default_role="album_artist",
+        )
         for artist in artists:
             artists_by_id.setdefault(artist["artist_id"], artist)
             album_artists.append({"album_id": album_id, **artist})
@@ -225,13 +340,15 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         metadata = {
             "name": name,
             "sort_name": _text(_value(raw, "SortName", "sortName")),
-            "album_artist_display": _text(_value(raw, "AlbumArtist", "albumArtist", "albumartist")),
+            "album_artist_display": _text(_value(raw, "AlbumArtist", "albumArtist", "albumartist"))
+            or ", ".join(artist["name"] for artist in artists)
+            or None,
             "added_at": _text(_value(raw, "created", "DateCreated", "added_at")),
             "release_type": _text(_value(raw, "releaseTypes", "ReleaseType", "albumType")),
             "content_kind": _content_kind(raw),
             "year": _integer(_value(raw, "year", "ProductionYear")),
-            "genres": _safe_payload(_value(raw, "genre", "Genres", "genres", default=[])),
-            "provider_ids": _safe_payload(_value(raw, "ProviderIds", "providerIds", default={})),
+            "genres": _string_list(_value(raw, "genre", "Genres", "genres", default=[])),
+            "provider_ids": _external_ids(raw),
         }
         payload = _safe_payload(raw)
         albums_by_id[album_id] = {
@@ -255,9 +372,7 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         if track_id in seen_track_ids:
             raise CatalogScanError(f"Provider returned duplicate track ID {track_id}")
         seen_track_ids.add(track_id)
-        album_id = _text(
-            _value(raw, "albumId", "AlbumId", "album_id", "albumid", "ParentId")
-        )
+        album_id = _text(_value(raw, "albumId", "AlbumId", "album_id", "albumid", "ParentId"))
         album_name = _text(_value(raw, "album", "Album"))
         if album_name and not album_id:
             raise CatalogScanError(f"Album-backed track {track_id} has no provider album identity")
@@ -267,6 +382,8 @@ def normalize_provider_catalog(raw_catalog, provider_type):
                 "name": album_name or "Unknown Album",
                 "AlbumArtist": _value(raw, "AlbumArtist", "albumArtist", "albumartist"),
                 "year": _value(raw, "year", "ProductionYear"),
+                "Genres": _value(raw, "genre", "Genres", "genres", default=[]),
+                "releaseTypes": _value(raw, "releaseType", "albumType"),
                 "coverArt": _value(raw, "coverArt", "PrimaryImageItemId"),
             }
             nested = normalize_provider_catalog({"albums": [inferred]}, provider_type)
@@ -279,29 +396,37 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             artists_by_id.setdefault(artist["artist_id"], artist)
             track_artists.append({"track_id": track_id, **artist})
         media = _media_payload(raw)
+        replay_gain = _replay_gain_payload(raw)
         art = _art_payload(raw)
         kind = _content_kind(raw)
         metadata = {
             "album_id": album_id,
             "title": title,
-            "artist_display": _text(_value(raw, "artist", "Artist", "AlbumArtist")),
-            "album_artist_display": _text(
-                _value(raw, "albumArtist", "AlbumArtist", "albumartist")
-            ),
-            "disc_number": _integer(
-                _value(raw, "discNumber", "ParentIndexNumber", "disc", "discnumber")
-            ),
-            "track_number": _integer(
-                _value(raw, "track", "trackNumber", "IndexNumber", "tracknum")
-            ),
+            "artist_display": _text(_value(raw, "artist", "Artist", "AlbumArtist"))
+            or ", ".join(artist["name"] for artist in artists)
+            or None,
+            "album_artist_display": _text(_value(raw, "albumArtist", "AlbumArtist", "albumartist"))
+            or (albums_by_id.get(album_id, {}).get("album_artist_display") if album_id else None),
+            "disc_number": _integer(_value(raw, "discNumber", "ParentIndexNumber", "disc", "discnumber")),
+            "track_number": _integer(_value(raw, "track", "trackNumber", "IndexNumber", "tracknum")),
             "duration_ms": media["duration_ms"],
             "content_kind": kind,
-            "release_type": _text(_value(raw, "releaseType", "albumType")),
+            "release_type": _text(_value(raw, "releaseType", "albumType"))
+            or (albums_by_id.get(album_id, {}).get("release_type") if album_id else None),
             "cover_art_id": art["cover_art_id"],
             "streamable": bool(_value(raw, "streamable", "IsPlayable", default=True)),
             "downloadable": bool(_value(raw, "downloadable", default=True)),
             "analysis_eligible": kind == "music",
             "provider_type": provider_type,
+            "album": album_name,
+            "year": _integer(_value(raw, "year", "ProductionYear")),
+            "genres": _string_list(_value(raw, "genre", "Genres", "genres", default=[])),
+            "external_ids": _external_ids(raw),
+            "disc_title": _text(_value(raw, "discTitle", "DiscTitle")),
+            "track_total": _integer(_value(raw, "trackTotal", "TrackTotal")),
+            "disc_total": _integer(_value(raw, "discTotal", "DiscTotal")),
+            "compilation": bool(_value(raw, "isCompilation", "Compilation", default=False)),
+            "explicit": bool(_value(raw, "isExplicit", "Explicit", default=False)),
         }
         payload = _safe_payload(raw)
         tracks.append(
@@ -312,13 +437,145 @@ def normalize_provider_catalog(raw_catalog, provider_type):
                 "metadata_fp": fingerprint(metadata),
                 "media_fp": fingerprint(media),
                 "artwork_fp": fingerprint(art),
+                "audio_properties": media,
+                "replay_gain": replay_gain,
             }
         )
         library_id = _text(_value(raw, "musicFolderId", "LibraryId", "library_id"))
         if library_id:
             entity_libraries.append(
-                {"entity_type": "track", "entity_id": track_id, "library_id": library_id}
+                {
+                    "entity_type": "track",
+                    "entity_id": track_id,
+                    "library_id": library_id,
+                }
             )
+
+    track_credits = {}
+    for credit in track_artists:
+        track_credits.setdefault(credit["track_id"], []).append(
+            {
+                "artist_id": credit["artist_id"],
+                "display_name": credit["name"],
+                "position": credit["position"],
+                "role": credit.get("role") or "artist",
+                "identity_provenance": credit["identity_provenance"],
+            }
+        )
+    album_credits = {}
+    for credit in album_artists:
+        album_credits.setdefault(credit["album_id"], []).append(
+            {
+                "artist_id": credit["artist_id"],
+                "display_name": credit["name"],
+                "position": credit["position"],
+                "role": credit.get("role") or "album_artist",
+                "identity_provenance": credit["identity_provenance"],
+            }
+        )
+    track_libraries = {}
+    for membership in entity_libraries:
+        track_libraries.setdefault(membership["entity_id"], set()).add(membership["library_id"])
+    album_libraries = {}
+    artist_libraries = {}
+    for track in tracks:
+        library_ids = sorted(track_libraries.get(track["track_id"], set()))
+        if track.get("album_id"):
+            album_libraries.setdefault(track["album_id"], set()).update(library_ids)
+        for credit in track_credits.get(track["track_id"], []):
+            artist_libraries.setdefault(credit["artist_id"], set()).update(library_ids)
+        catalogue_enrichment = {
+            "album": track.get("album"),
+            "year": track.get("year"),
+            "genres": track.get("genres") or [],
+            "external_ids": track.get("external_ids") or {},
+            "disc_title": track.get("disc_title"),
+            "track_total": track.get("track_total"),
+            "disc_total": track.get("disc_total"),
+            "compilation": track.get("compilation", False),
+            "explicit": track.get("explicit", False),
+            "artist_credits": sorted(
+                track_credits.get(track["track_id"], []),
+                key=lambda item: item["position"],
+            ),
+            "library_ids": library_ids,
+        }
+        track["payload"]["_lumae"] = {
+            **catalogue_enrichment,
+            "audio_properties": track["audio_properties"],
+            "replay_gain": track["replay_gain"],
+        }
+        track["metadata_fp"] = fingerprint({"base": track["metadata_fp"], "enrichment": catalogue_enrichment})
+
+    for album_id, library_ids in album_libraries.items():
+        for library_id in library_ids:
+            entity_libraries.append(
+                {
+                    "entity_type": "album",
+                    "entity_id": album_id,
+                    "library_id": library_id,
+                }
+            )
+    for album_id, credits in album_credits.items():
+        for credit in credits:
+            artist_libraries.setdefault(credit["artist_id"], set()).update(album_libraries.get(album_id, set()))
+
+    for album in albums_by_id.values():
+        album_tracks = [track for track in tracks if track.get("album_id") == album["album_id"]]
+        disc_titles = {}
+        for track in album_tracks:
+            if track.get("disc_number") is None:
+                continue
+            disc_number = int(track["disc_number"])
+            current = disc_titles.setdefault(
+                disc_number,
+                {
+                    "disc_number": disc_number,
+                    "title": None,
+                    "cover_art_id": track.get("cover_art_id"),
+                },
+            )
+            if track.get("disc_title"):
+                current["title"] = track["disc_title"]
+        track_count = len(album_tracks)
+        disc_count = len({track.get("disc_number") or 1 for track in album_tracks})
+        duration_ms = sum(track["duration_ms"] for track in album_tracks if track.get("duration_ms") is not None)
+        for track in album_tracks:
+            if track.get("track_total") is None:
+                track["track_total"] = track_count or None
+            if track.get("disc_total") is None:
+                track["disc_total"] = disc_count or None
+            rich = track["payload"].get("_lumae", {})
+            rich["track_total"] = track.get("track_total")
+            rich["disc_total"] = track.get("disc_total")
+            track["metadata_fp"] = fingerprint(
+                {
+                    "base": track["metadata_fp"],
+                    "derived_totals": [track_count, disc_count],
+                }
+            )
+        enrichment = {
+            "year": album.get("year"),
+            "genres": album.get("genres") or [],
+            "external_ids": album.get("provider_ids") or {},
+            "artist_credits": sorted(
+                album_credits.get(album["album_id"], []),
+                key=lambda item: item["position"],
+            ),
+            "library_ids": sorted(album_libraries.get(album["album_id"], set())),
+            "disc_titles": [disc_titles[key] for key in sorted(disc_titles)],
+            "track_count": track_count,
+            "disc_count": disc_count,
+            "duration_ms": duration_ms if any(track.get("duration_ms") is not None for track in album_tracks) else None,
+            "compilation": any(
+                track.get("compilation", False) for track in tracks if track.get("album_id") == album["album_id"]
+            ),
+            "explicit": any(
+                track.get("explicit", False) for track in tracks if track.get("album_id") == album["album_id"]
+            ),
+        }
+        album["payload"]["_lumae"] = enrichment
+        album["metadata_fp"] = fingerprint({"base": album["metadata_fp"], "enrichment": enrichment})
 
     artists = []
     for artist in artists_by_id.values():
@@ -326,13 +583,17 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             "name": artist["name"],
             "identity_provenance": artist["identity_provenance"],
         }
-        artists.append(
-            {
-                **artist,
-                "payload": metadata,
-                "metadata_fp": fingerprint(metadata),
-            }
-        )
+        library_ids = sorted(artist_libraries.get(artist["artist_id"], set()))
+        payload = {**metadata, "_lumae": {"library_ids": library_ids}}
+        artists.append({**artist, "payload": payload, "metadata_fp": fingerprint(payload)})
+        for library_id in library_ids:
+            entity_libraries.append(
+                {
+                    "entity_type": "artist",
+                    "entity_id": artist["artist_id"],
+                    "library_id": library_id,
+                }
+            )
     return {
         "libraries": sorted(libraries, key=lambda row: row["library_id"]),
         "artists": sorted(artists, key=lambda row: row["artist_id"]),
@@ -340,7 +601,10 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         "tracks": sorted(tracks, key=lambda row: row["track_id"]),
         "track_artists": track_artists,
         "album_artists": album_artists,
-        "entity_libraries": entity_libraries,
+        "entity_libraries": sorted(
+            {(row["entity_type"], row["entity_id"], row["library_id"]): row for row in entity_libraries}.values(),
+            key=lambda row: (row["entity_type"], row["entity_id"], row["library_id"]),
+        ),
     }
 
 
@@ -364,12 +628,8 @@ def catalog_scope_evidence(normalized, provider_type):
     library_ids_fp = fingerprint({"library_ids": library_ids})
     provider_sample_fp = fingerprint({"track_ids": sample_ids})
     return {
-        "provider_instance_fp": fingerprint(
-            {"provider_type": str(provider_type), "track_ids": track_ids}
-        ),
-        "library_scope_fp": fingerprint(
-            {"library_ids": library_ids, "track_memberships": memberships}
-        ),
+        "provider_instance_fp": fingerprint({"provider_type": str(provider_type), "track_ids": track_ids}),
+        "library_scope_fp": fingerprint({"library_ids": library_ids, "track_memberships": memberships}),
         "scope_summary": {
             "library_count": len(library_ids),
             "track_count": len(track_ids),
@@ -385,11 +645,7 @@ def verify_library_scope(db, catalog_instance_id, library_ids):
     if not isinstance(library_ids, list) or not 1 <= len(library_ids) <= 1000:
         raise ValueError("One to 1000 provider library IDs are required")
     normalized_ids = sorted(
-        {
-            unicodedata.normalize("NFC", str(value)).strip()
-            for value in library_ids
-            if str(value).strip()
-        }
+        {unicodedata.normalize("NFC", str(value)).strip() for value in library_ids if str(value).strip()}
     )
     if not normalized_ids:
         raise ValueError("At least one provider library ID is required")
@@ -418,7 +674,7 @@ def migrate_catalog(db):
     cur = db.cursor()
     statements = [
         f"""
-        CREATE TABLE IF NOT EXISTS {t('catalog_sources')} (
+        CREATE TABLE IF NOT EXISTS {t("catalog_sources")} (
             catalog_instance_id TEXT PRIMARY KEY,
             current_core_server_id TEXT,
             provider_type TEXT NOT NULL,
@@ -434,12 +690,12 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE UNIQUE INDEX IF NOT EXISTS {t('idx_catalog_source_core')}
-        ON {t('catalog_sources')} (current_core_server_id)
+        CREATE UNIQUE INDEX IF NOT EXISTS {t("idx_catalog_source_core")}
+        ON {t("catalog_sources")} (current_core_server_id)
         WHERE current_core_server_id IS NOT NULL AND rebind_status = 'active'
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('catalog_state')} (
+        CREATE TABLE IF NOT EXISTS {t("catalog_state")} (
             catalog_instance_id TEXT PRIMARY KEY,
             current_core_server_id TEXT,
             provider_type TEXT NOT NULL,
@@ -491,7 +747,7 @@ def migrate_catalog(db):
             include_artwork_fp=True,
         ),
         f"""
-        CREATE TABLE IF NOT EXISTS {t('catalog_track_artists')} (
+        CREATE TABLE IF NOT EXISTS {t("catalog_track_artists")} (
             catalog_instance_id TEXT NOT NULL,
             published_generation BIGINT NOT NULL,
             track_id TEXT NOT NULL,
@@ -505,7 +761,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('catalog_album_artists')} (
+        CREATE TABLE IF NOT EXISTS {t("catalog_album_artists")} (
             catalog_instance_id TEXT NOT NULL,
             published_generation BIGINT NOT NULL,
             album_id TEXT NOT NULL,
@@ -519,7 +775,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('catalog_entity_libraries')} (
+        CREATE TABLE IF NOT EXISTS {t("catalog_entity_libraries")} (
             catalog_instance_id TEXT NOT NULL,
             published_generation BIGINT NOT NULL,
             entity_type TEXT NOT NULL,
@@ -529,7 +785,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('catalog_disc_titles')} (
+        CREATE TABLE IF NOT EXISTS {t("catalog_disc_titles")} (
             catalog_instance_id TEXT NOT NULL,
             published_generation BIGINT NOT NULL,
             album_id TEXT NOT NULL,
@@ -541,7 +797,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('catalog_scans')} (
+        CREATE TABLE IF NOT EXISTS {t("catalog_scans")} (
             scan_id TEXT PRIMARY KEY,
             catalog_instance_id TEXT NOT NULL,
             core_server_id TEXT NOT NULL,
@@ -555,7 +811,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('catalog_scan_entities')} (
+        CREATE TABLE IF NOT EXISTS {t("catalog_scan_entities")} (
             scan_id TEXT NOT NULL,
             catalog_instance_id TEXT NOT NULL,
             entity_type TEXT NOT NULL,
@@ -568,7 +824,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('catalog_changes')} (
+        CREATE TABLE IF NOT EXISTS {t("catalog_changes")} (
             catalog_instance_id TEXT NOT NULL,
             epoch TEXT NOT NULL,
             seq BIGINT NOT NULL,
@@ -584,7 +840,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('stream_bootstrap_sessions')} (
+        CREATE TABLE IF NOT EXISTS {t("stream_bootstrap_sessions")} (
             token_hash TEXT PRIMARY KEY,
             stream TEXT NOT NULL,
             catalog_instance_id TEXT NOT NULL,
@@ -601,7 +857,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('analysis_state')} (
+        CREATE TABLE IF NOT EXISTS {t("analysis_state")} (
             catalog_instance_id TEXT PRIMARY KEY,
             analysis_schema_version INTEGER NOT NULL DEFAULT {ANALYSIS_SCHEMA_VERSION},
             projection_generation BIGINT NOT NULL DEFAULT 0,
@@ -617,7 +873,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('analysis_items')} (
+        CREATE TABLE IF NOT EXISTS {t("analysis_items")} (
             catalog_instance_id TEXT NOT NULL,
             projection_generation BIGINT NOT NULL,
             analysis_id TEXT NOT NULL,
@@ -635,7 +891,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('track_analysis_links')} (
+        CREATE TABLE IF NOT EXISTS {t("track_analysis_links")} (
             catalog_instance_id TEXT NOT NULL,
             projection_generation BIGINT NOT NULL,
             provider_track_id TEXT NOT NULL,
@@ -652,7 +908,7 @@ def migrate_catalog(db):
         )
         """,
         f"""
-        CREATE TABLE IF NOT EXISTS {t('analysis_changes')} (
+        CREATE TABLE IF NOT EXISTS {t("analysis_changes")} (
             catalog_instance_id TEXT NOT NULL,
             epoch TEXT NOT NULL,
             seq BIGINT NOT NULL,
@@ -687,19 +943,45 @@ def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, r
         fields = ["name", "sort_name", "display_order", "metadata_fp", "payload"]
     elif entity_type == "artist":
         fields = [
-            "name", "sort_name", "identity_provenance", "cover_art_id", "metadata_fp", "payload"
+            "name",
+            "sort_name",
+            "identity_provenance",
+            "cover_art_id",
+            "metadata_fp",
+            "payload",
         ]
     elif entity_type == "album":
         fields = [
-            "name", "sort_name", "album_artist_display", "added_at", "release_type",
-            "content_kind", "cover_art_id", "metadata_fp", "artwork_fp", "payload",
+            "name",
+            "sort_name",
+            "album_artist_display",
+            "added_at",
+            "release_type",
+            "content_kind",
+            "cover_art_id",
+            "metadata_fp",
+            "artwork_fp",
+            "payload",
         ]
     else:
         fields = [
-            "album_id", "title", "artist_display", "album_artist_display", "disc_number",
-            "track_number", "duration_ms", "content_kind", "release_type", "cover_art_id",
-            "streamable", "downloadable", "analysis_eligible", "metadata_fp", "media_fp",
-            "artwork_fp", "payload",
+            "album_id",
+            "title",
+            "artist_display",
+            "album_artist_display",
+            "disc_number",
+            "track_number",
+            "duration_ms",
+            "content_kind",
+            "release_type",
+            "cover_art_id",
+            "streamable",
+            "downloadable",
+            "analysis_eligible",
+            "metadata_fp",
+            "media_fp",
+            "artwork_fp",
+            "payload",
         ]
     columns = common + fields + ["available", "first_seen_at", "last_seen_at", "deleted_at"]
     placeholders = ["%s"] * len(columns)
@@ -750,7 +1032,7 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
                 row[position],
                 row.get(artist_id),
                 row[display_name],
-                role,
+                row.get("role") or role,
                 row.get(provenance),
                 "{}",
             )
@@ -761,7 +1043,7 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
     membership = normalized["entity_libraries"]
     if membership:
         sql = f"""
-            INSERT INTO {t('catalog_entity_libraries')}
+            INSERT INTO {t("catalog_entity_libraries")}
                 (catalog_instance_id, published_generation, entity_type, entity_id, library_id)
             VALUES (%s, %s, %s, %s, %s)
         """
@@ -806,11 +1088,25 @@ def _row_fingerprints(entity_type, row):
 
 def _coverage(normalized):
     fields = {
+        "album_id": "album_id",
         "track_number": "track_number",
         "disc_number": "disc_number",
+        "track_total": "track_total",
+        "disc_total": "disc_total",
+        "disc_title": "disc_title",
         "duration_ms": "duration_ms",
         "media_type": "content_kind",
         "release_type": "release_type",
+        "year": "year",
+        "genres": "genres",
+        "external_ids": "external_ids",
+        "container": None,
+        "bit_rate": None,
+        "sample_rate": None,
+        "bit_depth": None,
+        "channels": None,
+        "file_size": None,
+        "replay_gain": None,
         "cover_art_id": "cover_art_id",
         "artist_credits": None,
         "library_membership": None,
@@ -821,13 +1117,23 @@ def _coverage(normalized):
         if public_name == "artist_credits":
             count = len({row["track_id"] for row in normalized["track_artists"]})
         elif public_name == "library_membership":
-            count = len(
-                {
-                    row["entity_id"]
-                    for row in normalized["entity_libraries"]
-                    if row["entity_type"] == "track"
-                }
+            count = len({row["entity_id"] for row in normalized["entity_libraries"] if row["entity_type"] == "track"})
+        elif public_name == "replay_gain":
+            count = sum(
+                any(value is not None for value in row.get("replay_gain", {}).values()) for row in normalized["tracks"]
             )
+        elif public_name in {
+            "container",
+            "bit_rate",
+            "sample_rate",
+            "bit_depth",
+            "channels",
+            "file_size",
+        }:
+            media_field = "size" if public_name == "file_size" else public_name
+            count = sum(row.get("audio_properties", {}).get(media_field) is not None for row in normalized["tracks"])
+        elif public_name in {"genres", "external_ids"}:
+            count = sum(bool(row.get(field)) for row in normalized["tracks"])
         else:
             count = sum(row.get(field) is not None for row in normalized["tracks"])
         result[public_name] = {
@@ -902,9 +1208,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
     try:
         raw = provider_bridge.fetch_catalog(server_id)
         normalized = normalize_provider_catalog(raw, server["provider_type"])
-        counts = {
-            entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER
-        }
+        counts = {entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER}
         old_track_count = int(_state_counts(previous_counts).get("track", 0) or 0)
         if old_track_count and counts["track"] == 0:
             raise CatalogScanError("Refusing to replace a non-empty catalogue with an empty scan")
@@ -923,16 +1227,12 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         changes = []
         for entity_type in ENTITY_ORDER:
             rows = normalized[ENTITY_COLLECTIONS[entity_type]]
-            old = _published_fingerprints(
-                cur, entity_type, catalog_instance_id, previous_generation
-            )
+            old = _published_fingerprints(cur, entity_type, catalog_instance_id, previous_generation)
             current = {row[ENTITY_TABLES[entity_type][1]]: row for row in rows}
             for entity_id, row in current.items():
                 if old.get(entity_id) != _row_fingerprints(entity_type, row):
                     changes.append((entity_type, entity_id, "upsert", row))
-            _insert_generation_rows(
-                cur, entity_type, catalog_instance_id, generation, rows, now
-            )
+            _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, rows, now)
             for entity_id in sorted(set(old) - set(current)):
                 changes.append((entity_type, entity_id, "delete", None))
         _insert_relationship_rows(cur, catalog_instance_id, generation, normalized)
@@ -947,7 +1247,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             next_seq += 1
             cur.execute(
                 f"""
-                INSERT INTO {t('catalog_changes')}
+                INSERT INTO {t("catalog_changes")}
                     (catalog_instance_id, epoch, seq, generation, entity_type,
                      entity_id, operation, payload)
                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
@@ -965,13 +1265,10 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             )
         coverage = _coverage(normalized)
         scope = catalog_scope_evidence(normalized, server["provider_type"])
-        field_support = {
-            name: "observed" if value["present"] else "not_observed"
-            for name, value in coverage.items()
-        }
+        field_support = {name: "observed" if value["present"] else "not_observed" for name, value in coverage.items()}
         cur.execute(
             f"""
-            UPDATE {t('catalog_state')}
+            UPDATE {t("catalog_state")}
                SET published_generation=%s, catalog_head_seq=%s, status='complete',
                    entity_counts=%s::jsonb, field_support=%s::jsonb,
                    field_coverage=%s::jsonb, scope_summary=%s::jsonb,
@@ -1026,8 +1323,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             (str(exc)[:1000], catalog_instance_id),
         )
         cur.execute(
-            f"UPDATE {t('catalog_scans')} SET status='failed', completed_at=now(), "
-            "last_error=%s WHERE scan_id=%s",
+            f"UPDATE {t('catalog_scans')} SET status='failed', completed_at=now(), last_error=%s WHERE scan_id=%s",
             (str(exc)[:1000], scan_id),
         )
         cur.close()
@@ -1036,9 +1332,9 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
 
 
 def opaque_cursor(catalog_instance_id, epoch, seq):
-    payload = canonical_json(
-        {"catalog_instance_id": catalog_instance_id, "epoch": epoch, "seq": int(seq)}
-    ).encode("utf-8")
+    payload = canonical_json({"catalog_instance_id": catalog_instance_id, "epoch": epoch, "seq": int(seq)}).encode(
+        "utf-8"
+    )
     return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
 
 
@@ -1072,9 +1368,9 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
                    s.library_scope_fp, c.scope_summary
-              FROM {t('catalog_sources')} s
-              JOIN {t('catalog_state')} c USING (catalog_instance_id)
-              LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
+              FROM {t("catalog_sources")} s
+              JOIN {t("catalog_state")} c USING (catalog_instance_id)
+              LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
              WHERE s.current_core_server_id=%s{suffix}
             """,
             (server_id,),
@@ -1092,9 +1388,9 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
                    s.library_scope_fp, c.scope_summary
-              FROM {t('catalog_sources')} s
-              JOIN {t('catalog_state')} c USING (catalog_instance_id)
-              LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
+              FROM {t("catalog_sources")} s
+              JOIN {t("catalog_state")} c USING (catalog_instance_id)
+              LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
              WHERE s.catalog_instance_id=%s{suffix}
             """,
             (catalog_instance_id,),
@@ -1112,9 +1408,9 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
                    s.library_scope_fp, c.scope_summary
-              FROM {t('catalog_sources')} s
-              JOIN {t('catalog_state')} c USING (catalog_instance_id)
-              LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
+              FROM {t("catalog_sources")} s
+              JOIN {t("catalog_state")} c USING (catalog_instance_id)
+              LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
              ORDER BY s.is_default DESC, s.server_name, s.catalog_instance_id{suffix}
             """
         )
@@ -1180,9 +1476,7 @@ def _session_hash(token):
 
 
 def _page_token(session_token, stream, entity_type, after_id):
-    body = canonical_json(
-        {"stream": stream, "entity_type": entity_type, "after_id": after_id}
-    ).encode("utf-8")
+    body = canonical_json({"stream": stream, "entity_type": entity_type, "after_id": after_id}).encode("utf-8")
     signature = hmac.new(str(session_token).encode("utf-8"), body, hashlib.sha256).hexdigest().encode("ascii")
     return base64.urlsafe_b64encode(body + b"." + signature).rstrip(b"=").decode("ascii")
 
@@ -1192,9 +1486,7 @@ def _parse_page_token(session_token, value):
         raw = str(value or "")
         decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
         body, signature = decoded.rsplit(b".", 1)
-        expected = hmac.new(
-            str(session_token).encode("utf-8"), body, hashlib.sha256
-        ).hexdigest().encode("ascii")
+        expected = hmac.new(str(session_token).encode("utf-8"), body, hashlib.sha256).hexdigest().encode("ascii")
         if not hmac.compare_digest(signature, expected):
             raise ValueError
         payload = json.loads(body.decode("utf-8"))
@@ -1213,9 +1505,7 @@ def create_bootstrap_session(
 ):
     if stream not in ("catalog", "analysis"):
         raise ValueError("Unknown bootstrap stream")
-    sources = resolve_catalog_source(
-        db, server_id=server_id, catalog_instance_id=catalog_instance_id, lock=True
-    )
+    sources = resolve_catalog_source(db, server_id=server_id, catalog_instance_id=catalog_instance_id, lock=True)
     if len(sources) != 1:
         raise ValueError("An explicit server_id is required when multiple sources exist")
     source = sources[0]
@@ -1225,10 +1515,7 @@ def create_bootstrap_session(
     if state["status"] not in ("complete", "ready"):
         raise CatalogScanError(f"{stream.capitalize()} bootstrap is not ready")
     cur = db.cursor()
-    cur.execute(
-        f"DELETE FROM {t('stream_bootstrap_sessions')} "
-        "WHERE expires_at <= now() OR completed_at IS NOT NULL"
-    )
+    cur.execute(f"DELETE FROM {t('stream_bootstrap_sessions')} WHERE expires_at <= now() OR completed_at IS NOT NULL")
     cur.execute(
         f"SELECT COUNT(*) FROM {t('stream_bootstrap_sessions')} "
         "WHERE principal_key=%s AND expires_at > now() AND completed_at IS NULL",
@@ -1248,7 +1535,7 @@ def create_bootstrap_session(
     }
     cur.execute(
         f"""
-        INSERT INTO {t('stream_bootstrap_sessions')}
+        INSERT INTO {t("stream_bootstrap_sessions")}
             (token_hash, stream, catalog_instance_id, core_server_id, principal_key,
              pinned_generation, snapshot_epoch, snapshot_seq, totals, expires_at)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
@@ -1288,7 +1575,7 @@ def _load_bootstrap_session(db, session_token, principal_key, stream):
         f"""
         SELECT catalog_instance_id, core_server_id, pinned_generation,
                snapshot_epoch, snapshot_seq, totals
-          FROM {t('stream_bootstrap_sessions')}
+          FROM {t("stream_bootstrap_sessions")}
          WHERE token_hash=%s AND principal_key=%s AND stream=%s
            AND expires_at > now() AND completed_at IS NULL
          FOR UPDATE
@@ -1348,9 +1635,7 @@ def bootstrap_page(
             "provider_track_id",
             "projection_generation",
         )
-    vector_exclusions = (
-        " - 'musicnn_vector' - 'clap_vector'" if stream == "analysis" and entity_type == "item" else ""
-    )
+    vector_exclusions = " - 'musicnn_vector' - 'clap_vector'" if stream == "analysis" and entity_type == "item" else ""
     cur.execute(
         f"""
         SELECT {id_column},
@@ -1385,8 +1670,7 @@ def bootstrap_page(
             )
     if not completed:
         cur.execute(
-            f"UPDATE {t('stream_bootstrap_sessions')} SET last_used_at=now() "
-            "WHERE token_hash=%s",
+            f"UPDATE {t('stream_bootstrap_sessions')} SET last_used_at=now() WHERE token_hash=%s",
             (_session_hash(session_token),),
         )
     cur.close()
@@ -1400,9 +1684,7 @@ def bootstrap_page(
         "items": items,
         "next_page_token": next_token,
         "completed": completed,
-        "snapshot_cursor": opaque_cursor(
-            session["catalog_instance_id"], session["epoch"], session["seq"]
-        ),
+        "snapshot_cursor": opaque_cursor(session["catalog_instance_id"], session["epoch"], session["seq"]),
     }
 
 
@@ -1422,9 +1704,7 @@ def release_bootstrap_session(db, session_token, principal_key):
 def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=None, limit=500):
     cursor = parse_opaque_cursor(cursor_value)
     expected_id = catalog_instance_id or cursor["catalog_instance_id"]
-    sources = resolve_catalog_source(
-        db, server_id=server_id, catalog_instance_id=None if server_id else expected_id
-    )
+    sources = resolve_catalog_source(db, server_id=server_id, catalog_instance_id=None if server_id else expected_id)
     if len(sources) != 1:
         raise ValueError("An explicit server_id is required when multiple sources exist")
     source = sources[0]
@@ -1440,7 +1720,7 @@ def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=N
         f"""
         SELECT seq, generation, entity_type, entity_id, operation, old_entity_id,
                payload, evidence, created_at
-          FROM {t('catalog_changes')}
+          FROM {t("catalog_changes")}
          WHERE catalog_instance_id=%s AND epoch=%s AND seq > %s
          ORDER BY seq
          LIMIT %s
@@ -1474,9 +1754,7 @@ def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=N
         "server_id": source["server_id"],
         "changes": changes,
         "cursor": opaque_cursor(source["catalog_instance_id"], state["epoch"], next_seq),
-        "head_cursor": opaque_cursor(
-            source["catalog_instance_id"], state["epoch"], state["head_seq"]
-        ),
+        "head_cursor": opaque_cursor(source["catalog_instance_id"], state["epoch"], state["head_seq"]),
         "has_more": next_seq < state["head_seq"],
     }
 
@@ -1516,8 +1794,7 @@ def ensure_catalog_sources(db, bridge=None):
     provider_bridge = bridge or ProviderCatalogBridge()
     cur = db.cursor()
     cur.execute(
-        f"SELECT catalog_instance_id, current_core_server_id, provider_type, rebind_status "
-        f"FROM {t('catalog_sources')}"
+        f"SELECT catalog_instance_id, current_core_server_id, provider_type, rebind_status FROM {t('catalog_sources')}"
     )
     existing = [
         {
@@ -1551,7 +1828,7 @@ def ensure_catalog_sources(db, bridge=None):
             source_id = _new_catalog_instance_id()
             cur.execute(
                 f"""
-                INSERT INTO {t('catalog_sources')}
+                INSERT INTO {t("catalog_sources")}
                     (catalog_instance_id, current_core_server_id, provider_type,
                      server_name, is_default, rebind_status)
                 VALUES (%s, %s, %s, %s, %s, 'active')
@@ -1566,16 +1843,21 @@ def ensure_catalog_sources(db, bridge=None):
             )
             cur.execute(
                 f"""
-                INSERT INTO {t('catalog_state')}
+                INSERT INTO {t("catalog_state")}
                     (catalog_instance_id, current_core_server_id, provider_type, catalog_epoch)
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (catalog_instance_id) DO NOTHING
                 """,
-                (source_id, server["server_id"], server["provider_type"], str(uuid.uuid4())),
+                (
+                    source_id,
+                    server["server_id"],
+                    server["provider_type"],
+                    str(uuid.uuid4()),
+                ),
             )
             cur.execute(
                 f"""
-                INSERT INTO {t('analysis_state')}
+                INSERT INTO {t("analysis_state")}
                     (catalog_instance_id, analysis_epoch)
                 VALUES (%s, %s)
                 ON CONFLICT (catalog_instance_id) DO NOTHING
@@ -1607,7 +1889,12 @@ def ensure_catalog_sources(db, bridge=None):
 
 def accept_legacy_rebind(db, catalog_instance_id, core_server_id, evidence):
     """Rebind v2 source ownership only when every continuity proof is true."""
-    required = ("provider_type", "provider_instance", "library_scope", "provider_sample")
+    required = (
+        "provider_type",
+        "provider_instance",
+        "library_scope",
+        "provider_sample",
+    )
     if not all(evidence.get(key) is True for key in required):
         raise ValueError("AudioMuse v2-to-v3 catalogue continuity evidence is incomplete")
 
@@ -1630,7 +1917,7 @@ def accept_legacy_rebind(db, catalog_instance_id, core_server_id, evidence):
 
     cur.execute(
         f"""
-        UPDATE {t('catalog_sources')}
+        UPDATE {t("catalog_sources")}
            SET current_core_server_id=%s, continuity_from='legacy-default',
                rebind_status='active', candidate_core_server_id=NULL, updated_at=now()
          WHERE catalog_instance_id=%s
@@ -1638,8 +1925,7 @@ def accept_legacy_rebind(db, catalog_instance_id, core_server_id, evidence):
         (core_server_id, catalog_instance_id),
     )
     cur.execute(
-        f"UPDATE {t('catalog_state')} SET current_core_server_id=%s, updated_at=now() "
-        "WHERE catalog_instance_id=%s",
+        f"UPDATE {t('catalog_state')} SET current_core_server_id=%s, updated_at=now() WHERE catalog_instance_id=%s",
         (core_server_id, catalog_instance_id),
     )
     cur.close()
@@ -1653,8 +1939,8 @@ def _persisted_scope_evidence(db, catalog_instance_id):
         f"""
         SELECT s.provider_type, s.provider_instance_fp, s.library_scope_fp,
                c.scope_summary, c.published_generation
-          FROM {t('catalog_sources')} s
-          JOIN {t('catalog_state')} c USING (catalog_instance_id)
+          FROM {t("catalog_sources")} s
+          JOIN {t("catalog_state")} c USING (catalog_instance_id)
          WHERE s.catalog_instance_id=%s
         """,
         (catalog_instance_id,),
@@ -1691,8 +1977,7 @@ def _persisted_scope_evidence(db, catalog_instance_id):
         (catalog_instance_id, generation),
     )
     memberships = [
-        {"entity_type": "track", "entity_id": str(item[0]), "library_id": str(item[1])}
-        for item in cur.fetchall()
+        {"entity_type": "track", "entity_id": str(item[0]), "library_id": str(item[1])} for item in cur.fetchall()
     ]
     cur.close()
     return catalog_scope_evidence(
@@ -1716,7 +2001,11 @@ def attempt_legacy_rebind(db, catalog_instance_id, core_server_id, bridge=None):
         raise KeyError("Unknown catalogue instance")
     current_server_id, candidate_server_id, provider_type, rebind_status = row
     if current_server_id == core_server_id and rebind_status == "active":
-        return {"status": "active", "rebound": False, "catalog_instance_id": catalog_instance_id}
+        return {
+            "status": "active",
+            "rebound": False,
+            "catalog_instance_id": catalog_instance_id,
+        }
     if (
         current_server_id != "legacy-default"
         or rebind_status != "rebind_required"
@@ -1728,9 +2017,7 @@ def attempt_legacy_rebind(db, catalog_instance_id, core_server_id, bridge=None):
         raise ValueError("Provider type changed during AudioMuse upgrade")
 
     stored = _persisted_scope_evidence(db, catalog_instance_id)
-    normalized = normalize_provider_catalog(
-        provider_bridge.fetch_catalog(core_server_id), candidate["provider_type"]
-    )
+    normalized = normalize_provider_catalog(provider_bridge.fetch_catalog(core_server_id), candidate["provider_type"])
     incoming = catalog_scope_evidence(normalized, candidate["provider_type"])
     evidence = {
         "provider_type": True,
@@ -1746,18 +2033,19 @@ def attempt_legacy_rebind(db, catalog_instance_id, core_server_id, bridge=None):
             "catalog_instance_id": catalog_instance_id,
             "evidence": evidence,
         }
-    changed = accept_legacy_rebind(
-        db, catalog_instance_id, core_server_id, evidence
-    )
+    changed = accept_legacy_rebind(db, catalog_instance_id, core_server_id, evidence)
     cur = db.cursor()
     cur.execute(
         f"UPDATE {t('catalog_sources')} SET provider_instance_fp=%s, library_scope_fp=%s, "
         "updated_at=now() WHERE catalog_instance_id=%s",
-        (incoming["provider_instance_fp"], incoming["library_scope_fp"], catalog_instance_id),
+        (
+            incoming["provider_instance_fp"],
+            incoming["library_scope_fp"],
+            catalog_instance_id,
+        ),
     )
     cur.execute(
-        f"UPDATE {t('catalog_state')} SET scope_summary=%s::jsonb, updated_at=now() "
-        "WHERE catalog_instance_id=%s",
+        f"UPDATE {t('catalog_state')} SET scope_summary=%s::jsonb, updated_at=now() WHERE catalog_instance_id=%s",
         (_json_param(incoming["scope_summary"]), catalog_instance_id),
     )
     cur.close()
