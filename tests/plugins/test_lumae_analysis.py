@@ -1,6 +1,7 @@
 import importlib
 import json
 import pathlib
+import struct
 import sys
 import math
 import types
@@ -1335,6 +1336,7 @@ class FakeCtx:
         self.install_hooks = []
         self.song_hooks = []
         self.cron_tasks = []
+        self.tasks = []
         self.menu_items = []
 
     def add_blueprint(self, blueprint):
@@ -1356,6 +1358,9 @@ class FakeCtx:
 
     def add_cron_task(self, name, func, queue="default"):
         self.cron_tasks.append((name, func, queue))
+
+    def add_task(self, name, func, queue="default"):
+        self.tasks.append((name, func, queue))
 
 
 def test_analyze_one_track_marks_missing_file(monkeypatch):
@@ -1736,7 +1741,12 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
             mod.CATALOG_REFRESH_TASK_TYPE,
             mod.CATALOG_REFRESH_TASK_TYPE,
             "17 */6 * * *",
-        )
+        ),
+        (
+            mod.ANALYSIS_PROJECTION_TASK_TYPE,
+            mod.ANALYSIS_PROJECTION_TASK_TYPE,
+            "47 */6 * * *",
+        ),
     ]
     migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
     assert "plugin_lumae_analysis__collections" in migration_sql
@@ -2152,6 +2162,130 @@ def test_refresh_catalog_failure_keeps_prior_generation_and_records_error():
     )
 
 
+class ProjectionCursor(FakeCursor):
+    def __init__(self, db):
+        super().__init__([])
+        self.db = db
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        self.db.executed.append((sql, params))
+        if "JOIN plugin_lumae_analysis__catalog_state" in sql:
+            self.rows = [
+                (
+                    "catalog-a", "server-a", "navidrome", "Server", True, "active",
+                    1, "catalog-epoch", 0, 0, "complete", {"track": 2}, {}, {},
+                    None, None, None,
+                    0, "analysis-epoch", 0, 0, "not_initialized", 0, 0,
+                    None, None,
+                )
+            ]
+        elif "FROM plugin_lumae_analysis__catalog_tracks" in sql:
+            self.rows = [
+                ("copy-a", "Same song", "Artist", "album-a", 180000, {}),
+                ("copy-b", "Same song", "Artist", "album-b", 180000, {}),
+            ]
+        elif "FROM fake_mapping" in sql:
+            self.rows = [
+                ("copy-a", "canonical-1", "fingerprint"),
+                ("copy-b", "canonical-1", "fingerprint"),
+            ]
+        elif "FROM score s" in sql:
+            self.rows = [
+                (
+                    "canonical-1", 120.0, "C", "major", "happy:0.8", 0.08,
+                    "danceable:0.7", struct.pack("<2f", 0.1, 0.2), None,
+                )
+            ]
+        elif "FROM map_projection_data" in sql:
+            self.rows = [(struct.pack("<2f", 1.5, -2.5), '["canonical-1"]', 2)]
+        elif "FROM plugin_lumae_analysis__analysis_state" in sql:
+            self.rows = [(0, "analysis-epoch", 0)]
+        elif "SELECT analysis_id, scalar_fp" in sql:
+            self.rows = []
+        elif "SELECT provider_track_id, analysis_id, status" in sql:
+            self.rows = []
+        else:
+            self.rows = []
+
+
+class ProjectionDb:
+    def __init__(self):
+        self.executed = []
+        self.commits = 0
+
+    def cursor(self):
+        return ProjectionCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+
+class ProjectionAdapter:
+    def active_server_id(self):
+        return "server-a"
+
+    def analysis_mapping_sql(self):
+        return (
+            "SELECT provider_track_id, analysis_id, match_tier "
+            "FROM fake_mapping WHERE server_id=%s"
+        )
+
+
+def test_analysis_projection_reuses_one_vector_for_two_provider_occurrences():
+    from plugins.LumaeAnalysis.catalog_analysis import project_analysis
+
+    db = ProjectionDb()
+
+    result = project_analysis("server-a", db=db, adapter=ProjectionAdapter())
+
+    assert result["item_count"] == 1
+    assert result["link_count"] == 2
+    assert result["suspect_count"] == 0
+    assert db.commits == 1
+    assert sum("INSERT INTO plugin_lumae_analysis__analysis_items" in sql for sql, _ in db.executed) == 1
+    assert sum("INSERT INTO plugin_lumae_analysis__track_analysis_links" in sql for sql, _ in db.executed) == 2
+
+
+def test_analysis_projection_marks_contradictory_dedup_group_suspect():
+    from plugins.LumaeAnalysis.catalog_analysis import _suspect_analysis_ids
+
+    tracks = {
+        "a": {"title": "Song A", "artist": "Artist A", "duration_ms": 180000, "payload": {}},
+        "b": {"title": "Song B", "artist": "Artist B", "duration_ms": 240000, "payload": {}},
+    }
+    links = {
+        "a": {"analysis_id": "canonical-1"},
+        "b": {"analysis_id": "canonical-1"},
+    }
+
+    assert _suspect_analysis_ids(tracks, links) == {"canonical-1"}
+
+
+def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypatch):
+    import struct
+
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    header = b'{"format":"lumae-f32le-v1"}'
+    binary = struct.pack("<I", len(header)) + header + struct.pack("<2f", 0.1, 0.2)
+    monkeypatch.setattr(mod, "vector_batch", lambda *_args, **_kwargs: binary)
+
+    response = plugin_client(mod).post(
+        "/api/catalog/analysis/vectors",
+        json={
+            "catalog_instance_id": "catalog-a",
+            "analysis_ids": ["canonical-1"],
+            "family": "musicnn",
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.mimetype == "application/vnd.lumae.f32le-v1"
+    assert response.data == binary
+    assert response.headers["Cache-Control"] == "private, no-store"
+
+
 def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     mod = load_plugin()
     ctx = FakeCtx()
@@ -2162,7 +2296,11 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.settings_endpoint == "lumae_analysis.settings"
     assert ctx.install_hooks == [mod.migrate]
     assert ctx.song_hooks == [mod.analyze_song_hook]
-    assert ctx.cron_tasks == [("catalog_refresh", mod.catalog_refresh_task, "default")]
+    assert ctx.tasks == [("analysis_projection", mod.analysis_projection_task, "default")]
+    assert ctx.cron_tasks == [
+        ("catalog_refresh", mod.catalog_refresh_task, "default"),
+        ("analysis_projection", mod.analysis_projection_task, "default"),
+    ]
     assert ctx.menu_items == []
 
 

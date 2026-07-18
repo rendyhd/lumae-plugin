@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 from html import escape
 
-from flask import Blueprint, g, jsonify, request
+from flask import Blueprint, Response, g, jsonify, request
 
 from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
 
@@ -25,6 +25,13 @@ from .catalog import (
     refresh_catalog,
     release_bootstrap_session,
     resolve_catalog_source,
+)
+from .catalog_analysis import (
+    dedup_policy,
+    project_analysis,
+    read_analysis_changes,
+    scalar_batch,
+    vector_batch,
 )
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
@@ -59,6 +66,7 @@ CATALOG_FEATURES = (
 )
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
+ANALYSIS_PROJECTION_TASK_TYPE = "plugin.lumae_analysis.analysis_projection"
 WHOLE_LIBRARY_CHUNK_SIZE = 250
 COLLECTIONS_MENU_LABEL = "Living Collections"
 COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
@@ -202,9 +210,24 @@ def ensure_catalog_refresh_schedule(db):
     cur.close()
 
 
+def ensure_analysis_projection_schedule(db):
+    cur = db.cursor()
+    cur.execute(
+        "INSERT INTO cron (name, task_type, cron_expr, enabled) "
+        "VALUES (%s, %s, %s, FALSE) ON CONFLICT (task_type) DO NOTHING",
+        (ANALYSIS_PROJECTION_TASK_TYPE, ANALYSIS_PROJECTION_TASK_TYPE, "47 */6 * * *"),
+    )
+    cur.close()
+
+
 def catalog_refresh_task(server_id=None):
     adapter = get_core_adapter()
     return refresh_catalog(server_id=server_id or adapter.active_server_id())
+
+
+def analysis_projection_task(server_id=None):
+    adapter = get_core_adapter()
+    return project_analysis(server_id=server_id or adapter.active_server_id(), adapter=adapter)
 
 
 def migrate(db):
@@ -232,6 +255,7 @@ def migrate(db):
     ensure_catalog_sources(db)
     migrate_collections(db)
     ensure_catalog_refresh_schedule(db)
+    ensure_analysis_projection_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
 
@@ -493,6 +517,7 @@ def catalog_health():
             "catalog_schema_version": CATALOG_SCHEMA_VERSION,
             "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
             "capability": catalog_capability(),
+            "dedup_policy": dedup_policy(),
             "servers": servers,
         }
     )
@@ -654,6 +679,65 @@ def catalog_changes_api():
         return _catalog_error("invalid_cursor", str(exc), 400)
 
 
+@bp.get("/api/catalog/analysis/changes")
+def analysis_changes_api():
+    cursor = request.args.get("cursor")
+    if not cursor:
+        return _catalog_error("cursor_required", "Analysis cursor is required.", 400)
+    try:
+        result = read_analysis_changes(
+            get_db(),
+            cursor,
+            server_id=request.args.get("server_id"),
+            catalog_instance_id=request.args.get("catalog_instance_id"),
+            limit=request.args.get("limit", 500),
+        )
+        return _private_json(result, no_store=False)
+    except KeyError:
+        return _catalog_error(
+            "bootstrap_required", "Analysis cursor expired or belongs to an old epoch.", 410
+        )
+    except ValueError as exc:
+        return _catalog_error("invalid_cursor", str(exc), 400)
+
+
+@bp.post("/api/catalog/analysis/scalars")
+def analysis_scalars_api():
+    try:
+        body = _json_body(max_bytes=64_000)
+        catalog_instance_id = str(body.get("catalog_instance_id") or "")
+        ids = body.get("provider_track_ids") or []
+        if not catalog_instance_id or not isinstance(ids, list):
+            raise ValueError("catalog_instance_id and provider_track_ids are required")
+        return _private_json(
+            {
+                "catalog_instance_id": catalog_instance_id,
+                "items": scalar_batch(get_db(), catalog_instance_id, ids),
+            }
+        )
+    except (KeyError, ValueError) as exc:
+        return _catalog_error("invalid_batch", str(exc), 400)
+
+
+@bp.post("/api/catalog/analysis/vectors")
+def analysis_vectors_api():
+    try:
+        body = _json_body(max_bytes=64_000)
+        catalog_instance_id = str(body.get("catalog_instance_id") or "")
+        ids = body.get("analysis_ids") or []
+        family = str(body.get("family") or "musicnn")
+        if not catalog_instance_id or not isinstance(ids, list):
+            raise ValueError("catalog_instance_id and analysis_ids are required")
+        payload = vector_batch(get_db(), catalog_instance_id, ids, family=family)
+        response = Response(payload, mimetype="application/vnd.lumae.f32le-v1")
+        response.headers["Cache-Control"] = "private, no-store"
+        response.headers["Vary"] = "Authorization, Cookie"
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        return response
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_batch", str(exc), 400)
+
+
 @bp.get("/api/profiles")
 def profiles():
     ids = parse_ids(request.args.get("ids", ""))
@@ -755,6 +839,11 @@ def hook_media_signature(song, audio_path):
 
 
 def analyze_song_hook(song):
+    try:
+        event = get_core_adapter().normalize_analysis_hook(song)
+        enqueue(analysis_projection_task, event["server_id"], queue="default")
+    except Exception:
+        logger.exception("lumae_analysis could not queue the analysis projection")
     track_id = hook_track_id(song)
     audio_path = (song or {}).get("audio_path")
     if not track_id:
@@ -1259,4 +1348,6 @@ def register(ctx):
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
     ctx.on_install(migrate)
     ctx.on_song_analyzed(analyze_song_hook)
+    ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_cron_task("catalog_refresh", catalog_refresh_task, queue="default")
+    ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")
