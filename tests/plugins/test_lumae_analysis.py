@@ -15,7 +15,10 @@ sys.path.insert(0, str(pathlib.Path(__file__).resolve().parents[2]))
 
 plugin_module = types.ModuleType("plugin")
 plugin_api_module = types.ModuleType("plugin.api")
-plugin_api_module.config = types.SimpleNamespace()
+plugin_api_module.config = types.SimpleNamespace(
+    APP_VERSION="v2.6.2",
+    MEDIASERVER_TYPE="navidrome",
+)
 plugin_api_module.enqueue = lambda *args, **kwargs: None
 plugin_api_module.get_db = lambda: None
 plugin_api_module.get_setting = lambda _key, default=None: default
@@ -49,7 +52,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.5.0"
+    assert manifest["versions"][0]["version"] == "0.6.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -72,6 +75,27 @@ def test_plugin_manifest_has_lumae_identity():
             "additive_restore",
         ],
     }
+    assert manifest["capabilities"]["catalog_mirror"] == {
+        "catalog_schema_version": 2,
+        "analysis_schema_version": 2,
+        "supported_core_range": ">=2.6.0,<4.0.0",
+        "features": [
+            "dual_core_compat",
+            "stable_catalog_instance",
+            "provider_occurrences",
+            "rich_metadata",
+            "complete_generations",
+            "bootstrap_leases",
+            "cursor_changes",
+            "refresh_on_demand",
+            "library_scope",
+            "album_ids",
+            "artist_credits",
+            "soft_deletions",
+            "shared_analysis",
+            "binary_vectors",
+        ],
+    }
 
 
 def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
@@ -83,6 +107,10 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
+        "plugin_version": "0.6.0",
+        "core_version": "v2.6.2",
+        "core_adapter": "v2_single_server",
+        "supported_core_range": ">=2.6.0,<4.0.0",
         "schema_version": 1,
         "analyzer_version": 1,
         "capabilities": {
@@ -91,10 +119,88 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "backup_version": 1,
                 "enabled": False,
                 "scope": "shared",
-            }
+            },
+            "catalog_mirror": mod.catalog_capability(),
         },
         "status": "ok",
     }
+
+
+def test_catalog_health_uses_v2_single_server_adapter():
+    mod = load_plugin()
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["core_adapter"] == "v2_single_server"
+    assert body["supported"] is True
+    assert body["servers"] == [
+        {
+            "server_id": "legacy-default",
+            "catalog_instance_id": None,
+            "name": "Default music server",
+            "provider_type": "navidrome",
+            "is_default": True,
+            "status": "not_initialized",
+        }
+    ]
+
+
+def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", "v3.0.0")
+    monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
+    monkeypatch.setattr(plugin_api_module, "use_server", lambda _server_id: None, raising=False)
+    monkeypatch.setattr(
+        plugin_api_module,
+        "list_servers",
+        lambda: [
+            {
+                "server_id": "server-a",
+                "name": "Main",
+                "server_type": "jellyfin",
+                "is_default": True,
+                "creds": {"token": "secret"},
+                "url": "https://internal.invalid",
+            }
+        ],
+        raising=False,
+    )
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["core_adapter"] == "v3_registry"
+    assert body["servers"] == [
+        {
+            "server_id": "server-a",
+            "catalog_instance_id": None,
+            "name": "Main",
+            "provider_type": "jellyfin",
+            "is_default": True,
+            "status": "not_initialized",
+        }
+    ]
+    assert "secret" not in response.get_data(as_text=True)
+    assert "internal.invalid" not in response.get_data(as_text=True)
+
+
+@pytest.mark.parametrize(
+    ("version", "expected_status"),
+    [("v2.5.0", "core_too_old"), ("v4.0.0", "core_untested")],
+)
+def test_catalog_health_rejects_unsupported_core_before_server_work(
+    monkeypatch, version, expected_status
+):
+    mod = load_plugin()
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", version)
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 409
+    assert response.get_json()["status"] == expected_status
+    assert response.get_json()["servers"] == []
 
 
 def test_collections_api_is_hidden_until_enabled():

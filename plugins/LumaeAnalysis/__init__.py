@@ -8,6 +8,7 @@ from flask import Blueprint, jsonify, request
 from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
 
 from .loudness import SilentAudioError, analyze_file
+from .core_compat import SUPPORTED_CORE_RANGE, detect_core, sanitized_server_summaries
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -20,6 +21,25 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
+PLUGIN_VERSION = "0.6.0"
+CATALOG_SCHEMA_VERSION = 2
+ANALYSIS_SCHEMA_VERSION = 2
+CATALOG_FEATURES = (
+    "dual_core_compat",
+    "stable_catalog_instance",
+    "provider_occurrences",
+    "rich_metadata",
+    "complete_generations",
+    "bootstrap_leases",
+    "cursor_changes",
+    "refresh_on_demand",
+    "library_scope",
+    "album_ids",
+    "artist_credits",
+    "soft_deletions",
+    "shared_analysis",
+    "binary_vectors",
+)
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 WHOLE_LIBRARY_CHUNK_SIZE = 250
 COLLECTIONS_MENU_LABEL = "Living Collections"
@@ -362,11 +382,25 @@ def upsert_profile(track_id, result, status, last_error=None, media_sig=None):
     cur.close()
 
 
+def catalog_capability():
+    return {
+        "catalog_schema_version": CATALOG_SCHEMA_VERSION,
+        "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+        "supported_core_range": SUPPORTED_CORE_RANGE,
+        "features": list(CATALOG_FEATURES),
+    }
+
+
 @bp.get("/api/health")
 def health():
+    compatibility = detect_core()
     return jsonify(
         {
             "plugin": "lumae_analysis",
+            "plugin_version": PLUGIN_VERSION,
+            "core_version": compatibility.core_version,
+            "core_adapter": compatibility.adapter,
+            "supported_core_range": SUPPORTED_CORE_RANGE,
             "schema_version": SCHEMA_VERSION,
             "analyzer_version": ANALYZER_VERSION,
             "capabilities": {
@@ -375,11 +409,48 @@ def health():
                     "backup_version": COLLECTIONS_BACKUP_VERSION,
                     "enabled": collections_enabled(),
                     "scope": current_collection_scope()["mode"],
-                }
+                },
+                "catalog_mirror": catalog_capability(),
             },
-            "status": "ok",
+            "status": "ok" if compatibility.supported else compatibility.status,
         }
     )
+
+
+@bp.get("/api/catalog/health")
+def catalog_health():
+    compatibility = detect_core()
+    try:
+        servers = sanitized_server_summaries(compatibility)
+    except Exception as exc:
+        logger.exception("lumae_analysis could not enumerate AudioMuse servers")
+        payload = compatibility.as_dict()
+        payload.update(
+            {
+                "plugin": "lumae_analysis",
+                "plugin_version": PLUGIN_VERSION,
+                "catalog_schema_version": CATALOG_SCHEMA_VERSION,
+                "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+                "capability": catalog_capability(),
+                "servers": [],
+                "status": "server_discovery_failed",
+                "reason": str(exc),
+            }
+        )
+        return jsonify(payload), 503
+
+    payload = compatibility.as_dict()
+    payload.update(
+        {
+            "plugin": "lumae_analysis",
+            "plugin_version": PLUGIN_VERSION,
+            "catalog_schema_version": CATALOG_SCHEMA_VERSION,
+            "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+            "capability": catalog_capability(),
+            "servers": servers,
+        }
+    )
+    return jsonify(payload), 200 if compatibility.supported else 409
 
 
 @bp.get("/api/profiles")
