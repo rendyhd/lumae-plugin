@@ -1,9 +1,12 @@
 """Plugin-owned provider catalogue schema and source identity management."""
 
 from datetime import datetime, timezone
+import base64
 import hashlib
+import hmac
 import json
 import re
+import secrets
 import unicodedata
 import uuid
 
@@ -948,6 +951,437 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         cur.close()
         db.commit()
         raise
+
+
+def opaque_cursor(catalog_instance_id, epoch, seq):
+    payload = canonical_json(
+        {"catalog_instance_id": catalog_instance_id, "epoch": epoch, "seq": int(seq)}
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).rstrip(b"=").decode("ascii")
+
+
+def parse_opaque_cursor(value):
+    try:
+        raw = str(value or "")
+        decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        payload = json.loads(decoded.decode("utf-8"))
+        return {
+            "catalog_instance_id": str(payload["catalog_instance_id"]),
+            "epoch": str(payload["epoch"]),
+            "seq": int(payload["seq"]),
+        }
+    except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Malformed catalogue cursor") from exc
+
+
+def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=False):
+    cur = db.cursor()
+    suffix = " FOR UPDATE OF s, c" if lock else ""
+    if server_id:
+        cur.execute(
+            f"""
+            SELECT s.catalog_instance_id, s.current_core_server_id, s.provider_type,
+                   s.server_name, s.is_default, s.rebind_status,
+                   c.published_generation, c.catalog_epoch, c.catalog_head_seq,
+                   c.catalog_floor_seq, c.status, c.entity_counts, c.field_support,
+                   c.field_coverage, c.started_at, c.completed_at, c.last_error,
+                   a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
+                   a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
+                   a.completed_at, a.last_error
+              FROM {t('catalog_sources')} s
+              JOIN {t('catalog_state')} c USING (catalog_instance_id)
+              LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
+             WHERE s.current_core_server_id=%s{suffix}
+            """,
+            (server_id,),
+        )
+    elif catalog_instance_id:
+        cur.execute(
+            f"""
+            SELECT s.catalog_instance_id, s.current_core_server_id, s.provider_type,
+                   s.server_name, s.is_default, s.rebind_status,
+                   c.published_generation, c.catalog_epoch, c.catalog_head_seq,
+                   c.catalog_floor_seq, c.status, c.entity_counts, c.field_support,
+                   c.field_coverage, c.started_at, c.completed_at, c.last_error,
+                   a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
+                   a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
+                   a.completed_at, a.last_error
+              FROM {t('catalog_sources')} s
+              JOIN {t('catalog_state')} c USING (catalog_instance_id)
+              LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
+             WHERE s.catalog_instance_id=%s{suffix}
+            """,
+            (catalog_instance_id,),
+        )
+    else:
+        cur.execute(
+            f"""
+            SELECT s.catalog_instance_id, s.current_core_server_id, s.provider_type,
+                   s.server_name, s.is_default, s.rebind_status,
+                   c.published_generation, c.catalog_epoch, c.catalog_head_seq,
+                   c.catalog_floor_seq, c.status, c.entity_counts, c.field_support,
+                   c.field_coverage, c.started_at, c.completed_at, c.last_error,
+                   a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
+                   a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
+                   a.completed_at, a.last_error
+              FROM {t('catalog_sources')} s
+              JOIN {t('catalog_state')} c USING (catalog_instance_id)
+              LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
+             ORDER BY s.is_default DESC, s.server_name, s.catalog_instance_id{suffix}
+            """
+        )
+    rows = cur.fetchall()
+    cur.close()
+    if server_id or catalog_instance_id:
+        if not rows:
+            raise KeyError("Unknown catalogue source")
+        rows = rows[:1]
+    return [_source_dto(row) for row in rows]
+
+
+def _iso(value):
+    if value is None:
+        return None
+    if hasattr(value, "isoformat"):
+        return value.isoformat().replace("+00:00", "Z")
+    return str(value)
+
+
+def _source_dto(row):
+    return {
+        "catalog_instance_id": str(row[0]),
+        "server_id": str(row[1]) if row[1] is not None else None,
+        "provider_type": row[2],
+        "name": row[3],
+        "is_default": bool(row[4]),
+        "rebind_status": row[5],
+        "catalog": {
+            "generation": int(row[6]),
+            "epoch": str(row[7]),
+            "head_seq": int(row[8]),
+            "floor_seq": int(row[9]),
+            "status": row[10],
+            "entity_counts": _state_counts(row[11]),
+            "field_support": _state_counts(row[12]),
+            "field_coverage": _state_counts(row[13]),
+            "started_at": _iso(row[14]),
+            "completed_at": _iso(row[15]),
+            "last_error": row[16],
+        },
+        "analysis": {
+            "generation": int(row[17] or 0),
+            "epoch": str(row[18] or ""),
+            "head_seq": int(row[19] or 0),
+            "floor_seq": int(row[20] or 0),
+            "status": row[21] or "not_initialized",
+            "item_count": int(row[22] or 0),
+            "mapped_track_count": int(row[23] or 0),
+            "completed_at": _iso(row[24]),
+            "last_error": row[25],
+        },
+    }
+
+
+def _session_hash(token):
+    return hashlib.sha256(str(token).encode("utf-8")).hexdigest()
+
+
+def _page_token(session_token, stream, entity_type, after_id):
+    body = canonical_json(
+        {"stream": stream, "entity_type": entity_type, "after_id": after_id}
+    ).encode("utf-8")
+    signature = hmac.new(str(session_token).encode("utf-8"), body, hashlib.sha256).hexdigest().encode("ascii")
+    return base64.urlsafe_b64encode(body + b"." + signature).rstrip(b"=").decode("ascii")
+
+
+def _parse_page_token(session_token, value):
+    try:
+        raw = str(value or "")
+        decoded = base64.urlsafe_b64decode(raw + "=" * (-len(raw) % 4))
+        body, signature = decoded.rsplit(b".", 1)
+        expected = hmac.new(
+            str(session_token).encode("utf-8"), body, hashlib.sha256
+        ).hexdigest().encode("ascii")
+        if not hmac.compare_digest(signature, expected):
+            raise ValueError
+        payload = json.loads(body.decode("utf-8"))
+        return payload
+    except (ValueError, TypeError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError("Malformed or invalid bootstrap page token") from exc
+
+
+def create_bootstrap_session(
+    db,
+    principal_key,
+    stream="catalog",
+    server_id=None,
+    catalog_instance_id=None,
+    lifetime_minutes=30,
+):
+    if stream not in ("catalog", "analysis"):
+        raise ValueError("Unknown bootstrap stream")
+    sources = resolve_catalog_source(
+        db, server_id=server_id, catalog_instance_id=catalog_instance_id, lock=True
+    )
+    if len(sources) != 1:
+        raise ValueError("An explicit server_id is required when multiple sources exist")
+    source = sources[0]
+    if catalog_instance_id and source["catalog_instance_id"] != catalog_instance_id:
+        raise ValueError("Catalogue source identity does not match the current server")
+    state = source[stream]
+    if state["status"] not in ("complete", "ready"):
+        raise CatalogScanError(f"{stream.capitalize()} bootstrap is not ready")
+    cur = db.cursor()
+    cur.execute(
+        f"DELETE FROM {t('stream_bootstrap_sessions')} "
+        "WHERE expires_at <= now() OR completed_at IS NOT NULL"
+    )
+    cur.execute(
+        f"SELECT COUNT(*) FROM {t('stream_bootstrap_sessions')} "
+        "WHERE principal_key=%s AND expires_at > now() AND completed_at IS NULL",
+        (principal_key,),
+    )
+    active_count = int((cur.fetchone() or (0,))[0])
+    if active_count >= 4:
+        cur.close()
+        raise CatalogScanError("Too many active bootstrap sessions")
+    token = secrets.token_urlsafe(32)
+    generation = state["generation"]
+    epoch = state["epoch"]
+    seq = state["head_seq"]
+    totals = state.get("entity_counts") or {
+        "item": state.get("item_count", 0),
+        "link": state.get("mapped_track_count", 0),
+    }
+    cur.execute(
+        f"""
+        INSERT INTO {t('stream_bootstrap_sessions')}
+            (token_hash, stream, catalog_instance_id, core_server_id, principal_key,
+             pinned_generation, snapshot_epoch, snapshot_seq, totals, expires_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb,
+                now() + (%s * interval '1 minute'))
+        """,
+        (
+            _session_hash(token),
+            stream,
+            source["catalog_instance_id"],
+            source["server_id"],
+            principal_key,
+            generation,
+            epoch,
+            seq,
+            _json_param(totals),
+            max(5, min(int(lifetime_minutes), 60)),
+        ),
+    )
+    cur.close()
+    db.commit()
+    return {
+        "session_token": token,
+        "stream": stream,
+        "catalog_instance_id": source["catalog_instance_id"],
+        "server_id": source["server_id"],
+        "generation": generation,
+        "snapshot_cursor": opaque_cursor(source["catalog_instance_id"], epoch, seq),
+        "totals": totals,
+        "expires_in_seconds": max(5, min(int(lifetime_minutes), 60)) * 60,
+    }
+
+
+def _load_bootstrap_session(db, session_token, principal_key, stream):
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT catalog_instance_id, core_server_id, pinned_generation,
+               snapshot_epoch, snapshot_seq, totals
+          FROM {t('stream_bootstrap_sessions')}
+         WHERE token_hash=%s AND principal_key=%s AND stream=%s
+           AND expires_at > now() AND completed_at IS NULL
+         FOR UPDATE
+        """,
+        (_session_hash(session_token), principal_key, stream),
+    )
+    row = cur.fetchone()
+    if row is None:
+        cur.close()
+        raise KeyError("bootstrap_required")
+    return cur, {
+        "catalog_instance_id": str(row[0]),
+        "server_id": str(row[1]) if row[1] else None,
+        "generation": int(row[2]),
+        "epoch": str(row[3]),
+        "seq": int(row[4]),
+        "totals": _state_counts(row[5]),
+    }
+
+
+def bootstrap_page(
+    db,
+    session_token,
+    principal_key,
+    stream="catalog",
+    page_token=None,
+    limit=500,
+):
+    limit = max(1, min(int(limit), 1000))
+    cur, session = _load_bootstrap_session(db, session_token, principal_key, stream)
+    if page_token:
+        position = _parse_page_token(session_token, page_token)
+        if position.get("stream") != stream:
+            cur.close()
+            raise ValueError("Bootstrap page token belongs to another stream")
+        entity_type = position.get("entity_type")
+        after_id = position.get("after_id") or ""
+    else:
+        entity_type = "library" if stream == "catalog" else "item"
+        after_id = ""
+    stream_entities = ENTITY_ORDER if stream == "catalog" else ("item", "link")
+    if entity_type not in stream_entities:
+        cur.close()
+        raise ValueError("Unknown bootstrap entity type")
+    if stream == "catalog":
+        table_name, id_column = ENTITY_TABLES[entity_type]
+        generation_column = "published_generation"
+    elif entity_type == "item":
+        table_name, id_column, generation_column = (
+            "analysis_items",
+            "analysis_id",
+            "projection_generation",
+        )
+    else:
+        table_name, id_column, generation_column = (
+            "track_analysis_links",
+            "provider_track_id",
+            "projection_generation",
+        )
+    cur.execute(
+        f"""
+        SELECT {id_column},
+               to_jsonb(entity_row) - 'catalog_instance_id' - '{generation_column}' AS dto
+          FROM {t(table_name)} entity_row
+         WHERE catalog_instance_id=%s AND {generation_column}=%s
+           AND {id_column} > %s
+           {"AND available=TRUE" if stream == "catalog" else ""}
+         ORDER BY {id_column}
+         LIMIT %s
+        """,
+        (session["catalog_instance_id"], session["generation"], after_id, limit + 1),
+    )
+    rows = cur.fetchall()
+    has_more_in_entity = len(rows) > limit
+    rows = rows[:limit]
+    items = [row[1] if isinstance(row[1], dict) else json.loads(row[1]) for row in rows]
+    next_token = None
+    completed = False
+    if has_more_in_entity:
+        next_token = _page_token(session_token, stream, entity_type, str(rows[-1][0]))
+    else:
+        index = stream_entities.index(entity_type)
+        if index + 1 < len(stream_entities):
+            next_token = _page_token(session_token, stream, stream_entities[index + 1], "")
+        else:
+            completed = True
+            cur.execute(
+                f"UPDATE {t('stream_bootstrap_sessions')} SET completed_at=now(), "
+                "last_used_at=now() WHERE token_hash=%s",
+                (_session_hash(session_token),),
+            )
+    if not completed:
+        cur.execute(
+            f"UPDATE {t('stream_bootstrap_sessions')} SET last_used_at=now() "
+            "WHERE token_hash=%s",
+            (_session_hash(session_token),),
+        )
+    cur.close()
+    db.commit()
+    return {
+        "stream": stream,
+        "catalog_instance_id": session["catalog_instance_id"],
+        "server_id": session["server_id"],
+        "generation": session["generation"],
+        "entity_type": entity_type,
+        "items": items,
+        "next_page_token": next_token,
+        "completed": completed,
+        "snapshot_cursor": opaque_cursor(
+            session["catalog_instance_id"], session["epoch"], session["seq"]
+        ),
+    }
+
+
+def release_bootstrap_session(db, session_token, principal_key):
+    cur = db.cursor()
+    cur.execute(
+        f"UPDATE {t('stream_bootstrap_sessions')} SET completed_at=now() "
+        "WHERE token_hash=%s AND principal_key=%s AND completed_at IS NULL",
+        (_session_hash(session_token), principal_key),
+    )
+    released = bool(getattr(cur, "rowcount", 0))
+    cur.close()
+    db.commit()
+    return released
+
+
+def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=None, limit=500):
+    cursor = parse_opaque_cursor(cursor_value)
+    expected_id = catalog_instance_id or cursor["catalog_instance_id"]
+    sources = resolve_catalog_source(
+        db, server_id=server_id, catalog_instance_id=None if server_id else expected_id
+    )
+    if len(sources) != 1:
+        raise ValueError("An explicit server_id is required when multiple sources exist")
+    source = sources[0]
+    if source["catalog_instance_id"] != cursor["catalog_instance_id"]:
+        raise ValueError("Cursor belongs to another catalogue source")
+    state = source["catalog"]
+    if cursor["epoch"] != state["epoch"] or cursor["seq"] < state["floor_seq"]:
+        raise KeyError("bootstrap_required")
+    if cursor["seq"] > state["head_seq"]:
+        raise ValueError("Cursor is ahead of the catalogue head")
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT seq, generation, entity_type, entity_id, operation, old_entity_id,
+               payload, evidence, created_at
+          FROM {t('catalog_changes')}
+         WHERE catalog_instance_id=%s AND epoch=%s AND seq > %s
+         ORDER BY seq
+         LIMIT %s
+        """,
+        (
+            source["catalog_instance_id"],
+            state["epoch"],
+            cursor["seq"],
+            max(1, min(int(limit), 1000)),
+        ),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    changes = [
+        {
+            "seq": int(row[0]),
+            "generation": int(row[1]),
+            "entity_type": row[2],
+            "entity_id": str(row[3]),
+            "operation": row[4],
+            "old_entity_id": str(row[5]) if row[5] else None,
+            "payload": row[6] if isinstance(row[6], dict) or row[6] is None else json.loads(row[6]),
+            "evidence": row[7] if isinstance(row[7], dict) or row[7] is None else json.loads(row[7]),
+            "created_at": _iso(row[8]),
+        }
+        for row in rows
+    ]
+    next_seq = changes[-1]["seq"] if changes else cursor["seq"]
+    return {
+        "catalog_instance_id": source["catalog_instance_id"],
+        "server_id": source["server_id"],
+        "changes": changes,
+        "cursor": opaque_cursor(source["catalog_instance_id"], state["epoch"], next_seq),
+        "head_cursor": opaque_cursor(
+            source["catalog_instance_id"], state["epoch"], state["head_seq"]
+        ),
+        "has_more": next_seq < state["head_seq"],
+    }
 
 
 def _entity_table_sql(

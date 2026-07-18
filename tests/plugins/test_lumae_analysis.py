@@ -182,6 +182,107 @@ def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch):
             "status": "not_initialized",
         }
     ]
+
+
+def test_catalog_cursor_is_opaque_round_trippable_and_source_bound():
+    from plugins.LumaeAnalysis.catalog import opaque_cursor, parse_opaque_cursor
+
+    cursor = opaque_cursor("catalog-a", "epoch-a", 42)
+
+    assert "catalog-a" not in cursor
+    assert parse_opaque_cursor(cursor) == {
+        "catalog_instance_id": "catalog-a",
+        "epoch": "epoch-a",
+        "seq": 42,
+    }
+    with pytest.raises(ValueError, match="Malformed"):
+        parse_opaque_cursor("not-a-cursor")
+
+
+def test_bootstrap_session_api_keeps_token_out_of_url_and_private_cache(monkeypatch):
+    mod = load_plugin()
+    captured = {}
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+
+    def create(db, principal, **kwargs):
+        captured.update({"db": db, "principal": principal, **kwargs})
+        return {
+            "session_token": "secret-session-token",
+            "catalog_instance_id": "catalog-a",
+            "server_id": "server-a",
+        }
+
+    monkeypatch.setattr(mod, "create_bootstrap_session", create)
+    response = plugin_client(mod).post(
+        "/api/catalog/bootstrap-sessions",
+        json={"server_id": "server-a", "stream": "catalog"},
+    )
+
+    assert response.status_code == 201
+    assert response.get_json()["session_token"] == "secret-session-token"
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert captured["server_id"] == "server-a"
+    assert captured["principal"].startswith("client:")
+
+
+def test_bootstrap_page_requires_token_header_and_returns_410_after_expiry(monkeypatch):
+    mod = load_plugin()
+    client = plugin_client(mod)
+
+    assert client.get("/api/catalog/bootstrap").status_code == 400
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(
+        mod,
+        "bootstrap_page",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyError("bootstrap_required")),
+    )
+    response = client.get(
+        "/api/catalog/bootstrap?stream=catalog",
+        headers={"X-Lumae-Bootstrap-Token": "expired"},
+    )
+
+    assert response.status_code == 410
+    assert response.get_json()["error"] == "bootstrap_required"
+
+
+def test_catalog_changes_rejects_malformed_cursor_without_reading_database(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    response = plugin_client(mod).get("/api/catalog/changes?cursor=malformed")
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "invalid_cursor"
+
+
+def test_catalog_refresh_coalesces_to_selected_source(monkeypatch):
+    mod = load_plugin()
+    calls = []
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(
+        mod,
+        "resolve_catalog_source",
+        lambda *_args, **_kwargs: [
+            {
+                "server_id": "server-a",
+                "catalog_instance_id": "catalog-a",
+                "catalog": {"generation": 3, "status": "complete", "completed_at": None},
+            }
+        ],
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda func, server_id, queue="default": calls.append((func, server_id, queue)),
+    )
+
+    response = plugin_client(mod).post(
+        "/api/catalog/refresh",
+        json={"server_id": "server-a", "catalog_instance_id": "catalog-a"},
+    )
+
+    assert response.status_code == 202
+    assert response.get_json()["status"] == "queued"
+    assert calls == [(mod.catalog_refresh_task, "server-a", "default")]
     assert "secret" not in response.get_data(as_text=True)
     assert "internal.invalid" not in response.get_data(as_text=True)
 

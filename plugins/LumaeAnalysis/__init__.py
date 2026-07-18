@@ -3,7 +3,7 @@ import os
 from datetime import datetime, timezone
 from html import escape
 
-from flask import Blueprint, jsonify, request
+from flask import Blueprint, g, jsonify, request
 
 from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
 
@@ -14,7 +14,18 @@ from .core_compat import (
     get_core_adapter,
     sanitized_server_summaries,
 )
-from .catalog import ensure_catalog_sources, migrate_catalog, refresh_catalog
+from .catalog import (
+    CatalogScanError,
+    bootstrap_page,
+    create_bootstrap_session,
+    ensure_catalog_sources,
+    migrate_catalog,
+    opaque_cursor,
+    read_catalog_changes,
+    refresh_catalog,
+    release_bootstrap_session,
+    resolve_catalog_source,
+)
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -191,9 +202,9 @@ def ensure_catalog_refresh_schedule(db):
     cur.close()
 
 
-def catalog_refresh_task():
+def catalog_refresh_task(server_id=None):
     adapter = get_core_adapter()
-    return refresh_catalog(server_id=adapter.active_server_id())
+    return refresh_catalog(server_id=server_id or adapter.active_server_id())
 
 
 def migrate(db):
@@ -464,6 +475,16 @@ def catalog_health():
         )
         return jsonify(payload), 503
 
+    persisted = []
+    if compatibility.supported:
+        try:
+            db = get_db()
+            if db is not None:
+                persisted = resolve_catalog_source(db)
+        except Exception:
+            logger.exception("lumae_analysis could not read persisted catalogue health")
+    if persisted:
+        servers = persisted
     payload = compatibility.as_dict()
     payload.update(
         {
@@ -475,7 +496,162 @@ def catalog_health():
             "servers": servers,
         }
     )
-    return jsonify(payload), 200 if compatibility.supported else 409
+    response = jsonify(payload)
+    response.headers["Cache-Control"] = "private, no-cache"
+    response.headers["Vary"] = "Authorization, Cookie"
+    return response, 200 if compatibility.supported else 409
+
+
+def _catalog_principal_key():
+    username = getattr(g, "auth_user", None)
+    if username:
+        return f"user:{username}"
+    return f"client:{request.remote_addr or 'unknown'}"
+
+
+def _private_json(payload, status=200, no_store=True):
+    response = jsonify(payload)
+    response.status_code = status
+    response.headers["Cache-Control"] = "private, no-store" if no_store else "private, no-cache"
+    response.headers["Vary"] = "Authorization, Cookie"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+def _catalog_error(code, message, status):
+    return _private_json({"error": code, "message": message}, status)
+
+
+def _json_body(max_bytes=16_384):
+    if request.content_length and request.content_length > max_bytes:
+        raise ValueError("Request body is too large")
+    body = request.get_json(silent=True)
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise ValueError("JSON body must be an object")
+    return body
+
+
+@bp.post("/api/catalog/refresh")
+def catalog_refresh_api():
+    try:
+        body = _json_body()
+        server_id = body.get("server_id")
+        catalog_instance_id = body.get("catalog_instance_id")
+        sources = resolve_catalog_source(
+            get_db(), server_id=server_id, catalog_instance_id=catalog_instance_id
+        )
+        if len(sources) != 1:
+            return _catalog_error(
+                "source_required",
+                "An explicit server_id is required when multiple music servers are configured.",
+                409,
+            )
+        source = sources[0]
+        if catalog_instance_id and source["catalog_instance_id"] != catalog_instance_id:
+            return _catalog_error("source_mismatch", "Catalogue source identity changed.", 409)
+        stale_for = max(0, min(int(body.get("if_stale_for_seconds", 0) or 0), 604_800))
+        completed_at = source["catalog"].get("completed_at")
+        if stale_for and completed_at and source["catalog"]["status"] == "complete":
+            try:
+                completed = datetime.fromisoformat(completed_at.replace("Z", "+00:00"))
+                age = (datetime.now(timezone.utc) - completed).total_seconds()
+                if age < stale_for:
+                    return _private_json(
+                        {
+                            "status": "fresh",
+                            "server_id": source["server_id"],
+                            "catalog_instance_id": source["catalog_instance_id"],
+                            "generation": source["catalog"]["generation"],
+                        },
+                        200,
+                    )
+            except ValueError:
+                pass
+        enqueue(catalog_refresh_task, source["server_id"], queue="default")
+        return _private_json(
+            {
+                "status": "queued",
+                "server_id": source["server_id"],
+                "catalog_instance_id": source["catalog_instance_id"],
+            },
+            202,
+        )
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_refresh", str(exc), 400)
+
+
+@bp.post("/api/catalog/bootstrap-sessions")
+def catalog_bootstrap_session_api():
+    try:
+        body = _json_body()
+        result = create_bootstrap_session(
+            get_db(),
+            _catalog_principal_key(),
+            stream=str(body.get("stream") or "catalog"),
+            server_id=body.get("server_id"),
+            catalog_instance_id=body.get("catalog_instance_id"),
+        )
+        return _private_json(result, 201)
+    except KeyError:
+        return _catalog_error("source_not_found", "Catalogue source was not found.", 404)
+    except (ValueError, CatalogScanError) as exc:
+        return _catalog_error("bootstrap_unavailable", str(exc), 409)
+
+
+@bp.delete("/api/catalog/bootstrap-sessions")
+def catalog_bootstrap_release_api():
+    token = request.headers.get("X-Lumae-Bootstrap-Token")
+    if not token:
+        return _catalog_error("token_required", "Bootstrap token header is required.", 400)
+    released = release_bootstrap_session(get_db(), token, _catalog_principal_key())
+    return _private_json({"released": released})
+
+
+@bp.get("/api/catalog/bootstrap")
+def catalog_bootstrap_api():
+    token = request.headers.get("X-Lumae-Bootstrap-Token")
+    if not token:
+        return _catalog_error("token_required", "Bootstrap token header is required.", 400)
+    try:
+        result = bootstrap_page(
+            get_db(),
+            token,
+            _catalog_principal_key(),
+            stream=str(request.args.get("stream") or "catalog"),
+            page_token=request.args.get("page_token"),
+            limit=request.args.get("limit", 500),
+        )
+        return _private_json(result)
+    except KeyError:
+        return _catalog_error(
+            "bootstrap_required", "Bootstrap lease expired or was released.", 410
+        )
+    except ValueError as exc:
+        return _catalog_error("invalid_page", str(exc), 400)
+
+
+@bp.get("/api/catalog/changes")
+def catalog_changes_api():
+    cursor = request.args.get("cursor")
+    if not cursor:
+        return _catalog_error("cursor_required", "Catalogue cursor is required.", 400)
+    try:
+        result = read_catalog_changes(
+            get_db(),
+            cursor,
+            server_id=request.args.get("server_id"),
+            catalog_instance_id=request.args.get("catalog_instance_id"),
+            limit=request.args.get("limit", 500),
+        )
+        return _private_json(result, no_store=False)
+    except KeyError:
+        return _catalog_error(
+            "bootstrap_required", "Catalogue cursor expired or belongs to an old epoch.", 410
+        )
+    except ValueError as exc:
+        return _catalog_error("invalid_cursor", str(exc), 400)
 
 
 @bp.get("/api/profiles")
