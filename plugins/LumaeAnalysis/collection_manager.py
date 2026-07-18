@@ -1,11 +1,13 @@
 """Optional, per-principal Living Collections storage and web manager."""
 
+import hashlib
 import json
+import re
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, timezone
 from functools import wraps
 
-from flask import g, jsonify, request
+from flask import Response, abort, g, jsonify, request
 
 from plugin.api import get_db, get_setting, render_page, table
 
@@ -14,6 +16,11 @@ from .collection_ui import render_collection_workbench
 
 
 COLLECTIONS_SCHEMA_VERSION = 1
+COLLECTIONS_BACKUP_FORMAT = "lumae-living-collections"
+COLLECTIONS_BACKUP_VERSION = 1
+MAX_BACKUP_COLLECTIONS = 2_000
+MAX_BACKUP_ITEMS_PER_COLLECTION = 50_000
+MAX_BACKUP_ITEMS = 100_000
 GLOBAL_PRINCIPAL = "__global__"
 
 
@@ -45,7 +52,30 @@ def current_principal():
     if getattr(g, "auth_method", None) == "bearer":
         return GLOBAL_PRINCIPAL
     username = getattr(g, "auth_user", None)
-    return f"user:{username}" if username else GLOBAL_PRINCIPAL
+    if username:
+        return f"user:{username}"
+    if getattr(g, "auth_method", None) == "session":
+        # Fail closed if host authentication ever presents a malformed session.
+        # Falling back to the shared bearer principal here would expose another
+        # account's collections.
+        abort(401)
+    return GLOBAL_PRINCIPAL
+
+
+def current_collection_scope():
+    """Return a credential-free description suitable for APIs and UI copy."""
+    if current_principal() == GLOBAL_PRINCIPAL:
+        return {
+            "mode": "shared",
+            "label": "Shared bearer-token library",
+            "detail": "Everyone using the AudioMuse installation token sees these collections.",
+        }
+    username = str(getattr(g, "auth_user", "") or "").strip()
+    return {
+        "mode": "personal",
+        "label": f"Personal library · {username}" if username else "Personal library",
+        "detail": "Only this signed-in AudioMuse user can see these collections.",
+    }
 
 
 def migrate_collections(db):
@@ -199,6 +229,213 @@ def _fetch_items(cur, principal, collection_id):
         (principal, collection_id),
     )
     return _all_dicts(cur)
+
+
+def _backup_checksum(collections):
+    encoded = json.dumps(
+        collections,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
+
+
+def _backup_envelope(collections, scope_mode, exported_at=None):
+    exported_at = exported_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    item_count = sum(len(collection.get("items") or []) for collection in collections)
+    return {
+        "format": COLLECTIONS_BACKUP_FORMAT,
+        "version": COLLECTIONS_BACKUP_VERSION,
+        "exported_at": exported_at,
+        "scope": scope_mode,
+        "collection_count": len(collections),
+        "item_count": item_count,
+        "collections": collections,
+        "checksum": _backup_checksum(collections),
+    }
+
+
+def _export_principal_collections(principal, collection_id=None):
+    """Read only active collections belonging to one authenticated principal."""
+    db = get_db()
+    cur = db.cursor()
+    if collection_id is not None:
+        rows = [_fetch_collection(cur, principal, collection_id)]
+        rows = [row for row in rows if row is not None]
+    else:
+        cur.execute(
+            _collection_select()
+            + """
+             WHERE c.principal = %s AND c.deleted_at IS NULL
+             GROUP BY c.principal, c.id
+             ORDER BY c.created_at ASC, lower(c.name)
+            """,
+            (principal,),
+        )
+        rows = _all_dicts(cur)
+
+    collections = []
+    for row in rows:
+        collections.append(
+            {
+                "id": row["id"],
+                "name": row["name"],
+                "description": row.get("description"),
+                "created_at": row.get("created_at"),
+                "updated_at": row.get("updated_at"),
+                "items": _fetch_items(cur, principal, row["id"]),
+            }
+        )
+    cur.close()
+    return collections
+
+
+def _backup_response(collections, scope_mode, filename):
+    envelope = _backup_envelope(collections, scope_mode)
+    body = json.dumps(envelope, ensure_ascii=False, indent=2) + "\n"
+    response = Response(body, content_type="application/json; charset=utf-8")
+    response.headers["Content-Disposition"] = f'attachment; filename="{filename}"'
+    response.headers["Cache-Control"] = "no-store"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
+
+
+def _backup_filename(name=None):
+    stem = re.sub(r"[^a-z0-9]+", "-", str(name or "collections").lower()).strip("-")
+    stem = stem[:60] or "collections"
+    day = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    return f"lumae-{stem}-{day}.json"
+
+
+def _normalize_backup_document(document):
+    if not isinstance(document, dict):
+        raise ValueError("Backup must be a JSON object.")
+    if document.get("format") != COLLECTIONS_BACKUP_FORMAT:
+        raise ValueError("This is not a Lumae Living Collections backup.")
+    if document.get("version") != COLLECTIONS_BACKUP_VERSION:
+        raise ValueError("This collection backup version is not supported.")
+    raw_collections = document.get("collections")
+    if not isinstance(raw_collections, list):
+        raise ValueError("Backup collections must be a list.")
+    if len(raw_collections) > MAX_BACKUP_COLLECTIONS:
+        raise ValueError(f"A backup can contain at most {MAX_BACKUP_COLLECTIONS} collections.")
+
+    checksum = document.get("checksum")
+    if not isinstance(checksum, str) or not checksum.startswith("sha256:"):
+        raise ValueError("Backup checksum is missing or invalid.")
+    if checksum != _backup_checksum(raw_collections):
+        raise ValueError("Backup checksum does not match its collection data.")
+
+    normalized = []
+    total_items = 0
+    for raw_collection in raw_collections:
+        if not isinstance(raw_collection, dict):
+            raise ValueError("Every backup collection must be an object.")
+        name = str(raw_collection.get("name") or "").strip()
+        if not name:
+            raise ValueError("Every backup collection requires a name.")
+        if len(name) > 120:
+            raise ValueError("Collection names must be 120 characters or fewer.")
+        description = raw_collection.get("description")
+        if description is not None:
+            description = str(description).strip() or None
+            if description and len(description) > 1000:
+                raise ValueError("Collection descriptions must be 1,000 characters or fewer.")
+        raw_items = raw_collection.get("items") or []
+        if not isinstance(raw_items, list):
+            raise ValueError(f"Items for {name} must be a list.")
+        if len(raw_items) > MAX_BACKUP_ITEMS_PER_COLLECTION:
+            raise ValueError(
+                f"{name} has more than {MAX_BACKUP_ITEMS_PER_COLLECTION:,} items."
+            )
+        total_items += len(raw_items)
+        if total_items > MAX_BACKUP_ITEMS:
+            raise ValueError(f"A backup can contain at most {MAX_BACKUP_ITEMS:,} items.")
+
+        items = []
+        membership_keys = set()
+        kind_positions = {"album": 0, "track": 0}
+        for raw_item in raw_items:
+            if not isinstance(raw_item, dict):
+                raise ValueError(f"Every item in {name} must be an object.")
+            item = _normalize_item(raw_item)
+            if item["kind"] == "track":
+                membership_key = ("track", item["track_id"])
+            elif item["provider_album_id"]:
+                membership_key = ("album-id", item["provider_album_id"])
+            else:
+                membership_key = ("album-key", item["album_key"].lower())
+            if membership_key in membership_keys:
+                raise ValueError(f"{name} contains the same media item more than once.")
+            membership_keys.add(membership_key)
+            item["id"] = str(uuid.uuid4())
+            item["position"] = kind_positions[item["kind"]]
+            kind_positions[item["kind"]] += 1
+            items.append(item)
+        normalized.append({"name": name, "description": description, "items": items})
+    return normalized
+
+
+def _restore_principal_collections(principal, collections):
+    """Add backup contents as new collections; never overwrite live records."""
+    db = get_db()
+    cur = db.cursor()
+    restored = []
+    item_count = 0
+    try:
+        for source in collections:
+            collection_id = str(uuid.uuid4())
+            cur.execute(
+                f"""
+                INSERT INTO {collections_table()} (principal, id, name, description)
+                VALUES (%s, %s, %s, %s)
+                """,
+                (principal, collection_id, source["name"], source["description"]),
+            )
+            for item in source["items"]:
+                _upsert_item(cur, principal, collection_id, item)
+            if source["items"]:
+                cur.execute(
+                    f"UPDATE {collections_table()} SET revision = 2, updated_at = now() "
+                    "WHERE principal = %s AND id = %s",
+                    (principal, collection_id),
+                )
+            collection = _fetch_collection(cur, principal, collection_id)
+            _record_change(
+                cur,
+                principal,
+                collection_id,
+                "collection",
+                collection_id,
+                "upsert",
+                collection,
+            )
+            for item in source["items"]:
+                _record_change(
+                    cur,
+                    principal,
+                    collection_id,
+                    "item",
+                    item["id"],
+                    "upsert",
+                    {
+                        **item,
+                        "collection_revision": collection["revision"],
+                        "collection_updated_at": collection["updated_at"],
+                    },
+                )
+            item_count += len(source["items"])
+            restored.append(collection)
+        cur.close()
+        db.commit()
+    except Exception:
+        cur.close()
+        rollback = getattr(db, "rollback", None)
+        if rollback:
+            rollback()
+        raise
+    return {"collections": restored, "collection_count": len(restored), "item_count": item_count}
 
 
 def _record_change(cur, principal, collection_id, entity_kind, entity_id, operation, payload):
@@ -390,7 +627,40 @@ def register_collection_routes(bp):
         )
         rows = _all_dicts(cur)
         cur.close()
-        return jsonify({"schema_version": COLLECTIONS_SCHEMA_VERSION, "collections": rows})
+        return jsonify(
+            {
+                "schema_version": COLLECTIONS_SCHEMA_VERSION,
+                "scope": current_collection_scope()["mode"],
+                "collections": rows,
+            }
+        )
+
+    @bp.get("/api/collections/backup")
+    @require_collections_enabled
+    def collection_backup():
+        principal = current_principal()
+        collections = _export_principal_collections(principal)
+        return _backup_response(
+            collections,
+            current_collection_scope()["mode"],
+            _backup_filename(),
+        )
+
+    @bp.post("/api/collections/restore")
+    @require_collections_enabled
+    def collection_restore():
+        try:
+            collections = _normalize_backup_document(request.get_json(silent=True))
+        except (TypeError, ValueError) as exc:
+            return jsonify({"error": str(exc)}), 400
+        if not collections:
+            return jsonify({"error": "The backup does not contain any collections."}), 400
+
+        def mutate(principal):
+            result = _restore_principal_collections(principal, collections)
+            return {"restored": True, **result}, 201
+
+        return _mutation_response(mutate)
 
     @bp.post("/api/collections")
     @require_collections_enabled
@@ -437,6 +707,19 @@ def register_collection_routes(bp):
         items = _fetch_items(cur, principal, collection_id)
         cur.close()
         return jsonify({"collection": collection, "items": items})
+
+    @bp.get("/api/collections/<collection_id>/export")
+    @require_collections_enabled
+    def collection_export(collection_id):
+        principal = current_principal()
+        collections = _export_principal_collections(principal, collection_id)
+        if not collections:
+            return jsonify({"error": "collection_not_found"}), 404
+        return _backup_response(
+            collections,
+            current_collection_scope()["mode"],
+            _backup_filename(collections[0]["name"]),
+        )
 
     @bp.patch("/api/collections/<collection_id>")
     @require_collections_enabled
@@ -799,13 +1082,10 @@ def render_collections_settings_panel():
       </section>
     """
 
+
 def render_collections_manager():
-    principal_label = (
-        "Shared bearer-token library"
-        if current_principal() == GLOBAL_PRINCIPAL
-        else "Your library"
-    )
+    scope = current_collection_scope()
     return render_page(
-        render_collection_workbench(principal_label),
+        render_collection_workbench(scope["label"], scope["detail"]),
         title="Living Collections",
     )

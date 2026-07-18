@@ -6,6 +6,7 @@ import math
 import types
 
 import numpy as np
+import pytest
 
 from flask import Flask, g
 
@@ -48,7 +49,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.4.1"
+    assert manifest["versions"][0]["version"] == "0.5.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -67,6 +68,8 @@ def test_plugin_manifest_has_lumae_identity():
             "album_track_numbers",
             "preview_playback",
             "bulk_management",
+            "principal_scoped_backup",
+            "additive_restore",
         ],
     }
 
@@ -85,7 +88,9 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
         "capabilities": {
             "collections": {
                 "schema_version": 1,
+                "backup_version": 1,
                 "enabled": False,
+                "scope": "shared",
             }
         },
         "status": "ok",
@@ -112,6 +117,238 @@ def test_collection_principal_is_per_user_but_bearer_is_global():
         g.auth_method = "bearer"
         g.auth_user = None
         assert collections.current_principal() == collections.GLOBAL_PRINCIPAL
+
+
+def test_collection_principal_fails_closed_for_session_without_username():
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    app = Flask(__name__)
+    with app.test_request_context("/"):
+        g.auth_method = "session"
+        g.auth_user = None
+        with pytest.raises(Exception) as exc_info:
+            collections.current_principal()
+        assert getattr(exc_info.value, "code", None) == 401
+
+
+def _collection_backup_fixture(collections):
+    rows = [
+        {
+            "id": "collection-source",
+            "name": "Sunday Records",
+            "description": "Slow mornings",
+            "created_at": "2026-07-18T10:00:00Z",
+            "updated_at": "2026-07-18T11:00:00Z",
+            "items": [
+                {
+                    "id": "item-source",
+                    "collection_id": "collection-source",
+                    "kind": "track",
+                    "track_id": "track-1",
+                    "provider_album_id": None,
+                    "album_key": None,
+                    "title": "Roads",
+                    "artist": "Portishead",
+                    "album": "Dummy",
+                    "cover_item_id": "track-1",
+                    "position": 0,
+                    "added_at": "2026-07-18T10:00:00Z",
+                    "updated_at": "2026-07-18T10:00:00Z",
+                }
+            ],
+        }
+    ]
+    return collections._backup_envelope(rows, "personal", "2026-07-18T12:00:00Z")
+
+
+def test_collection_backup_is_versioned_checksummed_and_tamper_evident():
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    backup = _collection_backup_fixture(collections)
+
+    assert backup["format"] == "lumae-living-collections"
+    assert backup["version"] == 1
+    assert backup["scope"] == "personal"
+    assert backup["collection_count"] == 1
+    assert backup["item_count"] == 1
+    assert backup["checksum"].startswith("sha256:")
+
+    restored = collections._normalize_backup_document(backup)
+    assert restored[0]["name"] == "Sunday Records"
+    assert restored[0]["items"][0]["track_id"] == "track-1"
+    assert restored[0]["items"][0]["id"] != "item-source"
+
+    missing_checksum = dict(backup)
+    missing_checksum.pop("checksum")
+    with pytest.raises(ValueError, match="checksum"):
+        collections._normalize_backup_document(missing_checksum)
+
+    backup["collections"][0]["name"] = "Tampered"
+    with pytest.raises(ValueError, match="checksum"):
+        collections._normalize_backup_document(backup)
+
+
+def test_collection_backup_restore_rejects_duplicate_membership():
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    backup = _collection_backup_fixture(collections)
+    duplicate = dict(backup["collections"][0]["items"][0])
+    duplicate["id"] = "item-duplicate"
+    backup["collections"][0]["items"].append(duplicate)
+    backup["checksum"] = collections._backup_checksum(backup["collections"])
+
+    with pytest.raises(ValueError, match="same media item"):
+        collections._normalize_backup_document(backup)
+
+
+def test_collection_backup_routes_are_scoped_to_the_authenticated_user(monkeypatch):
+    mod = load_plugin()
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    seen = []
+
+    def exported(principal, collection_id=None):
+        seen.append((principal, collection_id))
+        document = _collection_backup_fixture(collections)["collections"]
+        document[0]["name"] = principal
+        return document
+
+    monkeypatch.setattr(collections, "get_setting", lambda key, default=None: True)
+    monkeypatch.setattr(collections, "_export_principal_collections", exported)
+    app = Flask(__name__)
+
+    @app.before_request
+    def authenticate_test_user():
+        g.auth_method = "session"
+        g.auth_user = "alice"
+
+    app.register_blueprint(mod.bp)
+    client = app.test_client()
+
+    response = client.get("/api/collections/backup")
+    single = client.get("/api/collections/collection-7/export")
+
+    assert response.status_code == 200
+    assert response.get_json()["collections"][0]["name"] == "user:alice"
+    assert response.get_json()["scope"] == "personal"
+    assert response.headers["Cache-Control"] == "no-store"
+    assert response.headers["Content-Disposition"].startswith("attachment;")
+    assert single.status_code == 200
+    assert seen == [("user:alice", None), ("user:alice", "collection-7")]
+
+
+def test_collection_restore_route_validates_checksum_and_uses_current_principal(monkeypatch):
+    mod = load_plugin()
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+    restored = []
+    monkeypatch.setattr(collections, "get_setting", lambda key, default=None: True)
+    monkeypatch.setattr(
+        collections,
+        "_restore_principal_collections",
+        lambda principal, payload: restored.append((principal, payload))
+        or {
+            "collections": [{"id": "restored-1", "name": payload[0]["name"]}],
+            "collection_count": 1,
+            "item_count": 1,
+        },
+    )
+    app = Flask(__name__)
+
+    @app.before_request
+    def authenticate_test_user():
+        g.auth_method = "session"
+        g.auth_user = "bob"
+
+    app.register_blueprint(mod.bp)
+    client = app.test_client()
+    backup = _collection_backup_fixture(collections)
+
+    response = client.post("/api/collections/restore", json=backup)
+
+    assert response.status_code == 201
+    assert response.get_json()["restored"] is True
+    assert restored[0][0] == "user:bob"
+    assert restored[0][1][0]["items"][0]["id"] != "item-source"
+
+    backup["collections"][0]["description"] = "changed after export"
+    rejected = client.post("/api/collections/restore", json=backup)
+    assert rejected.status_code == 400
+    assert "checksum" in rejected.get_json()["error"]
+    assert len(restored) == 1
+
+
+def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(monkeypatch):
+    collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
+
+    class RestoreCursor:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+
+        def close(self):
+            pass
+
+    class RestoreDb:
+        def __init__(self):
+            self.cursor_obj = RestoreCursor()
+            self.commits = 0
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def commit(self):
+            self.commits += 1
+
+    db = RestoreDb()
+    upserts = []
+    changes = []
+    monkeypatch.setattr(collections, "get_db", lambda: db)
+    monkeypatch.setattr(
+        collections,
+        "_upsert_item",
+        lambda cur, principal, collection_id, item: upserts.append(
+            (principal, collection_id, item.copy())
+        ),
+    )
+    monkeypatch.setattr(
+        collections,
+        "_fetch_collection",
+        lambda cur, principal, collection_id: {
+            "id": collection_id,
+            "name": "Restored",
+            "description": None,
+            "revision": 2,
+            "created_at": "created",
+            "updated_at": "updated",
+            "deleted_at": None,
+            "album_count": 0,
+            "track_count": 1,
+        },
+    )
+    monkeypatch.setattr(
+        collections,
+        "_record_change",
+        lambda cur, principal, collection_id, entity_kind, entity_id, operation, payload: changes.append(
+            (principal, collection_id, entity_kind, entity_id, operation, payload)
+        ),
+    )
+    payload = collections._normalize_backup_document(_collection_backup_fixture(collections))
+
+    result = collections._restore_principal_collections("user:alice", payload)
+
+    collection_inserts = [
+        call for call in db.cursor_obj.executed if "INSERT INTO" in call[0] and "collections" in call[0]
+    ]
+    assert len(collection_inserts) == 1
+    assert "ON CONFLICT" not in collection_inserts[0][0]
+    assert collection_inserts[0][1][0] == "user:alice"
+    assert collection_inserts[0][1][1] != "collection-source"
+    assert upserts[0][0] == "user:alice"
+    assert upserts[0][1] == collection_inserts[0][1][1]
+    assert changes[0][2:5] == ("collection", collection_inserts[0][1][1], "upsert")
+    assert changes[1][2:5] == ("item", upserts[0][2]["id"], "upsert")
+    assert changes[1][5]["collection_revision"] == 2
+    assert result["collection_count"] == 1
+    assert result["item_count"] == 1
+    assert db.commits == 1
 
 
 def test_collection_library_normalizes_live_track_and_disc_numbers():
@@ -1425,6 +1662,15 @@ def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypa
     body = enabled_response.get_data(as_text=True)
     assert "Living Collections" in body
     assert "New collection" in body
+    assert "Backup &amp; restore" in body
+    assert "Download full backup" in body
+    assert "Restore always creates new copies" in body
+    assert "Shared bearer-token library" in body
+    assert "Everyone using the AudioMuse installation token" in body
+    assert 'href="api/collections/backup"' in body
+    assert "lumae-living-collections" in body
+    assert "restoreDocument" in body
+    assert "/export" in body
     assert "Add selected" in body
     assert "Duplicate" in body
     assert 'id="collection-toast"' in body

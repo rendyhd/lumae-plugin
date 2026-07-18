@@ -24,11 +24,21 @@
         "library_browser",
         "album_track_numbers",
         "preview_playback",
-        "bulk_management"
+        "bulk_management",
+        "principal_scoped_backup",
+        "additive_restore"
       ]
     }
   },
   "versions": [
+    {
+      "version": "0.5.0",
+      "min_core_version": "2.6.0",
+      "changelog": "Make personal versus shared collection scope explicit and add principal-scoped, checksummed JSON backups with full-library and per-collection export plus safe additive restore in the web manager.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.5.0.zip",
+      "checksum": ""
+    },
     {
       "version": "0.4.1",
       "min_core_version": "2.6.0",

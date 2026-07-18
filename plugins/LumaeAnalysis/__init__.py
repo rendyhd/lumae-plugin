@@ -9,8 +9,10 @@ from plugin.api import config, enqueue, get_db, get_setting, logger, render_page
 
 from .loudness import SilentAudioError, analyze_file
 from .collection_manager import (
+    COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
     collections_enabled,
+    current_collection_scope,
     migrate_collections,
     register_collection_routes,
     render_collections_settings_panel,
@@ -370,7 +372,9 @@ def health():
             "capabilities": {
                 "collections": {
                     "schema_version": COLLECTIONS_SCHEMA_VERSION,
+                    "backup_version": COLLECTIONS_BACKUP_VERSION,
                     "enabled": collections_enabled(),
+                    "scope": current_collection_scope()["mode"],
                 }
             },
             "status": "ok",
