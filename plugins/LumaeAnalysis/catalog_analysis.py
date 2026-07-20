@@ -5,7 +5,6 @@ analysis assets only, linked explicitly to every provider occurrence.
 """
 
 from collections import defaultdict
-from datetime import datetime, timezone
 import hashlib
 import json
 import struct
@@ -29,10 +28,52 @@ def t(name):
 
 def dedup_policy():
     threshold = getattr(config, "DUPLICATE_DISTANCE_THRESHOLD_COSINE", None)
+    scheme = getattr(config, "CATALOGUE_ID_SCHEME_VERSION", None)
+    duration_tolerance = getattr(config, "DURATION_TOLERANCE_SECONDS", None)
+    chromaprint_collection = getattr(config, "CHROMAPRINT_COLLECTION_ENABLED", None)
+    chromaprint_gate = getattr(config, "CHROMAPRINT_GATE_ENABLED", None)
+    chromaprint_threshold = getattr(config, "CHROMAPRINT_MATCH_THRESHOLD", None)
+    chromaprint_min_overlap = getattr(config, "CHROMAPRINT_MIN_OVERLAP", None)
+
+    try:
+        scheme = int(scheme) if scheme is not None else None
+    except (TypeError, ValueError):
+        scheme = None
+    try:
+        duration_tolerance = (
+            float(duration_tolerance) if duration_tolerance is not None else None
+        )
+    except (TypeError, ValueError):
+        duration_tolerance = None
+    try:
+        chromaprint_threshold = (
+            float(chromaprint_threshold) if chromaprint_threshold is not None else None
+        )
+    except (TypeError, ValueError):
+        chromaprint_threshold = None
+    try:
+        chromaprint_min_overlap = (
+            int(chromaprint_min_overlap) if chromaprint_min_overlap is not None else None
+        )
+    except (TypeError, ValueError):
+        chromaprint_min_overlap = None
+
     return {
-        "algorithm": "musicnn_cosine" if threshold is not None else "unknown",
+        "algorithm": (
+            f"audiomuse_catalogue_fp_{scheme}"
+            if scheme is not None
+            else ("musicnn_cosine" if threshold is not None else "unknown")
+        ),
+        "catalogue_id_scheme_version": scheme,
         "configured_threshold": float(threshold) if threshold is not None else None,
+        "duration_tolerance_seconds": duration_tolerance,
+        "folder_aware": scheme is not None and scheme >= 4,
+        "chromaprint_collection_enabled": chromaprint_collection,
+        "chromaprint_gate_enabled": chromaprint_gate,
+        "chromaprint_match_threshold": chromaprint_threshold,
+        "chromaprint_min_overlap": chromaprint_min_overlap,
         "per_link_distance_available": False,
+        "per_link_chromaprint_evidence_available": False,
         "evidence_status": "configured_policy_only" if threshold is not None else "unknown",
     }
 
@@ -178,7 +219,10 @@ def _recording_ids(track):
     return result
 
 
-def _suspect_analysis_ids(tracks, links):
+def _suspect_analysis_ids(tracks, links, policy=None):
+    policy = policy or dedup_policy()
+    tolerance_seconds = policy.get("duration_tolerance_seconds")
+    tolerance_ms = 3000 if tolerance_seconds is None else max(0, tolerance_seconds * 1000)
     grouped = defaultdict(list)
     for track_id, link in links.items():
         if link.get("analysis_id") and track_id in tracks:
@@ -193,7 +237,7 @@ def _suspect_analysis_ids(tracks, links):
             and not set.intersection(*recording_sets)
         )
         durations = [row["duration_ms"] for row in occurrences if row["duration_ms"] is not None]
-        duration_conflict = durations and max(durations) - min(durations) > 3000
+        duration_conflict = bool(durations) and max(durations) - min(durations) > tolerance_ms
         titles = {_normalized_identity(row["title"]) for row in occurrences}
         artists = {_normalized_identity(row["artist"]) for row in occurrences if row["artist"]}
         text_conflict = len(titles) > 1 and len(artists) > 1
@@ -275,7 +319,7 @@ def project_analysis(server_id=None, db=None, adapter=None):
             "conflict_flags": [],
             "review_state": None,
         }
-    for analysis_id in _suspect_analysis_ids(tracks, links):
+    for analysis_id in _suspect_analysis_ids(tracks, links, policy):
         for link in links.values():
             if link["analysis_id"] == analysis_id:
                 link["status"] = "suspect"

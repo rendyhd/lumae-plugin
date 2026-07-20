@@ -97,7 +97,14 @@ def _duration_ms(row):
     milliseconds = _integer(_value(row, "duration_ms", "durationMs"))
     if milliseconds is not None:
         return max(0, milliseconds)
-    seconds = _value(row, "duration", "Duration", "duration_seconds")
+    seconds = _value(
+        row,
+        "duration",
+        "Duration",
+        "duration_seconds",
+        "durationSeconds",
+        "DurationSeconds",
+    )
     try:
         return max(0, round(float(seconds) * 1000)) if seconds is not None else None
     except (TypeError, ValueError):

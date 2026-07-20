@@ -147,9 +147,10 @@ def test_catalog_health_uses_v2_single_server_adapter():
     ]
 
 
-def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch):
+@pytest.mark.parametrize("core_version", ["v3.0.0", "v3.0.3"])
+def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch, core_version):
     mod = load_plugin()
-    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", "v3.0.0")
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", core_version)
     monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
     monkeypatch.setattr(plugin_api_module, "use_server", lambda _server_id: None, raising=False)
     monkeypatch.setattr(
@@ -2206,6 +2207,27 @@ def test_provider_catalog_normalization_keeps_rich_order_and_strips_private_fiel
     assert "PlayCount" not in canonical_json(row["payload"])
 
 
+def test_provider_catalog_accepts_v3_duration_seconds_field():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    normalized = normalize_provider_catalog(
+        {
+            "albums": [{"id": "album-1", "name": "Record"}],
+            "tracks": [
+                {
+                    "id": "track-1",
+                    "title": "Song",
+                    "albumId": "album-1",
+                    "DurationSeconds": 201.25,
+                }
+            ],
+        },
+        "navidrome",
+    )
+
+    assert normalized["tracks"][0]["duration_ms"] == 201250
+
+
 def test_provider_catalog_publishes_relationships_and_rich_enrichment_in_stream_payloads():
     from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
 
@@ -2656,6 +2678,48 @@ def test_analysis_projection_marks_contradictory_dedup_group_suspect():
     }
 
     assert _suspect_analysis_ids(tracks, links) == {"canonical-1"}
+
+
+def test_v3_0_3_dedup_policy_and_duration_backstop(monkeypatch):
+    from plugins.LumaeAnalysis.catalog_analysis import _suspect_analysis_ids, dedup_policy
+
+    values = {
+        "DUPLICATE_DISTANCE_THRESHOLD_COSINE": 0.02,
+        "CATALOGUE_ID_SCHEME_VERSION": 4,
+        "DURATION_TOLERANCE_SECONDS": 1.0,
+        "CHROMAPRINT_COLLECTION_ENABLED": True,
+        "CHROMAPRINT_GATE_ENABLED": True,
+        "CHROMAPRINT_MATCH_THRESHOLD": 0.95,
+        "CHROMAPRINT_MIN_OVERLAP": 40,
+    }
+    for name, value in values.items():
+        monkeypatch.setattr(plugin_api_module.config, name, value, raising=False)
+
+    policy = dedup_policy()
+
+    assert policy == {
+        "algorithm": "audiomuse_catalogue_fp_4",
+        "catalogue_id_scheme_version": 4,
+        "configured_threshold": 0.02,
+        "duration_tolerance_seconds": 1.0,
+        "folder_aware": True,
+        "chromaprint_collection_enabled": True,
+        "chromaprint_gate_enabled": True,
+        "chromaprint_match_threshold": 0.95,
+        "chromaprint_min_overlap": 40,
+        "per_link_distance_available": False,
+        "per_link_chromaprint_evidence_available": False,
+        "evidence_status": "configured_policy_only",
+    }
+    tracks = {
+        "a": {"title": "Song", "artist": "Artist", "duration_ms": 180000, "payload": {}},
+        "b": {"title": "Song", "artist": "Artist", "duration_ms": 181500, "payload": {}},
+    }
+    links = {
+        "a": {"analysis_id": "canonical-1"},
+        "b": {"analysis_id": "canonical-1"},
+    }
+    assert _suspect_analysis_ids(tracks, links, policy) == {"canonical-1"}
 
 
 def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypatch):
