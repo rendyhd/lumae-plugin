@@ -1132,6 +1132,7 @@ _READINESS_BLOCKER_LABELS = {
     "chromaprint_backfill_incomplete": "Mapped tracks are still missing Chromaprint fingerprints.",
     "chromaprint_collection_disabled": "Chromaprint collection is disabled in AudioMuse.",
     "chromaprint_gate_disabled": "Chromaprint duplicate validation is disabled in AudioMuse.",
+    "cleaning_predates_chromaprint_completion": "Chromaprint completed after Cleaning; run Cleaning and then Analysis again.",
     "duration_tolerance_too_wide": "The AudioMuse duplicate duration tolerance is wider than one second.",
     "folder_gate_not_active": "The fp_4 folder-aware duplicate rule is not active.",
     "fp_4_not_active": "AudioMuse catalogue ID scheme fp_4 is not active.",

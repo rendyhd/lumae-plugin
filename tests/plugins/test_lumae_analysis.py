@@ -2829,7 +2829,7 @@ class ReadinessCursor:
 
 
 class ReadinessDb:
-    def __init__(self, coverage=(10, 9, 9), tasks=None):
+    def __init__(self, coverage=(10, 9, 9, 150.0), tasks=None):
         self.coverage = coverage
         self.tasks = tasks or []
         self.executed = []
@@ -2893,6 +2893,7 @@ def test_v3_readiness_requires_source_scoped_admin_acknowledgement(monkeypatch):
     assert before["missing_mapping_count"] == 1
     assert before["chromaprint_coverage"] == 1.0
     assert before["task_evidence"]["upgrade_sequence_complete"] is True
+    assert before["task_evidence"]["chromaprint_complete_before_cleaning"] is True
 
     after = readiness.acknowledge_v3_release(
         db,
@@ -2934,7 +2935,7 @@ def test_v3_readiness_rejects_incomplete_backfill_and_upgrade_sequence(monkeypat
         adapter="v3_registry",
     )
     monkeypatch.setattr(readiness, "get_setting", lambda _key, default=None: default)
-    db = ReadinessDb(coverage=(10, 9, 8), tasks=[])
+    db = ReadinessDb(coverage=(10, 9, 8, 150.0), tasks=[])
 
     with pytest.raises(ValueError, match="chromaprint_backfill_incomplete") as exc:
         readiness.acknowledge_v3_release(
@@ -2946,6 +2947,25 @@ def test_v3_readiness_rejects_incomplete_backfill_and_upgrade_sequence(monkeypat
         )
 
     assert "upgrade_repair_sequence_incomplete" in str(exc.value)
+
+
+def test_v3_readiness_requires_cleaning_after_chromaprint_completion(monkeypatch):
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.3",
+        adapter="v3_registry",
+    )
+    monkeypatch.setattr(readiness, "get_setting", lambda _key, default=None: default)
+    db = ReadinessDb(coverage=(10, 10, 10, 250.0), tasks=readiness_tasks())
+
+    with pytest.raises(ValueError, match="cleaning_predates_chromaprint_completion"):
+        readiness.acknowledge_v3_release(
+            db,
+            compatibility,
+            readiness_source(),
+            readiness_policy(),
+            "upgraded",
+        )
 
 
 def test_v3_fresh_install_can_be_confirmed_without_legacy_repair_tasks(monkeypatch):
@@ -2963,7 +2983,7 @@ def test_v3_fresh_install_can_be_confirmed_without_legacy_repair_tasks(monkeypat
     monkeypatch.setattr(readiness, "set_setting", lambda key, value: settings.__setitem__(key, value))
 
     result = readiness.acknowledge_v3_release(
-        ReadinessDb(coverage=(10, 10, 10), tasks=[]),
+        ReadinessDb(coverage=(10, 10, 10, 150.0), tasks=[]),
         compatibility,
         readiness_source(),
         readiness_policy(),

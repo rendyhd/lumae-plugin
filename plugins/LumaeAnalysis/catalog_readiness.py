@@ -137,7 +137,8 @@ def _coverage(db, source):
             SELECT count(*) AS eligible_tracks,
                    count(m.provider_track_id) AS mapped_tracks,
                    count(CASE WHEN cp.fingerprint IS NOT NULL THEN 1 END)
-                     AS fingerprinted_tracks
+                     AS fingerprinted_tracks,
+                   max(EXTRACT(EPOCH FROM cp.updated_at)) AS latest_chromaprint_at
               FROM {t("catalog_tracks")} ct
               LEFT JOIN track_server_map m
                 ON m.server_id=%s AND m.provider_track_id=ct.track_id
@@ -155,12 +156,13 @@ def _coverage(db, source):
                 source["catalog"]["generation"],
             ),
         )
-        row = cur.fetchone() or (0, 0, 0)
+        row = cur.fetchone() or (0, 0, 0, None)
     finally:
         cur.close()
     eligible = int(row[0] or 0)
     mapped = int(row[1] or 0)
     fingerprinted = int(row[2] or 0)
+    latest_chromaprint_at = float(row[3]) if row[3] is not None else None
     return {
         "eligible_track_count": eligible,
         "mapped_track_count": mapped,
@@ -168,6 +170,7 @@ def _coverage(db, source):
         "chromaprint_track_count": fingerprinted,
         "chromaprint_missing_count": max(0, mapped - fingerprinted),
         "chromaprint_coverage": fingerprinted / mapped if mapped else 0.0,
+        "latest_chromaprint_at_unix": latest_chromaprint_at,
     }
 
 
@@ -247,6 +250,20 @@ def v3_release_readiness(
             "blockers": ["readiness_unavailable"],
         }
 
+    cleaning = tasks.get("cleaning") or {}
+    cleaning_time = cleaning.get("completed_at_unix")
+    latest_chromaprint_at = coverage.get("latest_chromaprint_at_unix")
+    chromaprint_complete_before_cleaning = bool(
+        cleaning_time is not None
+        and latest_chromaprint_at is not None
+        and latest_chromaprint_at <= cleaning_time
+    )
+    task_order_complete = tasks["upgrade_sequence_complete"]
+    tasks["chromaprint_complete_before_cleaning"] = chromaprint_complete_before_cleaning
+    tasks["upgrade_sequence_complete"] = bool(
+        task_order_complete and chromaprint_complete_before_cleaning
+    )
+
     if acknowledgement is None:
         acknowledgement = _setting_map().get(source["catalog_instance_id"])
     acknowledged = _valid_acknowledgement(source, compatibility, acknowledgement)
@@ -262,12 +279,11 @@ def v3_release_readiness(
         blockers.append("no_analysis_mappings")
     elif coverage["chromaprint_missing_count"]:
         blockers.append("chromaprint_backfill_incomplete")
-    if (
-        mode == "upgraded"
-        and not acknowledged
-        and not tasks["upgrade_sequence_complete"]
-    ):
-        blockers.append("upgrade_repair_sequence_incomplete")
+    if mode == "upgraded" and not acknowledged:
+        if not task_order_complete:
+            blockers.append("upgrade_repair_sequence_incomplete")
+        elif not chromaprint_complete_before_cleaning:
+            blockers.append("cleaning_predates_chromaprint_completion")
     if requested_mode is None and not acknowledged:
         blockers.append("administrator_acknowledgement_required")
 
