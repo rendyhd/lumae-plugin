@@ -46,6 +46,22 @@ def plugin_client(mod):
     return app.test_client()
 
 
+def expect_v3_readiness(core_version):
+    qualified = core_version == "v3.0.3"
+    blocker = "catalog_not_initialized" if qualified else "core_release_unqualified"
+    return {
+        "qualified_core_version": "v3.0.3",
+        "detected_core_version": core_version,
+        "applicable": True,
+        "status": blocker,
+        "ready": False,
+        "verification_mode": None,
+        "administrator_acknowledged": False,
+        "acknowledged_at": None,
+        "blockers": [blocker],
+    }
+
+
 def test_plugin_manifest_has_lumae_identity():
     with open("plugins/LumaeAnalysis/plugin.json", "r", encoding="utf-8") as fh:
         manifest = json.load(fh)
@@ -53,7 +69,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.6.0"
+    assert manifest["versions"][0]["version"] == "0.7.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -95,6 +111,7 @@ def test_plugin_manifest_has_lumae_identity():
             "soft_deletions",
             "shared_analysis",
             "binary_vectors",
+            "v3_release_readiness",
         ],
     }
 
@@ -108,7 +125,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.6.0",
+        "plugin_version": "0.7.0",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -174,16 +191,81 @@ def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch, core_versio
     assert response.status_code == 200
     body = response.get_json()
     assert body["core_adapter"] == "v3_registry"
-    assert body["servers"] == [
-        {
-            "server_id": "server-a",
-            "catalog_instance_id": None,
-            "name": "Main",
-            "provider_type": "jellyfin",
-            "is_default": True,
-            "status": "not_initialized",
+    assert body["servers"][0] == {
+        "server_id": "server-a",
+        "catalog_instance_id": None,
+        "name": "Main",
+        "provider_type": "jellyfin",
+        "is_default": True,
+        "status": "not_initialized",
+        "v3_readiness": expect_v3_readiness(core_version),
+    }
+
+
+def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
+    mod = load_plugin()
+    source = readiness_source()
+    db = object()
+    captured = {}
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", "v3.0.3")
+    monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
+    monkeypatch.setattr(plugin_api_module, "use_server", lambda _server_id: None, raising=False)
+    monkeypatch.setattr(
+        plugin_api_module,
+        "list_servers",
+        lambda: [{"server_id": "server-a", "server_type": "navidrome"}],
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+
+    def release_readiness(selected_db, compatibility, selected_source, policy):
+        captured.update(
+            {
+                "db": selected_db,
+                "core": compatibility.core_version,
+                "source": selected_source,
+                "policy": policy,
+            }
+        )
+        return {
+            "qualified_core_version": "v3.0.3",
+            "detected_core_version": "v3.0.3",
+            "applicable": True,
+            "status": "ready",
+            "ready": True,
+            "verification_mode": "upgraded",
+            "administrator_acknowledged": True,
+            "acknowledged_at": "2026-07-20T12:00:00Z",
+            "blockers": [],
         }
-    ]
+
+    monkeypatch.setattr(mod, "v3_release_readiness", release_readiness)
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["plugin_version"] == "0.7.0"
+    assert body["servers"][0]["v3_readiness"]["ready"] is True
+    assert captured["db"] is db
+    assert captured["core"] == "v3.0.3"
+    assert captured["source"] == source
+    assert captured["policy"]["catalogue_id_scheme_version"] is None
+
+
+def test_v2_catalog_health_never_executes_v3_readiness_queries(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(
+        mod,
+        "v3_release_readiness",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("v3-only")),
+    )
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 200
+    assert response.get_json()["core_adapter"] == "v2_single_server"
 
 
 def test_catalog_cursor_is_opaque_round_trippable_and_source_bound():
@@ -2720,6 +2802,287 @@ def test_v3_0_3_dedup_policy_and_duration_backstop(monkeypatch):
         "b": {"analysis_id": "canonical-1"},
     }
     assert _suspect_analysis_ids(tracks, links, policy) == {"canonical-1"}
+
+
+class ReadinessCursor:
+    def __init__(self, db):
+        self.db = db
+        self.rows = []
+
+    def execute(self, sql, params=None):
+        self.db.executed.append((sql, params))
+        if "FROM plugin_lumae_analysis__catalog_tracks" in sql:
+            self.rows = [self.db.coverage]
+        elif "FROM task_status" in sql:
+            self.rows = list(self.db.tasks)
+        else:
+            raise AssertionError(f"Unexpected readiness SQL: {sql}")
+
+    def fetchone(self):
+        return self.rows[0] if self.rows else None
+
+    def fetchall(self):
+        return list(self.rows)
+
+    def close(self):
+        pass
+
+
+class ReadinessDb:
+    def __init__(self, coverage=(10, 9, 9), tasks=None):
+        self.coverage = coverage
+        self.tasks = tasks or []
+        self.executed = []
+
+    def cursor(self):
+        return ReadinessCursor(self)
+
+
+def readiness_source():
+    return {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "name": "Main",
+        "catalog": {"generation": 4, "status": "complete"},
+        "analysis": {"status": "complete"},
+    }
+
+
+def readiness_policy():
+    return {
+        "catalogue_id_scheme_version": 4,
+        "duration_tolerance_seconds": 1.0,
+        "folder_aware": True,
+        "chromaprint_collection_enabled": True,
+        "chromaprint_gate_enabled": True,
+    }
+
+
+def readiness_tasks():
+    return [
+        ("analysis-after", "main_analysis", "SUCCESS", 300.0, {"failed_servers": []}, None),
+        ("cleaning", "cleaning", "SUCCESS", 200.0, {}, None),
+        ("analysis-before", "main_analysis", "SUCCESS", 100.0, {"failed_servers": []}, None),
+    ]
+
+
+def test_v3_readiness_requires_source_scoped_admin_acknowledgement(monkeypatch):
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.3",
+        adapter="v3_registry",
+    )
+    settings = {}
+    monkeypatch.setattr(
+        readiness,
+        "get_setting",
+        lambda key, default=None: settings.get(key, default),
+    )
+    monkeypatch.setattr(readiness, "set_setting", lambda key, value: settings.__setitem__(key, value))
+    db = ReadinessDb(tasks=readiness_tasks())
+
+    before = readiness.v3_release_readiness(
+        db,
+        compatibility,
+        readiness_source(),
+        readiness_policy(),
+    )
+
+    assert before["status"] == "acknowledgement_required"
+    assert before["blockers"] == ["administrator_acknowledgement_required"]
+    assert before["missing_mapping_count"] == 1
+    assert before["chromaprint_coverage"] == 1.0
+    assert before["task_evidence"]["upgrade_sequence_complete"] is True
+
+    after = readiness.acknowledge_v3_release(
+        db,
+        compatibility,
+        readiness_source(),
+        readiness_policy(),
+        "upgraded",
+    )
+
+    assert after["ready"] is True
+    assert after["status"] == "ready"
+    assert after["verification_mode"] == "upgraded"
+    saved = settings[readiness.ACKNOWLEDGEMENT_SETTING]["catalog-a"]
+    assert saved["server_id"] == "server-a"
+    assert saved["cleaning_task_id"] == "cleaning"
+    assert saved["post_clean_analysis_task_id"] == "analysis-after"
+    archived = readiness.v3_release_readiness(
+        ReadinessDb(tasks=[]),
+        compatibility,
+        readiness_source(),
+        readiness_policy(),
+    )
+    assert archived["ready"] is True
+    rebound_source = {**readiness_source(), "server_id": "server-b"}
+    rebound = readiness.v3_release_readiness(
+        ReadinessDb(tasks=[]),
+        compatibility,
+        rebound_source,
+        readiness_policy(),
+    )
+    assert rebound["ready"] is False
+    assert rebound["blockers"] == ["administrator_acknowledgement_required"]
+
+
+def test_v3_readiness_rejects_incomplete_backfill_and_upgrade_sequence(monkeypatch):
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.3",
+        adapter="v3_registry",
+    )
+    monkeypatch.setattr(readiness, "get_setting", lambda _key, default=None: default)
+    db = ReadinessDb(coverage=(10, 9, 8), tasks=[])
+
+    with pytest.raises(ValueError, match="chromaprint_backfill_incomplete") as exc:
+        readiness.acknowledge_v3_release(
+            db,
+            compatibility,
+            readiness_source(),
+            readiness_policy(),
+            "upgraded",
+        )
+
+    assert "upgrade_repair_sequence_incomplete" in str(exc.value)
+
+
+def test_v3_fresh_install_can_be_confirmed_without_legacy_repair_tasks(monkeypatch):
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.3",
+        adapter="v3_registry",
+    )
+    settings = {}
+    monkeypatch.setattr(
+        readiness,
+        "get_setting",
+        lambda key, default=None: settings.get(key, default),
+    )
+    monkeypatch.setattr(readiness, "set_setting", lambda key, value: settings.__setitem__(key, value))
+
+    result = readiness.acknowledge_v3_release(
+        ReadinessDb(coverage=(10, 10, 10), tasks=[]),
+        compatibility,
+        readiness_source(),
+        readiness_policy(),
+        "fresh",
+    )
+
+    assert result["ready"] is True
+    assert result["verification_mode"] == "fresh"
+
+
+def test_v2_readiness_is_not_applicable_without_database_access():
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v2.6.2",
+        adapter="v2_single_server",
+    )
+
+    result = readiness.v3_release_readiness(
+        None,
+        compatibility,
+        readiness_source(),
+        {},
+    )
+
+    assert result["applicable"] is False
+    assert result["ready"] is True
+    assert result["status"] == "not_applicable"
+
+
+def test_settings_acknowledges_v3_readiness_only_with_explicit_confirmation(monkeypatch):
+    mod = load_plugin()
+    source = readiness_source()
+    compatibility = types.SimpleNamespace(core_version="v3.0.3", adapter="v3_registry")
+    captured = {}
+    monkeypatch.setattr(mod, "detect_core", lambda: compatibility)
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "dedup_policy", readiness_policy)
+    monkeypatch.setattr(
+        mod,
+        "acknowledge_v3_release",
+        lambda db, compat, selected, policy, mode: captured.update(
+            {
+                "db": db,
+                "compatibility": compat,
+                "source": selected,
+                "policy": policy,
+                "mode": mode,
+            }
+        )
+        or {"verification_mode": mode},
+    )
+    monkeypatch.setattr(
+        mod,
+        "render_settings",
+        lambda message=None, error=None: message or error or "settings",
+    )
+    client = plugin_client(mod)
+
+    rejected = client.post(
+        "/settings",
+        data={
+            "action": "ack_v3_readiness",
+            "server_id": "server-a",
+            "catalog_instance_id": "catalog-a",
+            "verification_mode": "upgraded",
+        },
+    )
+    accepted = client.post(
+        "/settings",
+        data={
+            "action": "ack_v3_readiness",
+            "server_id": "server-a",
+            "catalog_instance_id": "catalog-a",
+            "verification_mode": "upgraded",
+            "confirm": "on",
+        },
+    )
+
+    assert rejected.status_code == 200
+    assert "Explicit AudioMuse 3.0.3 confirmation is required" in rejected.get_data(
+        as_text=True
+    )
+    assert accepted.status_code == 200
+    assert "sync readiness confirmed for Main" in accepted.get_data(as_text=True)
+    assert captured["source"] == source
+    assert captured["mode"] == "upgraded"
+
+
+def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
+    mod = load_plugin()
+    source = readiness_source()
+    readiness = {
+        "status": "repair_incomplete",
+        "ready": False,
+        "administrator_acknowledged": False,
+        "eligible_track_count": 12,
+        "mapped_track_count": 10,
+        "missing_mapping_count": 2,
+        "chromaprint_track_count": 8,
+        "chromaprint_coverage": 0.8,
+        "task_evidence": {"upgrade_sequence_complete": False},
+        "blockers": [
+            "chromaprint_backfill_incomplete",
+            "administrator_acknowledgement_required",
+        ],
+    }
+    monkeypatch.setattr(mod, "_v3_readiness_sources", lambda: [(source, readiness)])
+
+    body = mod.render_v3_readiness_panel()
+    compact = " ".join(body.split())
+
+    assert "AudioMuse 3.0.3 sync readiness" in body
+    assert "Chromaprint: 8 of 10 mapped tracks (80.00%)" in compact
+    assert "without analysis mapping: 2" in compact
+    assert "Mapped tracks are still missing Chromaprint fingerprints." in body
+    assert "Confirm fresh installation" in body
+    assert "Confirm upgraded installation" in body
+    assert "Analysis, Cleaning, then Analysis again" in body
 
 
 def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypatch):

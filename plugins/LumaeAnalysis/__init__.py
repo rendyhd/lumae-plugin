@@ -21,7 +21,6 @@ from .catalog import (
     create_bootstrap_session,
     ensure_catalog_sources,
     migrate_catalog,
-    opaque_cursor,
     read_catalog_changes,
     refresh_catalog,
     release_bootstrap_session,
@@ -34,6 +33,11 @@ from .catalog_analysis import (
     read_analysis_changes,
     scalar_batch,
     vector_batch,
+)
+from .catalog_readiness import (
+    acknowledge_v3_release,
+    clear_v3_release_acknowledgement,
+    v3_release_readiness,
 )
 from .catalog_providers import ProviderCatalogBridge
 from .collection_manager import (
@@ -48,7 +52,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.6.0"
+PLUGIN_VERSION = "0.7.0"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -66,6 +70,7 @@ CATALOG_FEATURES = (
     "soft_deletions",
     "shared_analysis",
     "binary_vectors",
+    "v3_release_readiness",
 )
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
@@ -518,6 +523,7 @@ def health():
 @bp.get("/api/catalog/health")
 def catalog_health():
     compatibility = detect_core()
+    db = None
     try:
         servers = sanitized_server_summaries(compatibility)
     except Exception as exc:
@@ -547,6 +553,20 @@ def catalog_health():
             logger.exception("lumae_analysis could not read persisted catalogue health")
     if persisted:
         servers = persisted
+    policy = dedup_policy()
+    if compatibility.adapter == "v3_registry":
+        servers = [
+            {
+                **server,
+                "v3_readiness": v3_release_readiness(
+                    db,
+                    compatibility,
+                    server,
+                    policy,
+                ),
+            }
+            for server in servers
+        ]
     payload = compatibility.as_dict()
     payload.update(
         {
@@ -555,7 +575,7 @@ def catalog_health():
             "catalog_schema_version": CATALOG_SCHEMA_VERSION,
             "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
             "capability": catalog_capability(),
-            "dedup_policy": dedup_policy(),
+            "dedup_policy": policy,
             "servers": servers,
         }
     )
@@ -1105,6 +1125,127 @@ def backfill_missing_profiles(limit=None):
     return analyze_tracks_task(ids)
 
 
+_READINESS_BLOCKER_LABELS = {
+    "administrator_acknowledgement_required": "Administrator confirmation is still required.",
+    "analysis_projection_incomplete": "The plugin analysis projection is not complete.",
+    "catalog_generation_incomplete": "The provider catalogue generation is not complete.",
+    "chromaprint_backfill_incomplete": "Mapped tracks are still missing Chromaprint fingerprints.",
+    "chromaprint_collection_disabled": "Chromaprint collection is disabled in AudioMuse.",
+    "chromaprint_gate_disabled": "Chromaprint duplicate validation is disabled in AudioMuse.",
+    "duration_tolerance_too_wide": "The AudioMuse duplicate duration tolerance is wider than one second.",
+    "folder_gate_not_active": "The fp_4 folder-aware duplicate rule is not active.",
+    "fp_4_not_active": "AudioMuse catalogue ID scheme fp_4 is not active.",
+    "no_analysis_mappings": "No provider tracks have AudioMuse analysis mappings yet.",
+    "readiness_unavailable": "The plugin could not read AudioMuse repair diagnostics.",
+    "upgrade_repair_sequence_incomplete": "Run Analysis, then Cleaning, then Analysis again.",
+}
+
+
+def _v3_readiness_sources():
+    compatibility = detect_core()
+    if compatibility.adapter != "v3_registry":
+        return []
+    db = get_db()
+    if db is None:
+        return []
+    policy = dedup_policy()
+    return [
+        (
+            source,
+            v3_release_readiness(db, compatibility, source, policy),
+        )
+        for source in resolve_catalog_source(db)
+    ]
+
+
+def render_v3_readiness_panel():
+    try:
+        sources = _v3_readiness_sources()
+    except Exception:
+        logger.exception("lumae_analysis could not render AudioMuse 3 readiness")
+        return ""
+    if not sources:
+        return ""
+    cards = []
+    for source, readiness in sources:
+        blockers = readiness.get("blockers") or []
+        blocker_html = "".join(
+            f"<li>{escape(_READINESS_BLOCKER_LABELS.get(code, code))}</li>"
+            for code in blockers
+        )
+        mapped = int(readiness.get("mapped_track_count") or 0)
+        eligible = int(readiness.get("eligible_track_count") or 0)
+        missing = int(readiness.get("missing_mapping_count") or 0)
+        fingerprinted = int(readiness.get("chromaprint_track_count") or 0)
+        coverage = float(readiness.get("chromaprint_coverage") or 0) * 100
+        sequence = bool(
+            (readiness.get("task_evidence") or {}).get("upgrade_sequence_complete")
+        )
+        hidden = (
+            f'<input type="hidden" name="server_id" value="{escape(str(source["server_id"]))}">'
+            f'<input type="hidden" name="catalog_instance_id" '
+            f'value="{escape(str(source["catalog_instance_id"]))}">'
+        )
+        if readiness.get("administrator_acknowledged"):
+            controls = f"""
+              <p class="lumae-help">Confirmed as {escape(str(readiness.get('verification_mode')))}
+                at {escape(str(readiness.get('acknowledged_at') or 'unknown time'))}.</p>
+              <form class="lumae-form" method="post">
+                {hidden}
+                <button class="lumae-button-secondary" type="submit" name="action"
+                  value="clear_v3_readiness">Revoke confirmation</button>
+              </form>
+            """
+        else:
+            controls = f"""
+              <form class="lumae-form" method="post">
+                {hidden}
+                <label class="lumae-toggle">
+                  <input type="checkbox" name="confirm" required>
+                  I confirm this is a fresh AudioMuse 3.0.3 database with no pre-3.x catalogue.
+                </label>
+                <input type="hidden" name="verification_mode" value="fresh">
+                <button class="lumae-button-secondary" type="submit" name="action"
+                  value="ack_v3_readiness">Confirm fresh installation</button>
+              </form>
+              <form class="lumae-form" method="post">
+                {hidden}
+                <label class="lumae-toggle">
+                  <input type="checkbox" name="confirm" required>
+                  I completed Analysis, Cleaning, then Analysis again after upgrading to 3.0.3.
+                </label>
+                <input type="hidden" name="verification_mode" value="upgraded">
+                <button class="lumae-button-caution" type="submit" name="action"
+                  value="ack_v3_readiness">Confirm upgraded installation</button>
+              </form>
+            """
+        cards.append(
+            f"""
+            <article class="lumae-coverage">
+              <div class="lumae-coverage-row">
+                <strong>{escape(str(source.get('name') or source['server_id']))}</strong>
+                <span>{escape(str(readiness.get('status') or 'unknown'))}</span>
+              </div>
+              <p class="lumae-help">Chromaprint: {fingerprinted:,} of {mapped:,} mapped tracks
+                ({coverage:.2f}%). Upgrade repair sequence detected: {'yes' if sequence else 'no'}.</p>
+              <p class="lumae-help">Provider tracks eligible for analysis: {eligible:,}; currently
+                mapped: {mapped:,}; without analysis mapping: {missing:,}. Unmapped provider tracks
+                remain in the Lumae catalogue.</p>
+              {f'<ul class="lumae-help">{blocker_html}</ul>' if blocker_html else ''}
+              {controls}
+            </article>
+            """
+        )
+    return f"""
+      <section class="lumae-panel" aria-label="AudioMuse 3 release readiness">
+        <h3>AudioMuse 3.0.3 sync readiness</h3>
+        <p class="lumae-action-copy">Lumae keeps provider tracks authoritative. Confirmation only
+          enables the mobile sync gate after fp_4 policy and Chromaprint coverage checks pass.</p>
+        {''.join(cards)}
+      </section>
+    """
+
+
 def render_settings(message=None, error=None):
     batch_size = configured_backfill_limit()
     counts = analysis_status_counts()
@@ -1148,6 +1289,7 @@ def render_settings(message=None, error=None):
         if error
         else ""
     )
+    readiness_html = render_v3_readiness_panel()
     return render_page(
         f"""
         <style>
@@ -1426,6 +1568,7 @@ def render_settings(message=None, error=None):
               <p class="lumae-help">Queues all missing, stale, or changed tracks in 250-track jobs.</p>
             </div>
           </section>
+          {readiness_html}
           {render_collections_settings_panel()}
         </section>
         """,
@@ -1445,6 +1588,34 @@ def settings():
                 set_setting("collection_manager_enabled", enabled)
                 sync_collections_menu(enabled)
                 message = f"Living Collections {'enabled' if enabled else 'disabled'}."
+            elif action == "ack_v3_readiness":
+                if request.form.get("confirm") != "on":
+                    raise ValueError("Explicit AudioMuse 3.0.3 confirmation is required")
+                compatibility = detect_core()
+                db = get_db()
+                sources = resolve_catalog_source(db, server_id=request.form.get("server_id"))
+                if (
+                    len(sources) != 1
+                    or sources[0]["catalog_instance_id"]
+                    != request.form.get("catalog_instance_id")
+                ):
+                    raise ValueError("The selected catalogue source changed; reload and retry")
+                result = acknowledge_v3_release(
+                    db,
+                    compatibility,
+                    sources[0],
+                    dedup_policy(),
+                    request.form.get("verification_mode"),
+                )
+                message = (
+                    f"AudioMuse 3.0.3 sync readiness confirmed for {sources[0]['name']} "
+                    f"({result['verification_mode']})."
+                )
+            elif action == "clear_v3_readiness":
+                clear_v3_release_acknowledgement(
+                    request.form.get("catalog_instance_id") or ""
+                )
+                message = "AudioMuse 3.0.3 sync readiness confirmation revoked."
             else:
                 batch_size = normalize_backfill_limit(request.form.get("backfill_batch_size") or 25)
                 set_setting("backfill_batch_size", batch_size)
@@ -1457,7 +1628,7 @@ def settings():
                     f"Queued {track_count_label(result['queued'])} across {format_count(result['jobs'])} jobs "
                     "for Lumae analysis."
                 )
-            elif action != "save_collections":
+            elif action == "save":
                 message = "Lumae analysis settings saved."
         except ValueError as exc:
             error = str(exc)

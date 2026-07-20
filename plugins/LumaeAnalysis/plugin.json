@@ -47,11 +47,20 @@
         "artist_credits",
         "soft_deletions",
         "shared_analysis",
-        "binary_vectors"
+        "binary_vectors",
+        "v3_release_readiness"
       ]
     }
   },
   "versions": [
+    {
+      "version": "0.7.0",
+      "min_core_version": "2.6.0",
+      "changelog": "Qualify AudioMuse 3.0.3 with source-scoped Chromaprint coverage, repair-sequence diagnostics, and an administrator-controlled sync readiness gate.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.6.0",
       "min_core_version": "2.6.0",
