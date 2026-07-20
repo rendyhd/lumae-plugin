@@ -58,8 +58,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Qualify AudioMuse 3.0.3 with source-scoped Chromaprint coverage, repair-sequence diagnostics, and an administrator-controlled sync readiness gate.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.7.0.zip",
+      "checksum": "12ebeb190f0fa9b4c223388b4c9d2a86"
     },
     {
       "version": "0.6.0",
