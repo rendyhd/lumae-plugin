@@ -1,4 +1,5 @@
 import base64
+import hashlib
 import os
 from datetime import datetime, timezone
 from html import escape
@@ -74,6 +75,7 @@ CATALOG_FEATURES = (
     "provider_track_scope_verification",
     "source_scoped_profiles",
     "prepare_lumae",
+    "analysis_run_finalization",
 )
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
@@ -128,6 +130,10 @@ def source_profiles_table():
 
 def preparation_state_table():
     return table("preparation_state")
+
+
+def analysis_runs_table():
+    return table("analysis_runs")
 
 
 def utc_now_iso():
@@ -356,6 +362,32 @@ def migrate(db):
             updated_at TIMESTAMP NOT NULL DEFAULT now()
         )
         """
+    )
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {analysis_runs_table()} (
+            catalog_instance_id TEXT NOT NULL REFERENCES {table('catalog_sources')}(catalog_instance_id)
+                ON DELETE CASCADE,
+            run_id TEXT NOT NULL,
+            server_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            songs_seen INTEGER NOT NULL DEFAULT 0,
+            finalizer_job_id TEXT,
+            queued_profiles INTEGER NOT NULL DEFAULT 0,
+            profile_jobs INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            first_seen_at TIMESTAMP NOT NULL DEFAULT now(),
+            last_seen_at TIMESTAMP NOT NULL DEFAULT now(),
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT now(),
+            PRIMARY KEY (catalog_instance_id, run_id)
+        )
+        """
+    )
+    cur.execute(
+        f"CREATE INDEX IF NOT EXISTS {table('analysis_runs_status_idx')} "
+        f"ON {analysis_runs_table()} (status, updated_at)"
     )
     cur.close()
     migrate_collections(db)
@@ -1238,7 +1270,237 @@ def catalog_media_signature(track_id, server_id=None):
     return f"catalog-media:{row[0]}" if row and row[0] else None
 
 
+def analysis_run_finalizer_job_id(catalog_instance_id, run_id):
+    identity = f"{catalog_instance_id}\0{run_id}".encode("utf-8")
+    return f"lumae-analysis-run-{hashlib.sha256(identity).hexdigest()[:40]}"
+
+
+def enqueue_analysis_run_finalizer(server_id, catalog_instance_id, run_id):
+    """Queue one source finalizer behind the AudioMuse parent analysis job."""
+    from plugin.api import dotted_path, rq_queue_default
+    from rq import Retry
+    from rq.exceptions import NoSuchJobError
+    from rq.job import Dependency, Job
+
+    job_id = analysis_run_finalizer_job_id(catalog_instance_id, run_id)
+    try:
+        return Job.fetch(job_id, connection=rq_queue_default.connection)
+    except NoSuchJobError:
+        pass
+    return rq_queue_default.enqueue(
+        "plugin.manager.run_plugin_task",
+        args=(
+            dotted_path(finalize_analysis_run_task),
+            server_id,
+            catalog_instance_id,
+            run_id,
+        ),
+        depends_on=Dependency(run_id, allow_failure=True),
+        job_id=job_id,
+        job_timeout=-1,
+        retry=Retry(max=2),
+        description=f"Finalize Lumae analysis run {run_id}",
+    )
+
+
+def update_analysis_run(
+    catalog_instance_id,
+    run_id,
+    status,
+    *,
+    finalizer_job_id=None,
+    queued_profiles=None,
+    profile_jobs=None,
+    last_error=None,
+    completed=False,
+    db=None,
+):
+    db = db or get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        UPDATE {analysis_runs_table()}
+           SET status=%s,
+               finalizer_job_id=COALESCE(%s, finalizer_job_id),
+               queued_profiles=COALESCE(%s, queued_profiles),
+               profile_jobs=COALESCE(%s, profile_jobs),
+               last_error=%s,
+               started_at=CASE WHEN %s='running' THEN COALESCE(started_at, now()) ELSE started_at END,
+               completed_at=CASE WHEN %s THEN now() ELSE completed_at END,
+               updated_at=now()
+         WHERE catalog_instance_id=%s AND run_id=%s
+        """,
+        (
+            status,
+            finalizer_job_id,
+            queued_profiles,
+            profile_jobs,
+            str(last_error)[:2000] if last_error else None,
+            status,
+            bool(completed),
+            catalog_instance_id,
+            run_id,
+        ),
+    )
+    db.commit()
+    cur.close()
+
+
+def record_analysis_run(server_id, catalog_instance_id, run_id, db=None):
+    """Count a per-song hook and atomically admit one finalizer for its run."""
+    db = db or get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        INSERT INTO {analysis_runs_table()}
+            (catalog_instance_id, run_id, server_id, status, songs_seen,
+             first_seen_at, last_seen_at, updated_at)
+        VALUES (%s, %s, %s, 'registering', 1, now(), now(), now())
+        ON CONFLICT (catalog_instance_id, run_id) DO NOTHING
+        RETURNING run_id
+        """,
+        (catalog_instance_id, run_id, server_id),
+    )
+    should_enqueue = cur.fetchone() is not None
+    if not should_enqueue:
+        cur.execute(
+            f"""
+            UPDATE {analysis_runs_table()}
+               SET status='registering', last_error=NULL, updated_at=now()
+             WHERE catalog_instance_id=%s AND run_id=%s
+               AND (status='enqueue_failed'
+                    OR (status='registering'
+                        AND updated_at < now() - interval '1 minute'))
+            RETURNING run_id
+            """,
+            (catalog_instance_id, run_id),
+        )
+        should_enqueue = cur.fetchone() is not None
+        cur.execute(
+            f"""
+            UPDATE {analysis_runs_table()}
+               SET songs_seen=songs_seen + 1, last_seen_at=now(), updated_at=now()
+             WHERE catalog_instance_id=%s AND run_id=%s
+            """,
+            (catalog_instance_id, run_id),
+        )
+    db.commit()
+    cur.close()
+    if not should_enqueue:
+        return {"queued": False, "coalesced": True}
+
+    try:
+        job = enqueue_analysis_run_finalizer(server_id, catalog_instance_id, run_id)
+    except Exception as exc:
+        update_analysis_run(
+            catalog_instance_id,
+            run_id,
+            "enqueue_failed",
+            last_error=exc,
+            db=db,
+        )
+        raise
+    update_analysis_run(
+        catalog_instance_id,
+        run_id,
+        "queued",
+        finalizer_job_id=getattr(job, "id", None),
+        db=db,
+    )
+    return {
+        "queued": True,
+        "coalesced": False,
+        "job_id": getattr(job, "id", None),
+    }
+
+
+def claim_analysis_run(catalog_instance_id, run_id, finalizer_job_id=None, db=None):
+    db = db or get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        UPDATE {analysis_runs_table()}
+           SET status='running', started_at=COALESCE(started_at, now()),
+               last_error=NULL, updated_at=now()
+         WHERE catalog_instance_id=%s AND run_id=%s
+           AND (status IN ('registering', 'queued', 'enqueue_failed', 'failed')
+                OR (status='running' AND finalizer_job_id=%s AND %s IS NOT NULL))
+        RETURNING songs_seen
+        """,
+        (catalog_instance_id, run_id, finalizer_job_id, finalizer_job_id),
+    )
+    row = cur.fetchone()
+    db.commit()
+    cur.close()
+    return int(row[0] or 0) if row else None
+
+
+def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
+    """Publish one complete source update after an AudioMuse analysis run settles."""
+    try:
+        from rq import get_current_job
+
+        current_job = get_current_job()
+        current_job_id = getattr(current_job, "id", None)
+    except Exception:
+        current_job_id = None
+    songs_seen = claim_analysis_run(
+        catalog_instance_id,
+        run_id,
+        finalizer_job_id=current_job_id,
+    )
+    if songs_seen is None:
+        return {"status": "already_finalized", "run_id": run_id}
+    try:
+        source = resolve_profile_source(
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+        )
+        if source["catalog_instance_id"] != catalog_instance_id:
+            raise CatalogScanError("Catalogue identity changed before run finalization")
+        catalog_result = refresh_catalog(server_id=server_id)
+        if catalog_result["catalog_instance_id"] != catalog_instance_id:
+            raise CatalogScanError("Catalogue identity changed during run finalization")
+        projection_result = project_analysis(
+            server_id=server_id,
+            adapter=get_core_adapter(),
+        )
+        if projection_result["catalog_instance_id"] != catalog_instance_id:
+            raise CatalogScanError("Analysis identity changed during run finalization")
+        recover_stale_pending_profiles(catalog_instance_id)
+        profile_result = queue_whole_library(
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+            include_failed=False,
+        )
+        update_analysis_run(
+            catalog_instance_id,
+            run_id,
+            "complete",
+            queued_profiles=profile_result["queued"],
+            profile_jobs=profile_result["jobs"],
+            completed=True,
+        )
+        return {
+            "status": "complete",
+            "run_id": run_id,
+            "songs_seen": songs_seen,
+            "catalog": catalog_result,
+            "analysis": projection_result,
+            "profiles": profile_result,
+        }
+    except Exception as exc:
+        update_analysis_run(
+            catalog_instance_id,
+            run_id,
+            "failed",
+            last_error=exc,
+        )
+        raise
+
+
 def analyze_song_hook(song):
+    event = {}
     source_server_id = None
     catalog_instance_id = None
     try:
@@ -1247,9 +1509,20 @@ def analyze_song_hook(song):
         catalog_instance_id = resolve_profile_source(server_id=source_server_id)[
             "catalog_instance_id"
         ]
-        enqueue(analysis_projection_task, event["server_id"], queue="default")
     except Exception:
-        logger.exception("lumae_analysis could not resolve the analysis source or queue projection")
+        logger.exception("lumae_analysis could not resolve the analysis source")
+    if catalog_instance_id:
+        run_id = str((event or {}).get("run_id") or "").strip()
+        if run_id:
+            try:
+                record_analysis_run(source_server_id, catalog_instance_id, run_id)
+            except Exception:
+                logger.exception(
+                    "lumae_analysis could not queue the source finalizer for run %s",
+                    run_id,
+                )
+        else:
+            logger.warning("lumae_analysis analysis hook did not include run_id")
     track_id = hook_track_id(song)
     audio_path = (song or {}).get("audio_path")
     if not track_id:
@@ -2225,7 +2498,9 @@ def render_settings(message=None, error=None):
           <header class="lumae-hero">
             <span class="lumae-kicker">Waveform profiles</span>
             <h2>Lumae analysis is preparing tracks for smoother playback.</h2>
-            <p>New songs are analyzed automatically after AudioMuse processes them. Use these controls to catch up older library items.</p>
+            <p>New songs receive profiles while AudioMuse analyzes them. After each analysis run,
+              Lumae publishes one source-scoped catalogue and analysis update and queues any
+              remaining profile work. Use these controls to catch up older library items.</p>
           </header>
 
           {preparation_html}

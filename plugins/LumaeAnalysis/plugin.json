@@ -53,7 +53,8 @@
         "v3_release_readiness",
         "provider_track_scope_verification",
         "source_scoped_profiles",
-        "prepare_lumae"
+        "prepare_lumae",
+        "analysis_run_finalization"
       ]
     }
   },
@@ -61,7 +62,7 @@
     {
       "version": "0.8.0",
       "min_core_version": "2.6.0",
-      "changelog": "Prevent cross-server catalogue and waveform-profile selection, verify a direct provider-track sample, and add one source-scoped Prepare Lumae workflow.",
+      "changelog": "Prevent cross-server data mixing, add source-scoped Prepare Lumae, and coalesce every AudioMuse analysis run into one catalogue, projection, and profile update.",
       "imageUrl": "",
       "sourceUrl": "",
       "checksum": ""

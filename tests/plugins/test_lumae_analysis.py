@@ -125,6 +125,7 @@ def test_plugin_manifest_has_lumae_identity():
             "provider_track_scope_verification",
             "source_scoped_profiles",
             "prepare_lumae",
+            "analysis_run_finalization",
         ],
     }
 
@@ -1196,10 +1197,27 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
         return Result()
 
     monkeypatch.setattr(mod, "analyze_file", fake_analyze_file)
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("per-song hooks must not enqueue full projections")
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "record_analysis_run",
+        lambda server_id, catalog_instance_id, run_id: seen.update(
+            {
+                "run": (server_id, catalog_instance_id, run_id),
+            }
+        ),
+    )
 
     result = mod.analyze_song_hook(
         {
             "item_id": "track-a",
+            "run_id": "analysis-run-a",
             "audio_path": str(audio),
             "metadata": {"file_path": "/metadata/path.flac"},
             "media_item": {"Id": "raw-track", "FilePath": "/music/raw-song.flac"},
@@ -1208,6 +1226,7 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
 
     assert result == {"track_id": "track-a", "status": "ready"}
     assert seen["path"] == str(audio)
+    assert seen["run"] == ("legacy-default", "catalog-a", "analysis-run-a")
     assert audio.exists()
     params = db.cursor_obj.executed[-1][1]
     assert params[0] == "catalog-a"
@@ -1215,6 +1234,275 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
     assert params[2] == 44100
     assert params[9].startswith("analysis-hook|track-a|/music/raw-song.flac|")
     assert params[11] == "ready"
+
+
+def test_analysis_run_events_coalesce_to_one_source_finalizer(monkeypatch):
+    mod = load_plugin()
+    db = AnalysisRunDb()
+    queued = []
+
+    def enqueue_finalizer(server_id, catalog_instance_id, run_id):
+        queued.append((server_id, catalog_instance_id, run_id))
+        return types.SimpleNamespace(id="finalizer-a")
+
+    monkeypatch.setattr(mod, "enqueue_analysis_run_finalizer", enqueue_finalizer)
+
+    first = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
+    second = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
+
+    assert first == {"queued": True, "coalesced": False, "job_id": "finalizer-a"}
+    assert second == {"queued": False, "coalesced": True}
+    assert queued == [("server-a", "catalog-a", "run-a")]
+    assert db.runs[("catalog-a", "run-a")]["songs_seen"] == 2
+    assert db.runs[("catalog-a", "run-a")]["status"] == "queued"
+
+
+def test_one_multiserver_analysis_run_gets_one_finalizer_per_source(monkeypatch):
+    mod = load_plugin()
+    db = AnalysisRunDb()
+    queued = []
+    monkeypatch.setattr(
+        mod,
+        "enqueue_analysis_run_finalizer",
+        lambda server_id, catalog_id, run_id: queued.append(
+            (server_id, catalog_id, run_id)
+        )
+        or types.SimpleNamespace(id=f"finalizer-{catalog_id}"),
+    )
+
+    mod.record_analysis_run("server-a", "catalog-a", "shared-run", db=db)
+    mod.record_analysis_run("server-b", "catalog-b", "shared-run", db=db)
+    mod.record_analysis_run("server-a", "catalog-a", "shared-run", db=db)
+    mod.record_analysis_run("server-b", "catalog-b", "shared-run", db=db)
+
+    assert queued == [
+        ("server-a", "catalog-a", "shared-run"),
+        ("server-b", "catalog-b", "shared-run"),
+    ]
+    assert db.runs[("catalog-a", "shared-run")]["songs_seen"] == 2
+    assert db.runs[("catalog-b", "shared-run")]["songs_seen"] == 2
+
+
+def test_analysis_run_enqueue_failure_is_retryable_by_the_next_song(monkeypatch):
+    mod = load_plugin()
+    db = AnalysisRunDb()
+    attempts = []
+
+    def enqueue_finalizer(*args):
+        attempts.append(args)
+        if len(attempts) == 1:
+            raise RuntimeError("redis unavailable")
+        return types.SimpleNamespace(id="finalizer-retry")
+
+    monkeypatch.setattr(mod, "enqueue_analysis_run_finalizer", enqueue_finalizer)
+
+    with pytest.raises(RuntimeError, match="redis unavailable"):
+        mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
+    assert db.runs[("catalog-a", "run-a")]["status"] == "enqueue_failed"
+
+    result = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
+
+    assert result["job_id"] == "finalizer-retry"
+    assert len(attempts) == 2
+    assert db.runs[("catalog-a", "run-a")]["songs_seen"] == 2
+    assert db.runs[("catalog-a", "run-a")]["status"] == "queued"
+
+
+def test_analysis_run_finalizer_refreshes_projects_then_queues_only_needed_profiles(monkeypatch):
+    mod = load_plugin()
+    db = AnalysisRunDb()
+    db.runs[("catalog-a", "run-a")] = {
+        "server_id": "server-a",
+        "status": "queued",
+        "songs_seen": 37,
+        "job_id": "finalizer-a",
+        "queued_profiles": 0,
+        "profile_jobs": 0,
+        "last_error": None,
+    }
+    calls = []
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **kwargs: calls.append(("resolve", kwargs))
+        or {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "refresh_catalog",
+        lambda server_id=None: calls.append(("refresh", server_id))
+        or {"catalog_instance_id": "catalog-a", "generation": 8},
+    )
+    adapter = object()
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: adapter)
+    monkeypatch.setattr(
+        mod,
+        "project_analysis",
+        lambda **kwargs: calls.append(("project", kwargs))
+        or {"catalog_instance_id": "catalog-a", "generation": 12},
+    )
+    monkeypatch.setattr(
+        mod,
+        "recover_stale_pending_profiles",
+        lambda catalog_id: calls.append(("recover", catalog_id)) or 0,
+    )
+    monkeypatch.setattr(
+        mod,
+        "queue_whole_library",
+        lambda **kwargs: calls.append(("profiles", kwargs))
+        or {"queued": 4, "jobs": 1, "chunk_size": 250},
+    )
+
+    result = mod.finalize_analysis_run_task("server-a", "catalog-a", "run-a")
+
+    assert [name for name, _value in calls] == [
+        "resolve",
+        "refresh",
+        "project",
+        "recover",
+        "profiles",
+    ]
+    assert calls[-1][1]["include_failed"] is False
+    assert result["songs_seen"] == 37
+    assert result["status"] == "complete"
+    assert db.runs[("catalog-a", "run-a")]["status"] == "complete"
+    assert db.runs[("catalog-a", "run-a")]["queued_profiles"] == 4
+
+
+def test_analysis_run_finalizer_failure_is_recorded_and_can_be_retried(monkeypatch):
+    mod = load_plugin()
+    db = AnalysisRunDb()
+    db.runs[("catalog-a", "run-a")] = {
+        "server_id": "server-a",
+        "status": "queued",
+        "songs_seen": 1,
+        "job_id": "finalizer-a",
+        "queued_profiles": 0,
+        "profile_jobs": 0,
+        "last_error": None,
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+    attempts = []
+
+    def refresh(server_id=None):
+        attempts.append(server_id)
+        if len(attempts) == 1:
+            raise RuntimeError("provider temporarily unavailable")
+        return {"catalog_instance_id": "catalog-a"}
+
+    monkeypatch.setattr(mod, "refresh_catalog", refresh)
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
+    monkeypatch.setattr(
+        mod,
+        "project_analysis",
+        lambda **_kwargs: {"catalog_instance_id": "catalog-a"},
+    )
+    monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda _catalog_id: 0)
+    monkeypatch.setattr(
+        mod,
+        "queue_whole_library",
+        lambda **_kwargs: {"queued": 0, "jobs": 0, "chunk_size": 250},
+    )
+
+    with pytest.raises(RuntimeError, match="temporarily unavailable"):
+        mod.finalize_analysis_run_task("server-a", "catalog-a", "run-a")
+    assert db.runs[("catalog-a", "run-a")]["status"] == "failed"
+    assert "temporarily unavailable" in db.runs[("catalog-a", "run-a")]["last_error"]
+
+    result = mod.finalize_analysis_run_task("server-a", "catalog-a", "run-a")
+
+    assert result["status"] == "complete"
+    assert len(attempts) == 2
+
+
+def test_running_analysis_finalizer_can_only_be_reclaimed_by_the_same_rq_job():
+    mod = load_plugin()
+    db = AnalysisRunDb()
+    db.runs[("catalog-a", "run-a")] = {
+        "server_id": "server-a",
+        "status": "running",
+        "songs_seen": 9,
+        "job_id": "finalizer-a",
+        "queued_profiles": 0,
+        "profile_jobs": 0,
+        "last_error": None,
+    }
+
+    assert (
+        mod.claim_analysis_run(
+            "catalog-a",
+            "run-a",
+            finalizer_job_id="different-job",
+            db=db,
+        )
+        is None
+    )
+    assert (
+        mod.claim_analysis_run(
+            "catalog-a",
+            "run-a",
+            finalizer_job_id="finalizer-a",
+            db=db,
+        )
+        == 9
+    )
+
+
+def test_analysis_run_finalizer_identity_is_scoped_by_catalogue():
+    mod = load_plugin()
+
+    first = mod.analysis_run_finalizer_job_id("catalog-a", "shared-run")
+    same = mod.analysis_run_finalizer_job_id("catalog-a", "shared-run")
+    other_source = mod.analysis_run_finalizer_job_id("catalog-b", "shared-run")
+
+    assert first == same
+    assert first != other_source
+
+
+def test_analysis_run_finalizer_waits_for_parent_even_when_parent_fails(monkeypatch):
+    from rq.exceptions import NoSuchJobError
+    from rq.job import Job
+
+    mod = load_plugin()
+    captured = {}
+
+    class Queue:
+        connection = object()
+
+        def enqueue(self, func, **kwargs):
+            captured["func"] = func
+            captured.update(kwargs)
+            return types.SimpleNamespace(id=kwargs["job_id"])
+
+    monkeypatch.setattr(plugin_api_module, "rq_queue_default", Queue(), raising=False)
+    monkeypatch.setattr(
+        plugin_api_module,
+        "dotted_path",
+        lambda func: f"{func.__module__}.{func.__name__}",
+        raising=False,
+    )
+    monkeypatch.setattr(
+        Job,
+        "fetch",
+        classmethod(
+            lambda _cls, _job_id, connection=None: (_ for _ in ()).throw(NoSuchJobError())
+        ),
+    )
+
+    job = mod.enqueue_analysis_run_finalizer("server-a", "catalog-a", "run-a")
+
+    assert job.id == mod.analysis_run_finalizer_job_id("catalog-a", "run-a")
+    assert captured["func"] == "plugin.manager.run_plugin_task"
+    assert captured["args"][1:] == ("server-a", "catalog-a", "run-a")
+    assert captured["depends_on"].dependencies == ["run-a"]
+    assert captured["depends_on"].allow_failure is True
+    assert captured["retry"].max == 2
 
 
 def test_encode_ramp_matches_lumae_byte_layout():
@@ -1550,6 +1838,83 @@ class FakeCursor:
 class FakeDb:
     def __init__(self, rows=None):
         self.cursor_obj = FakeCursor(rows)
+        self.commits = 0
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commits += 1
+
+
+class AnalysisRunCursor:
+    def __init__(self, db):
+        self.db = db
+        self.current_row = None
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        normalized = " ".join(sql.split())
+        self.current_row = None
+        if normalized.startswith("INSERT INTO plugin_lumae_analysis__analysis_runs"):
+            catalog_id, run_id, server_id = params
+            key = (catalog_id, run_id)
+            if key not in self.db.runs:
+                self.db.runs[key] = {
+                    "server_id": server_id,
+                    "status": "registering",
+                    "songs_seen": 1,
+                    "job_id": None,
+                    "queued_profiles": 0,
+                    "profile_jobs": 0,
+                    "last_error": None,
+                }
+                self.current_row = (run_id,)
+        elif "SET songs_seen=songs_seen + 1" in normalized:
+            row = self.db.runs[(params[0], params[1])]
+            row["songs_seen"] += 1
+        elif "SET status='registering'" in normalized:
+            row = self.db.runs[(params[0], params[1])]
+            if row["status"] == "enqueue_failed":
+                row["status"] = "registering"
+                row["last_error"] = None
+                self.current_row = (params[1],)
+        elif "SET status='running'" in normalized:
+            row = self.db.runs[(params[0], params[1])]
+            same_retry = (
+                row["status"] == "running"
+                and params[2] is not None
+                and row["job_id"] == params[2]
+            )
+            if row["status"] in {"registering", "queued", "enqueue_failed", "failed"} or same_retry:
+                row["status"] = "running"
+                row["last_error"] = None
+                self.current_row = (row["songs_seen"],)
+        elif normalized.startswith("UPDATE plugin_lumae_analysis__analysis_runs"):
+            status, job_id, queued_profiles, profile_jobs, error = params[:5]
+            key = (params[-2], params[-1])
+            row = self.db.runs[key]
+            row["status"] = status
+            if job_id is not None:
+                row["job_id"] = job_id
+            if queued_profiles is not None:
+                row["queued_profiles"] = queued_profiles
+            if profile_jobs is not None:
+                row["profile_jobs"] = profile_jobs
+            row["last_error"] = error
+
+    def fetchone(self):
+        return self.current_row
+
+    def close(self):
+        pass
+
+
+class AnalysisRunDb:
+    def __init__(self):
+        self.runs = {}
+        self.cursor_obj = AnalysisRunCursor(self)
         self.commits = 0
 
     def cursor(self):
@@ -2248,6 +2613,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "source_profiles",
         "profile_migrations",
         "preparation_state",
+        "analysis_runs",
         "analysis_changes",
     ):
         assert f"plugin_lumae_analysis__{table_name}" in migration_sql
@@ -2273,12 +2639,17 @@ def test_core_adapters_normalize_equivalent_v2_and_v3_analysis_events(monkeypatc
     from plugins.LumaeAnalysis.core_v2 import AudioMuseV2Adapter
     from plugins.LumaeAnalysis.core_v3 import AudioMuseV3Adapter
 
-    v2 = AudioMuseV2Adapter().normalize_analysis_hook({"item_id": "provider-track"})
-    v3 = AudioMuseV3Adapter().normalize_analysis_hook({"item_id": "provider-track", "server_id": "server-a"})
+    v2 = AudioMuseV2Adapter().normalize_analysis_hook(
+        {"item_id": "provider-track", "run_id": "run-a"}
+    )
+    v3 = AudioMuseV3Adapter().normalize_analysis_hook(
+        {"item_id": "provider-track", "server_id": "server-a", "run_id": "run-a"}
+    )
 
     assert v2["provider_track_id"] == v3["provider_track_id"] == "provider-track"
     assert v2["server_id"] == "legacy-default"
     assert v3["server_id"] == "server-a"
+    assert v2["run_id"] == v3["run_id"] == "run-a"
 
 
 def test_provider_bridge_never_exposes_credentials_or_urls():
