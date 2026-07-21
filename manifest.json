@@ -4,7 +4,7 @@
       "id": "lumae_analysis",
       "name": "Lumae Analysis",
       "author": "Lumae",
-      "description": "Precomputes Lumae loudness and MixRamp profiles for server-side volume normalization and SmoothFade.",
+      "description": "Mirrors supported Navidrome catalogues and precomputes Lumae loudness and MixRamp profiles for volume normalization and SmoothFade.",
       "pluginUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/plugins/LumaeAnalysis/plugin.json"
     }
   ]

@@ -67,8 +67,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Provide a Navidrome-only, source-safe catalogue with Prepare Lumae and one coalesced catalogue, projection, and profile update per AudioMuse analysis run.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.0.zip",
+      "checksum": "c3cd9c675191cb4ac3f4b214f0c44660"
     },
     {
       "version": "0.7.0",
