@@ -2,7 +2,7 @@
   "id": "lumae_analysis",
   "name": "Lumae Analysis",
   "author": "Lumae",
-  "description": "Precomputes Lumae loudness and MixRamp profiles for server-side volume normalization and SmoothFade.",
+  "description": "Mirrors supported Navidrome catalogues and precomputes Lumae loudness and MixRamp profiles for volume normalization and SmoothFade.",
   "requirements": [],
   "capabilities": {
     "lumae_analysis_profiles": {
@@ -35,6 +35,9 @@
       "catalog_schema_version": 2,
       "analysis_schema_version": 2,
       "supported_core_range": ">=2.6.0,<4.0.0",
+      "supported_provider_types": [
+        "navidrome"
+      ],
       "features": [
         "dual_core_compat",
         "stable_catalog_instance",
@@ -62,7 +65,7 @@
     {
       "version": "0.8.0",
       "min_core_version": "2.6.0",
-      "changelog": "Prevent cross-server data mixing, add source-scoped Prepare Lumae, and coalesce every AudioMuse analysis run into one catalogue, projection, and profile update.",
+      "changelog": "Provide a Navidrome-only, source-safe catalogue with Prepare Lumae and one coalesced catalogue, projection, and profile update per AudioMuse analysis run.",
       "imageUrl": "",
       "sourceUrl": "",
       "checksum": ""

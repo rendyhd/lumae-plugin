@@ -12,7 +12,7 @@ import uuid
 
 from plugin.api import table
 
-from .catalog_providers import ProviderCatalogBridge
+from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 
 
 CATALOG_SCHEMA_VERSION = 2
@@ -1510,6 +1510,11 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
         )
     rows = cur.fetchall()
     cur.close()
+    rows = [
+        row
+        for row in rows
+        if str(row[2] or "").strip().lower() in SUPPORTED_PROVIDER_TYPES
+    ]
     if server_id or catalog_instance_id:
         if not rows:
             raise KeyError("Unknown catalogue source")
@@ -1901,7 +1906,12 @@ def ensure_catalog_sources(db, bridge=None):
     ]
     by_server = {row["current_core_server_id"]: row for row in existing}
     legacy = by_server.get("legacy-default")
-    servers = provider_bridge.list_servers()
+    servers = [
+        server
+        for server in provider_bridge.list_servers()
+        if str(server.get("provider_type") or "").strip().lower()
+        in SUPPORTED_PROVIDER_TYPES
+    ]
     results = []
 
     if legacy and len(servers) == 1 and servers[0]["server_id"] != "legacy-default":

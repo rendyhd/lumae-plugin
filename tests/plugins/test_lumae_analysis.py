@@ -50,6 +50,7 @@ def settings_catalog_source():
     return {
         "catalog_instance_id": "catalog-a",
         "server_id": "server-a",
+        "provider_type": "navidrome",
         "name": "Main Navidrome",
         "catalog": {"status": "complete"},
         "analysis": {"status": "complete"},
@@ -106,6 +107,7 @@ def test_plugin_manifest_has_lumae_identity():
         "catalog_schema_version": 2,
         "analysis_schema_version": 2,
         "supported_core_range": ">=2.6.0,<4.0.0",
+        "supported_provider_types": ["navidrome"],
         "features": [
             "dual_core_compat",
             "stable_catalog_instance",
@@ -174,6 +176,7 @@ def test_catalog_health_uses_v2_single_server_adapter():
             "provider_type": "navidrome",
             "is_default": True,
             "status": "not_initialized",
+            "supported": True,
         }
     ]
 
@@ -211,8 +214,8 @@ def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch, core_versio
         "name": "Main",
         "provider_type": "jellyfin",
         "is_default": True,
-        "status": "not_initialized",
-        "v3_readiness": expect_v3_readiness(core_version),
+        "status": "provider_unsupported",
+        "supported": False,
     }
 
 
@@ -264,7 +267,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
-    assert captured["source"] == source
+    assert captured["source"] == {**source, "supported": True}
     assert captured["policy"]["catalogue_id_scheme_version"] is None
 
 
@@ -2591,6 +2594,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         ),
     ]
     migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
+    assert "rebind_status='active' AND provider_type='navidrome'" in migration_sql
     assert "plugin_lumae_analysis__collections" in migration_sql
     assert "plugin_lumae_analysis__collection_items" in migration_sql
     assert "plugin_lumae_analysis__collection_changes" in migration_sql
@@ -2679,6 +2683,37 @@ def test_provider_bridge_never_exposes_credentials_or_urls():
     ]
 
 
+def test_provider_bridge_admits_only_navidrome_sources():
+    from plugins.LumaeAnalysis.catalog_providers import (
+        CatalogProviderError,
+        ProviderCatalogBridge,
+        SUPPORTED_PROVIDER_TYPES,
+    )
+
+    class Adapter:
+        def list_servers(self):
+            return [
+                {
+                    "server_id": "nav",
+                    "provider_type": "navidrome",
+                    "is_default": True,
+                },
+                {
+                    "server_id": "jelly",
+                    "provider_type": "jellyfin",
+                    "is_default": False,
+                },
+            ]
+
+    bridge = ProviderCatalogBridge(Adapter())
+
+    assert SUPPORTED_PROVIDER_TYPES == frozenset({"navidrome"})
+    assert [server["supported"] for server in bridge.list_servers()] == [True, False]
+    assert bridge.require_server("nav")["provider_type"] == "navidrome"
+    with pytest.raises(CatalogProviderError, match="not supported"):
+        bridge.require_server("jelly")
+
+
 class RebindCursor(FakeCursor):
     def __init__(self, source_rows, selected_source=None):
         super().__init__(source_rows)
@@ -2697,6 +2732,38 @@ class RebindDb(FakeDb):
     def __init__(self, source_rows, selected_source=None):
         self.cursor_obj = RebindCursor(source_rows, selected_source)
         self.commits = 0
+
+
+def test_catalogue_source_resolution_hides_persisted_non_navidrome_sources():
+    from plugins.LumaeAnalysis.catalog import resolve_catalog_source
+
+    db = FakeDb(rows=[("catalog-jelly", "server-jelly", "jellyfin")])
+
+    with pytest.raises(KeyError, match="Unknown catalogue source"):
+        resolve_catalog_source(db, server_id="server-jelly")
+
+
+def test_catalogue_source_migration_does_not_create_non_navidrome_sources():
+    from plugins.LumaeAnalysis.catalog import ensure_catalog_sources
+
+    db = RebindDb([])
+
+    class Bridge:
+        def list_servers(self):
+            return [
+                {
+                    "server_id": "server-jelly",
+                    "name": "Jellyfin",
+                    "provider_type": "jellyfin",
+                    "is_default": True,
+                }
+            ]
+
+    assert ensure_catalog_sources(db, bridge=Bridge()) == []
+    assert not any(
+        sql.lstrip().startswith("INSERT INTO")
+        for sql, _params in db.cursor_obj.executed
+    )
 
 
 def test_v2_source_requires_proven_continuity_before_v3_rebind(monkeypatch):
@@ -3590,6 +3657,7 @@ def readiness_source():
     return {
         "catalog_instance_id": "catalog-a",
         "server_id": "server-a",
+        "provider_type": "navidrome",
         "name": "Main",
         "catalog": {"generation": 4, "status": "complete"},
         "analysis": {"status": "complete"},

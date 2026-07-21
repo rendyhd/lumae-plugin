@@ -10,7 +10,10 @@ from contextlib import nullcontext
 from .core_compat import get_core_adapter
 
 
-SUPPORTED_PROVIDER_TYPES = frozenset(("navidrome", "jellyfin", "emby", "lyrion"))
+# Lumae's mobile catalogue contract is intentionally Navidrome-only for now.
+# Keep the other normalizers below as future-facing compatibility code, but do
+# not admit those providers into a source of truth until the app supports them.
+SUPPORTED_PROVIDER_TYPES = frozenset(("navidrome",))
 
 
 class CatalogProviderError(RuntimeError):

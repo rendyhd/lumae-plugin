@@ -40,7 +40,7 @@ from .catalog_readiness import (
     clear_v3_release_acknowledgement,
     v3_release_readiness,
 )
-from .catalog_providers import ProviderCatalogBridge
+from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -328,7 +328,7 @@ def migrate(db):
         ), active_sources AS (
             SELECT catalog_instance_id
               FROM {table('catalog_sources')}
-             WHERE rebind_status='active'
+             WHERE rebind_status='active' AND provider_type='navidrome'
         ), default_source AS (
             SELECT catalog_instance_id
               FROM active_sources
@@ -718,6 +718,7 @@ def catalog_capability():
         "catalog_schema_version": CATALOG_SCHEMA_VERSION,
         "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
         "supported_core_range": SUPPORTED_CORE_RANGE,
+        "supported_provider_types": sorted(SUPPORTED_PROVIDER_TYPES),
         "features": list(CATALOG_FEATURES),
     }
 
@@ -800,16 +801,36 @@ def catalog_health():
             logger.exception("lumae_analysis could not read persisted catalogue health")
     if persisted:
         servers = persisted
+    servers = [
+        {
+            **server,
+            "supported": str(server.get("provider_type") or "").strip().lower()
+            in SUPPORTED_PROVIDER_TYPES,
+            **(
+                {"status": "provider_unsupported"}
+                if str(server.get("provider_type") or "").strip().lower()
+                not in SUPPORTED_PROVIDER_TYPES
+                else {}
+            ),
+        }
+        for server in servers
+    ]
     policy = dedup_policy()
     if compatibility.adapter == "v3_registry":
         servers = [
             {
                 **server,
-                "v3_readiness": v3_release_readiness(
-                    db,
-                    compatibility,
-                    server,
-                    policy,
+                **(
+                    {
+                        "v3_readiness": v3_release_readiness(
+                            db,
+                            compatibility,
+                            server,
+                            policy,
+                        )
+                    }
+                    if server["supported"]
+                    else {}
                 ),
             }
             for server in servers
