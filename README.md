@@ -13,8 +13,9 @@ The plugin provides:
 * a health endpoint for app setup checks;
 * profile read/request API endpoints for the Lumae app;
 * an analysis hook that reuses AudioMuse's per-track analysis audio;
-* a catch-up settings page for existing libraries;
-* a Queue Whole Library action that chunks large libraries into worker jobs.
+* a source-scoped preparation page that marks the provider catalogue and AudioMuse projection ready before waveform enrichment finishes;
+* one bounded background-enrichment chain per source, using small worker jobs instead of flooding the queue;
+* high-priority, idempotent promotion for the current playback window, so a requested track is not trapped behind a library backfill.
 
 ## Layout
 

@@ -13,7 +13,9 @@
         "loudness",
         "mix_ramp",
         "source_scoped_profiles",
-        "prepare_lumae"
+        "prepare_lumae",
+        "interactive_profile_priority",
+        "bounded_profile_backfill"
       ]
     },
     "living_collections": {
@@ -57,11 +59,22 @@
         "provider_track_scope_verification",
         "source_scoped_profiles",
         "prepare_lumae",
-        "analysis_run_finalization"
+        "analysis_run_finalization",
+        "catalog_ready_before_profile_backfill",
+        "interactive_profile_priority",
+        "bounded_profile_backfill"
       ]
     }
   },
   "versions": [
+    {
+      "version": "0.8.1",
+      "min_core_version": "2.6.0",
+      "changelog": "Make Lumae usable as soon as the Navidrome catalogue and AudioMuse projection publish; move waveform coverage to bounded background batches and prioritize current playback tracks.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.8.0",
       "min_core_version": "2.6.0",

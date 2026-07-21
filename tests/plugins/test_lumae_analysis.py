@@ -80,13 +80,20 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.0"
+    assert manifest["versions"][0]["version"] == "0.8.1"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
         "analyzer_version": 1,
         "profile_source": "waveform",
-        "features": ["loudness", "mix_ramp", "source_scoped_profiles", "prepare_lumae"],
+        "features": [
+            "loudness",
+            "mix_ramp",
+            "source_scoped_profiles",
+            "prepare_lumae",
+            "interactive_profile_priority",
+            "bounded_profile_backfill",
+        ],
     }
     assert manifest["capabilities"]["living_collections"] == {
         "schema_version": 1,
@@ -128,6 +135,9 @@ def test_plugin_manifest_has_lumae_identity():
             "source_scoped_profiles",
             "prepare_lumae",
             "analysis_run_finalization",
+            "catalog_ready_before_profile_backfill",
+            "interactive_profile_priority",
+            "bounded_profile_backfill",
         ],
     }
 
@@ -141,7 +151,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.0",
+        "plugin_version": "0.8.1",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -263,7 +273,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.0"
+    assert body["plugin_version"] == "0.8.1"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -1115,7 +1125,7 @@ def test_scoped_profile_writes_use_catalogue_and_track_composite_key(monkeypatch
     assert params[:2] == ("catalog-b", ["same-track-id"])
 
 
-def test_analyze_endpoint_enqueues_only_missing_or_stale_ids(monkeypatch):
+def test_analyze_endpoint_promotes_pending_and_enqueues_small_high_priority_chunks(monkeypatch):
     mod = load_plugin()
     calls = []
     rows = [
@@ -1133,8 +1143,8 @@ def test_analyze_endpoint_enqueues_only_missing_or_stale_ids(monkeypatch):
     monkeypatch.setattr(
         mod,
         "mark_pending",
-        lambda ids, catalog_instance_id=None: calls.append(
-            ("mark_pending", ids, catalog_instance_id)
+        lambda ids, catalog_instance_id=None, priority="background": calls.append(
+            ("mark_pending", ids, catalog_instance_id, priority)
         ),
     )
     monkeypatch.setattr(
@@ -1159,11 +1169,21 @@ def test_analyze_endpoint_enqueues_only_missing_or_stale_ids(monkeypatch):
         "already_pending": ["pending-1"],
     }
     assert calls == [
-        ("mark_pending", ["stale-1", "missing-1"], "catalog-a"),
+        (
+            "mark_pending",
+            ["stale-1", "missing-1", "pending-1"],
+            "catalog-a",
+            "interactive",
+        ),
         (
             "analyze_tracks_task",
-            (["stale-1", "missing-1"], "catalog-a", "server-a"),
-            "default",
+            (
+                ["stale-1", "missing-1", "pending-1"],
+                "catalog-a",
+                "server-a",
+                "interactive",
+            ),
+            "high",
         ),
     ]
 
@@ -1347,14 +1367,9 @@ def test_analysis_run_finalizer_refreshes_projects_then_queues_only_needed_profi
     )
     monkeypatch.setattr(
         mod,
-        "recover_stale_pending_profiles",
-        lambda catalog_id: calls.append(("recover", catalog_id)) or 0,
-    )
-    monkeypatch.setattr(
-        mod,
-        "queue_whole_library",
+        "start_profile_backfill",
         lambda **kwargs: calls.append(("profiles", kwargs))
-        or {"queued": 4, "jobs": 1, "chunk_size": 250},
+        or {"queued": True, "coalesced": False, "batch_size": 4},
     )
 
     result = mod.finalize_analysis_run_task("server-a", "catalog-a", "run-a")
@@ -1363,10 +1378,8 @@ def test_analysis_run_finalizer_refreshes_projects_then_queues_only_needed_profi
         "resolve",
         "refresh",
         "project",
-        "recover",
         "profiles",
     ]
-    assert calls[-1][1]["include_failed"] is False
     assert result["songs_seen"] == 37
     assert result["status"] == "complete"
     assert db.runs[("catalog-a", "run-a")]["status"] == "complete"
@@ -1406,11 +1419,10 @@ def test_analysis_run_finalizer_failure_is_recorded_and_can_be_retried(monkeypat
         "project_analysis",
         lambda **_kwargs: {"catalog_instance_id": "catalog-a"},
     )
-    monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda _catalog_id: 0)
     monkeypatch.setattr(
         mod,
-        "queue_whole_library",
-        lambda **_kwargs: {"queued": 0, "jobs": 0, "chunk_size": 250},
+        "start_profile_backfill",
+        lambda **_kwargs: {"queued": False, "coalesced": True, "batch_size": 10},
     )
 
     with pytest.raises(RuntimeError, match="temporarily unavailable"):
@@ -2268,7 +2280,14 @@ def test_backfill_uses_configured_batch_size(monkeypatch):
     )
     monkeypatch.setattr(mod, "find_backfill_ids", lambda limit: seen_limits.append(limit) or [])
 
-    assert mod.backfill_missing_profiles() == {"ready": 0, "failed": 0, "skipped": 0}
+    assert mod.backfill_missing_profiles() == {
+        "ready": 0,
+        "already_ready": 0,
+        "promoted": 0,
+        "failed": 0,
+        "skipped": 0,
+        "deferred": 0,
+    }
     assert seen_limits == [7]
 
 
@@ -2333,103 +2352,219 @@ def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch)
         "find_backfill_ids",
         lambda limit: calls.append(("find", limit)) or ["a", "b"],
     )
-    monkeypatch.setattr(mod, "mark_pending", lambda ids: calls.append(("mark_pending", ids)))
+    monkeypatch.setattr(
+        mod,
+        "mark_pending",
+        lambda ids, priority="background": calls.append(("mark_pending", ids, priority)),
+    )
     monkeypatch.setattr(
         mod,
         "enqueue",
-        lambda func, ids, queue="default": calls.append((func.__name__, ids, queue)),
+        lambda func, *args, queue="default": calls.append((func.__name__, args, queue)),
     )
 
     assert mod.queue_backfill_batch() == {"queued": 2, "limit": 3}
     assert calls == [
         ("find", 3),
-        ("mark_pending", ["a", "b"]),
-        ("analyze_tracks_task", ["a", "b"], "default"),
+        ("mark_pending", ["a", "b"], "background"),
+        ("analyze_tracks_task", (["a", "b"], None, None, "background"), "default"),
     ]
 
 
-def test_queue_whole_library_splits_every_candidate_into_250_track_jobs(monkeypatch):
+def test_start_profile_backfill_claims_one_bounded_default_queue_chain(monkeypatch):
     mod = load_plugin()
     calls = []
-    ids = [f"track-{i}" for i in range(601)]
-
-    monkeypatch.setattr(mod, "find_all_backfill_ids", lambda: ids)
-    monkeypatch.setattr(mod, "mark_pending", lambda chunk: calls.append(("mark_pending", chunk)))
+    source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(mod, "claim_profile_backfill", lambda selected: selected == source)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 10)
     monkeypatch.setattr(
         mod,
         "enqueue",
-        lambda func, chunk, queue="default": calls.append((func.__name__, chunk, queue)),
+        lambda func, *args, queue="default": calls.append((func.__name__, args, queue))
+        or types.SimpleNamespace(id="backfill-a"),
     )
 
-    assert mod.queue_whole_library() == {"queued": 601, "jobs": 3, "chunk_size": 250}
-    assert calls == [
-        ("mark_pending", ids[:250]),
-        ("analyze_tracks_task", ids[:250], "default"),
-        ("mark_pending", ids[250:500]),
-        ("analyze_tracks_task", ids[250:500], "default"),
-        ("mark_pending", ids[500:]),
-        ("analyze_tracks_task", ids[500:], "default"),
-    ]
+    assert mod.start_profile_backfill("catalog-a", "server-a") == {
+        "queued": True,
+        "coalesced": False,
+        "batch_size": 10,
+        "job_id": "backfill-a",
+    }
+    assert calls == [("profile_backfill_task", ("server-a", "catalog-a"), "default")]
 
 
-def test_queue_whole_library_does_not_enqueue_when_no_candidates(monkeypatch):
+def test_start_profile_backfill_coalesces_while_chain_is_active(monkeypatch):
     mod = load_plugin()
     calls = []
+    source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(mod, "claim_profile_backfill", lambda _source: False)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 10)
+    monkeypatch.setattr(mod, "enqueue", lambda *args, **kwargs: calls.append((args, kwargs)))
 
-    monkeypatch.setattr(mod, "find_all_backfill_ids", lambda: [])
-    monkeypatch.setattr(mod, "mark_pending", lambda chunk: calls.append(("mark_pending", chunk)))
-    monkeypatch.setattr(
-        mod,
-        "enqueue",
-        lambda func, chunk, queue="default": calls.append((func.__name__, chunk, queue)),
-    )
-
-    assert mod.queue_whole_library() == {"queued": 0, "jobs": 0, "chunk_size": 250}
+    assert mod.start_profile_backfill("catalog-a", "server-a") == {
+        "queued": False,
+        "coalesced": True,
+        "batch_size": 10,
+    }
     assert calls == []
 
 
-def test_queue_whole_library_keeps_child_jobs_on_exact_source(monkeypatch):
+def test_profile_backfill_task_processes_one_batch_then_yields_worker(monkeypatch):
     mod = load_plugin()
     calls = []
     monkeypatch.setattr(
         mod,
-        "find_all_backfill_ids",
-        lambda **kwargs: calls.append(("find", kwargs)) or ["same-track-id"],
+        "resolve_profile_source",
+        lambda **kwargs: calls.append(("resolve", kwargs))
+        or {"catalog_instance_id": "catalog-b", "server_id": "server-b"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "update_profile_backfill_state",
+        lambda *args, **kwargs: calls.append(("state", args, kwargs)),
+    )
+    monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda catalog_id: 0)
+    batches = iter([["a", "b"], ["c"]])
+    monkeypatch.setattr(
+        mod,
+        "find_backfill_ids",
+        lambda *args, **kwargs: next(batches),
     )
     monkeypatch.setattr(
         mod,
         "mark_pending",
-        lambda ids, catalog_instance_id=None: calls.append(
-            ("pending", ids, catalog_instance_id)
+        lambda ids, catalog_instance_id=None, priority="background": calls.append(
+            ("pending", ids, catalog_instance_id, priority)
         ),
     )
     monkeypatch.setattr(
         mod,
-        "enqueue",
-        lambda func, *args, queue="default": calls.append(
-            (func.__name__, args, queue)
+        "analyze_tracks_task",
+        lambda *args, **kwargs: calls.append(("analyze", args, kwargs))
+        or {"ready": 2, "already_ready": 0, "promoted": 0, "failed": 0, "skipped": 0},
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue_next_profile_backfill",
+        lambda *args: calls.append(("next", args)),
+    )
+
+    result = mod.profile_backfill_task("server-b", "catalog-b")
+
+    assert result["status"] == "queued"
+    assert result["processed"] == 2
+    assert result["queued_next"] is True
+    assert ("pending", ["a", "b"], "catalog-b", "background") in calls
+    assert ("next", ("server-b", "catalog-b")) in calls
+
+
+def test_profile_backfill_task_releases_claimed_rows_when_batch_crashes(monkeypatch):
+    mod = load_plugin()
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "update_profile_backfill_state",
+        lambda *args, **kwargs: calls.append(("state", args, kwargs)),
+    )
+    monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda _catalog_id: 0)
+    monkeypatch.setattr(mod, "find_backfill_ids", lambda *_args, **_kwargs: ["track-a"])
+    monkeypatch.setattr(mod, "mark_pending", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "analyze_tracks_task",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("decoder crashed")),
+    )
+    monkeypatch.setattr(
+        mod,
+        "release_pending",
+        lambda ids, catalog_instance_id=None, reason=None: calls.append(
+            ("release", ids, catalog_instance_id, reason)
         ),
     )
 
-    result = mod.queue_whole_library("catalog-b", "server-b")
+    with pytest.raises(RuntimeError, match="decoder crashed"):
+        mod.profile_backfill_task("server-a", "catalog-a")
 
-    assert result == {"queued": 1, "jobs": 1, "chunk_size": 250}
-    assert calls == [
-        (
-            "find",
-            {
-                "catalog_instance_id": "catalog-b",
-                "server_id": "server-b",
-                "include_failed": False,
-            },
+    assert calls[-2][0:3] == ("release", ["track-a"], "catalog-a")
+    assert "decoder crashed" in calls[-2][3]
+    assert calls[-1][0] == "state"
+    assert calls[-1][1][2] == "failed"
+
+
+def test_legacy_oversized_background_job_is_drained_into_bounded_chain(monkeypatch):
+    mod = load_plugin()
+    ids = [f"track-{index}" for index in range(mod.MAX_BACKFILL_BATCH_SIZE + 1)]
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "release_pending",
+        lambda selected, catalog_instance_id=None, reason=None: calls.append(
+            ("release", selected, catalog_instance_id, reason)
         ),
-        ("pending", ["same-track-id"], "catalog-b"),
-        (
-            "analyze_tracks_task",
-            (["same-track-id"], "catalog-b", "server-b"),
-            "default",
-        ),
-    ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "start_profile_backfill",
+        lambda **kwargs: calls.append(("start", kwargs)) or {"queued": True},
+    )
+
+    result = mod.analyze_tracks_task(ids, "catalog-a", "server-a")
+
+    assert result["deferred"] == len(ids)
+    assert calls[0][0:3] == ("release", ids, "catalog-a")
+    assert "bounded 0.8.1" in calls[0][3]
+    assert calls[1] == (
+        "start",
+        {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+
+
+def test_background_task_skips_ready_and_interactively_promoted_tracks(monkeypatch):
+    mod = load_plugin()
+    rows = {
+        "ready": {
+            "track_id": "ready",
+            "status": "ready",
+            "analyzer_ver": mod.ANALYZER_VERSION,
+            "media_signature": "catalog-media:same",
+        },
+        "promoted": {
+            "track_id": "promoted",
+            "status": "pending_interactive",
+            "analyzer_ver": mod.ANALYZER_VERSION,
+            "media_signature": None,
+        },
+    }
+    monkeypatch.setattr(
+        mod,
+        "fetch_profile_rows",
+        lambda ids, catalog_instance_id=None: [rows[ids[0]]],
+    )
+    monkeypatch.setattr(mod, "catalog_media_signature", lambda *_args: "catalog-media:same")
+    monkeypatch.setattr(
+        mod,
+        "analyze_one_track",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not analyze")),
+    )
+    monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
+
+    result = mod.analyze_tracks_task(["ready", "promoted"], "catalog-a", "server-a")
+
+    assert result == {
+        "ready": 0,
+        "already_ready": 1,
+        "promoted": 1,
+        "failed": 0,
+        "skipped": 0,
+        "deferred": 0,
+    }
 
 
 def test_profile_enqueue_failure_releases_pending_rows_for_retry(monkeypatch):
@@ -2438,8 +2573,8 @@ def test_profile_enqueue_failure_releases_pending_rows_for_retry(monkeypatch):
     monkeypatch.setattr(
         mod,
         "mark_pending",
-        lambda ids, catalog_instance_id=None: calls.append(
-            ("pending", ids, catalog_instance_id)
+        lambda ids, catalog_instance_id=None, priority="background": calls.append(
+            ("pending", ids, catalog_instance_id, priority)
         ),
     )
     monkeypatch.setattr(
@@ -2458,12 +2593,12 @@ def test_profile_enqueue_failure_releases_pending_rows_for_retry(monkeypatch):
     with pytest.raises(RuntimeError, match="redis down"):
         mod.enqueue_profile_analysis(["track-a"], "catalog-a", "server-a")
 
-    assert calls[0] == ("pending", ["track-a"], "catalog-a")
+    assert calls[0] == ("pending", ["track-a"], "catalog-a", "background")
     assert calls[1][:3] == ("released", ["track-a"], "catalog-a")
     assert "redis down" in calls[1][3]
 
 
-def test_prepare_lumae_runs_catalog_projection_then_source_profiles(monkeypatch):
+def test_prepare_lumae_marks_catalog_ready_before_background_profiles(monkeypatch):
     mod = load_plugin()
     calls = []
     source = settings_catalog_source()
@@ -2488,41 +2623,33 @@ def test_prepare_lumae_runs_catalog_projection_then_source_profiles(monkeypatch)
     monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
     monkeypatch.setattr(
         mod,
-        "queue_whole_library",
+        "start_profile_backfill",
         lambda **kwargs: calls.append(("profiles", kwargs))
-        or {"queued": 25, "jobs": 1, "chunk_size": 250},
+        or {"queued": True, "coalesced": False, "batch_size": 10},
     )
     monkeypatch.setattr(
         mod,
-        "recover_stale_pending_profiles",
-        lambda catalog_id: calls.append(("recover", catalog_id)) or 0,
-    )
-    monkeypatch.setattr(
-        mod,
-        "finalize_preparation_if_settled",
-        lambda catalog_id: calls.append(("finalize", catalog_id)) or {"status": "profiles_queued"},
+        "preparation_state",
+        lambda catalog_id: {"catalog_instance_id": catalog_id, "status": "ready"},
     )
 
     result = mod.prepare_lumae_task("server-a", "catalog-a")
 
-    assert result["profiles"]["queued"] == 25
+    assert result["profiles"]["queued"] is True
+    assert result["preparation"]["status"] == "ready"
     assert calls == [
         ("state", "running", "catalog_refresh"),
         ("catalog", "server-a"),
         ("state", "running", "analysis_projection"),
         ("projection", "server-a"),
-        ("state", "profiles_queued", "profile_backfill"),
-        ("recover", "catalog-a"),
+        ("state", "ready", "catalog_ready"),
         (
             "profiles",
             {
                 "catalog_instance_id": "catalog-a",
                 "server_id": "server-a",
-                "include_failed": True,
             },
         ),
-        ("state", "profiles_queued", "profile_backfill"),
-        ("finalize", "catalog-a"),
     ]
 
 
@@ -2548,7 +2675,7 @@ def test_prepare_lumae_records_failure_and_does_not_queue_profiles(monkeypatch):
     monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
     monkeypatch.setattr(
         mod,
-        "queue_whole_library",
+        "start_profile_backfill",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not queue")),
     )
 
@@ -2558,14 +2685,41 @@ def test_prepare_lumae_records_failure_and_does_not_queue_profiles(monkeypatch):
     assert calls[-1] == ("failed", "failed")
 
 
-def test_preparation_active_guard_expires_interrupted_jobs_after_24_hours():
+def test_preparation_active_guard_only_blocks_short_catalog_publication():
     mod = load_plugin()
     now = mod.datetime(2026, 7, 21, 12, 0, tzinfo=mod.timezone.utc)
-    state = {"status": "profiles_queued", "updated_at": "2026-07-21T11:00:00+00:00"}
+    state = {"status": "running", "updated_at": "2026-07-21T11:30:01+00:00"}
 
     assert mod.preparation_is_active(state, now=now) is True
-    state["updated_at"] = "2026-07-20T11:59:59+00:00"
+    state["updated_at"] = "2026-07-21T10:59:59+00:00"
     assert mod.preparation_is_active(state, now=now) is False
+    state["status"] = "ready"
+    state["updated_at"] = "2026-07-21T11:59:59+00:00"
+    assert mod.preparation_is_active(state, now=now) is False
+
+
+def test_profile_backfill_active_guard_makes_stalled_queue_retryable():
+    mod = load_plugin()
+    now = mod.datetime(2026, 7, 21, 12, 0, tzinfo=mod.timezone.utc)
+    state = {"status": "queued", "updated_at": "2026-07-21T11:30:01+00:00"}
+
+    assert mod.profile_backfill_is_active(state, now=now) is True
+    state["updated_at"] = "2026-07-21T11:29:59+00:00"
+    assert mod.profile_backfill_is_active(state, now=now) is False
+    state["status"] = "complete"
+    state["updated_at"] = "2026-07-21T11:59:59+00:00"
+    assert mod.profile_backfill_is_active(state, now=now) is False
+
+
+def test_catalog_preparation_claim_does_not_inherit_legacy_profile_queue_lock():
+    mod = load_plugin()
+    db = FakeDb([("catalog-a",)])
+    source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
+
+    assert mod.claim_preparation(source, db=db) is True
+    sql, _params = db.cursor_obj.executed[-1]
+    assert "status NOT IN ('queued', 'running')" in sql
+    assert "profiles_queued" not in sql
 
 
 def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
@@ -2596,6 +2750,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
     assert "rebind_status='active' AND provider_type='navidrome'" in migration_sql
     assert "plugin_lumae_analysis__collections" in migration_sql
+    assert "plugin_lumae_analysis__profile_backfill_state" in migration_sql
     assert "plugin_lumae_analysis__collection_items" in migration_sql
     assert "plugin_lumae_analysis__collection_changes" in migration_sql
     for table_name in (
@@ -3965,6 +4120,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.song_hooks == [mod.analyze_song_hook]
     assert ctx.tasks == [
         ("prepare", mod.prepare_lumae_task, "default"),
+        ("profile_backfill", mod.profile_backfill_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
     ]
     assert ctx.cron_tasks == [
@@ -4028,6 +4184,7 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     monkeypatch.setattr(mod, "get_db", lambda: object())
     monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [settings_catalog_source()])
     monkeypatch.setattr(mod, "preparation_state", lambda _catalog_id: None)
+    monkeypatch.setattr(mod, "profile_backfill_state", lambda _catalog_id: None)
     monkeypatch.setattr(
         mod,
         "analysis_status_counts",
@@ -4048,10 +4205,10 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     assert response.status_code == 200
     body = response.get_data(as_text=True)
     assert 'class="lumae-meter-fill" style="width: 1%;"' in body
-    assert "Prepare Lumae" in body
-    assert "Analyze next batch" in body
-    assert "Queue all profiles" in body
-    assert "Tracks per catch-up batch" in body
+    assert "Refresh Lumae catalogue" in body
+    assert "Start background enrichment" in body
+    assert "Queue all profiles" not in body
+    assert "Tracks per background batch" in body
     assert "15,894 need analysis" in body
     assert "15,894" in body
     assert "Enable scheduled catch-up" not in body
@@ -4131,6 +4288,11 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
     monkeypatch.setattr(mod, "preparation_state", lambda _catalog_id: None)
     monkeypatch.setattr(
         mod,
+        "profile_backfill_state",
+        lambda _catalog_id: {"status": "running", "last_error": None},
+    )
+    monkeypatch.setattr(
+        mod,
         "analysis_status_counts",
         lambda **_kwargs: {
             "total_with_files": 100,
@@ -4149,27 +4311,26 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
     assert response.status_code == 200
     body = response.get_data(as_text=True)
     assert 'aria-valuenow="82"' in body
-    assert "Profiles: 82 ready of 100" in body
+    assert "Playback enrichment: 82 ready of 100" in body
     assert "11 need analysis" in body
-    assert "refreshes the provider catalogue" in body
-    assert "publishes its analysis projection" in body
+    assert "provider catalogue" in body
+    assert "AudioMuse projection" in body
+    assert "App readiness and waveform coverage are independent" in body
+    assert "setTimeout(()=&gt;location.reload(),5000)" in body or "setTimeout(()=>location.reload(),5000)" in body
 
 
-def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(
+def test_settings_page_starts_bounded_background_enrichment(
     monkeypatch,
 ):
     mod = load_plugin()
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 250)
     source = settings_catalog_source()
     monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
-    monkeypatch.setattr(mod, "preparation_state", lambda _catalog_id: None)
     monkeypatch.setattr(
         mod,
-        "queue_whole_library",
-        lambda **_kwargs: {"queued": 15894, "jobs": 64, "chunk_size": 250},
+        "start_profile_backfill",
+        lambda **_kwargs: {"queued": True, "coalesced": False, "batch_size": 25},
     )
-    monkeypatch.setattr(mod, "update_preparation_state", lambda *args, **kwargs: None)
-    monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
     monkeypatch.setattr(mod, "set_setting", lambda key, value: None)
     monkeypatch.setattr(mod, "render_source_preparation_panel", lambda _batch_size: "")
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
@@ -4179,7 +4340,7 @@ def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(
         "/settings",
         data={
             "backfill_batch_size": "25",
-            "action": "queue_all",
+            "action": "start_backfill",
             "server_id": "server-a",
             "catalog_instance_id": "catalog-a",
         },
@@ -4188,7 +4349,8 @@ def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(
     assert response.status_code == 200
     body = response.get_data(as_text=True)
     assert 'class="lumae-notice lumae-notice-success" role="status"' in body
-    assert "Queued 15,894 tracks from Main Navidrome across 64 jobs" in body
+    assert "Started background enrichment for Main Navidrome in batches of 25" in body
+    assert "Playback requests are prioritized separately" in body
 
 
 def test_settings_prepare_action_claims_and_enqueues_exact_source_once(monkeypatch):
