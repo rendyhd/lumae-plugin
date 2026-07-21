@@ -72,8 +72,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Make Lumae usable as soon as the Navidrome catalogue and AudioMuse projection publish; move waveform coverage to bounded background batches and prioritize current playback tracks.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.1.zip",
+      "checksum": "cf5797a43ea2a08cdfa1bb36f6e55fd4"
     },
     {
       "version": "0.8.0",
