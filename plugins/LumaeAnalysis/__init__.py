@@ -52,7 +52,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.7.0"
+PLUGIN_VERSION = "0.8.0"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -71,6 +71,7 @@ CATALOG_FEATURES = (
     "shared_analysis",
     "binary_vectors",
     "v3_release_readiness",
+    "provider_track_scope_verification",
 )
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
@@ -698,7 +699,10 @@ def catalog_verify_scope_api():
         if not catalog_instance_id:
             return _catalog_error("identity_required", "Catalogue instance is required.", 400)
         result = verify_library_scope(
-            get_db(), catalog_instance_id, body.get("library_ids")
+            get_db(),
+            catalog_instance_id,
+            body.get("library_ids"),
+            body.get("provider_track_ids") if "provider_track_ids" in body else None,
         )
         return _private_json(result)
     except KeyError:

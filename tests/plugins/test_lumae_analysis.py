@@ -69,7 +69,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.7.0"
+    assert manifest["versions"][0]["version"] == "0.8.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -112,6 +112,7 @@ def test_plugin_manifest_has_lumae_identity():
             "shared_analysis",
             "binary_vectors",
             "v3_release_readiness",
+            "provider_track_scope_verification",
         ],
     }
 
@@ -125,7 +126,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.7.0",
+        "plugin_version": "0.8.0",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -246,7 +247,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.7.0"
+    assert body["plugin_version"] == "0.8.0"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -2127,11 +2128,107 @@ def test_catalog_scope_evidence_is_order_independent_and_scope_sensitive():
     db = FakeDb([(expected["scope_summary"],)])
     assert verify_library_scope(db, "catalog-a", ["library-b", "library-a"]) == {
         "verified": True,
+        "library_verified": True,
         "expected_count": 2,
         "submitted_count": 2,
         "evidence_available": True,
     }
     assert verify_library_scope(db, "catalog-a", ["library-a"])["verified"] is False
+
+
+def test_catalog_scope_requires_a_sufficient_direct_provider_track_sample():
+    from plugins.LumaeAnalysis.catalog import verify_library_scope
+
+    summary = {
+        "library_count": 1,
+        "track_count": 20,
+        "library_ids_fp": "",
+    }
+    from plugins.LumaeAnalysis.catalog import fingerprint
+
+    summary["library_ids_fp"] = fingerprint({"library_ids": ["1"]})
+
+    class ScopeCursor(FakeCursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if "COUNT(DISTINCT ct.track_id)" in sql:
+                submitted = params[0]
+                matches = len([track_id for track_id in submitted if track_id != "wrong-server-track"])
+                self.rows = [(7, matches)]
+            else:
+                self.rows = [(summary,)]
+
+    class ScopeDb(FakeDb):
+        def __init__(self):
+            self.cursor_obj = ScopeCursor()
+            self.commits = 0
+
+    matching = [f"track-{index}" for index in range(12)]
+    verified = verify_library_scope(ScopeDb(), "catalog-a", ["1"], matching)
+    assert verified == {
+        "verified": True,
+        "library_verified": True,
+        "expected_count": 1,
+        "submitted_count": 1,
+        "evidence_available": True,
+        "track_evidence_available": True,
+        "tracks_verified": True,
+        "expected_track_count": 20,
+        "required_track_count": 12,
+        "submitted_track_count": 12,
+        "matched_track_count": 12,
+        "sample_sufficient": True,
+    }
+
+    wrong_server = verify_library_scope(
+        ScopeDb(), "catalog-a", ["1"], [*matching[:-1], "wrong-server-track"]
+    )
+    assert wrong_server["verified"] is False
+    assert wrong_server["library_verified"] is True
+    assert wrong_server["matched_track_count"] == 11
+    assert wrong_server["tracks_verified"] is False
+
+    too_small = verify_library_scope(ScopeDb(), "catalog-a", ["1"], matching[:4])
+    assert too_small["verified"] is False
+    assert too_small["sample_sufficient"] is False
+
+
+def test_catalog_scope_endpoint_forwards_direct_provider_track_evidence(monkeypatch):
+    mod = load_plugin()
+    captured = {}
+
+    def verify(db, catalog_instance_id, library_ids, provider_track_ids=None):
+        captured.update(
+            {
+                "db": db,
+                "catalog_instance_id": catalog_instance_id,
+                "library_ids": library_ids,
+                "provider_track_ids": provider_track_ids,
+            }
+        )
+        return {"verified": True, "tracks_verified": True}
+
+    db = object()
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "verify_library_scope", verify)
+
+    response = plugin_client(mod).post(
+        "/api/catalog/verify-scope",
+        json={
+            "catalog_instance_id": "catalog-a",
+            "library_ids": ["1"],
+            "provider_track_ids": ["track-a", "track-b"],
+        },
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {"verified": True, "tracks_verified": True}
+    assert captured == {
+        "db": db,
+        "catalog_instance_id": "catalog-a",
+        "library_ids": ["1"],
+        "provider_track_ids": ["track-a", "track-b"],
+    }
 
 
 def test_automatic_rebind_accepts_only_an_exact_provider_projection(monkeypatch):

@@ -48,11 +48,20 @@
         "soft_deletions",
         "shared_analysis",
         "binary_vectors",
-        "v3_release_readiness"
+        "v3_release_readiness",
+        "provider_track_scope_verification"
       ]
     }
   },
   "versions": [
+    {
+      "version": "0.8.0",
+      "min_core_version": "2.6.0",
+      "changelog": "Prevent cross-server catalogue selection by verifying a direct provider-track sample in addition to Navidrome library IDs.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.7.0",
       "min_core_version": "2.6.0",

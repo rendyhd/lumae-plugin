@@ -647,8 +647,18 @@ def catalog_scope_evidence(normalized, provider_type):
     }
 
 
-def verify_library_scope(db, catalog_instance_id, library_ids):
-    """Compare client-visible provider library IDs without returning stored IDs."""
+SOURCE_VERIFICATION_MIN_TRACKS = 12
+SOURCE_VERIFICATION_MAX_TRACKS = 128
+
+
+def verify_library_scope(db, catalog_instance_id, library_ids, provider_track_ids=None):
+    """Prove the client sees this provider catalogue without returning stored IDs.
+
+    ``provider_track_ids`` is optional for compatibility with older Lumae apps.
+    New clients submit a small sample fetched directly from their playback
+    provider; matching library IDs alone is insufficient because two separate
+    Navidrome databases can both number their first library ``1``.
+    """
     if not isinstance(library_ids, list) or not 1 <= len(library_ids) <= 1000:
         raise ValueError("One to 1000 provider library IDs are required")
     normalized_ids = sorted(
@@ -662,18 +672,95 @@ def verify_library_scope(db, catalog_instance_id, library_ids):
         (catalog_instance_id,),
     )
     row = cur.fetchone()
-    cur.close()
     if row is None:
+        cur.close()
         raise KeyError("Unknown catalogue instance")
     summary = _state_counts(row[0])
     expected_fp = summary.get("library_ids_fp")
     actual_fp = fingerprint({"library_ids": normalized_ids})
-    return {
-        "verified": bool(expected_fp) and hmac.compare_digest(str(expected_fp), actual_fp),
+    library_verified = bool(expected_fp) and hmac.compare_digest(str(expected_fp), actual_fp)
+    result = {
+        "verified": library_verified,
+        "library_verified": library_verified,
         "expected_count": int(summary.get("library_count", 0) or 0),
         "submitted_count": len(normalized_ids),
         "evidence_available": bool(expected_fp),
     }
+    # Preserve the v0.7 response contract for older clients. New clients
+    # require the extended track-evidence fields and therefore fail closed
+    # against an older plugin that silently ignores provider_track_ids.
+    if provider_track_ids is None:
+        cur.close()
+        return result
+    if (
+        not isinstance(provider_track_ids, list)
+        or not 1 <= len(provider_track_ids) <= SOURCE_VERIFICATION_MAX_TRACKS
+    ):
+        cur.close()
+        raise ValueError(
+            f"One to {SOURCE_VERIFICATION_MAX_TRACKS} provider track IDs are required"
+        )
+    normalized_track_ids = sorted(
+        {
+            unicodedata.normalize("NFC", str(value)).strip()
+            for value in provider_track_ids
+            if value is not None and str(value).strip()
+        }
+    )
+    if not normalized_track_ids:
+        cur.close()
+        raise ValueError("At least one provider track ID is required")
+
+    cur.execute(
+        f"""
+        SELECT c.published_generation,
+               (SELECT COUNT(DISTINCT ct.track_id)
+                  FROM {t("catalog_tracks")} ct
+                 WHERE ct.catalog_instance_id=c.catalog_instance_id
+                   AND ct.published_generation=c.published_generation
+                   AND ct.available=TRUE
+                   AND ct.track_id=ANY(%s))
+          FROM {t("catalog_state")} c
+         WHERE c.catalog_instance_id=%s
+        """,
+        (normalized_track_ids, catalog_instance_id),
+    )
+    track_row = cur.fetchone()
+    cur.close()
+    if track_row is None:
+        raise KeyError("Unknown catalogue instance")
+
+    expected_track_count_raw = summary.get("track_count")
+    expected_track_count = int(expected_track_count_raw or 0)
+    published_generation = int(track_row[0] or 0)
+    matched_track_count = int(track_row[1] or 0)
+    required_track_count = min(SOURCE_VERIFICATION_MIN_TRACKS, expected_track_count)
+    track_evidence_available = (
+        expected_track_count_raw is not None
+        and expected_track_count > 0
+        and published_generation > 0
+    )
+    sample_sufficient = (
+        required_track_count > 0 and len(normalized_track_ids) >= required_track_count
+    )
+    tracks_verified = (
+        track_evidence_available
+        and sample_sufficient
+        and matched_track_count == len(normalized_track_ids)
+    )
+    result.update(
+        {
+            "verified": library_verified and tracks_verified,
+            "track_evidence_available": track_evidence_available,
+            "tracks_verified": tracks_verified,
+            "expected_track_count": expected_track_count,
+            "required_track_count": required_track_count,
+            "submitted_track_count": len(normalized_track_ids),
+            "matched_track_count": matched_track_count,
+            "sample_sufficient": sample_sufficient,
+        }
+    )
+    return result
 
 
 def migrate_catalog(db):
