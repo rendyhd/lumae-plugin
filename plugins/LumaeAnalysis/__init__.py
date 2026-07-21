@@ -72,11 +72,14 @@ CATALOG_FEATURES = (
     "binary_vectors",
     "v3_release_readiness",
     "provider_track_scope_verification",
+    "source_scoped_profiles",
+    "prepare_lumae",
 )
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
 ANALYSIS_PROJECTION_TASK_TYPE = "plugin.lumae_analysis.analysis_projection"
 WHOLE_LIBRARY_CHUNK_SIZE = 250
+PREPARATION_STALE_HOURS = 24
 COLLECTIONS_MENU_LABEL = "Living Collections"
 COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
 
@@ -117,6 +120,14 @@ class MediaDownloadError(Exception):
 
 def profiles_table():
     return table("profiles")
+
+
+def source_profiles_table():
+    return table("source_profiles")
+
+
+def preparation_state_table():
+    return table("preparation_state")
 
 
 def utc_now_iso():
@@ -262,6 +273,91 @@ def migrate(db):
     cur.close()
     migrate_catalog(db)
     ensure_catalog_sources(db)
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {source_profiles_table()} (
+            catalog_instance_id TEXT NOT NULL REFERENCES {table('catalog_sources')}(catalog_instance_id)
+                ON DELETE CASCADE,
+            track_id TEXT NOT NULL,
+            sample_rate INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            ref_lufs REAL NOT NULL,
+            start_ramp BYTEA NOT NULL,
+            end_ramp BYTEA NOT NULL,
+            analyzer_ver INTEGER NOT NULL,
+            profile_schema_ver INTEGER NOT NULL,
+            media_signature TEXT,
+            analyzed_at TIMESTAMP NOT NULL DEFAULT now(),
+            status TEXT NOT NULL,
+            last_error TEXT,
+            PRIMARY KEY (catalog_instance_id, track_id)
+        )
+        """
+    )
+    cur.execute(
+        f"CREATE INDEX IF NOT EXISTS {table('source_profiles_status_idx')} "
+        f"ON {source_profiles_table()} (catalog_instance_id, status)"
+    )
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table('profile_migrations')} (
+            name TEXT PRIMARY KEY,
+            completed_at TIMESTAMP NOT NULL DEFAULT now()
+        )
+        """
+    )
+    # Releases before 0.8 could only analyze the default provider. Preserve
+    # those expensive waveform results only when exactly one active source
+    # makes their ownership unambiguous. Record the one-shot attempt even on a
+    # multi-source install so a later default-provider change cannot misassign
+    # legacy rows.
+    cur.execute(
+        f"""
+        WITH migration AS (
+            INSERT INTO {table('profile_migrations')} (name)
+            VALUES ('legacy_default_profiles_v1')
+            ON CONFLICT (name) DO NOTHING
+            RETURNING name
+        ), active_sources AS (
+            SELECT catalog_instance_id
+              FROM {table('catalog_sources')}
+             WHERE rebind_status='active'
+        ), default_source AS (
+            SELECT catalog_instance_id
+              FROM active_sources
+             WHERE (SELECT COUNT(*) FROM active_sources)=1
+        )
+        INSERT INTO {source_profiles_table()}
+            (catalog_instance_id, track_id, sample_rate, duration_ms, ref_lufs,
+             start_ramp, end_ramp, analyzer_ver, profile_schema_ver,
+             media_signature, analyzed_at, status, last_error)
+        SELECT d.catalog_instance_id, p.track_id, p.sample_rate, p.duration_ms,
+               p.ref_lufs, p.start_ramp, p.end_ramp, p.analyzer_ver,
+               p.profile_schema_ver, p.media_signature, p.analyzed_at,
+               p.status, p.last_error
+          FROM migration CROSS JOIN default_source d CROSS JOIN {profiles_table()} p
+        ON CONFLICT (catalog_instance_id, track_id) DO NOTHING
+        """
+    )
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {preparation_state_table()} (
+            catalog_instance_id TEXT PRIMARY KEY REFERENCES {table('catalog_sources')}(catalog_instance_id)
+                ON DELETE CASCADE,
+            server_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            phase TEXT NOT NULL,
+            queued_profiles INTEGER NOT NULL DEFAULT 0,
+            profile_jobs INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            updated_at TIMESTAMP NOT NULL DEFAULT now()
+        )
+        """
+    )
+    cur.close()
     migrate_collections(db)
     ensure_catalog_refresh_schedule(db)
     ensure_analysis_projection_schedule(db)
@@ -282,20 +378,32 @@ def parse_ids(value):
     return ids[:500]
 
 
-def fetch_profile_rows(ids):
+def fetch_profile_rows(ids, catalog_instance_id=None):
     if not ids:
         return []
     db = get_db()
     cur = db.cursor()
-    cur.execute(
-        f"""
-        SELECT track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
-               analyzer_ver, analyzed_at, media_signature, status, last_error
-          FROM {profiles_table()}
-         WHERE track_id = ANY(%s)
-        """,
-        (ids,),
-    )
+    if catalog_instance_id:
+        cur.execute(
+            f"""
+            SELECT track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
+                   analyzer_ver, analyzed_at, media_signature, status, last_error
+              FROM {source_profiles_table()}
+             WHERE catalog_instance_id=%s AND track_id = ANY(%s)
+            """,
+            (catalog_instance_id, ids),
+        )
+    else:
+        # Compatibility path for pre-0.8 clients on a single-provider install.
+        cur.execute(
+            f"""
+            SELECT track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
+                   analyzer_ver, analyzed_at, media_signature, status, last_error
+              FROM {profiles_table()}
+             WHERE track_id = ANY(%s)
+            """,
+            (ids,),
+        )
     columns = [desc[0] for desc in cur.description]
     rows = [dict(zip(columns, row)) for row in cur.fetchall()]
     cur.close()
@@ -327,8 +435,8 @@ def serialize_ready_profile(row):
     }
 
 
-def split_analyze_ids(ids):
-    rows = fetch_profile_rows(ids)
+def split_analyze_ids(ids, catalog_instance_id=None):
+    rows = fetch_profile_rows(ids, catalog_instance_id=catalog_instance_id)
     by_id = {row["track_id"]: row for row in rows}
     accepted = []
     already_ready = []
@@ -345,32 +453,100 @@ def split_analyze_ids(ids):
     return accepted, already_ready, already_pending
 
 
-def mark_pending(ids):
+def mark_pending(ids, catalog_instance_id=None):
     if not ids:
         return
     db = get_db()
     cur = db.cursor()
-    cur.execute(
-        f"""
-        INSERT INTO {profiles_table()}
-            (track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
-             analyzer_ver, profile_schema_ver, analyzed_at, status, last_error)
-        SELECT unnest(%s::text[]), 0, 0, 0, decode('', 'hex'), decode('', 'hex'), %s, %s, now(), 'pending', NULL
-        ON CONFLICT (track_id) DO UPDATE SET
-            analyzed_at = EXCLUDED.analyzed_at,
-            status = 'pending',
-            last_error = NULL
-        """,
-        (ids, ANALYZER_VERSION, SCHEMA_VERSION),
-    )
+    if catalog_instance_id:
+        cur.execute(
+            f"""
+            INSERT INTO {source_profiles_table()}
+                (catalog_instance_id, track_id, sample_rate, duration_ms, ref_lufs,
+                 start_ramp, end_ramp, analyzer_ver, profile_schema_ver,
+                 analyzed_at, status, last_error)
+            SELECT %s, unnest(%s::text[]), 0, 0, 0, decode('', 'hex'), decode('', 'hex'),
+                   %s, %s, now(), 'pending', NULL
+            ON CONFLICT (catalog_instance_id, track_id) DO UPDATE SET
+                analyzed_at = EXCLUDED.analyzed_at,
+                status = 'pending',
+                last_error = NULL
+            """,
+            (catalog_instance_id, ids, ANALYZER_VERSION, SCHEMA_VERSION),
+        )
+    else:
+        cur.execute(
+            f"""
+            INSERT INTO {profiles_table()}
+                (track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
+                 analyzer_ver, profile_schema_ver, analyzed_at, status, last_error)
+            SELECT unnest(%s::text[]), 0, 0, 0, decode('', 'hex'), decode('', 'hex'), %s, %s, now(), 'pending', NULL
+            ON CONFLICT (track_id) DO UPDATE SET
+                analyzed_at = EXCLUDED.analyzed_at,
+                status = 'pending',
+                last_error = NULL
+            """,
+            (ids, ANALYZER_VERSION, SCHEMA_VERSION),
+        )
     db.commit()
     cur.close()
 
 
-def load_track_file(track_id):
+def release_pending(ids, catalog_instance_id=None, reason="Profile job could not be queued"):
+    if not ids:
+        return
+    db = get_db()
+    cur = db.cursor()
+    if catalog_instance_id:
+        cur.execute(
+            f"""
+            UPDATE {source_profiles_table()}
+               SET status='stale', last_error=%s, analyzed_at=now()
+             WHERE catalog_instance_id=%s AND track_id=ANY(%s) AND status='pending'
+            """,
+            (str(reason)[:2000], catalog_instance_id, ids),
+        )
+    else:
+        cur.execute(
+            f"""
+            UPDATE {profiles_table()}
+               SET status='stale', last_error=%s, analyzed_at=now()
+             WHERE track_id=ANY(%s) AND status='pending'
+            """,
+            (str(reason)[:2000], ids),
+        )
+    db.commit()
+    cur.close()
+
+
+def enqueue_profile_analysis(ids, catalog_instance_id=None, server_id=None):
+    if catalog_instance_id:
+        mark_pending(ids, catalog_instance_id=catalog_instance_id)
+    else:
+        mark_pending(ids)
+    try:
+        if catalog_instance_id:
+            return enqueue(
+                analyze_tracks_task,
+                ids,
+                catalog_instance_id,
+                server_id,
+                queue="default",
+            )
+        return enqueue(analyze_tracks_task, ids, queue="default")
+    except Exception as exc:
+        release_pending(
+            ids,
+            catalog_instance_id=catalog_instance_id,
+            reason=f"Profile job could not be queued: {exc}",
+        )
+        raise
+
+
+def load_track_file(track_id, catalog_instance_id=None, server_id=None):
     db = get_db()
     adapter = get_core_adapter()
-    server_id = adapter.active_server_id()
+    server_id = server_id or adapter.active_server_id()
     cur = db.cursor()
     cur.execute(
         f"""
@@ -383,11 +559,12 @@ def load_track_file(track_id):
            AND t.published_generation=c.published_generation
          WHERE t.track_id=%s AND t.available=TRUE
            AND s.rebind_status='active'
+           AND (%s IS NULL OR s.catalog_instance_id=%s)
            AND (%s IS NULL OR s.current_core_server_id=%s)
          ORDER BY s.is_default DESC
          LIMIT 1
         """,
-        (track_id, server_id, server_id),
+        (track_id, catalog_instance_id, catalog_instance_id, server_id, server_id),
     )
     row = cur.fetchone()
     cur.close()
@@ -445,16 +622,47 @@ def load_track_file(track_id):
     }
 
 
-def upsert_profile(track_id, result, status, last_error=None, media_sig=None):
+def upsert_profile(
+    track_id,
+    result,
+    status,
+    last_error=None,
+    media_sig=None,
+    catalog_instance_id=None,
+):
     db = get_db()
     cur = db.cursor()
+    values = (
+        track_id,
+        int(getattr(result, "sample_rate", 0)),
+        int(getattr(result, "duration_ms", 0)),
+        float(getattr(result, "ref_lufs", 0.0)),
+        getattr(result, "start_ramp_blob", b""),
+        getattr(result, "end_ramp_blob", b""),
+        ANALYZER_VERSION,
+        SCHEMA_VERSION,
+        media_sig,
+        utc_now_iso(),
+        status,
+        last_error,
+    )
+    conflict_target = "track_id"
+    target_table = profiles_table()
+    columns = "track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp"
+    placeholders = "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s"
+    if catalog_instance_id:
+        target_table = source_profiles_table()
+        conflict_target = "catalog_instance_id, track_id"
+        columns = "catalog_instance_id, " + columns
+        placeholders = "%s, " + placeholders
+        values = (catalog_instance_id,) + values
     cur.execute(
         f"""
-        INSERT INTO {profiles_table()}
-            (track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
-             analyzer_ver, profile_schema_ver, media_signature, analyzed_at, status, last_error)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-        ON CONFLICT (track_id) DO UPDATE SET
+        INSERT INTO {target_table}
+            ({columns}, analyzer_ver, profile_schema_ver, media_signature,
+             analyzed_at, status, last_error)
+        VALUES ({placeholders})
+        ON CONFLICT ({conflict_target}) DO UPDATE SET
             sample_rate = EXCLUDED.sample_rate,
             duration_ms = EXCLUDED.duration_ms,
             ref_lufs = EXCLUDED.ref_lufs,
@@ -467,20 +675,7 @@ def upsert_profile(track_id, result, status, last_error=None, media_sig=None):
             status = EXCLUDED.status,
             last_error = EXCLUDED.last_error
         """,
-        (
-            track_id,
-            int(getattr(result, "sample_rate", 0)),
-            int(getattr(result, "duration_ms", 0)),
-            float(getattr(result, "ref_lufs", 0.0)),
-            getattr(result, "start_ramp_blob", b""),
-            getattr(result, "end_ramp_blob", b""),
-            ANALYZER_VERSION,
-            SCHEMA_VERSION,
-            media_sig,
-            utc_now_iso(),
-            status,
-            last_error,
-        ),
+        values,
     )
     db.commit()
     cur.close()
@@ -493,6 +688,25 @@ def catalog_capability():
         "supported_core_range": SUPPORTED_CORE_RANGE,
         "features": list(CATALOG_FEATURES),
     }
+
+
+def resolve_profile_source(catalog_instance_id=None, server_id=None, db=None):
+    """Resolve one exact profile namespace; never fall through across providers."""
+    sources = resolve_catalog_source(
+        db or get_db(),
+        server_id=str(server_id) if server_id else None,
+        catalog_instance_id=str(catalog_instance_id) if catalog_instance_id else None,
+    )
+    if len(sources) != 1:
+        raise ValueError(
+            "An explicit catalog_instance_id is required when multiple music servers are configured."
+        )
+    source = sources[0]
+    if catalog_instance_id and source["catalog_instance_id"] != str(catalog_instance_id):
+        raise ValueError("Profile catalogue source identity changed")
+    if server_id and source["server_id"] != str(server_id):
+        raise ValueError("Profile music-server identity changed")
+    return source
 
 
 @bp.get("/api/health")
@@ -847,8 +1061,14 @@ def analysis_vectors_api():
 
 @bp.get("/api/profiles")
 def profiles():
+    try:
+        source = resolve_profile_source(
+            catalog_instance_id=request.args.get("catalog_instance_id")
+        )
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("source_required", str(exc), 409)
     ids = parse_ids(request.args.get("ids", ""))
-    rows = fetch_profile_rows(ids)
+    rows = fetch_profile_rows(ids, catalog_instance_id=source["catalog_instance_id"])
     by_id = {row["track_id"]: row for row in rows}
     ready = []
     failed = []
@@ -870,6 +1090,7 @@ def profiles():
         {
             "schema_version": SCHEMA_VERSION,
             "analyzer_version": ANALYZER_VERSION,
+            "catalog_instance_id": source["catalog_instance_id"],
             "profiles": ready,
             "missing": missing,
             "failed": failed,
@@ -880,11 +1101,22 @@ def profiles():
 @bp.post("/api/analyze")
 def analyze():
     body = request.get_json(silent=True) or {}
+    try:
+        source = resolve_profile_source(catalog_instance_id=body.get("catalog_instance_id"))
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("source_required", str(exc), 409)
     ids = parse_ids(",".join(body.get("ids", [])))
-    accepted, already_ready, already_pending = split_analyze_ids(ids)
+    catalog_instance_id = source["catalog_instance_id"]
+    server_id = source["server_id"]
+    accepted, already_ready, already_pending = split_analyze_ids(
+        ids, catalog_instance_id=catalog_instance_id
+    )
     if accepted:
-        mark_pending(accepted)
-        enqueue(analyze_tracks_task, accepted, queue="default")
+        enqueue_profile_analysis(
+            accepted,
+            catalog_instance_id,
+            server_id,
+        )
     return jsonify(
         {
             "accepted": accepted,
@@ -894,25 +1126,64 @@ def analyze():
     ), 202
 
 
-def analyze_one_track(track_id):
+def analyze_one_track(track_id, catalog_instance_id=None, server_id=None):
     try:
-        info = load_track_file(track_id)
+        info = load_track_file(
+            track_id,
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+        )
     except MediaDownloadError as exc:
-        upsert_profile(track_id, object(), "failed", str(exc), None)
+        upsert_profile(
+            track_id,
+            object(),
+            "failed",
+            str(exc),
+            None,
+            catalog_instance_id=catalog_instance_id,
+        )
         return {"track_id": track_id, "status": "failed"}
     if info is None:
-        upsert_profile(track_id, object(), "skipped_no_file", "missing file path", None)
+        upsert_profile(
+            track_id,
+            object(),
+            "skipped_no_file",
+            "missing file path",
+            None,
+            catalog_instance_id=catalog_instance_id,
+        )
         return {"track_id": track_id, "status": "skipped_no_file"}
     try:
         result = analyze_file(info["file_path"])
-        upsert_profile(track_id, result, "ready", None, info["media_signature"])
+        upsert_profile(
+            track_id,
+            result,
+            "ready",
+            None,
+            info["media_signature"],
+            catalog_instance_id=catalog_instance_id,
+        )
         return {"track_id": track_id, "status": "ready"}
     except SilentAudioError as exc:
-        upsert_profile(track_id, object(), "failed", str(exc), info["media_signature"])
+        upsert_profile(
+            track_id,
+            object(),
+            "failed",
+            str(exc),
+            info["media_signature"],
+            catalog_instance_id=catalog_instance_id,
+        )
         return {"track_id": track_id, "status": "failed"}
     except Exception as exc:
         logger.exception("lumae_analysis failed for %s", track_id)
-        upsert_profile(track_id, object(), "failed", str(exc), info["media_signature"])
+        upsert_profile(
+            track_id,
+            object(),
+            "failed",
+            str(exc),
+            info["media_signature"],
+            catalog_instance_id=catalog_instance_id,
+        )
         return {"track_id": track_id, "status": "failed"}
     finally:
         remove_downloaded_file(info.get("cleanup_path"))
@@ -969,44 +1240,89 @@ def catalog_media_signature(track_id, server_id=None):
 
 def analyze_song_hook(song):
     source_server_id = None
+    catalog_instance_id = None
     try:
         event = get_core_adapter().normalize_analysis_hook(song)
         source_server_id = event["server_id"]
+        catalog_instance_id = resolve_profile_source(server_id=source_server_id)[
+            "catalog_instance_id"
+        ]
         enqueue(analysis_projection_task, event["server_id"], queue="default")
     except Exception:
-        logger.exception("lumae_analysis could not queue the analysis projection")
+        logger.exception("lumae_analysis could not resolve the analysis source or queue projection")
     track_id = hook_track_id(song)
     audio_path = (song or {}).get("audio_path")
     if not track_id:
         logger.warning("lumae_analysis song hook skipped payload without item_id")
         return {"track_id": "", "status": "skipped_no_file"}
+    if not catalog_instance_id:
+        logger.warning("lumae_analysis song hook skipped %s without an exact source", track_id)
+        return {"track_id": track_id, "status": "skipped_source_unresolved"}
     if not audio_path or not os.path.exists(audio_path):
-        upsert_profile(track_id, object(), "skipped_no_file", "missing analysis audio path", None)
+        upsert_profile(
+            track_id,
+            object(),
+            "skipped_no_file",
+            "missing analysis audio path",
+            None,
+            catalog_instance_id=catalog_instance_id,
+        )
         return {"track_id": track_id, "status": "skipped_no_file"}
     media_sig = catalog_media_signature(track_id, source_server_id) or hook_media_signature(
         song, audio_path
     )
     try:
         result = analyze_file(audio_path)
-        upsert_profile(track_id, result, "ready", None, media_sig)
+        upsert_profile(
+            track_id,
+            result,
+            "ready",
+            None,
+            media_sig,
+            catalog_instance_id=catalog_instance_id,
+        )
         return {"track_id": track_id, "status": "ready"}
     except SilentAudioError as exc:
-        upsert_profile(track_id, object(), "failed", str(exc), media_sig)
+        upsert_profile(
+            track_id,
+            object(),
+            "failed",
+            str(exc),
+            media_sig,
+            catalog_instance_id=catalog_instance_id,
+        )
         return {"track_id": track_id, "status": "failed"}
     except Exception as exc:
         logger.exception("lumae_analysis hook failed for %s", track_id)
-        upsert_profile(track_id, object(), "failed", str(exc), media_sig)
+        upsert_profile(
+            track_id,
+            object(),
+            "failed",
+            str(exc),
+            media_sig,
+            catalog_instance_id=catalog_instance_id,
+        )
         return {"track_id": track_id, "status": "failed"}
 
 
-def analyze_tracks_task(ids):
+def analyze_tracks_task(ids, catalog_instance_id=None, server_id=None):
     ids = parse_ids(",".join(ids or []))
-    results = [analyze_one_track(track_id) for track_id in ids]
-    return {
+    results = [
+        analyze_one_track(
+            track_id,
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+        )
+        for track_id in ids
+    ]
+    summary = {
         "ready": sum(1 for result in results if result["status"] == "ready"),
         "failed": sum(1 for result in results if result["status"] == "failed"),
         "skipped": sum(1 for result in results if result["status"].startswith("skipped")),
     }
+    if catalog_instance_id:
+        finalize_preparation_if_settled(catalog_instance_id)
+    return summary
 
 
 def is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
@@ -1028,16 +1344,28 @@ def is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
     return False
 
 
-def fetch_analysis_rows():
+def fetch_analysis_rows(catalog_instance_id=None, server_id=None):
     db = get_db()
     cur = db.cursor()
-    cur.execute(
-        f"""
+    profile_table = source_profiles_table() if catalog_instance_id else profiles_table()
+    profile_source_join = (
+        "AND p.catalog_instance_id=source.catalog_instance_id" if catalog_instance_id else ""
+    )
+    source_filters = ""
+    params = ()
+    if catalog_instance_id or server_id:
+        source_filters = """
+               AND (%s IS NULL OR s.catalog_instance_id=%s)
+               AND (%s IS NULL OR s.current_core_server_id=%s)
+        """
+        params = (catalog_instance_id, catalog_instance_id, server_id, server_id)
+    sql = f"""
         WITH source AS (
             SELECT s.catalog_instance_id, c.published_generation
               FROM {table('catalog_sources')} s
               JOIN {table('catalog_state')} c USING (catalog_instance_id)
              WHERE s.rebind_status='active' AND c.status='complete'
+               {source_filters}
              ORDER BY s.is_default DESC, s.server_name, s.catalog_instance_id
              LIMIT 1
         )
@@ -1047,36 +1375,59 @@ def fetch_analysis_rows():
           JOIN {table('catalog_tracks')} t
             ON t.catalog_instance_id=source.catalog_instance_id
            AND t.published_generation=source.published_generation
-          LEFT JOIN {profiles_table()} p ON p.track_id=t.track_id
+          LEFT JOIN {profile_table} p ON p.track_id=t.track_id
+               {profile_source_join}
          WHERE t.available=TRUE AND t.analysis_eligible=TRUE
          ORDER BY t.track_id
         """
-    )
+    if params:
+        cur.execute(sql, params)
+    else:
+        cur.execute(sql)
     rows = cur.fetchall()
     cur.close()
     return rows
 
 
-def find_backfill_ids(limit=25):
+def find_backfill_ids(
+    limit=25,
+    catalog_instance_id=None,
+    server_id=None,
+    include_failed=False,
+):
     batch_limit = normalize_backfill_limit(limit or configured_backfill_limit())
     ids = []
-    for item_id, file_path, stored_sig, analyzer_ver, status in fetch_analysis_rows():
-        if is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
+    rows = (
+        fetch_analysis_rows(catalog_instance_id=catalog_instance_id, server_id=server_id)
+        if catalog_instance_id or server_id
+        else fetch_analysis_rows()
+    )
+    for item_id, file_path, stored_sig, analyzer_ver, status in rows:
+        if (include_failed and status == "failed") or is_backfill_candidate(
+            file_path, stored_sig, analyzer_ver, status
+        ):
             ids.append(str(item_id))
             if len(ids) >= batch_limit:
                 break
     return ids
 
 
-def find_all_backfill_ids():
+def find_all_backfill_ids(catalog_instance_id=None, server_id=None, include_failed=False):
     ids = []
-    for item_id, file_path, stored_sig, analyzer_ver, status in fetch_analysis_rows():
-        if is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
+    rows = (
+        fetch_analysis_rows(catalog_instance_id=catalog_instance_id, server_id=server_id)
+        if catalog_instance_id or server_id
+        else fetch_analysis_rows()
+    )
+    for item_id, file_path, stored_sig, analyzer_ver, status in rows:
+        if (include_failed and status == "failed") or is_backfill_candidate(
+            file_path, stored_sig, analyzer_ver, status
+        ):
             ids.append(str(item_id))
     return ids
 
 
-def analysis_status_counts():
+def analysis_status_counts(catalog_instance_id=None, server_id=None):
     counts = {
         "total_with_files": 0,
         "ready_current": 0,
@@ -1085,7 +1436,12 @@ def analysis_status_counts():
         "skipped": 0,
         "needs_analysis": 0,
     }
-    for _item_id, file_path, stored_sig, analyzer_ver, status in fetch_analysis_rows():
+    rows = (
+        fetch_analysis_rows(catalog_instance_id=catalog_instance_id, server_id=server_id)
+        if catalog_instance_id or server_id
+        else fetch_analysis_rows()
+    )
+    for _item_id, file_path, stored_sig, analyzer_ver, status in rows:
         counts["total_with_files"] += 1
         if status == "pending":
             counts["pending"] += 1
@@ -1102,31 +1458,301 @@ def analysis_status_counts():
     return counts
 
 
-def queue_backfill_batch(limit=None):
+def queue_backfill_batch(
+    limit=None,
+    catalog_instance_id=None,
+    server_id=None,
+    include_failed=False,
+):
     batch_limit = normalize_backfill_limit(limit or configured_backfill_limit())
-    ids = find_backfill_ids(batch_limit)
+    ids = (
+        find_backfill_ids(
+            batch_limit,
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+            include_failed=include_failed,
+        )
+        if catalog_instance_id or server_id
+        else find_backfill_ids(batch_limit)
+    )
     if ids:
-        mark_pending(ids)
-        enqueue(analyze_tracks_task, ids, queue="default")
+        enqueue_profile_analysis(
+            ids,
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+        )
     return {"queued": len(ids), "limit": batch_limit}
 
 
-def queue_whole_library():
-    ids = find_all_backfill_ids()
+def queue_whole_library(catalog_instance_id=None, server_id=None, include_failed=False):
+    ids = (
+        find_all_backfill_ids(
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+            include_failed=include_failed,
+        )
+        if catalog_instance_id or server_id
+        else find_all_backfill_ids()
+    )
     jobs = 0
     for start in range(0, len(ids), WHOLE_LIBRARY_CHUNK_SIZE):
         chunk = ids[start:start + WHOLE_LIBRARY_CHUNK_SIZE]
         if not chunk:
             continue
-        mark_pending(chunk)
-        enqueue(analyze_tracks_task, chunk, queue="default")
+        enqueue_profile_analysis(
+            chunk,
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+        )
         jobs += 1
     return {"queued": len(ids), "jobs": jobs, "chunk_size": WHOLE_LIBRARY_CHUNK_SIZE}
 
 
-def backfill_missing_profiles(limit=None):
-    ids = find_backfill_ids(limit or configured_backfill_limit())
+def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=None):
+    requested_limit = limit or configured_backfill_limit()
+    ids = (
+        find_backfill_ids(
+            requested_limit,
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+        )
+        if catalog_instance_id or server_id
+        else find_backfill_ids(requested_limit)
+    )
+    if catalog_instance_id or server_id:
+        return analyze_tracks_task(
+            ids,
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+        )
     return analyze_tracks_task(ids)
+
+
+def preparation_state(catalog_instance_id, db=None):
+    db = db or get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT server_id, status, phase, queued_profiles, profile_jobs,
+               last_error, started_at, completed_at, updated_at
+          FROM {preparation_state_table()}
+         WHERE catalog_instance_id=%s
+        """,
+        (catalog_instance_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    if row is None:
+        return None
+    return {
+        "catalog_instance_id": str(catalog_instance_id),
+        "server_id": str(row[0]),
+        "status": str(row[1]),
+        "phase": str(row[2]),
+        "queued_profiles": int(row[3] or 0),
+        "profile_jobs": int(row[4] or 0),
+        "last_error": str(row[5]) if row[5] else None,
+        "started_at": str(row[6]) if row[6] else None,
+        "completed_at": str(row[7]) if row[7] else None,
+        "updated_at": str(row[8]) if row[8] else None,
+    }
+
+
+def preparation_is_active(state, now=None):
+    if not state or state.get("status") not in ("queued", "running", "profiles_queued"):
+        return False
+    try:
+        updated_at = datetime.fromisoformat(str(state["updated_at"]).replace("Z", "+00:00"))
+        current = now or datetime.now(timezone.utc)
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        return (current - updated_at).total_seconds() < PREPARATION_STALE_HOURS * 3600
+    except (KeyError, TypeError, ValueError):
+        return True
+
+
+def claim_preparation(source, db=None):
+    """Atomically admit one preparation run for an exact catalogue source."""
+    db = db or get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        INSERT INTO {preparation_state_table()}
+            (catalog_instance_id, server_id, status, phase, queued_profiles,
+             profile_jobs, last_error, started_at, completed_at, updated_at)
+        VALUES (%s, %s, 'queued', 'queued', 0, 0, NULL, now(), NULL, now())
+        ON CONFLICT (catalog_instance_id) DO UPDATE SET
+            server_id=EXCLUDED.server_id,
+            status='queued', phase='queued', queued_profiles=0, profile_jobs=0,
+            last_error=NULL, started_at=now(), completed_at=NULL, updated_at=now()
+        WHERE {preparation_state_table()}.status NOT IN ('queued', 'running', 'profiles_queued')
+           OR {preparation_state_table()}.updated_at < now() - interval '{PREPARATION_STALE_HOURS} hours'
+        RETURNING catalog_instance_id
+        """,
+        (source["catalog_instance_id"], source["server_id"]),
+    )
+    claimed = cur.fetchone() is not None
+    db.commit()
+    cur.close()
+    return claimed
+
+
+def recover_stale_pending_profiles(catalog_instance_id, db=None):
+    db = db or get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        UPDATE {source_profiles_table()}
+           SET status='stale', last_error='Recovered an interrupted preparation job'
+         WHERE catalog_instance_id=%s AND status='pending'
+           AND analyzed_at < now() - interval '{PREPARATION_STALE_HOURS} hours'
+        """,
+        (catalog_instance_id,),
+    )
+    recovered = max(0, int(getattr(cur, "rowcount", 0) or 0))
+    db.commit()
+    cur.close()
+    return recovered
+
+
+def update_preparation_state(
+    catalog_instance_id,
+    server_id,
+    status,
+    phase,
+    queued_profiles=0,
+    profile_jobs=0,
+    last_error=None,
+    completed=False,
+    db=None,
+):
+    db = db or get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        INSERT INTO {preparation_state_table()}
+            (catalog_instance_id, server_id, status, phase, queued_profiles,
+             profile_jobs, last_error, started_at, completed_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, now(),
+                CASE WHEN %s THEN now() ELSE NULL END, now())
+        ON CONFLICT (catalog_instance_id) DO UPDATE SET
+            server_id=EXCLUDED.server_id,
+            status=EXCLUDED.status,
+            phase=EXCLUDED.phase,
+            queued_profiles=EXCLUDED.queued_profiles,
+            profile_jobs=EXCLUDED.profile_jobs,
+            last_error=EXCLUDED.last_error,
+            completed_at=EXCLUDED.completed_at,
+            updated_at=now()
+        """,
+        (
+            catalog_instance_id,
+            server_id,
+            status,
+            phase,
+            int(queued_profiles or 0),
+            int(profile_jobs or 0),
+            str(last_error)[:2000] if last_error else None,
+            bool(completed),
+        ),
+    )
+    db.commit()
+    cur.close()
+
+
+def finalize_preparation_if_settled(catalog_instance_id):
+    state = preparation_state(catalog_instance_id)
+    if not state or state["status"] not in ("running", "profiles_queued"):
+        return state
+    counts = analysis_status_counts(
+        catalog_instance_id=catalog_instance_id,
+        server_id=state["server_id"],
+    )
+    if counts["pending"] > 0:
+        return state
+    ready = (
+        counts["needs_analysis"] == 0
+        and counts["failed"] == 0
+        and counts["skipped"] == 0
+    )
+    update_preparation_state(
+        catalog_instance_id,
+        state["server_id"],
+        "ready" if ready else "needs_attention",
+        "complete" if ready else "profiles_need_attention",
+        queued_profiles=state["queued_profiles"],
+        profile_jobs=state["profile_jobs"],
+        last_error=None if ready else "One or more profiles could not be prepared.",
+        completed=True,
+    )
+    return preparation_state(catalog_instance_id)
+
+
+def prepare_lumae_task(server_id=None, catalog_instance_id=None):
+    """Refresh catalogue, project analysis, then queue source-scoped profiles."""
+    server_id = server_id or get_core_adapter().active_server_id()
+    source = resolve_profile_source(
+        catalog_instance_id=catalog_instance_id,
+        server_id=server_id,
+    )
+    catalog_instance_id = source["catalog_instance_id"]
+    server_id = source["server_id"]
+    try:
+        update_preparation_state(
+            catalog_instance_id,
+            server_id,
+            "running",
+            "catalog_refresh",
+        )
+        catalog_result = refresh_catalog(server_id=server_id)
+        if catalog_result["catalog_instance_id"] != catalog_instance_id:
+            raise CatalogScanError("Catalogue identity changed during preparation")
+        update_preparation_state(
+            catalog_instance_id,
+            server_id,
+            "running",
+            "analysis_projection",
+        )
+        projection_result = project_analysis(server_id=server_id, adapter=get_core_adapter())
+        if projection_result["catalog_instance_id"] != catalog_instance_id:
+            raise CatalogScanError("Analysis identity changed during preparation")
+        update_preparation_state(
+            catalog_instance_id,
+            server_id,
+            "profiles_queued",
+            "profile_backfill",
+        )
+        recover_stale_pending_profiles(catalog_instance_id)
+        profile_result = queue_whole_library(
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+            include_failed=True,
+        )
+        update_preparation_state(
+            catalog_instance_id,
+            server_id,
+            "profiles_queued",
+            "profile_backfill",
+            queued_profiles=profile_result["queued"],
+            profile_jobs=profile_result["jobs"],
+        )
+        settled = finalize_preparation_if_settled(catalog_instance_id)
+        return {
+            "catalog": catalog_result,
+            "analysis": projection_result,
+            "profiles": profile_result,
+            "preparation": settled,
+        }
+    except Exception as exc:
+        update_preparation_state(
+            catalog_instance_id,
+            server_id,
+            "failed",
+            "failed",
+            last_error=exc,
+            completed=True,
+        )
+        raise
 
 
 _READINESS_BLOCKER_LABELS = {
@@ -1251,31 +1877,92 @@ def render_v3_readiness_panel():
     """
 
 
+def render_source_preparation_panel(batch_size):
+    try:
+        sources = resolve_catalog_source(get_db())
+    except Exception:
+        logger.exception("lumae_analysis could not render source preparation")
+        return ""
+    cards = []
+    for source in sources:
+        catalog_instance_id = source["catalog_instance_id"]
+        server_id = source["server_id"]
+        counts = analysis_status_counts(
+            catalog_instance_id=catalog_instance_id,
+            server_id=server_id,
+        )
+        state = preparation_state(catalog_instance_id)
+        if state and state["status"] == "profiles_queued" and counts["pending"] == 0:
+            state = finalize_preparation_if_settled(catalog_instance_id)
+        total = int(counts["total_with_files"])
+        ready = int(counts["ready_current"])
+        coverage = min(max(int(round((ready / total) * 100)) if total else 0, 0), 100)
+        queueable = int(counts["needs_analysis"])
+        active = preparation_is_active(state)
+        status = state["status"] if state else "not_prepared"
+        phase = state["phase"] if state else "not_started"
+        last_error = state.get("last_error") if state else None
+        hidden = (
+            f'<input type="hidden" name="server_id" value="{escape(str(server_id))}">'
+            f'<input type="hidden" name="catalog_instance_id" '
+            f'value="{escape(str(catalog_instance_id))}">'
+        )
+        disabled = " disabled" if active else ""
+        cards.append(
+            f"""
+            <article class="lumae-coverage" aria-label="Prepare {escape(str(source['name']))}">
+              <div class="lumae-coverage-row">
+                <strong>{escape(str(source.get('name') or server_id))}</strong>
+                <span>{escape(status.replace('_', ' '))} · {escape(phase.replace('_', ' '))}</span>
+              </div>
+              <p class="lumae-help">Catalogue: {escape(str(source['catalog']['status']))};
+                analysis projection: {escape(str(source['analysis']['status']))}.</p>
+              <div class="lumae-meter" role="progressbar" aria-valuemin="0"
+                aria-valuemax="100" aria-valuenow="{coverage}">
+                <div class="lumae-meter-fill" style="width: {coverage}%;"></div>
+              </div>
+              <p class="lumae-help">Profiles: {ready:,} ready of {total:,};
+                {counts['pending']:,} pending; {queueable:,} need analysis;
+                {counts['failed']:,} failed; {counts['skipped']:,} skipped.</p>
+              {f'<p class="lumae-notice lumae-notice-error">{escape(last_error)}</p>' if last_error else ''}
+              <form class="lumae-form" method="post">
+                {hidden}
+                <label class="lumae-field">
+                  <span>Tracks per catch-up batch</span>
+                  <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric">
+                </label>
+                <div class="lumae-actions">
+                  <button class="lumae-button-primary" type="submit" name="action"
+                    value="prepare_lumae"{disabled}>Prepare Lumae</button>
+                  <button class="lumae-button-secondary" type="submit" name="action"
+                    value="catch_up"{disabled}>Analyze next batch</button>
+                  <button class="lumae-button-caution" type="submit" name="action"
+                    value="queue_all"{disabled}>Queue all profiles</button>
+                </div>
+              </form>
+            </article>
+            """
+        )
+    if not cards:
+        return """
+          <section class="lumae-panel" aria-label="Prepare Lumae">
+            <h3>Prepare Lumae</h3>
+            <p class="lumae-help">No supported AudioMuse music server is available yet.</p>
+          </section>
+        """
+    return f"""
+      <section class="lumae-panel" aria-label="Prepare Lumae">
+        <h3>Prepare Lumae</h3>
+        <p class="lumae-action-copy">One source-safe action refreshes the provider catalogue,
+          publishes its analysis projection, and queues missing waveform profiles. AudioMuse 3.0.3
+          readiness confirmation remains a separate administrator safety step.</p>
+        {''.join(cards)}
+      </section>
+    """
+
+
 def render_settings(message=None, error=None):
     batch_size = configured_backfill_limit()
-    counts = analysis_status_counts()
-    total = int(counts["total_with_files"])
-    ready = int(counts["ready_current"])
-    coverage = int(round((ready / total) * 100)) if total else 0
-    coverage = min(max(coverage, 0), 100)
-    queueable = int(counts["needs_analysis"])
-    status_cards = [
-        ("Needs analysis", queueable, "lumae-status-attention"),
-        ("Ready/current", ready, "lumae-status-ready"),
-        ("Pending", counts["pending"], "lumae-status-pending"),
-        ("Failed", counts["failed"], "lumae-status-failed"),
-        ("Skipped", counts["skipped"], "lumae-status-muted"),
-        ("Total with files", total, "lumae-status-muted"),
-    ]
-    cards_html = "\n".join(
-        f"""
-          <article class="lumae-status-card {state}">
-            <span>{escape(label)}</span>
-            <strong>{format_count(value)}</strong>
-          </article>
-        """
-        for label, value, state in status_cards
-    )
     message_html = (
         f"""
         <div class="lumae-notice lumae-notice-success" role="status">
@@ -1295,6 +1982,7 @@ def render_settings(message=None, error=None):
         else ""
     )
     readiness_html = render_v3_readiness_panel()
+    preparation_html = render_source_preparation_panel(batch_size)
     return render_page(
         f"""
         <style>
@@ -1540,39 +2228,7 @@ def render_settings(message=None, error=None):
             <p>New songs are analyzed automatically after AudioMuse processes them. Use these controls to catch up older library items.</p>
           </header>
 
-          <section class="lumae-coverage" aria-label="Profile coverage">
-            <div class="lumae-coverage-row">
-              <strong>{coverage}% profile coverage</strong>
-              <span>{track_count_label(ready)} ready of {track_count_label(total)}</span>
-            </div>
-            <div class="lumae-meter" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="{coverage}">
-              <div class="lumae-meter-fill" style="width: {coverage}%;"></div>
-            </div>
-          </section>
-
-          <section class="lumae-status-grid" aria-label="Analysis status">
-            {cards_html}
-          </section>
-
-          <section class="lumae-panel" aria-label="Catch-up controls">
-            <h3>Catch-up controls</h3>
-            <p class="lumae-action-copy">{track_count_label(queueable)} can be queued now.</p>
-            <form class="lumae-form" method="post">
-              <label class="lumae-field">
-                <span>Tracks per batch</span>
-                <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric">
-              </label>
-              <div class="lumae-actions">
-                <button class="lumae-button-secondary" type="submit" name="action" value="save">Save</button>
-                <button class="lumae-button-primary" type="submit" name="action" value="catch_up">Analyze next batch</button>
-                <button class="lumae-button-caution" type="submit" name="action" value="queue_all">Queue all missing tracks</button>
-              </div>
-            </form>
-            <div class="lumae-action-notes">
-              <p class="lumae-help">Runs one controlled batch using the current batch size.</p>
-              <p class="lumae-help">Queues all missing, stale, or changed tracks in 250-track jobs.</p>
-            </div>
-          </section>
+          {preparation_html}
           {readiness_html}
           {render_collections_settings_panel()}
         </section>
@@ -1621,21 +2277,88 @@ def settings():
                     request.form.get("catalog_instance_id") or ""
                 )
                 message = "AudioMuse 3.0.3 sync readiness confirmation revoked."
-            else:
+            elif action in ("prepare_lumae", "catch_up", "queue_all"):
                 batch_size = normalize_backfill_limit(request.form.get("backfill_batch_size") or 25)
                 set_setting("backfill_batch_size", batch_size)
-            if action == "catch_up":
-                result = queue_backfill_batch(batch_size)
-                message = f"Queued {track_count_label(result['queued'])} for Lumae analysis."
-            elif action == "queue_all":
-                result = queue_whole_library()
-                message = (
-                    f"Queued {track_count_label(result['queued'])} across {format_count(result['jobs'])} jobs "
-                    "for Lumae analysis."
+                source = resolve_profile_source(
+                    catalog_instance_id=request.form.get("catalog_instance_id"),
+                    server_id=request.form.get("server_id"),
                 )
+                catalog_instance_id = source["catalog_instance_id"]
+                server_id = source["server_id"]
+                state = preparation_state(catalog_instance_id)
+                active = preparation_is_active(state)
+                if action == "prepare_lumae":
+                    if not claim_preparation(source):
+                        message = f"Preparation is already running for {source['name']}."
+                    else:
+                        try:
+                            enqueue(
+                                prepare_lumae_task,
+                                server_id,
+                                catalog_instance_id,
+                                queue="default",
+                            )
+                        except Exception as exc:
+                            update_preparation_state(
+                                catalog_instance_id,
+                                server_id,
+                                "failed",
+                                "queue_failed",
+                                last_error=exc,
+                                completed=True,
+                            )
+                            raise
+                        message = (
+                            f"Preparing {source['name']}: catalogue refresh, analysis projection, "
+                            "then source-scoped waveform profiles."
+                        )
+                elif active:
+                    raise ValueError(f"Preparation is already running for {source['name']}")
+                elif action == "catch_up":
+                    result = queue_backfill_batch(
+                        batch_size,
+                        catalog_instance_id=catalog_instance_id,
+                        server_id=server_id,
+                        include_failed=True,
+                    )
+                    update_preparation_state(
+                        catalog_instance_id,
+                        server_id,
+                        "profiles_queued",
+                        "profile_backfill",
+                        queued_profiles=result["queued"],
+                        profile_jobs=1 if result["queued"] else 0,
+                    )
+                    finalize_preparation_if_settled(catalog_instance_id)
+                    message = (
+                        f"Queued {track_count_label(result['queued'])} from {source['name']} "
+                        "for Lumae analysis."
+                    )
+                elif action == "queue_all":
+                    result = queue_whole_library(
+                        catalog_instance_id=catalog_instance_id,
+                        server_id=server_id,
+                        include_failed=True,
+                    )
+                    update_preparation_state(
+                        catalog_instance_id,
+                        server_id,
+                        "profiles_queued",
+                        "profile_backfill",
+                        queued_profiles=result["queued"],
+                        profile_jobs=result["jobs"],
+                    )
+                    finalize_preparation_if_settled(catalog_instance_id)
+                    message = (
+                        f"Queued {track_count_label(result['queued'])} from {source['name']} across "
+                        f"{format_count(result['jobs'])} jobs for Lumae analysis."
+                    )
             elif action == "save":
+                batch_size = normalize_backfill_limit(request.form.get("backfill_batch_size") or 25)
+                set_setting("backfill_batch_size", batch_size)
                 message = "Lumae analysis settings saved."
-        except ValueError as exc:
+        except (KeyError, ValueError, CatalogScanError, RuntimeError) as exc:
             error = str(exc)
 
     return render_settings(message=message, error=error)
@@ -1648,6 +2371,7 @@ def register(ctx):
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
     ctx.on_install(migrate)
     ctx.on_song_analyzed(analyze_song_hook)
+    ctx.add_task("prepare", prepare_lumae_task, queue="default")
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_cron_task("catalog_refresh", catalog_refresh_task, queue="default")
     ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")
