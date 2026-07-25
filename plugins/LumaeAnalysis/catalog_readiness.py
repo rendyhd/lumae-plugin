@@ -1,4 +1,4 @@
-"""AudioMuse 3.0.3 catalogue-repair readiness diagnostics.
+"""AudioMuse 3 catalogue-repair readiness diagnostics.
 
 AudioMuse owns analysis identity, but it does not expose one durable flag that
 proves an upgraded installation completed Chromaprint backfill, Cleaning, and
@@ -8,12 +8,14 @@ source-scoped administrator acknowledgement.  V2 never executes these queries.
 
 from datetime import datetime, timezone
 import json
+import re
 
 from plugin.api import get_setting, set_setting, table
 
 
 ACKNOWLEDGEMENT_SETTING = "v3_catalogue_repair_acknowledgements"
-QUALIFIED_CORE_VERSION = "v3.0.3"
+QUALIFIED_CORE_VERSIONS = ("v3.0.3", "v3.0.4", "v3.0.5")
+LATEST_QUALIFIED_CORE_VERSION = QUALIFIED_CORE_VERSIONS[-1]
 
 
 def t(name):
@@ -24,9 +26,19 @@ def _iso_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
-def _qualified_release(compatibility):
+def _normalized_core_version(compatibility):
     raw = str(getattr(compatibility, "core_version", "") or "").strip().lower()
-    return raw in {"3.0.3", QUALIFIED_CORE_VERSION}
+    match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", raw)
+    return f"v{match.group(1)}" if match else None
+
+
+def _qualified_core_version(compatibility):
+    version = _normalized_core_version(compatibility)
+    return version if version in QUALIFIED_CORE_VERSIONS else None
+
+
+def _qualified_release(compatibility):
+    return _qualified_core_version(compatibility) is not None
 
 
 def _setting_map():
@@ -191,9 +203,11 @@ def _policy_blockers(policy):
 
 
 def _valid_acknowledgement(source, compatibility, acknowledgement):
+    qualified_core_version = _qualified_core_version(compatibility)
     return bool(
         isinstance(acknowledgement, dict)
-        and acknowledgement.get("core_version") == QUALIFIED_CORE_VERSION
+        and qualified_core_version is not None
+        and acknowledgement.get("core_version") == qualified_core_version
         and acknowledgement.get("catalog_instance_id")
         == source.get("catalog_instance_id")
         and acknowledgement.get("server_id") == source.get("server_id")
@@ -211,9 +225,15 @@ def v3_release_readiness(
     requested_mode=None,
 ):
     """Return source-scoped, fail-closed v3 release readiness."""
+    qualified_core_version = _qualified_core_version(compatibility)
+    detected_core_version = _normalized_core_version(compatibility) or str(
+        getattr(compatibility, "core_version", "") or ""
+    ).strip()
     base = {
-        "qualified_core_version": QUALIFIED_CORE_VERSION,
-        "detected_core_version": compatibility.core_version,
+        "qualified_core_version": (
+            qualified_core_version or LATEST_QUALIFIED_CORE_VERSION
+        ),
+        "detected_core_version": detected_core_version,
         "applicable": compatibility.adapter == "v3_registry",
         "status": "not_applicable",
         "ready": compatibility.adapter != "v3_registry",
@@ -311,7 +331,7 @@ def v3_release_readiness(
 
 def acknowledge_v3_release(db, compatibility, source, policy, mode):
     if mode not in {"fresh", "upgraded"}:
-        raise ValueError("Choose fresh or upgraded AudioMuse 3.0.3 verification")
+        raise ValueError("Choose fresh or upgraded AudioMuse 3 verification")
     candidate = v3_release_readiness(
         db,
         compatibility,
@@ -322,11 +342,11 @@ def acknowledge_v3_release(db, compatibility, source, policy, mode):
     )
     if not candidate["ready"]:
         raise ValueError(
-            "AudioMuse 3.0.3 is not ready: " + ", ".join(candidate["blockers"])
+            "AudioMuse 3 is not ready: " + ", ".join(candidate["blockers"])
         )
     acknowledgements = _setting_map()
     acknowledgements[source["catalog_instance_id"]] = {
-        "core_version": QUALIFIED_CORE_VERSION,
+        "core_version": candidate["qualified_core_version"],
         "catalog_instance_id": source["catalog_instance_id"],
         "server_id": source["server_id"],
         "verification_mode": mode,
