@@ -58,10 +58,11 @@ def settings_catalog_source():
 
 
 def expect_v3_readiness(core_version):
-    qualified = core_version == "v3.0.3"
+    qualified_versions = {"v3.0.3", "v3.0.4", "v3.0.5"}
+    qualified = core_version in qualified_versions
     blocker = "catalog_not_initialized" if qualified else "core_release_unqualified"
     return {
-        "qualified_core_version": "v3.0.3",
+        "qualified_core_version": core_version if qualified else "v3.0.5",
         "detected_core_version": core_version,
         "applicable": True,
         "status": blocker,
@@ -80,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.1"
+    assert manifest["versions"][0]["version"] == "0.8.2"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -151,7 +152,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.1",
+        "plugin_version": "0.8.2",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -273,7 +274,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.1"
+    assert body["plugin_version"] == "0.8.2"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -3939,10 +3940,21 @@ def test_v3_readiness_requires_cleaning_after_chromaprint_completion(monkeypatch
         )
 
 
-def test_v3_fresh_install_can_be_confirmed_without_legacy_repair_tasks(monkeypatch):
+@pytest.mark.parametrize(
+    ("core_version", "qualified_version"),
+    [
+        ("v3.0.3", "v3.0.3"),
+        ("v3.0.4", "v3.0.4"),
+        ("v3.0.5", "v3.0.5"),
+        ("3.0.5", "v3.0.5"),
+    ],
+)
+def test_v3_fresh_install_can_be_confirmed_without_legacy_repair_tasks(
+    monkeypatch, core_version, qualified_version
+):
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
-        core_version="v3.0.3",
+        core_version=core_version,
         adapter="v3_registry",
     )
     settings = {}
@@ -3963,6 +3975,68 @@ def test_v3_fresh_install_can_be_confirmed_without_legacy_repair_tasks(monkeypat
 
     assert result["ready"] is True
     assert result["verification_mode"] == "fresh"
+    assert result["qualified_core_version"] == qualified_version
+    assert (
+        settings[readiness.ACKNOWLEDGEMENT_SETTING]["catalog-a"]["core_version"]
+        == qualified_version
+    )
+
+
+def test_v3_readiness_invalidates_acknowledgement_after_patch_upgrade(monkeypatch):
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.5",
+        adapter="v3_registry",
+    )
+    settings = {
+        readiness.ACKNOWLEDGEMENT_SETTING: {
+            "catalog-a": {
+                "core_version": "v3.0.4",
+                "catalog_instance_id": "catalog-a",
+                "server_id": "server-a",
+                "verification_mode": "fresh",
+                "acknowledged_at": "2026-07-20T12:00:00Z",
+            }
+        }
+    }
+    monkeypatch.setattr(
+        readiness,
+        "get_setting",
+        lambda key, default=None: settings.get(key, default),
+    )
+
+    result = readiness.v3_release_readiness(
+        ReadinessDb(coverage=(10, 10, 10, 150.0), tasks=[]),
+        compatibility,
+        readiness_source(),
+        readiness_policy(),
+    )
+
+    assert result["ready"] is False
+    assert result["administrator_acknowledged"] is False
+    assert result["qualified_core_version"] == "v3.0.5"
+    assert result["blockers"] == ["administrator_acknowledgement_required"]
+
+
+def test_v3_readiness_rejects_unqualified_future_patch_before_database_access():
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.6",
+        adapter="v3_registry",
+    )
+
+    result = readiness.v3_release_readiness(
+        None,
+        compatibility,
+        readiness_source(),
+        readiness_policy(),
+    )
+
+    assert result["qualified_core_version"] == "v3.0.5"
+    assert result["detected_core_version"] == "v3.0.6"
+    assert result["status"] == "core_release_unqualified"
+    assert result["ready"] is False
+    assert result["blockers"] == ["core_release_unqualified"]
 
 
 def test_v2_readiness_is_not_applicable_without_database_access():
@@ -4035,7 +4109,7 @@ def test_settings_acknowledges_v3_readiness_only_with_explicit_confirmation(monk
     )
 
     assert rejected.status_code == 200
-    assert "Explicit AudioMuse 3.0.3 confirmation is required" in rejected.get_data(
+    assert "Explicit AudioMuse 3 confirmation is required" in rejected.get_data(
         as_text=True
     )
     assert accepted.status_code == 200
@@ -4048,6 +4122,7 @@ def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
     mod = load_plugin()
     source = readiness_source()
     readiness = {
+        "detected_core_version": "v3.0.5",
         "status": "repair_incomplete",
         "ready": False,
         "administrator_acknowledged": False,
@@ -4067,7 +4142,8 @@ def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
     body = mod.render_v3_readiness_panel()
     compact = " ".join(body.split())
 
-    assert "AudioMuse 3.0.3 sync readiness" in body
+    assert "AudioMuse 3 sync readiness" in body
+    assert "fresh v3.0.5 database" in compact
     assert "Chromaprint: 8 of 10 mapped tracks (80.00%)" in compact
     assert "without analysis mapping: 2" in compact
     assert "Mapped tracks are still missing Chromaprint fingerprints." in body

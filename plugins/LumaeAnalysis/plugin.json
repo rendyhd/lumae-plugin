@@ -68,6 +68,14 @@
   },
   "versions": [
     {
+      "version": "0.8.2",
+      "min_core_version": "2.6.0",
+      "changelog": "Qualify AudioMuse 3.0.4 and 3.0.5 with exact patch-bound readiness acknowledgements while keeping later 3.x releases fail-closed.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "0.8.1",
       "min_core_version": "2.6.0",
       "changelog": "Make Lumae usable as soon as the Navidrome catalogue and AudioMuse projection publish; move waveform coverage to bounded background batches and prioritize current playback tracks.",

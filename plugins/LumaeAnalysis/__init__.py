@@ -53,7 +53,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.1"
+PLUGIN_VERSION = "0.8.2"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -2428,6 +2428,9 @@ def render_v3_readiness_panel():
         sequence = bool(
             (readiness.get("task_evidence") or {}).get("upgrade_sequence_complete")
         )
+        detected_version = escape(
+            str(readiness.get("detected_core_version") or "AudioMuse 3")
+        )
         hidden = (
             f'<input type="hidden" name="server_id" value="{escape(str(source["server_id"]))}">'
             f'<input type="hidden" name="catalog_instance_id" '
@@ -2449,7 +2452,7 @@ def render_v3_readiness_panel():
                 {hidden}
                 <label class="lumae-toggle">
                   <input type="checkbox" name="confirm" required>
-                  I confirm this is a fresh AudioMuse 3.0.3 database with no pre-3.x catalogue.
+                  I confirm this is a fresh {detected_version} database with no pre-3.x catalogue.
                 </label>
                 <input type="hidden" name="verification_mode" value="fresh">
                 <button class="lumae-button-secondary" type="submit" name="action"
@@ -2459,7 +2462,8 @@ def render_v3_readiness_panel():
                 {hidden}
                 <label class="lumae-toggle">
                   <input type="checkbox" name="confirm" required>
-                  I completed Analysis, Cleaning, then Analysis again after upgrading to 3.0.3.
+                  I completed Analysis, Cleaning, then Analysis again after the original
+                  AudioMuse 3 upgrade, and this {detected_version} source now passes the checks.
                 </label>
                 <input type="hidden" name="verification_mode" value="upgraded">
                 <button class="lumae-button-caution" type="submit" name="action"
@@ -2485,7 +2489,7 @@ def render_v3_readiness_panel():
         )
     return f"""
       <section class="lumae-panel" aria-label="AudioMuse 3 release readiness">
-        <h3>AudioMuse 3.0.3 sync readiness</h3>
+        <h3>AudioMuse 3 sync readiness</h3>
         <p class="lumae-action-copy">Lumae keeps provider tracks authoritative. Confirmation only
           enables the mobile sync gate after fp_4 policy and Chromaprint coverage checks pass.</p>
         {''.join(cards)}
@@ -2585,7 +2589,7 @@ def render_source_preparation_panel(batch_size):
         <h3>Prepare Lumae</h3>
         <p class="lumae-action-copy">The source-safe refresh publishes the provider catalogue and
           AudioMuse projection first. Waveform enrichment then advances in small, fair background
-          batches while playback requests use the high-priority worker. AudioMuse 3.0.3 readiness
+          batches while playback requests use the high-priority worker. AudioMuse 3 readiness
           confirmation remains a separate administrator safety step.</p>
         {''.join(cards)}
         {"<script>setTimeout(()=>location.reload(),5000)</script>" if auto_refresh else ""}
@@ -2885,7 +2889,7 @@ def settings():
                 message = f"Living Collections {'enabled' if enabled else 'disabled'}."
             elif action == "ack_v3_readiness":
                 if request.form.get("confirm") != "on":
-                    raise ValueError("Explicit AudioMuse 3.0.3 confirmation is required")
+                    raise ValueError("Explicit AudioMuse 3 confirmation is required")
                 compatibility = detect_core()
                 db = get_db()
                 sources = resolve_catalog_source(db, server_id=request.form.get("server_id"))
@@ -2902,15 +2906,19 @@ def settings():
                     dedup_policy(),
                     request.form.get("verification_mode"),
                 )
+                confirmed_version = result.get(
+                    "detected_core_version", compatibility.core_version
+                )
                 message = (
-                    f"AudioMuse 3.0.3 sync readiness confirmed for {sources[0]['name']} "
+                    f"{confirmed_version} sync readiness confirmed for "
+                    f"{sources[0]['name']} "
                     f"({result['verification_mode']})."
                 )
             elif action == "clear_v3_readiness":
                 clear_v3_release_acknowledgement(
                     request.form.get("catalog_instance_id") or ""
                 )
-                message = "AudioMuse 3.0.3 sync readiness confirmation revoked."
+                message = "AudioMuse 3 sync readiness confirmation revoked."
             elif action in ("prepare_lumae", "start_backfill", "catch_up", "queue_all"):
                 batch_size = normalize_backfill_limit(
                     request.form.get("backfill_batch_size") or DEFAULT_BACKFILL_BATCH_SIZE
