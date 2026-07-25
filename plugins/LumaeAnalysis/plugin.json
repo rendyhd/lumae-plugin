@@ -72,8 +72,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Qualify AudioMuse 3.0.4 and 3.0.5 with exact patch-bound readiness acknowledgements while keeping later 3.x releases fail-closed.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.2.zip",
+      "checksum": "705f3b810e5af55f10e0c6c76f1a9b44"
     },
     {
       "version": "0.8.1",
