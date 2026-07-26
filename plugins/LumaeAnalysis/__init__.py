@@ -42,6 +42,7 @@ from .catalog_readiness import (
     v3_release_readiness,
 )
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
+from .database_state import collect_database_state, render_database_state
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -74,6 +75,7 @@ CATALOG_FEATURES = (
     "binary_vectors",
     "v3_release_readiness",
     "progressive_analysis_admission",
+    "database_state_dashboard",
     "provider_track_scope_verification",
     "source_scoped_profiles",
     "prepare_lumae",
@@ -2928,6 +2930,11 @@ def render_settings(message=None, error=None):
             <p>New songs receive profiles while AudioMuse analyzes them. After each analysis run,
               Lumae publishes one source-scoped catalogue and analysis update and queues any
               remaining profile work. Use these controls to catch up older library items.</p>
+            <div class="lumae-actions">
+              <a class="lumae-button lumae-button-secondary" href="database-state">
+                View database state
+              </a>
+            </div>
           </header>
 
           {preparation_html}
@@ -3043,6 +3050,47 @@ def settings():
             error = str(exc)
 
     return render_settings(message=message, error=error)
+
+
+@bp.route("/database-state", methods=["GET"])
+def database_state_page():
+    compatibility = detect_core()
+    db = get_db()
+    try:
+        sources = resolve_catalog_source(db) if db is not None else []
+        readiness_by_source = {}
+        if db is not None and compatibility.adapter == "v3_registry":
+            policy = dedup_policy()
+            readiness_by_source = {
+                source["catalog_instance_id"]: v3_release_readiness(
+                    db, compatibility, source, policy
+                )
+                for source in sources
+            }
+        snapshot = collect_database_state(
+            db,
+            compatibility,
+            sources,
+            readiness_by_source=readiness_by_source,
+        )
+    except Exception as exc:
+        logger.exception("lumae_analysis could not collect database state")
+        snapshot = {
+            "captured_at": utc_now_iso(),
+            "status": "unavailable",
+            "core": compatibility.as_dict(),
+            "sources": [],
+            "errors": [
+                {
+                    "section": "database snapshot",
+                    "message": str(exc)[:500],
+                }
+            ],
+        }
+    return render_page(
+        render_database_state(snapshot),
+        title="Lumae Database State",
+    )
 
 
 def register(ctx):

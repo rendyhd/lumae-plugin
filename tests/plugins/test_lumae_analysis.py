@@ -133,6 +133,7 @@ def test_plugin_manifest_has_lumae_identity():
             "binary_vectors",
             "v3_release_readiness",
             "progressive_analysis_admission",
+            "database_state_dashboard",
             "provider_track_scope_verification",
             "source_scoped_profiles",
             "prepare_lumae",
@@ -4677,6 +4678,366 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     assert "Scheduled Tasks" not in body
     assert "Living Collections" in body
     assert "Enable the collection manager" in body
+    assert "View database state" in body
+
+
+def test_database_state_snapshot_is_source_scoped_and_generation_aware():
+    state = importlib.import_module("plugins.LumaeAnalysis.database_state")
+    compatibility_module = importlib.import_module("plugins.LumaeAnalysis.core_compat")
+    compatibility = compatibility_module.CoreCompatibility(
+        "v3.0.5",
+        (3, 0, 5),
+        "v3_registry",
+        "compatible",
+        True,
+    )
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "provider_type": "navidrome",
+        "name": "Main Navidrome",
+        "is_default": True,
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 7,
+            "epoch": "catalog-epoch",
+            "head_seq": 101,
+            "floor_seq": 4,
+            "status": "complete",
+            "entity_counts": {
+                "library": 1,
+                "artist": 100,
+                "album": 50,
+                "track": 1000,
+            },
+            "field_coverage": {"track_number": {"ratio": 0.98}},
+        },
+        "analysis": {
+            "generation": 9,
+            "epoch": "analysis-epoch",
+            "head_seq": 88,
+            "floor_seq": 3,
+            "status": "complete",
+            "item_count": 900,
+            "mapped_track_count": 950,
+        },
+    }
+
+    class Cursor:
+        def __init__(self, db):
+            self.db = db
+            self.result = None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            self.db.executed.append((normalized, params))
+            if "AS total" in normalized and "track_analysis_links" in normalized:
+                self.result = [(1000, 930, 800, 130, 10, 20, 40, 850)]
+            elif "AS items" in normalized and "analysis_items" in normalized:
+                self.result = [(850, 840, 700)]
+            elif "AS analysis_groups" in normalized:
+                self.result = [(850, 40, 4)]
+            elif "AS catalogue_tracks" in normalized:
+                self.result = [(1000, 600, 550, 20, 5, 25, 400)]
+            elif "FROM plugin_lumae_analysis__preparation_state" in normalized:
+                self.result = [
+                    (
+                        "ready",
+                        "catalog_ready",
+                        20,
+                        2,
+                        None,
+                        "2026-07-26T10:00:00Z",
+                        "2026-07-26T10:01:00Z",
+                        "2026-07-26T10:01:00Z",
+                    )
+                ]
+            elif "FROM plugin_lumae_analysis__profile_backfill_state" in normalized:
+                self.result = [
+                    (
+                        "running",
+                        550,
+                        20,
+                        None,
+                        "2026-07-26T10:01:00Z",
+                        None,
+                        "2026-07-26T10:02:00Z",
+                    )
+                ]
+            elif "FROM plugin_lumae_analysis__analysis_runs" in normalized:
+                self.result = [("complete", 3, "2026-07-26T10:00:00Z")]
+            elif "FROM plugin_lumae_analysis__catalog_changes" in normalized:
+                self.result = [(101,)]
+            elif "FROM plugin_lumae_analysis__analysis_changes" in normalized:
+                self.result = [(88,)]
+            elif "FROM plugin_lumae_analysis__stream_bootstrap_sessions" in normalized:
+                self.result = [(1, 4)]
+            elif "AS mapping_rows" in normalized:
+                self.result = [(950, 850, 850, 840, 700, 725)]
+            else:
+                raise AssertionError(f"Unexpected diagnostic query: {normalized}")
+
+        def fetchone(self):
+            return self.result[0] if self.result else None
+
+        def fetchall(self):
+            return list(self.result or [])
+
+        def close(self):
+            return None
+
+    class Db:
+        def __init__(self):
+            self.executed = []
+            self.rollbacks = 0
+
+        def cursor(self):
+            return Cursor(self)
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    db = Db()
+    snapshot = state.collect_database_state(
+        db,
+        compatibility,
+        [source],
+        readiness_by_source={"catalog-a": {"status": "progressive"}},
+    )
+
+    assert snapshot["status"] == "ready"
+    assert snapshot["errors"] == []
+    assert db.rollbacks == 0
+    result = snapshot["sources"][0]
+    assert result["links"] == {
+        "total": 1000,
+        "usable": 930,
+        "verified": 800,
+        "provisional": 130,
+        "pending": 10,
+        "suspect": 20,
+        "missing": 40,
+        "usable_analysis_ids": 850,
+    }
+    assert result["items"]["shared_groups"] == 40
+    assert result["profiles"]["ready"] == 550
+    assert result["core"]["chromaprint"] == 725
+    assert result["journals"]["bootstrap_leases"]["active"] == 1
+    assert result["readiness"]["status"] == "progressive"
+    projection_queries = [
+        (sql, params)
+        for sql, params in db.executed
+        if "track_analysis_links" in sql or "analysis_items" in sql
+    ]
+    assert projection_queries
+    assert all(params == ("catalog-a", 9) for _sql, params in projection_queries)
+    core_query = next(
+        (sql, params) for sql, params in db.executed if "AS mapping_rows" in sql
+    )
+    assert core_query[1] == ("server-a",)
+
+
+def test_database_state_reads_v2_core_as_one_direct_provider():
+    state = importlib.import_module("plugins.LumaeAnalysis.database_state")
+    compatibility_module = importlib.import_module("plugins.LumaeAnalysis.core_compat")
+    compatibility = compatibility_module.CoreCompatibility(
+        "v2.6.2",
+        (2, 6, 2),
+        "v2_single_server",
+        "compatible",
+        True,
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.sql = ""
+
+        def execute(self, sql, params=()):
+            self.sql = " ".join(sql.split())
+            assert params == ()
+
+        def fetchone(self):
+            return (100, 99, 75)
+
+        def close(self):
+            return None
+
+    class Db:
+        def __init__(self):
+            self.cursor_instance = Cursor()
+
+        def cursor(self):
+            return self.cursor_instance
+
+    db = Db()
+    errors = []
+    result = state._core_state(db, compatibility, {}, errors)
+
+    assert errors == []
+    assert result == {
+        "mode": "single_server",
+        "mapping_rows": 100,
+        "canonical_analysis_ids": 100,
+        "scored": 100,
+        "musicnn_vectors": 99,
+        "clap_vectors": 75,
+        "chromaprint": None,
+    }
+    assert "(SELECT count(*) FROM score)" in db.cursor_instance.sql
+    assert "track_server_map" not in db.cursor_instance.sql
+
+
+def test_database_state_explains_an_uninitialized_database():
+    state = importlib.import_module("plugins.LumaeAnalysis.database_state")
+    compatibility_module = importlib.import_module("plugins.LumaeAnalysis.core_compat")
+    compatibility = compatibility_module.CoreCompatibility(
+        "v2.6.2",
+        (2, 6, 2),
+        "v2_single_server",
+        "compatible",
+        True,
+    )
+
+    snapshot = state.collect_database_state(None, compatibility, [])
+    body = state.render_database_state(snapshot)
+
+    assert snapshot["status"] == "database_unavailable"
+    assert snapshot["errors"] == [
+        {
+            "section": "database",
+            "message": "AudioMuse did not provide a database connection.",
+        }
+    ]
+    assert "No published Lumae catalogue yet" in body
+    assert "run Prepare Lumae" in body
+    assert "snapshot database_unavailable" in body
+
+
+def test_database_state_page_renders_partial_state_without_exposing_rows(monkeypatch):
+    mod = load_plugin()
+    source = settings_catalog_source()
+    source["catalog"].update(
+        {
+            "generation": 2,
+            "epoch": "cat-epoch",
+            "head_seq": 12,
+            "floor_seq": 0,
+            "entity_counts": {"track": 100, "album": 12, "artist": 30, "library": 1},
+            "field_coverage": {"track_number": {"ratio": 1.0}},
+            "completed_at": "2026-07-26T10:00:00Z",
+        }
+    )
+    source["analysis"].update(
+        {
+            "generation": 3,
+            "epoch": "analysis-epoch",
+            "head_seq": 7,
+            "floor_seq": 0,
+            "completed_at": "2026-07-26T10:01:00Z",
+        }
+    )
+    snapshot = {
+        "captured_at": "2026-07-26T10:02:00Z",
+        "status": "partial",
+        "core": {
+            "core_version": "v3.0.5",
+            "core_adapter": "v3_registry",
+        },
+        "sources": [
+            {
+                "identity": {
+                    "catalog_instance_id": "catalog-a",
+                    "server_id": "server-a",
+                    "provider_type": "navidrome",
+                    "name": "Main Navidrome",
+                    "is_default": True,
+                    "rebind_status": "active",
+                },
+                "catalog": source["catalog"],
+                "analysis": source["analysis"],
+                "links": {
+                    "total": 100,
+                    "usable": 95,
+                    "verified": 80,
+                    "provisional": 15,
+                    "pending": 1,
+                    "suspect": 2,
+                    "missing": 2,
+                    "usable_analysis_ids": 90,
+                },
+                "items": {
+                    "items": 90,
+                    "musicnn_vectors": 89,
+                    "clap_vectors": 70,
+                    "analysis_groups": 90,
+                    "shared_groups": 5,
+                    "largest_group": 3,
+                },
+                "profiles": {
+                    "catalogue_tracks": 100,
+                    "stored": 60,
+                    "ready": 55,
+                    "pending": 2,
+                    "failed": 1,
+                    "skipped": 2,
+                    "needs_attention": 40,
+                },
+                "workflow": {
+                    "preparation": None,
+                    "backfill": None,
+                    "analysis_runs": [],
+                },
+                "journals": {
+                    "catalog": {"rows": 12, "head": 12, "floor": 0},
+                    "analysis": {"rows": 7, "head": 7, "floor": 0},
+                    "bootstrap_leases": {"active": 0, "completed": 1},
+                },
+                "core": {
+                    "mode": "source_scoped",
+                    "mapping_rows": 98,
+                    "canonical_analysis_ids": 90,
+                    "scored": 90,
+                    "musicnn_vectors": 89,
+                    "clap_vectors": 70,
+                    "chromaprint": 75,
+                },
+                "readiness": {"status": "progressive"},
+                "errors": [
+                    {
+                        "section": "AudioMuse core",
+                        "message": "<private> failed",
+                    }
+                ],
+            }
+        ],
+        "errors": [{"section": "AudioMuse core", "message": "<private> failed"}],
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(mod, "detect_core", lambda: types.SimpleNamespace(
+        adapter="v3_registry",
+        as_dict=lambda: snapshot["core"],
+    ))
+    monkeypatch.setattr(mod, "dedup_policy", lambda: {})
+    monkeypatch.setattr(mod, "v3_release_readiness", lambda *_args: {"status": "progressive"})
+    monkeypatch.setattr(mod, "collect_database_state", lambda *_args, **_kwargs: snapshot)
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+    client = plugin_client(mod)
+
+    response = client.get("/database-state")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "Lumae database state" in body
+    assert "Published provider truth" in body
+    assert "Usable sonic coverage" in body
+    assert "Provisional" in body
+    assert "Chromaprint coverage" in body
+    assert "profiles never remove tracks" in body
+    assert "Journals &amp; leases" in body
+    assert "&lt;private&gt; failed" in body
+    assert "<private> failed" not in body
+    assert 'href="settings"' in body
 
 
 def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypatch):
