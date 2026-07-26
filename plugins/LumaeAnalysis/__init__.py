@@ -55,7 +55,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.5"
+PLUGIN_VERSION = "0.8.6"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -2568,22 +2568,32 @@ def render_v3_readiness_panel():
         )
     return f"""
       <section class="lumae-panel" aria-label="AudioMuse 3 release readiness">
-        <h3>AudioMuse 3 sync readiness</h3>
-        <p class="lumae-action-copy">Lumae keeps provider tracks authoritative and publishes safe
-          sonic links progressively. Full coverage and confirmation mark the source fully verified;
-          they do not prevent already-qualified links from syncing.</p>
+        <span class="lumae-section-priority lumae-section-advanced">Separate verification</span>
+        <h3>AudioMuse 3 sonic verification</h3>
+        <p class="lumae-action-copy">This is separate from app-sync readiness above. Lumae publishes
+          safe sonic links progressively; full coverage and administrator confirmation mark the
+          source fully verified without blocking already-qualified links.</p>
         {''.join(cards)}
       </section>
     """
 
 
-def render_source_preparation_panel(batch_size):
+def _published_track_count(source):
+    entity_counts = (source.get("catalog") or {}).get("entity_counts") or {}
+    value = entity_counts.get("track")
+    if value is None:
+        value = entity_counts.get("tracks")
+    return max(int(value or 0), 0)
+
+
+def render_source_preparation_sections(batch_size):
     try:
         sources = resolve_catalog_source(get_db())
     except Exception:
         logger.exception("lumae_analysis could not render source preparation")
-        return ""
-    cards = []
+        return "", ""
+    catalogue_cards = []
+    waveform_cards = []
     auto_refresh = False
     for source in sources:
         catalog_instance_id = source["catalog_instance_id"]
@@ -2594,6 +2604,7 @@ def render_source_preparation_panel(batch_size):
         )
         state = preparation_state(catalog_instance_id)
         backfill = profile_backfill_state(catalog_instance_id)
+        published_tracks = _published_track_count(source)
         total = int(counts["total_with_files"])
         ready = int(counts["ready_current"])
         coverage = min(max(int(round((ready / total) * 100)) if total else 0, 0), 100)
@@ -2601,11 +2612,10 @@ def render_source_preparation_panel(batch_size):
         preparation_active = preparation_is_active(state)
         backfill_active = profile_backfill_is_active(backfill)
         auto_refresh = auto_refresh or preparation_active or backfill_active
-        catalogue_ready = (
-            source["catalog"]["status"] == "complete"
-            and source["analysis"]["status"] == "complete"
-        )
-        status = "ready for Lumae" if catalogue_ready else (state["status"] if state else "not prepared")
+        catalog_status = str(source["catalog"]["status"] or "not initialized")
+        projection_status = str(source["analysis"]["status"] or "not initialized")
+        catalogue_ready = catalog_status == "complete" and published_tracks > 0
+        app_ready = catalogue_ready and projection_status == "complete"
         phase = state["phase"] if state else "not started"
         backfill_status = backfill["status"] if backfill else "not started"
         if backfill and backfill["status"] in ("queued", "running") and not backfill_active:
@@ -2619,27 +2629,107 @@ def render_source_preparation_panel(batch_size):
         )
         prepare_disabled = " disabled" if preparation_active else ""
         backfill_disabled = " disabled" if backfill_active or queueable == 0 else ""
-        cards.append(
-            f"""
-            <article class="lumae-coverage" aria-label="Prepare {escape(str(source['name']))}">
-              <div class="lumae-coverage-row">
-                <strong>{escape(str(source.get('name') or server_id))}</strong>
-                <span>{escape(status.replace('_', ' '))} · {escape(phase.replace('_', ' '))}</span>
+        if app_ready:
+            source_status = "Ready for app sync"
+            source_status_class = "lumae-source-state-ready"
+            readiness_notice = f"""
+              <div class="lumae-notice lumae-notice-success" role="status">
+                <strong>Ready for app sync: {published_tracks:,} Navidrome tracks are published.</strong>
+                <span>The catalogue and AudioMuse projection are complete. Waveform coverage is
+                  optional and is reported separately below.</span>
               </div>
-              <p class="lumae-help">Catalogue: {escape(str(source['catalog']['status']))};
-                analysis projection: {escape(str(source['analysis']['status']))}.</p>
-              <p class="lumae-help"><strong>App readiness and waveform coverage are independent.</strong>
-                Lumae can sync, browse, and play as soon as the catalogue and projection above are
-                complete.</p>
-              <div class="lumae-meter" role="progressbar" aria-valuemin="0"
-                aria-valuemax="100" aria-valuenow="{coverage}">
+            """
+        elif catalog_status == "complete" and published_tracks == 0:
+            source_status = "Not ready - empty catalogue"
+            source_status_class = "lumae-source-state-danger"
+            readiness_notice = """
+              <div class="lumae-notice lumae-notice-error" role="alert">
+                <strong>Not ready: no Navidrome tracks were published.</strong>
+                <span>This is not a usable Lumae catalogue. Check Navidrome access and the
+                  <em>Music Libraries</em> selection in AudioMuse, then refresh required data.
+                  Lumae will no longer publish a new empty catalogue.</span>
+              </div>
+            """
+        elif preparation_active:
+            source_status = "Preparing required data"
+            source_status_class = "lumae-source-state-working"
+            readiness_notice = f"""
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>Not ready yet: preparation is in progress.</strong>
+                <span>Current phase: {escape(str(phase).replace("_", " "))}.</span>
+              </div>
+            """
+        else:
+            source_status = "Not ready"
+            source_status_class = "lumae-source-state-danger"
+            readiness_notice = """
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>Not ready for app sync.</strong>
+                <span>Publish a non-empty Navidrome catalogue and complete the AudioMuse
+                  projection by refreshing the required data.</span>
+              </div>
+            """
+        catalogue_cards.append(
+            f"""
+            <article class="lumae-source-card"
+              aria-label="Catalogue readiness for {escape(str(source['name']))}">
+              <header class="lumae-source-header">
+                <div>
+                  <span class="lumae-kicker">Navidrome source</span>
+                  <h4>{escape(str(source.get('name') or server_id))}</h4>
+                </div>
+                <span class="lumae-source-state {source_status_class}">{source_status}</span>
+              </header>
+              {readiness_notice}
+              <div class="lumae-status-grid" aria-label="Required data status">
+                <div class="lumae-status-card {'lumae-status-ready' if published_tracks else 'lumae-status-failed'}">
+                  <span>Published tracks</span>
+                  <strong>{published_tracks:,}</strong>
+                </div>
+                <div class="lumae-status-card {'lumae-status-ready' if catalogue_ready else 'lumae-status-attention'}">
+                  <span>Catalogue job</span>
+                  <strong>{escape(catalog_status.replace('_', ' '))}</strong>
+                </div>
+                <div class="lumae-status-card {'lumae-status-ready' if projection_status == 'complete' else 'lumae-status-attention'}">
+                  <span>AudioMuse projection</span>
+                  <strong>{escape(projection_status.replace('_', ' '))}</strong>
+                </div>
+              </div>
+              {f'<p class="lumae-notice lumae-notice-error">{escape(last_error)}</p>' if last_error else ''}
+              <form class="lumae-form" method="post">
+                {hidden}
+                <div class="lumae-actions">
+                  <button class="lumae-button-primary" type="submit" name="action"
+                    value="prepare_lumae"{prepare_disabled}>Refresh required data</button>
+                </div>
+              </form>
+              <p class="lumae-help">This refresh imports the selected Navidrome libraries first,
+                then publishes the AudioMuse projection. Optional waveform enrichment can continue
+                in the background after the source becomes ready.</p>
+            </article>
+            """
+        )
+        waveform_cards.append(
+            f"""
+            <article class="lumae-source-card"
+              aria-label="Waveform enrichment for {escape(str(source['name']))}">
+              <header class="lumae-source-header">
+                <div>
+                  <span class="lumae-kicker">Navidrome source</span>
+                  <h4>{escape(str(source.get('name') or server_id))}</h4>
+                </div>
+                <span class="lumae-source-state">Optional</span>
+              </header>
+              <div class="lumae-meter" role="progressbar" aria-label="Ready waveform profiles"
+                aria-valuemin="0" aria-valuemax="100" aria-valuenow="{coverage}">
                 <div class="lumae-meter-fill" style="width: {coverage}%;"></div>
               </div>
-              <p class="lumae-help">Playback enrichment: {ready:,} ready of {total:,};
+              <p class="lumae-help"><strong>{ready:,} of {total:,} waveform profiles ready.</strong>
                 {counts['pending']:,} pending; {queueable:,} need analysis;
                 {counts['failed']:,} failed; {counts['skipped']:,} skipped.
                 Background worker: {escape(backfill_status.replace('_', ' '))}.</p>
-              {f'<p class="lumae-notice lumae-notice-error">{escape(last_error)}</p>' if last_error else ''}
+              <p class="lumae-help">Waveforms improve volume normalization and SmoothFade.
+                They do not decide whether the catalogue is ready for app sync.</p>
               {f'<p class="lumae-notice lumae-notice-error">Waveform catch-up: {escape(backfill_error)}</p>' if backfill_error else ''}
               <form class="lumae-form" method="post">
                 {hidden}
@@ -2648,30 +2738,38 @@ def render_source_preparation_panel(batch_size):
                   <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric">
                 </label>
                 <div class="lumae-actions">
-                  <button class="lumae-button-primary" type="submit" name="action"
-                    value="prepare_lumae"{prepare_disabled}>Refresh Lumae catalogue</button>
                   <button class="lumae-button-secondary" type="submit" name="action"
-                    value="start_backfill"{backfill_disabled}>Start background enrichment</button>
+                    value="start_backfill"{backfill_disabled}>Start waveform enrichment</button>
                 </div>
               </form>
             </article>
             """
         )
-    if not cards:
+    if not catalogue_cards:
         return """
           <section class="lumae-panel" aria-label="Prepare Lumae">
-            <h3>Prepare Lumae</h3>
+            <span class="lumae-section-priority">Required</span>
+            <h3>Catalogue and app sync</h3>
             <p class="lumae-help">No supported AudioMuse music server is available yet.</p>
           </section>
-        """
-    return f"""
-      <section class="lumae-panel" aria-label="Prepare Lumae">
-        <h3>Prepare Lumae</h3>
-        <p class="lumae-action-copy">The source-safe refresh publishes the provider catalogue and
-          AudioMuse projection first. Waveform enrichment then advances in small, fair background
-          batches while playback requests use the high-priority worker. AudioMuse 3 readiness
-          confirmation remains a separate administrator safety step.</p>
-        {''.join(cards)}
+        """, ""
+    catalogue_html = f"""
+      <section class="lumae-panel" aria-label="Catalogue and app sync">
+        <span class="lumae-section-priority">Required - start here</span>
+        <h3>Catalogue and app sync</h3>
+        <p class="lumae-action-copy">“Ready for app sync” has one precise meaning: at least one
+          Navidrome track is published and the matching AudioMuse projection is complete.
+          A completed job with zero tracks is not ready.</p>
+        {''.join(catalogue_cards)}
+      </section>
+    """
+    waveform_html = f"""
+      <section class="lumae-panel" aria-label="Waveform playback enhancements">
+        <span class="lumae-section-priority lumae-section-optional">Optional</span>
+        <h3>Waveform playback enhancements</h3>
+        <p class="lumae-action-copy">Loudness and MixRamp profiles improve playback after app sync
+          is already available. Their progress never changes the required readiness status above.</p>
+        {''.join(waveform_cards)}
         {(
             '<script>setTimeout(()=>{const u=new URL(location.href);'
             'u.searchParams.set("_lumae_refresh",Date.now().toString());'
@@ -2681,6 +2779,13 @@ def render_source_preparation_panel(batch_size):
         )}
       </section>
     """
+    return catalogue_html, waveform_html
+
+
+def render_source_preparation_panel(batch_size):
+    """Return the required and optional source sections as one HTML fragment."""
+    catalogue_html, waveform_html = render_source_preparation_sections(batch_size)
+    return f"{catalogue_html}{waveform_html}"
 
 
 def render_settings(message=None, error=None):
@@ -2704,7 +2809,7 @@ def render_settings(message=None, error=None):
         else ""
     )
     readiness_html = render_v3_readiness_panel()
-    preparation_html = render_source_preparation_panel(batch_size)
+    catalogue_html, waveform_html = render_source_preparation_sections(batch_size)
     return render_page(
         f"""
         <style>
@@ -2718,10 +2823,16 @@ def render_settings(message=None, error=None):
             --lumae-ready: #247a5a;
             --lumae-warn: #b46b00;
             --lumae-danger: #b42318;
+            background: var(--lumae-panel);
+            border: 1px solid var(--lumae-line);
+            border-radius: 12px;
+            box-sizing: border-box;
             color: var(--lumae-ink);
             display: grid;
             gap: 18px;
             max-width: 920px;
+            padding: 20px;
+            width: 100%;
           }}
 
           .lumae-hero {{
@@ -2740,6 +2851,7 @@ def render_settings(message=None, error=None):
           }}
 
           .lumae-hero h2 {{
+            color: var(--lumae-ink);
             font-size: clamp(1.5rem, 3vw, 2.15rem);
             line-height: 1.1;
             margin: 0;
@@ -2771,6 +2883,57 @@ def render_settings(message=None, error=None):
 
           .lumae-coverage strong {{
             font-size: 1.1rem;
+          }}
+
+          .lumae-source-card {{
+            background: var(--lumae-soft);
+            border: 1px solid var(--lumae-line);
+            border-radius: 10px;
+            display: grid;
+            gap: 14px;
+            padding: 16px;
+          }}
+
+          .lumae-source-header {{
+            align-items: flex-start;
+            display: flex;
+            gap: 12px;
+            justify-content: space-between;
+          }}
+
+          .lumae-source-header h4 {{
+            color: var(--lumae-ink);
+            font-size: 1.15rem;
+            margin: 3px 0 0;
+          }}
+
+          .lumae-source-state {{
+            background: var(--lumae-panel);
+            border: 1px solid var(--lumae-line);
+            border-radius: 999px;
+            color: var(--lumae-ink);
+            font-size: 0.76rem;
+            font-weight: 800;
+            padding: 5px 9px;
+            white-space: nowrap;
+          }}
+
+          .lumae-source-state-ready {{
+            background: #e9f6ef;
+            border-color: #a7d8bd;
+            color: #14543c;
+          }}
+
+          .lumae-source-state-danger {{
+            background: #fff0ed;
+            border-color: #ffb4a8;
+            color: var(--lumae-danger);
+          }}
+
+          .lumae-source-state-working {{
+            background: #fff8eb;
+            border-color: #f2c879;
+            color: #6f4200;
           }}
 
           .lumae-meter {{
@@ -2808,8 +2971,10 @@ def render_settings(message=None, error=None):
           }}
 
           .lumae-status-card strong {{
-            font-size: 1.75rem;
-            line-height: 1;
+            color: var(--lumae-ink);
+            font-size: 1.15rem;
+            line-height: 1.2;
+            overflow-wrap: anywhere;
           }}
 
           .lumae-status-attention {{
@@ -2837,15 +3002,33 @@ def render_settings(message=None, error=None):
           }}
 
           .lumae-panel {{
-            border-top: 1px solid var(--lumae-line);
+            background: var(--lumae-panel);
+            border: 1px solid var(--lumae-line);
+            border-radius: 10px;
             display: grid;
             gap: 14px;
-            padding-top: 18px;
+            padding: 18px;
           }}
 
           .lumae-panel h3 {{
-            font-size: 1rem;
+            color: var(--lumae-ink);
+            font-size: 1.15rem;
             margin: 0;
+          }}
+
+          .lumae-section-priority {{
+            color: var(--lumae-accent);
+            font-size: 0.72rem;
+            font-weight: 800;
+            text-transform: uppercase;
+          }}
+
+          .lumae-section-optional {{
+            color: var(--lumae-ready);
+          }}
+
+          .lumae-section-advanced {{
+            color: var(--lumae-warn);
           }}
 
           .lumae-form {{
@@ -2860,12 +3043,14 @@ def render_settings(message=None, error=None):
           }}
 
           .lumae-field span {{
+            color: var(--lumae-ink);
             font-weight: 700;
           }}
 
           .lumae-field input {{
             border: 1px solid var(--lumae-line);
             border-radius: 8px;
+            color: var(--lumae-ink);
             font: inherit;
             padding: 9px 10px;
           }}
@@ -2875,6 +3060,10 @@ def render_settings(message=None, error=None):
             display: flex;
             gap: 10px;
             font-weight: 700;
+          }}
+
+          .lumae-toggle span {{
+            color: var(--lumae-ink);
           }}
 
           .lumae-toggle input {{
@@ -2923,8 +3112,13 @@ def render_settings(message=None, error=None):
 
           .lumae-notice {{
             border-radius: 8px;
-            font-weight: 700;
+            display: grid;
+            gap: 4px;
             padding: 12px 14px;
+          }}
+
+          .lumae-notice strong {{
+            color: inherit;
           }}
 
           .lumae-notice-success {{
@@ -2938,6 +3132,46 @@ def render_settings(message=None, error=None):
             border: 1px solid #ffb4a8;
             color: var(--lumae-danger);
           }}
+
+          .lumae-notice-warning {{
+            background: #fff8eb;
+            border: 1px solid #f2c879;
+            color: #6f4200;
+          }}
+
+          @media (max-width: 620px) {{
+            .lumae-analysis-settings {{
+              padding: 14px;
+            }}
+
+            .lumae-panel,
+            .lumae-source-card {{
+              padding: 14px;
+            }}
+
+            .lumae-source-header {{
+              align-items: flex-start;
+              flex-direction: column;
+            }}
+
+            .lumae-source-state {{
+              white-space: normal;
+            }}
+
+            .lumae-status-grid {{
+              grid-template-columns: 1fr;
+            }}
+
+            .lumae-field {{
+              max-width: none;
+            }}
+
+            .lumae-actions,
+            .lumae-actions button,
+            .lumae-actions .lumae-button {{
+              width: 100%;
+            }}
+          }}
         </style>
 
         <section class="lumae-analysis-settings" aria-label="Lumae analysis settings">
@@ -2945,11 +3179,11 @@ def render_settings(message=None, error=None):
           {error_html}
 
           <header class="lumae-hero">
-            <span class="lumae-kicker">Waveform profiles</span>
-            <h2>Lumae analysis is preparing tracks for smoother playback.</h2>
-            <p>New songs receive profiles while AudioMuse analyzes them. After each analysis run,
-              Lumae publishes one source-scoped catalogue and analysis update and queues any
-              remaining profile work. Use these controls to catch up older library items.</p>
+            <span class="lumae-kicker">Setup and readiness</span>
+            <h2>Prepare the Lumae catalogue before optional playback enhancements.</h2>
+            <p>Read this page from top to bottom. Required app data comes first, separate
+              AudioMuse 3 verification follows when applicable, and optional waveform work comes
+              last. “Ready” never means a completed but empty catalogue.</p>
             <div class="lumae-actions">
               <a class="lumae-button lumae-button-secondary" href="database-state">
                 View database state
@@ -2957,8 +3191,9 @@ def render_settings(message=None, error=None):
             </div>
           </header>
 
-          {preparation_html}
+          {catalogue_html}
           {readiness_html}
+          {waveform_html}
           {render_collections_settings_panel()}
         </section>
         """,

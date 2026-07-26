@@ -1284,7 +1284,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
     if state is None:
         cur.close()
         raise CatalogScanError("Catalogue state is missing")
-    previous_generation, epoch, head_seq, previous_counts = state
+    previous_generation, epoch, head_seq, _previous_counts = state
     cur.execute(
         f"INSERT INTO {t('catalog_scans')} "
         "(scan_id, catalog_instance_id, core_server_id, status, progress) "
@@ -1303,9 +1303,11 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         raw = provider_bridge.fetch_catalog(server_id)
         normalized = normalize_provider_catalog(raw, server["provider_type"])
         counts = {entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER}
-        old_track_count = int(_state_counts(previous_counts).get("track", 0) or 0)
-        if old_track_count and counts["track"] == 0:
-            raise CatalogScanError("Refusing to replace a non-empty catalogue with an empty scan")
+        if counts["track"] == 0:
+            raise CatalogScanError(
+                "Navidrome returned no usable tracks. The empty catalogue was not published; "
+                "check Navidrome access and the Music Libraries selection in AudioMuse."
+            )
 
         cur = db.cursor()
         cur.execute(

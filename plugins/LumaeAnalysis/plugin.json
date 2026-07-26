@@ -71,6 +71,14 @@
   },
   "versions": [
     {
+      "version": "0.8.6",
+      "min_core_version": "2.6.0",
+      "changelog": "Prevent selected Navidrome music folders from producing an empty catalogue, reject every zero-track publication, and make required app-sync readiness unmistakable before separate sonic verification and optional waveform work.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "0.8.5",
       "min_core_version": "2.6.0",
       "changelog": "Keep repair-flagged AudioMuse 3 mappings usable as provisional sonic links, preserve their conflict evidence for automatic replacement, reproject automatically after update, avoid unchanged journal churn, and make Firefox-safe GET status polling.",

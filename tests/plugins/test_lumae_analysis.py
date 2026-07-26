@@ -52,7 +52,7 @@ def settings_catalog_source():
         "server_id": "server-a",
         "provider_type": "navidrome",
         "name": "Main Navidrome",
-        "catalog": {"status": "complete"},
+        "catalog": {"status": "complete", "entity_counts": {"track": 100}},
         "analysis": {"status": "complete"},
     }
 
@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.5"
+    assert manifest["versions"][0]["version"] == "0.8.6"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -155,7 +155,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.5",
+        "plugin_version": "0.8.6",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -277,7 +277,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.5"
+    assert body["plugin_version"] == "0.8.6"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -2914,6 +2914,72 @@ def test_provider_bridge_admits_only_navidrome_sources():
         bridge.require_server("jelly")
 
 
+def test_navidrome_catalog_uses_folder_album_queries_when_song_rows_lack_folder_ids():
+    from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
+
+    calls = []
+
+    class Module:
+        @staticmethod
+        def list_libraries():
+            return [
+                {"id": "folder-a", "name": "Included"},
+                {"id": "folder-b", "name": "Excluded"},
+            ]
+
+        @staticmethod
+        def _get_target_music_folder_ids():
+            return {"folder-a"}
+
+        @staticmethod
+        def _navidrome_request(endpoint, params=None):
+            calls.append((endpoint, params))
+            if endpoint == "getAlbumList2":
+                assert params["musicFolderId"] == "folder-a"
+                return {
+                    "albumList2": {
+                        "album": [{"id": "album-a", "name": "Included album"}]
+                    }
+                }
+            if endpoint == "getAlbum":
+                return {
+                    "album": {
+                        "id": "album-a",
+                        "name": "Included album",
+                        "song": [
+                            {
+                                "id": "track-a",
+                                "title": "Included song",
+                                "albumId": "album-a",
+                                "album": "Included album",
+                            }
+                        ],
+                    }
+                }
+            raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
+
+    result = _fetch_navidrome(Module(), object(), "server-a")
+
+    assert [row["id"] for row in result["tracks"]] == ["track-a"]
+    assert [row["id"] for row in result["albums"]] == ["album-a"]
+    assert all(endpoint != "search3" for endpoint, _params in calls)
+
+
+def test_navidrome_catalog_rejects_an_unmatched_music_folder_filter():
+    from plugins.LumaeAnalysis.catalog_providers import CatalogProviderError, _fetch_navidrome
+
+    module = types.SimpleNamespace(
+        list_libraries=lambda: [{"id": "folder-a", "name": "Available"}],
+        _get_target_music_folder_ids=lambda: set(),
+        _navidrome_request=lambda *_args, **_kwargs: pytest.fail(
+            "No catalogue request should run for an invalid folder selection"
+        ),
+    )
+
+    with pytest.raises(CatalogProviderError, match="did not match any music folder"):
+        _fetch_navidrome(module, object(), "server-a")
+
+
 class RebindCursor(FakeCursor):
     def __init__(self, source_rows, selected_source=None):
         super().__init__(source_rows)
@@ -3794,6 +3860,24 @@ def test_refresh_catalog_failure_keeps_prior_generation_and_records_error():
     )
 
 
+def test_refresh_catalog_rejects_an_empty_first_generation():
+    from plugins.LumaeAnalysis.catalog import CatalogScanError, refresh_catalog
+
+    db = RefreshDb()
+
+    with pytest.raises(CatalogScanError, match="empty catalogue was not published"):
+        refresh_catalog("server-a", db=db, bridge=RefreshBridge({"tracks": []}))
+
+    assert db.rollbacks == 1
+    assert not any("SET published_generation" in sql for sql, _params in db.executed)
+    assert any(
+        "status='failed'" in sql
+        and "Navidrome returned no usable tracks" in params[0]
+        for sql, params in db.executed
+        if params
+    )
+
+
 class ProjectionCursor(FakeCursor):
     def __init__(self, db):
         super().__init__([])
@@ -4599,7 +4683,7 @@ def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
     body = mod.render_v3_readiness_panel()
     compact = " ".join(body.split())
 
-    assert "AudioMuse 3 sync readiness" in body
+    assert "AudioMuse 3 sonic verification" in body
     assert "fresh v3.0.5 database" in compact
     assert "Chromaprint: 8 of 10 mapped tracks (80.00%)" in compact
     assert "without analysis mapping: 2" in compact
@@ -4766,8 +4850,8 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     assert response.status_code == 200
     body = response.get_data(as_text=True)
     assert 'class="lumae-meter-fill" style="width: 1%;"' in body
-    assert "Refresh Lumae catalogue" in body
-    assert "Start background enrichment" in body
+    assert "Refresh required data" in body
+    assert "Start waveform enrichment" in body
     assert "Queue all profiles" not in body
     assert "Tracks per background batch" in body
     assert "15,894 need analysis" in body
@@ -5010,7 +5094,8 @@ def test_database_state_explains_an_uninitialized_database():
     ]
     assert "No published Lumae catalogue yet" in body
     assert "run Prepare Lumae" in body
-    assert "snapshot database_unavailable" in body
+    assert "diagnostic queries database_unavailable" in body
+    assert "app sync not ready" in body
 
 
 def test_database_state_page_renders_partial_state_without_exposing_rows(monkeypatch):
@@ -5130,7 +5215,8 @@ def test_database_state_page_renders_partial_state_without_exposing_rows(monkeyp
     body = response.get_data(as_text=True)
     compact = " ".join(body.split())
     assert "Lumae database state" in body
-    assert "Published provider truth" in body
+    assert "Required for app sync" in body
+    assert "1. Navidrome catalogue" in body
     assert "Usable sonic coverage" in body
     assert "Provisional" in body
     assert "Usable but flagged" in body
@@ -5143,6 +5229,106 @@ def test_database_state_page_renders_partial_state_without_exposing_rows(monkeyp
     assert 'href="settings"' in body
 
 
+def test_database_state_marks_a_completed_empty_catalogue_not_ready():
+    state = importlib.import_module("plugins.LumaeAnalysis.database_state")
+    zero_counts = {
+        "total": 0,
+        "usable": 0,
+        "verified": 0,
+        "provisional": 0,
+        "pending": 0,
+        "suspect": 0,
+        "missing": 0,
+        "usable_analysis_ids": 0,
+    }
+    snapshot = {
+        "captured_at": "2026-07-26T18:09:35Z",
+        "status": "ready",
+        "core": {"core_version": "v3.0.5", "core_adapter": "v3_registry"},
+        "errors": [],
+        "sources": [
+            {
+                "identity": {
+                    "catalog_instance_id": "catalog-a",
+                    "server_id": "server-a",
+                    "provider_type": "navidrome",
+                    "name": "Navidrome",
+                    "is_default": True,
+                    "rebind_status": "active",
+                },
+                "catalog": {
+                    "generation": 1,
+                    "head_seq": 0,
+                    "floor_seq": 0,
+                    "status": "complete",
+                    "entity_counts": {
+                        "library": 1,
+                        "artist": 0,
+                        "album": 0,
+                        "track": 0,
+                    },
+                    "field_coverage": {},
+                },
+                "analysis": {"generation": 1, "status": "complete"},
+                "links": zero_counts,
+                "items": {
+                    "items": 0,
+                    "musicnn_vectors": 0,
+                    "clap_vectors": 0,
+                    "shared_groups": 0,
+                    "largest_group": 0,
+                },
+                "profiles": {
+                    "catalogue_tracks": 0,
+                    "stored": 0,
+                    "ready": 0,
+                    "pending": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "needs_attention": 0,
+                },
+                "workflow": {
+                    "preparation": {
+                        "status": "ready",
+                        "phase": "catalog_ready",
+                        "updated_at": "2026-07-26T18:09:00Z",
+                    },
+                    "backfill": None,
+                    "analysis_runs": [],
+                },
+                "journals": {
+                    "catalog": {"rows": 0, "head": 0, "floor": 0},
+                    "analysis": {"rows": 0, "head": 0, "floor": 0},
+                    "bootstrap_leases": {"active": 0, "completed": 0},
+                },
+                "core": {
+                    "mode": "source_scoped",
+                    "mapping_rows": 0,
+                    "canonical_analysis_ids": 0,
+                    "scored": 0,
+                    "musicnn_vectors": 0,
+                    "clap_vectors": 0,
+                    "chromaprint": 0,
+                },
+                "readiness": {"status": "no_analysis_mappings", "blockers": []},
+                "errors": [],
+            }
+        ],
+    }
+
+    body = state.render_database_state(snapshot)
+    compact = " ".join(body.split())
+
+    assert "Lumae is not ready: the published catalogue is empty" in body
+    assert "App-ready sources" in body
+    assert "0 / 1" in body
+    assert "empty - not ready" in body
+    assert "blocked by empty catalogue" in body
+    assert "invalid (recorded ready)" in body
+    assert "Query / workflow errors" in body
+    assert compact.index("1. Navidrome catalogue") < compact.index("4. Loudness &amp; SmoothFade")
+
+
 def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypatch):
     mod = load_plugin()
     collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
@@ -5151,7 +5337,7 @@ def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypa
     monkeypatch.setattr(mod, "set_setting", lambda key, value: saved.append((key, value)))
     monkeypatch.setattr(mod, "sync_collections_menu", lambda enabled: menu_states.append(enabled))
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 25)
-    monkeypatch.setattr(mod, "render_source_preparation_panel", lambda _batch_size: "")
+    monkeypatch.setattr(mod, "render_source_preparation_sections", lambda _batch_size: ("", ""))
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
     client = plugin_client(mod)
 
@@ -5236,14 +5422,51 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
     assert response.status_code == 200
     body = response.get_data(as_text=True)
     assert 'aria-valuenow="82"' in body
-    assert "Playback enrichment: 82 ready of 100" in body
+    assert "82 of 100 waveform profiles ready" in body
     assert "11 need analysis" in body
-    assert "provider catalogue" in body
+    assert "Catalogue and app sync" in body
     assert "AudioMuse projection" in body
-    assert "App readiness and waveform coverage are independent" in body
+    assert "Ready for app sync: 100 Navidrome tracks are published" in body
+    assert "They do not decide whether the catalogue is ready for app sync" in body
     assert "location.reload" not in body
     assert 'u.searchParams.set("_lumae_refresh",Date.now().toString())' in body
     assert "location.replace(u.href)" in body
+
+
+def test_settings_page_never_labels_a_completed_empty_catalogue_ready(monkeypatch):
+    mod = load_plugin()
+    source = settings_catalog_source()
+    source["catalog"]["entity_counts"] = {"track": 0}
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 25)
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(
+        mod,
+        "preparation_state",
+        lambda _catalog_id: {"status": "ready", "phase": "catalog_ready", "last_error": None},
+    )
+    monkeypatch.setattr(mod, "profile_backfill_state", lambda _catalog_id: None)
+    monkeypatch.setattr(
+        mod,
+        "analysis_status_counts",
+        lambda **_kwargs: {
+            "total_with_files": 0,
+            "ready_current": 0,
+            "pending": 0,
+            "failed": 0,
+            "skipped": 0,
+            "needs_analysis": 0,
+        },
+    )
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+
+    body = plugin_client(mod).get("/settings").get_data(as_text=True)
+
+    assert "Not ready - empty catalogue" in body
+    assert "Not ready: no Navidrome tracks were published" in body
+    assert "A completed job with zero tracks is not ready" in body
+    assert "Refresh required data" in body
+    assert body.index("Catalogue and app sync") < body.index("Waveform playback enhancements")
 
 
 def test_settings_page_starts_bounded_background_enrichment(
@@ -5259,7 +5482,7 @@ def test_settings_page_starts_bounded_background_enrichment(
         lambda **_kwargs: {"queued": True, "coalesced": False, "batch_size": 25},
     )
     monkeypatch.setattr(mod, "set_setting", lambda key, value: None)
-    monkeypatch.setattr(mod, "render_source_preparation_panel", lambda _batch_size: "")
+    monkeypatch.setattr(mod, "render_source_preparation_sections", lambda _batch_size: ("", ""))
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
     client = plugin_client(mod)
 
@@ -5293,7 +5516,7 @@ def test_settings_prepare_action_claims_and_enqueues_exact_source_once(monkeypat
         lambda func, *args, queue="default": calls.append((func.__name__, args, queue)),
     )
     monkeypatch.setattr(mod, "set_setting", lambda *_args: None)
-    monkeypatch.setattr(mod, "render_source_preparation_panel", lambda _batch_size: "")
+    monkeypatch.setattr(mod, "render_source_preparation_sections", lambda _batch_size: ("", ""))
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
 
     response = plugin_client(mod).post(
