@@ -62,7 +62,10 @@ def _link_state(db, source, errors):
                  WHERE status='ready' AND evidence_complete=FALSE
                ) AS provisional,
                count(*) FILTER (WHERE status='pending') AS pending,
-               count(*) FILTER (WHERE status='suspect') AS suspect,
+               count(*) FILTER (
+                 WHERE status='suspect'
+                    OR review_state IN ('needs_repair', 'needs_review')
+               ) AS suspect,
                count(*) FILTER (WHERE status='missing') AS missing,
                count(DISTINCT analysis_id) FILTER (
                  WHERE status='ready' AND analysis_id IS NOT NULL
@@ -660,7 +663,7 @@ def _source_html(source):
             {_metric("Verified", _number(links["verified"]), "ready")}
             {_metric("Provisional", _number(links["provisional"]), "pending")}
             {_metric("Pending", _number(links["pending"]), "pending")}
-            {_metric("Suspect / isolated", _number(links["suspect"]), "danger")}
+            {_metric("Usable but flagged", _number(links["suspect"]), "danger")}
             {_metric("Missing", _number(links["missing"]))}
           </div>
           <div class="db-metrics">
@@ -672,8 +675,9 @@ def _source_html(source):
             {_metric("Projection generation", _number(analysis.get("generation")))}
           </div>
           <p class="db-muted">Readiness: {escape(str(readiness_status))}. Published
-            {_timestamp(analysis.get('completed_at'))}. Provisional links stay playable;
-            suspect links are the only mapped links isolated from sonic sync.
+            {_timestamp(analysis.get('completed_at'))}. Provisional and repair-flagged
+            links stay usable with their assigned sonic data; the flags preserve
+            attribution uncertainty until AudioMuse repairs and republishes the group.
             {readiness_detail}</p>
         </section>
 

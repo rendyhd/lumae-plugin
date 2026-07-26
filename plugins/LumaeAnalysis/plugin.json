@@ -57,6 +57,7 @@
         "binary_vectors",
         "v3_release_readiness",
         "progressive_analysis_admission",
+        "repair_flagged_analysis_admission",
         "database_state_dashboard",
         "provider_track_scope_verification",
         "source_scoped_profiles",
@@ -72,7 +73,7 @@
     {
       "version": "0.8.5",
       "min_core_version": "2.6.0",
-      "changelog": "Make preparation status polling navigate with a fresh GET so Firefox never asks to resubmit the settings form during automatic refresh.",
+      "changelog": "Keep repair-flagged AudioMuse 3 mappings usable as provisional sonic links, preserve their conflict evidence for automatic replacement, reproject automatically after update, avoid unchanged journal churn, and make Firefox-safe GET status polling.",
       "imageUrl": "",
       "sourceUrl": "",
       "checksum": ""

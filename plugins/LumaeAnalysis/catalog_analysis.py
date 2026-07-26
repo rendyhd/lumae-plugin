@@ -203,8 +203,19 @@ def _chromaprints_agree(left, right):
     return chromaprints_agree(left, right)
 
 
+REPAIR_CONFLICT_FLAGS = frozenset(
+    ("chromaprint_disagreement", "provider_evidence_conflict")
+)
+
+
+def _link_requires_repair(link):
+    return link.get("status") == "suspect" or bool(
+        REPAIR_CONFLICT_FLAGS.intersection(link.get("conflict_flags") or ())
+    )
+
+
 def _apply_progressive_evidence(links, fingerprints, policy=None, compare=None):
-    """Use threshold-qualified links provisionally until Chromaprint disproves them."""
+    """Keep mapped sonic data usable while recording Chromaprint uncertainty."""
     policy = policy or dedup_policy()
     compare = compare or _chromaprints_agree
     candidates = defaultdict(list)
@@ -254,7 +265,6 @@ def _apply_progressive_evidence(links, fingerprints, policy=None, compare=None):
                 verdicts.append(compare(fingerprints[left_id], fingerprints[right_id]))
         if any(verdict is False for verdict in verdicts):
             for track_id in track_ids:
-                links[track_id]["status"] = "suspect"
                 links[track_id]["conflict_flags"] = ["chromaprint_disagreement"]
                 links[track_id]["review_state"] = "needs_repair"
         elif any(verdict is None for verdict in verdicts):
@@ -266,6 +276,23 @@ def _apply_progressive_evidence(links, fingerprints, policy=None, compare=None):
         else:
             for track_id in track_ids:
                 links[track_id]["evidence_complete"] = True
+
+
+def _apply_provider_conflicts(links, analysis_ids):
+    """Flag questionable shared identities without withholding their sonic assets."""
+    analysis_ids = set(analysis_ids)
+    for link in links.values():
+        if link["analysis_id"] not in analysis_ids:
+            continue
+        link["evidence_complete"] = False
+        link["conflict_flags"] = sorted(
+            set(link["conflict_flags"] + ["provider_evidence_conflict"])
+        )
+        link["review_state"] = (
+            "needs_repair"
+            if "chromaprint_disagreement" in link["conflict_flags"]
+            else "needs_review"
+        )
 
 
 def _analysis_rows(cur, analysis_ids):
@@ -365,7 +392,8 @@ def _old_links(cur, catalog_instance_id, generation):
     cur.execute(
         f"""
         SELECT provider_track_id, analysis_id, status, match_tier, algorithm,
-               decision_threshold, distance, evidence_complete, conflict_flags
+               decision_threshold, distance, evidence_complete, conflict_flags,
+               review_state
           FROM {t('track_analysis_links')}
          WHERE catalog_instance_id=%s AND projection_generation=%s
         """,
@@ -374,6 +402,7 @@ def _old_links(cur, catalog_instance_id, generation):
     return {
         str(row[0]): fingerprint(
             {
+                "provider_track_id": str(row[0]),
                 "analysis_id": row[1],
                 "status": row[2],
                 "match_tier": row[3],
@@ -382,6 +411,7 @@ def _old_links(cur, catalog_instance_id, generation):
                 "distance": row[6],
                 "evidence_complete": row[7],
                 "conflict_flags": _json_value(row[8]) or [],
+                "review_state": row[9],
             }
         )
         for row in cur.fetchall()
@@ -427,15 +457,10 @@ def project_analysis(server_id=None, db=None, adapter=None):
             "review_state": None,
         }
     _apply_progressive_evidence(links, chromaprints, policy)
-    for analysis_id in _suspect_analysis_ids(tracks, links, policy):
-        for link in links.values():
-            if link["analysis_id"] == analysis_id:
-                link["status"] = "suspect"
-                link["evidence_complete"] = False
-                link["conflict_flags"] = sorted(
-                    set(link["conflict_flags"] + ["provider_evidence_conflict"])
-                )
-                link["review_state"] = "needs_review"
+    _apply_provider_conflicts(
+        links,
+        _suspect_analysis_ids(tracks, links, policy),
+    )
 
     cur.execute(
         f"SELECT projection_generation, analysis_epoch, analysis_head_seq "
@@ -573,7 +598,7 @@ def project_analysis(server_id=None, db=None, adapter=None):
         "ready_count": sum(link["status"] == "ready" for link in links.values()),
         "pending_count": sum(link["status"] == "pending" for link in links.values()),
         "missing_count": sum(link["status"] == "missing" for link in links.values()),
-        "suspect_count": sum(link["status"] == "suspect" for link in links.values()),
+        "suspect_count": sum(_link_requires_repair(link) for link in links.values()),
         "evidence_complete_count": sum(
             link["evidence_complete"] for link in links.values()
         ),

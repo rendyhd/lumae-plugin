@@ -133,6 +133,7 @@ def test_plugin_manifest_has_lumae_identity():
             "binary_vectors",
             "v3_release_readiness",
             "progressive_analysis_admission",
+            "repair_flagged_analysis_admission",
             "database_state_dashboard",
             "provider_track_scope_verification",
             "source_scoped_profiles",
@@ -2762,11 +2763,18 @@ def test_catalog_preparation_claim_does_not_inherit_legacy_profile_queue_lock():
 def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     mod = load_plugin()
     db = CronDb(existing=None)
+    queued = []
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
+    )
 
     mod.migrate(db)
 
     assert db.commits == 1
+    assert queued == [((mod.analysis_projection_task,), {"queue": "default"})]
     assert db.cursor_obj.executed[-1] == (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
@@ -3939,7 +3947,7 @@ def test_analysis_projection_marks_contradictory_dedup_group_suspect():
     assert _suspect_analysis_ids(tracks, links) == {"canonical-1"}
 
 
-def test_progressive_evidence_uses_incomplete_groups_and_isolates_only_disagreements():
+def test_progressive_evidence_keeps_disagreements_usable_and_flagged_for_repair():
     from plugins.LumaeAnalysis.catalog_analysis import _apply_progressive_evidence
 
     policy = {"per_link_chromaprint_evidence_available": True}
@@ -4000,10 +4008,94 @@ def test_progressive_evidence_uses_incomplete_groups_and_isolates_only_disagreem
     assert links["pending-a"]["evidence_complete"] is False
     assert links["pending-a"]["conflict_flags"] == ["chromaprint_evidence_pending"]
     assert links["pending-a"]["review_state"] == "provisional"
-    assert links["suspect-a"]["status"] == "suspect"
-    assert links["suspect-b"]["status"] == "suspect"
+    assert links["suspect-a"]["status"] == "ready"
+    assert links["suspect-b"]["status"] == "ready"
+    assert links["suspect-a"]["evidence_complete"] is False
     assert links["suspect-a"]["conflict_flags"] == ["chromaprint_disagreement"]
     assert links["suspect-a"]["review_state"] == "needs_repair"
+
+
+def test_provider_conflicts_keep_sonic_data_usable_and_preserve_stronger_repair_flag():
+    from plugins.LumaeAnalysis.catalog_analysis import _apply_provider_conflicts
+
+    links = {
+        "chromaprint-conflict": {
+            "analysis_id": "analysis-a",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": ["chromaprint_disagreement"],
+            "review_state": "needs_repair",
+        },
+        "provider-conflict": {
+            "analysis_id": "analysis-b",
+            "status": "ready",
+            "evidence_complete": True,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+    }
+
+    _apply_provider_conflicts(links, {"analysis-a", "analysis-b"})
+
+    assert {link["status"] for link in links.values()} == {"ready"}
+    assert links["chromaprint-conflict"]["conflict_flags"] == [
+        "chromaprint_disagreement",
+        "provider_evidence_conflict",
+    ]
+    assert links["chromaprint-conflict"]["review_state"] == "needs_repair"
+    assert links["provider-conflict"]["evidence_complete"] is False
+    assert links["provider-conflict"]["conflict_flags"] == [
+        "provider_evidence_conflict"
+    ]
+    assert links["provider-conflict"]["review_state"] == "needs_review"
+
+
+def test_old_link_fingerprint_uses_the_same_fields_as_new_projection_payload():
+    from plugins.LumaeAnalysis.catalog import fingerprint
+    from plugins.LumaeAnalysis.catalog_analysis import _old_links
+
+    link = {
+        "provider_track_id": "track-a",
+        "analysis_id": "analysis-a",
+        "status": "ready",
+        "match_tier": "provider_occurrence",
+        "algorithm": "audiomuse_catalogue_fp_4",
+        "decision_threshold": 0.01,
+        "distance": None,
+        "evidence_complete": False,
+        "conflict_flags": ["provider_evidence_conflict"],
+        "review_state": "needs_review",
+    }
+
+    class Cursor:
+        def __init__(self):
+            self.sql = ""
+
+        def execute(self, sql, params):
+            self.sql = " ".join(sql.split())
+            assert params == ("catalog-a", 4)
+
+        def fetchall(self):
+            return [
+                (
+                    link["provider_track_id"],
+                    link["analysis_id"],
+                    link["status"],
+                    link["match_tier"],
+                    link["algorithm"],
+                    link["decision_threshold"],
+                    link["distance"],
+                    link["evidence_complete"],
+                    link["conflict_flags"],
+                    link["review_state"],
+                )
+            ]
+
+    cur = Cursor()
+    old = _old_links(cur, "catalog-a", 4)
+
+    assert "review_state" in cur.sql
+    assert old == {"track-a": fingerprint(link)}
 
 
 def test_progressive_evidence_uses_inconclusive_fingerprints_provisionally():
@@ -4271,6 +4363,12 @@ def test_v3_readiness_rejects_incomplete_backfill_and_upgrade_sequence(monkeypat
     assert progressive["verified_link_count"] == 7
     assert progressive["provisional_link_count"] == 1
     assert progressive["usable_analysis_coverage"] == 0.8
+    link_query = next(
+        sql
+        for sql, _params in db.executed
+        if "track_analysis_links" in sql
+    )
+    assert "review_state IN ('needs_repair', 'needs_review')" in link_query
 
 
 def test_v3_readiness_requires_cleaning_after_chromaprint_completion(monkeypatch):
@@ -4507,6 +4605,7 @@ def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
     assert "without analysis mapping: 2" in compact
     assert "Full-library verification is still waiting for Chromaprint" in body
     assert "Sonic links: 7 usable (5 verified; 2 provisional)" in compact
+    assert "of the usable links, 1 flagged for repair" in compact
     assert "provisional matches remain usable" in body
     assert "Confirm fresh installation" in body
     assert "Confirm upgraded installation" in body
@@ -4831,6 +4930,7 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
     ]
     assert projection_queries
     assert all(params == ("catalog-a", 9) for _sql, params in projection_queries)
+    assert "review_state IN ('needs_repair', 'needs_review')" in projection_queries[0][0]
     core_query = next(
         (sql, params) for sql, params in db.executed if "AS mapping_rows" in sql
     )
@@ -5028,10 +5128,13 @@ def test_database_state_page_renders_partial_state_without_exposing_rows(monkeyp
 
     assert response.status_code == 200
     body = response.get_data(as_text=True)
+    compact = " ".join(body.split())
     assert "Lumae database state" in body
     assert "Published provider truth" in body
     assert "Usable sonic coverage" in body
     assert "Provisional" in body
+    assert "Usable but flagged" in body
+    assert "repair-flagged links stay usable" in compact
     assert "Chromaprint coverage" in body
     assert "profiles never remove tracks" in body
     assert "Journals &amp; leases" in body

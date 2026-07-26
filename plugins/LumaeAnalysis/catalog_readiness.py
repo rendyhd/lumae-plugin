@@ -193,7 +193,10 @@ def _link_coverage(db, source, eligible_track_count=0):
             f"""
             SELECT count(*) FILTER (WHERE status='ready') AS ready_links,
                    count(*) FILTER (WHERE status='pending') AS pending_links,
-                   count(*) FILTER (WHERE status='suspect') AS suspect_links,
+                   count(*) FILTER (
+                     WHERE status='suspect'
+                        OR review_state IN ('needs_repair', 'needs_review')
+                   ) AS suspect_links,
                    count(*) FILTER (WHERE status='missing') AS missing_links,
                    count(*) FILTER (
                      WHERE status='ready' AND evidence_complete=TRUE

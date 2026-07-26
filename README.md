@@ -15,6 +15,7 @@ The plugin provides:
 * an analysis hook that reuses AudioMuse's per-track analysis audio;
 * a source-scoped preparation page that marks the provider catalogue and AudioMuse projection ready before waveform enrichment finishes;
 * a read-only database-state dashboard for published catalogue generations, sonic-link evidence, embeddings, Chromaprint, journals, and waveform coverage;
+* progressive sonic admission that keeps repair-flagged AudioMuse 3 mappings usable while preserving their uncertainty evidence for later replacement;
 * one bounded background-enrichment chain per source, using small worker jobs instead of flooding the queue;
 * high-priority, idempotent promotion for the current playback window, so a requested track is not trapped behind a library backfill.
 

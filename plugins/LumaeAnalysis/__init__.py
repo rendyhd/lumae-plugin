@@ -75,6 +75,7 @@ CATALOG_FEATURES = (
     "binary_vectors",
     "v3_release_readiness",
     "progressive_analysis_admission",
+    "repair_flagged_analysis_admission",
     "database_state_dashboard",
     "provider_track_scope_verification",
     "source_scoped_profiles",
@@ -303,6 +304,17 @@ def analysis_projection_task(server_id=None):
     return project_analysis(server_id=resolved_server_id, adapter=adapter)
 
 
+def enqueue_post_migration_projection():
+    """Apply projection-policy changes without waiting for another analysis run."""
+    try:
+        return enqueue(analysis_projection_task, queue="default")
+    except Exception:
+        logger.exception(
+            "lumae_analysis could not queue its post-install analysis projection"
+        )
+        return None
+
+
 def migrate(db):
     cur = db.cursor()
     cur.execute(
@@ -458,6 +470,7 @@ def migrate(db):
     ensure_analysis_projection_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
+    enqueue_post_migration_projection()
 
 
 def parse_ids(value):
@@ -2417,7 +2430,7 @@ _READINESS_BLOCKER_LABELS = {
     "administrator_acknowledgement_required": "Administrator confirmation is still required.",
     "analysis_projection_incomplete": "The plugin analysis projection is not complete.",
     "catalog_generation_incomplete": "The provider catalogue generation is not complete.",
-    "chromaprint_backfill_incomplete": "Full-library verification is still waiting for Chromaprint; only affected collision groups remain withheld.",
+    "chromaprint_backfill_incomplete": "Full-library verification is still waiting for Chromaprint; affected collision groups remain usable but provisional.",
     "chromaprint_collection_disabled": "Chromaprint collection is disabled in AudioMuse.",
     "chromaprint_gate_disabled": "Chromaprint duplicate validation is disabled in AudioMuse.",
     "cleaning_predates_chromaprint_completion": "Chromaprint completed after Cleaning; run Cleaning and then Analysis again.",
@@ -2540,7 +2553,8 @@ def render_v3_readiness_panel():
                 remain in the Lumae catalogue.</p>
               <p class="lumae-help">Sonic links: {usable_links:,} usable
                 ({verified_links:,} verified; {provisional_links:,} provisional);
-                {pending_links:,} awaiting analysis; {suspect_links:,} isolated for repair;
+                {pending_links:,} awaiting analysis; of the usable links,
+                {suspect_links:,} flagged for repair;
                 {missing_links:,} not analyzed.</p>
               <p class="lumae-help">{(
                   'Sonic links are syncing progressively; provisional matches remain usable while Chromaprint continues.'
