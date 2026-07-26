@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.4"
+    assert manifest["versions"][0]["version"] == "0.8.5"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -154,7 +154,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.4",
+        "plugin_version": "0.8.5",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -276,7 +276,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.4"
+    assert body["plugin_version"] == "0.8.5"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -5138,7 +5138,9 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
     assert "provider catalogue" in body
     assert "AudioMuse projection" in body
     assert "App readiness and waveform coverage are independent" in body
-    assert "setTimeout(()=&gt;location.reload(),5000)" in body or "setTimeout(()=>location.reload(),5000)" in body
+    assert "location.reload" not in body
+    assert 'u.searchParams.set("_lumae_refresh",Date.now().toString())' in body
+    assert "location.replace(u.href)" in body
 
 
 def test_settings_page_starts_bounded_background_enrichment(

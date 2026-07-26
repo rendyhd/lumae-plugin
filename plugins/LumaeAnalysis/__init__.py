@@ -55,7 +55,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.4"
+PLUGIN_VERSION = "0.8.5"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -2658,7 +2658,13 @@ def render_source_preparation_panel(batch_size):
           batches while playback requests use the high-priority worker. AudioMuse 3 readiness
           confirmation remains a separate administrator safety step.</p>
         {''.join(cards)}
-        {"<script>setTimeout(()=>location.reload(),5000)</script>" if auto_refresh else ""}
+        {(
+            '<script>setTimeout(()=>{const u=new URL(location.href);'
+            'u.searchParams.set("_lumae_refresh",Date.now().toString());'
+            'location.replace(u.href)},5000)</script>'
+            if auto_refresh
+            else ""
+        )}
       </section>
     """
 

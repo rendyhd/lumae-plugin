@@ -70,6 +70,14 @@
   },
   "versions": [
     {
+      "version": "0.8.5",
+      "min_core_version": "2.6.0",
+      "changelog": "Make preparation status polling navigate with a fresh GET so Firefox never asks to resubmit the settings form during automatic refresh.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "0.8.4",
       "min_core_version": "2.6.0",
       "changelog": "Sync AudioMuse 3 sonic links progressively while Chromaprint backfills, keep incomplete groups usable unless they definitely disagree, and add a read-only source-scoped database state dashboard.",
