@@ -54,7 +54,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.3"
+PLUGIN_VERSION = "0.8.4"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -73,6 +73,7 @@ CATALOG_FEATURES = (
     "shared_analysis",
     "binary_vectors",
     "v3_release_readiness",
+    "progressive_analysis_admission",
     "provider_track_scope_verification",
     "source_scoped_profiles",
     "prepare_lumae",
@@ -2414,7 +2415,7 @@ _READINESS_BLOCKER_LABELS = {
     "administrator_acknowledgement_required": "Administrator confirmation is still required.",
     "analysis_projection_incomplete": "The plugin analysis projection is not complete.",
     "catalog_generation_incomplete": "The provider catalogue generation is not complete.",
-    "chromaprint_backfill_incomplete": "Mapped tracks are still missing Chromaprint fingerprints.",
+    "chromaprint_backfill_incomplete": "Full-library verification is still waiting for Chromaprint; only affected collision groups remain withheld.",
     "chromaprint_collection_disabled": "Chromaprint collection is disabled in AudioMuse.",
     "chromaprint_gate_disabled": "Chromaprint duplicate validation is disabled in AudioMuse.",
     "cleaning_predates_chromaprint_completion": "Chromaprint completed after Cleaning; run Cleaning and then Analysis again.",
@@ -2422,6 +2423,7 @@ _READINESS_BLOCKER_LABELS = {
     "folder_gate_not_active": "The fp_4 folder-aware duplicate rule is not active.",
     "fp_4_not_active": "AudioMuse catalogue ID scheme fp_4 is not active.",
     "no_analysis_mappings": "No provider tracks have AudioMuse analysis mappings yet.",
+    "per_link_evidence_unavailable": "This plugin cannot qualify AudioMuse analysis links individually.",
     "readiness_unavailable": "The plugin could not read AudioMuse repair diagnostics.",
     "source_rebind_required": "Confirm the AudioMuse v2-to-v3 source continuity before readiness.",
     "upgrade_repair_sequence_incomplete": "Run Analysis, then Cleaning, then Analysis again.",
@@ -2464,10 +2466,15 @@ def render_v3_readiness_panel():
         eligible = int(readiness.get("eligible_track_count") or 0)
         missing = int(readiness.get("missing_mapping_count") or 0)
         fingerprinted = int(readiness.get("chromaprint_track_count") or 0)
+        ready_links = int(readiness.get("ready_link_count") or 0)
+        pending_links = int(readiness.get("pending_link_count") or 0)
+        suspect_links = int(readiness.get("suspect_link_count") or 0)
+        missing_links = int(readiness.get("missing_link_count") or 0)
         coverage = float(readiness.get("chromaprint_coverage") or 0) * 100
         sequence = bool(
             (readiness.get("task_evidence") or {}).get("upgrade_sequence_complete")
         )
+        progressive = bool(readiness.get("analysis_sync_allowed"))
         detected_version = escape(
             str(readiness.get("detected_core_version") or "AudioMuse 3")
         )
@@ -2527,6 +2534,13 @@ def render_v3_readiness_panel():
               <p class="lumae-help">Provider tracks eligible for analysis: {eligible:,}; currently
                 mapped: {mapped:,}; without analysis mapping: {missing:,}. Unmapped provider tracks
                 remain in the Lumae catalogue.</p>
+              <p class="lumae-help">Sonic links: {ready_links:,} ready; {pending_links:,} awaiting
+                evidence; {suspect_links:,} isolated for repair; {missing_links:,} not analyzed.</p>
+              <p class="lumae-help">{(
+                  'Verified sonic links are syncing progressively while Chromaprint continues.'
+                  if progressive
+                  else 'Sonic sync is waiting for per-link safety evidence.'
+              )}</p>
               {f'<ul class="lumae-help">{blocker_html}</ul>' if blocker_html else ''}
               {controls}
             </article>
@@ -2535,8 +2549,9 @@ def render_v3_readiness_panel():
     return f"""
       <section class="lumae-panel" aria-label="AudioMuse 3 release readiness">
         <h3>AudioMuse 3 sync readiness</h3>
-        <p class="lumae-action-copy">Lumae keeps provider tracks authoritative. Confirmation only
-          enables the mobile sync gate after fp_4 policy and Chromaprint coverage checks pass.</p>
+        <p class="lumae-action-copy">Lumae keeps provider tracks authoritative and publishes safe
+          sonic links progressively. Full coverage and confirmation mark the source fully verified;
+          they do not prevent already-qualified links from syncing.</p>
         {''.join(cards)}
       </section>
     """

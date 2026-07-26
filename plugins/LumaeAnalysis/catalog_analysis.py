@@ -58,6 +58,12 @@ def dedup_policy():
     except (TypeError, ValueError):
         chromaprint_min_overlap = None
 
+    progressive_evidence = bool(
+        scheme is not None
+        and scheme >= 4
+        and chromaprint_collection is True
+        and chromaprint_gate is True
+    )
     return {
         "algorithm": (
             f"audiomuse_catalogue_fp_{scheme}"
@@ -73,8 +79,12 @@ def dedup_policy():
         "chromaprint_match_threshold": chromaprint_threshold,
         "chromaprint_min_overlap": chromaprint_min_overlap,
         "per_link_distance_available": False,
-        "per_link_chromaprint_evidence_available": False,
-        "evidence_status": "configured_policy_only" if threshold is not None else "unknown",
+        "per_link_chromaprint_evidence_available": progressive_evidence,
+        "evidence_status": (
+            "per_link_progressive"
+            if progressive_evidence
+            else ("configured_policy_only" if threshold is not None else "unknown")
+        ),
     }
 
 
@@ -160,6 +170,102 @@ def _analysis_mapping(cur, adapter, server_id):
         }
         for row in cur.fetchall()
     }
+
+
+def _analysis_chromaprints(cur, adapter, server_id, provider_track_ids):
+    """Return v3 provider fingerprints used to qualify dedup groups.
+
+    AudioMuse 2.6 has provider-keyed score IDs and no v3 canonical merge map,
+    so its direct links do not require this evidence path.
+    """
+    if getattr(adapter, "mode", None) != "v3_registry" or not provider_track_ids:
+        return None
+    cur.execute(
+        """
+        SELECT provider_track_id, fingerprint
+          FROM chromaprint
+         WHERE server_id=%s AND provider_track_id = ANY(%s)
+        """,
+        (server_id, list(provider_track_ids)),
+    )
+    return {
+        str(row[0]): _bytes(row[1])
+        for row in cur.fetchall()
+        if row[1] is not None
+    }
+
+
+def _chromaprints_agree(left, right):
+    if left == right:
+        return True
+    from tasks.chromaprint import chromaprints_agree
+
+    return chromaprints_agree(left, right)
+
+
+def _apply_progressive_evidence(links, fingerprints, policy=None, compare=None):
+    """Admit safe links without waiting for whole-library Chromaprint coverage."""
+    policy = policy or dedup_policy()
+    compare = compare or _chromaprints_agree
+    candidates = defaultdict(list)
+    for track_id, link in links.items():
+        if link.get("status") == "ready" and link.get("analysis_id"):
+            candidates[link["analysis_id"]].append(track_id)
+
+    # V2 links are direct provider IDs. There is no v3 probabilistic merge to
+    # qualify, so each available analysis row is complete evidence by design.
+    if fingerprints is None:
+        for track_ids in candidates.values():
+            for track_id in track_ids:
+                links[track_id]["evidence_complete"] = True
+        return
+
+    progressive_enabled = (
+        policy.get("per_link_chromaprint_evidence_available") is True
+    )
+    for track_ids in candidates.values():
+        # A false dedup merge is represented by N provider occurrences sharing
+        # one canonical analysis ID. A singleton has no current collision group
+        # and can be used while unrelated fingerprints continue backfilling.
+        if len(track_ids) == 1:
+            links[track_ids[0]]["evidence_complete"] = True
+            continue
+
+        if not progressive_enabled:
+            for track_id in track_ids:
+                links[track_id]["status"] = "pending"
+                links[track_id]["conflict_flags"] = [
+                    "chromaprint_validation_unavailable"
+                ]
+            continue
+
+        missing = [track_id for track_id in track_ids if not fingerprints.get(track_id)]
+        if missing:
+            for track_id in track_ids:
+                links[track_id]["status"] = "pending"
+                links[track_id]["conflict_flags"] = [
+                    "chromaprint_evidence_pending"
+                ]
+            continue
+
+        verdicts = []
+        for index, left_id in enumerate(track_ids):
+            for right_id in track_ids[index + 1 :]:
+                verdicts.append(compare(fingerprints[left_id], fingerprints[right_id]))
+        if any(verdict is False for verdict in verdicts):
+            for track_id in track_ids:
+                links[track_id]["status"] = "suspect"
+                links[track_id]["conflict_flags"] = ["chromaprint_disagreement"]
+                links[track_id]["review_state"] = "needs_repair"
+        elif any(verdict is None for verdict in verdicts):
+            for track_id in track_ids:
+                links[track_id]["status"] = "pending"
+                links[track_id]["conflict_flags"] = [
+                    "chromaprint_evidence_inconclusive"
+                ]
+        else:
+            for track_id in track_ids:
+                links[track_id]["evidence_complete"] = True
 
 
 def _analysis_rows(cur, analysis_ids):
@@ -298,6 +404,7 @@ def project_analysis(server_id=None, db=None, adapter=None):
     tracks = _active_catalog_tracks(cur, catalog_instance_id, catalog_generation)
     mapped = _analysis_mapping(cur, adapter, server_id)
     mapped = {track_id: row for track_id, row in mapped.items() if track_id in tracks}
+    chromaprints = _analysis_chromaprints(cur, adapter, server_id, mapped)
     analysis = _analysis_rows(
         cur, {row["analysis_id"] for row in mapped.values() if row["analysis_id"]}
     )
@@ -319,11 +426,15 @@ def project_analysis(server_id=None, db=None, adapter=None):
             "conflict_flags": [],
             "review_state": None,
         }
+    _apply_progressive_evidence(links, chromaprints, policy)
     for analysis_id in _suspect_analysis_ids(tracks, links, policy):
         for link in links.values():
             if link["analysis_id"] == analysis_id:
                 link["status"] = "suspect"
-                link["conflict_flags"] = ["provider_evidence_conflict"]
+                link["evidence_complete"] = False
+                link["conflict_flags"] = sorted(
+                    set(link["conflict_flags"] + ["provider_evidence_conflict"])
+                )
                 link["review_state"] = "needs_review"
 
     cur.execute(
@@ -459,7 +570,13 @@ def project_analysis(server_id=None, db=None, adapter=None):
         "cursor": opaque_cursor(catalog_instance_id, epoch, next_seq),
         "item_count": len(analysis),
         "link_count": len(links),
+        "ready_count": sum(link["status"] == "ready" for link in links.values()),
+        "pending_count": sum(link["status"] == "pending" for link in links.values()),
+        "missing_count": sum(link["status"] == "missing" for link in links.values()),
         "suspect_count": sum(link["status"] == "suspect" for link in links.values()),
+        "evidence_complete_count": sum(
+            link["evidence_complete"] for link in links.values()
+        ),
         "changes": len(item_changes) + len(link_changes),
     }
 

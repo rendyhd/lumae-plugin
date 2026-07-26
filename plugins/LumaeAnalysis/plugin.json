@@ -56,6 +56,7 @@
         "shared_analysis",
         "binary_vectors",
         "v3_release_readiness",
+        "progressive_analysis_admission",
         "provider_track_scope_verification",
         "source_scoped_profiles",
         "prepare_lumae",
@@ -67,6 +68,14 @@
     }
   },
   "versions": [
+    {
+      "version": "0.8.4",
+      "min_core_version": "2.6.0",
+      "changelog": "Sync safe AudioMuse 3 sonic links progressively while Chromaprint backfills; isolate incomplete or disagreeing duplicate groups without blocking the Navidrome catalogue or unrelated analysis.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.8.3",
       "min_core_version": "2.6.0",

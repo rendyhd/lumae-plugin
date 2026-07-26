@@ -186,6 +186,40 @@ def _coverage(db, source):
     }
 
 
+def _link_coverage(db, source, eligible_track_count=0):
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""
+            SELECT count(*) FILTER (WHERE status='ready') AS ready_links,
+                   count(*) FILTER (WHERE status='pending') AS pending_links,
+                   count(*) FILTER (WHERE status='suspect') AS suspect_links,
+                   count(*) FILTER (WHERE status='missing') AS missing_links,
+                   count(*) FILTER (WHERE evidence_complete=TRUE)
+                     AS evidence_complete_links
+              FROM {t("track_analysis_links")}
+             WHERE catalog_instance_id=%s AND projection_generation=%s
+            """,
+            (
+                source["catalog_instance_id"],
+                source.get("analysis", {}).get("generation", 0),
+            ),
+        )
+        row = cur.fetchone() or (0, 0, 0, 0, 0)
+    finally:
+        cur.close()
+    eligible = int(eligible_track_count or 0)
+    ready = int(row[0] or 0)
+    return {
+        "ready_link_count": ready,
+        "pending_link_count": int(row[1] or 0),
+        "suspect_link_count": int(row[2] or 0),
+        "missing_link_count": int(row[3] or 0),
+        "evidence_complete_link_count": int(row[4] or 0),
+        "usable_analysis_coverage": ready / eligible if eligible else 0.0,
+    }
+
+
 def _policy_blockers(policy):
     blockers = []
     if policy.get("catalogue_id_scheme_version") != 4:
@@ -237,6 +271,9 @@ def v3_release_readiness(
         "applicable": compatibility.adapter == "v3_registry",
         "status": "not_applicable",
         "ready": compatibility.adapter != "v3_registry",
+        "fully_verified": compatibility.adapter != "v3_registry",
+        "analysis_sync_allowed": compatibility.adapter != "v3_registry",
+        "progressive_analysis": False,
         "verification_mode": None,
         "administrator_acknowledged": False,
         "acknowledged_at": None,
@@ -268,6 +305,9 @@ def v3_release_readiness(
 
     try:
         coverage = _coverage(db, source)
+        link_coverage = _link_coverage(
+            db, source, coverage["eligible_track_count"]
+        )
         tasks = _task_evidence(db)
     except Exception:
         return {
@@ -298,14 +338,20 @@ def v3_release_readiness(
         acknowledgement.get("verification_mode") if acknowledged else None
     )
     blockers = _policy_blockers(policy)
+    progressive_blockers = list(blockers)
     if source.get("catalog", {}).get("status") != "complete":
         blockers.append("catalog_generation_incomplete")
+        progressive_blockers.append("catalog_generation_incomplete")
     if source.get("analysis", {}).get("status") != "complete":
         blockers.append("analysis_projection_incomplete")
+        progressive_blockers.append("analysis_projection_incomplete")
     if coverage["mapped_track_count"] == 0:
         blockers.append("no_analysis_mappings")
+        progressive_blockers.append("no_analysis_mappings")
     elif coverage["chromaprint_missing_count"]:
         blockers.append("chromaprint_backfill_incomplete")
+    if policy.get("per_link_chromaprint_evidence_available") is not True:
+        progressive_blockers.append("per_link_evidence_unavailable")
     if mode == "upgraded" and not acknowledged:
         if not task_order_complete:
             blockers.append("upgrade_repair_sequence_incomplete")
@@ -314,18 +360,25 @@ def v3_release_readiness(
     if requested_mode is None and not acknowledged:
         blockers.append("administrator_acknowledgement_required")
 
+    analysis_sync_allowed = not progressive_blockers
     ready = not blockers and (acknowledged or requested_mode is not None)
     if ready:
         status = "ready"
     elif blockers == ["administrator_acknowledgement_required"]:
         status = "acknowledgement_required"
+    elif analysis_sync_allowed:
+        status = "progressive"
     else:
         status = "repair_incomplete"
     return {
         **base,
         **coverage,
+        **link_coverage,
         "status": status,
         "ready": ready,
+        "fully_verified": ready,
+        "analysis_sync_allowed": analysis_sync_allowed,
+        "progressive_analysis": analysis_sync_allowed and not ready,
         "verification_mode": mode,
         "administrator_acknowledged": acknowledged,
         "acknowledged_at": (

@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.3"
+    assert manifest["versions"][0]["version"] == "0.8.4"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -132,6 +132,7 @@ def test_plugin_manifest_has_lumae_identity():
             "shared_analysis",
             "binary_vectors",
             "v3_release_readiness",
+            "progressive_analysis_admission",
             "provider_track_scope_verification",
             "source_scoped_profiles",
             "prepare_lumae",
@@ -152,7 +153,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.3",
+        "plugin_version": "0.8.4",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -274,7 +275,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.3"
+    assert body["plugin_version"] == "0.8.4"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -3833,6 +3834,11 @@ class ProjectionCursor(FakeCursor):
                 ("copy-a", "canonical-1", "fingerprint"),
                 ("copy-b", "canonical-1", "fingerprint"),
             ]
+        elif "FROM chromaprint" in sql:
+            self.rows = [
+                ("copy-a", b"same-fingerprint"),
+                ("copy-b", b"same-fingerprint"),
+            ]
         elif "FROM score s" in sql:
             self.rows = [
                 (
@@ -3872,6 +3878,8 @@ class ProjectionDb:
 
 
 class ProjectionAdapter:
+    mode = "v3_registry"
+
     def active_server_id(self):
         return "server-a"
 
@@ -3879,15 +3887,26 @@ class ProjectionAdapter:
         return "SELECT provider_track_id, analysis_id, match_tier FROM fake_mapping WHERE server_id=%s"
 
 
-def test_analysis_projection_reuses_one_vector_for_two_provider_occurrences():
+def test_analysis_projection_reuses_one_vector_for_two_provider_occurrences(monkeypatch):
     from plugins.LumaeAnalysis.catalog_analysis import project_analysis
 
+    monkeypatch.setattr(
+        plugin_api_module.config, "CATALOGUE_ID_SCHEME_VERSION", 4, raising=False
+    )
+    monkeypatch.setattr(
+        plugin_api_module.config, "CHROMAPRINT_COLLECTION_ENABLED", True, raising=False
+    )
+    monkeypatch.setattr(
+        plugin_api_module.config, "CHROMAPRINT_GATE_ENABLED", True, raising=False
+    )
     db = ProjectionDb()
 
     result = project_analysis("server-a", db=db, adapter=ProjectionAdapter())
 
     assert result["item_count"] == 1
     assert result["link_count"] == 2
+    assert result["ready_count"] == 2
+    assert result["evidence_complete_count"] == 2
     assert result["suspect_count"] == 0
     assert db.commits == 1
     assert sum("INSERT INTO plugin_lumae_analysis__analysis_items" in sql for sql, _ in db.executed) == 1
@@ -3919,6 +3938,71 @@ def test_analysis_projection_marks_contradictory_dedup_group_suspect():
     assert _suspect_analysis_ids(tracks, links) == {"canonical-1"}
 
 
+def test_progressive_evidence_isolates_only_unverified_or_disagreeing_groups():
+    from plugins.LumaeAnalysis.catalog_analysis import _apply_progressive_evidence
+
+    policy = {"per_link_chromaprint_evidence_available": True}
+    links = {
+        "single": {
+            "analysis_id": "single-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+        "pending-a": {
+            "analysis_id": "pending-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+        "pending-b": {
+            "analysis_id": "pending-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+        "suspect-a": {
+            "analysis_id": "suspect-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+        "suspect-b": {
+            "analysis_id": "suspect-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+    }
+    fingerprints = {
+        "pending-a": b"pending-a",
+        "suspect-a": b"suspect-a",
+        "suspect-b": b"suspect-b",
+    }
+
+    _apply_progressive_evidence(
+        links,
+        fingerprints,
+        policy,
+        compare=lambda left, right: False,
+    )
+
+    assert links["single"]["status"] == "ready"
+    assert links["single"]["evidence_complete"] is True
+    assert links["pending-a"]["status"] == "pending"
+    assert links["pending-b"]["status"] == "pending"
+    assert links["pending-a"]["conflict_flags"] == ["chromaprint_evidence_pending"]
+    assert links["suspect-a"]["status"] == "suspect"
+    assert links["suspect-b"]["status"] == "suspect"
+    assert links["suspect-a"]["conflict_flags"] == ["chromaprint_disagreement"]
+    assert links["suspect-a"]["review_state"] == "needs_repair"
+
+
 def test_v3_0_3_dedup_policy_and_duration_backstop(monkeypatch):
     from plugins.LumaeAnalysis.catalog_analysis import _suspect_analysis_ids, dedup_policy
 
@@ -3947,8 +4031,8 @@ def test_v3_0_3_dedup_policy_and_duration_backstop(monkeypatch):
         "chromaprint_match_threshold": 0.95,
         "chromaprint_min_overlap": 40,
         "per_link_distance_available": False,
-        "per_link_chromaprint_evidence_available": False,
-        "evidence_status": "configured_policy_only",
+        "per_link_chromaprint_evidence_available": True,
+        "evidence_status": "per_link_progressive",
     }
     tracks = {
         "a": {"title": "Song", "artist": "Artist", "duration_ms": 180000, "payload": {}},
@@ -3970,6 +4054,8 @@ class ReadinessCursor:
         self.db.executed.append((sql, params))
         if "FROM plugin_lumae_analysis__catalog_tracks" in sql:
             self.rows = [self.db.coverage]
+        elif "FROM plugin_lumae_analysis__track_analysis_links" in sql:
+            self.rows = [self.db.link_counts]
         elif "FROM task_status" in sql:
             self.rows = list(self.db.tasks)
         else:
@@ -3986,9 +4072,15 @@ class ReadinessCursor:
 
 
 class ReadinessDb:
-    def __init__(self, coverage=(10, 9, 9, 150.0), tasks=None):
+    def __init__(
+        self,
+        coverage=(10, 9, 9, 150.0),
+        tasks=None,
+        link_counts=(8, 1, 0, 1, 8),
+    ):
         self.coverage = coverage
         self.tasks = tasks or []
+        self.link_counts = link_counts
         self.executed = []
 
     def cursor(self):
@@ -4013,6 +4105,7 @@ def readiness_policy():
         "folder_aware": True,
         "chromaprint_collection_enabled": True,
         "chromaprint_gate_enabled": True,
+        "per_link_chromaprint_evidence_available": True,
     }
 
 
@@ -4130,6 +4223,21 @@ def test_v3_readiness_rejects_incomplete_backfill_and_upgrade_sequence(monkeypat
         )
 
     assert "upgrade_repair_sequence_incomplete" in str(exc.value)
+    progressive = readiness.v3_release_readiness(
+        db,
+        compatibility,
+        readiness_source(),
+        readiness_policy(),
+    )
+    assert progressive["status"] == "progressive"
+    assert progressive["ready"] is False
+    assert progressive["fully_verified"] is False
+    assert progressive["analysis_sync_allowed"] is True
+    assert progressive["progressive_analysis"] is True
+    assert progressive["ready_link_count"] == 8
+    assert progressive["pending_link_count"] == 1
+    assert progressive["missing_link_count"] == 1
+    assert progressive["usable_analysis_coverage"] == 0.8
 
 
 def test_v3_readiness_requires_cleaning_after_chromaprint_completion(monkeypatch):
@@ -4342,6 +4450,11 @@ def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
         "missing_mapping_count": 2,
         "chromaprint_track_count": 8,
         "chromaprint_coverage": 0.8,
+        "ready_link_count": 7,
+        "pending_link_count": 2,
+        "suspect_link_count": 1,
+        "missing_link_count": 2,
+        "analysis_sync_allowed": True,
         "task_evidence": {"upgrade_sequence_complete": False},
         "blockers": [
             "chromaprint_backfill_incomplete",
@@ -4357,7 +4470,9 @@ def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
     assert "fresh v3.0.5 database" in compact
     assert "Chromaprint: 8 of 10 mapped tracks (80.00%)" in compact
     assert "without analysis mapping: 2" in compact
-    assert "Mapped tracks are still missing Chromaprint fingerprints." in body
+    assert "Full-library verification is still waiting for Chromaprint" in body
+    assert "Sonic links: 7 ready; 2 awaiting" in compact
+    assert "Verified sonic links are syncing progressively" in body
     assert "Confirm fresh installation" in body
     assert "Confirm upgraded installation" in body
     assert "Analysis, Cleaning, then Analysis again" in body
