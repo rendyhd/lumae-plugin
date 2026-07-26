@@ -75,8 +75,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Prevent selected Navidrome music folders from producing an empty catalogue, reject every zero-track publication, and make required app-sync readiness unmistakable before separate sonic verification and optional waveform work.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.6.zip",
+      "checksum": "568ebb6d7750e2ddd9b960f7c54427d1"
     },
     {
       "version": "0.8.5",
