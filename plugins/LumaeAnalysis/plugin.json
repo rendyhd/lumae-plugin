@@ -75,8 +75,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Keep repair-flagged AudioMuse 3 mappings usable as provisional sonic links, preserve their conflict evidence for automatic replacement, reproject automatically after update, avoid unchanged journal churn, and make Firefox-safe GET status polling.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.5.zip",
+      "checksum": "3271ec53bcd158aa706bd1f246b6ccf6"
     },
     {
       "version": "0.8.4",
