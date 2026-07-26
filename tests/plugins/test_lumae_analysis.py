@@ -3938,7 +3938,7 @@ def test_analysis_projection_marks_contradictory_dedup_group_suspect():
     assert _suspect_analysis_ids(tracks, links) == {"canonical-1"}
 
 
-def test_progressive_evidence_isolates_only_unverified_or_disagreeing_groups():
+def test_progressive_evidence_uses_incomplete_groups_and_isolates_only_disagreements():
     from plugins.LumaeAnalysis.catalog_analysis import _apply_progressive_evidence
 
     policy = {"per_link_chromaprint_evidence_available": True}
@@ -3994,13 +3994,43 @@ def test_progressive_evidence_isolates_only_unverified_or_disagreeing_groups():
 
     assert links["single"]["status"] == "ready"
     assert links["single"]["evidence_complete"] is True
-    assert links["pending-a"]["status"] == "pending"
-    assert links["pending-b"]["status"] == "pending"
+    assert links["pending-a"]["status"] == "ready"
+    assert links["pending-b"]["status"] == "ready"
+    assert links["pending-a"]["evidence_complete"] is False
     assert links["pending-a"]["conflict_flags"] == ["chromaprint_evidence_pending"]
+    assert links["pending-a"]["review_state"] == "provisional"
     assert links["suspect-a"]["status"] == "suspect"
     assert links["suspect-b"]["status"] == "suspect"
     assert links["suspect-a"]["conflict_flags"] == ["chromaprint_disagreement"]
     assert links["suspect-a"]["review_state"] == "needs_repair"
+
+
+def test_progressive_evidence_uses_inconclusive_fingerprints_provisionally():
+    from plugins.LumaeAnalysis.catalog_analysis import _apply_progressive_evidence
+
+    links = {
+        track_id: {
+            "analysis_id": "analysis-a",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        }
+        for track_id in ("track-a", "track-b")
+    }
+
+    _apply_progressive_evidence(
+        links,
+        {"track-a": b"a", "track-b": b"b"},
+        {"per_link_chromaprint_evidence_available": True},
+        compare=lambda _left, _right: None,
+    )
+
+    assert {link["status"] for link in links.values()} == {"ready"}
+    assert {
+        tuple(link["conflict_flags"]) for link in links.values()
+    } == {("chromaprint_evidence_inconclusive",)}
+    assert {link["review_state"] for link in links.values()} == {"provisional"}
 
 
 def test_v3_0_3_dedup_policy_and_duration_backstop(monkeypatch):
@@ -4076,7 +4106,7 @@ class ReadinessDb:
         self,
         coverage=(10, 9, 9, 150.0),
         tasks=None,
-        link_counts=(8, 1, 0, 1, 8),
+        link_counts=(8, 1, 0, 1, 7, 1),
     ):
         self.coverage = coverage
         self.tasks = tasks or []
@@ -4237,6 +4267,8 @@ def test_v3_readiness_rejects_incomplete_backfill_and_upgrade_sequence(monkeypat
     assert progressive["ready_link_count"] == 8
     assert progressive["pending_link_count"] == 1
     assert progressive["missing_link_count"] == 1
+    assert progressive["verified_link_count"] == 7
+    assert progressive["provisional_link_count"] == 1
     assert progressive["usable_analysis_coverage"] == 0.8
 
 
@@ -4451,6 +4483,8 @@ def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
         "chromaprint_track_count": 8,
         "chromaprint_coverage": 0.8,
         "ready_link_count": 7,
+        "verified_link_count": 5,
+        "provisional_link_count": 2,
         "pending_link_count": 2,
         "suspect_link_count": 1,
         "missing_link_count": 2,
@@ -4471,8 +4505,8 @@ def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
     assert "Chromaprint: 8 of 10 mapped tracks (80.00%)" in compact
     assert "without analysis mapping: 2" in compact
     assert "Full-library verification is still waiting for Chromaprint" in body
-    assert "Sonic links: 7 ready; 2 awaiting" in compact
-    assert "Verified sonic links are syncing progressively" in body
+    assert "Sonic links: 7 usable (5 verified; 2 provisional)" in compact
+    assert "provisional matches remain usable" in body
     assert "Confirm fresh installation" in body
     assert "Confirm upgraded installation" in body
     assert "Analysis, Cleaning, then Analysis again" in body

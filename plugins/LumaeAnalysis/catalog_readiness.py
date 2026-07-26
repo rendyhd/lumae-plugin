@@ -195,8 +195,12 @@ def _link_coverage(db, source, eligible_track_count=0):
                    count(*) FILTER (WHERE status='pending') AS pending_links,
                    count(*) FILTER (WHERE status='suspect') AS suspect_links,
                    count(*) FILTER (WHERE status='missing') AS missing_links,
-                   count(*) FILTER (WHERE evidence_complete=TRUE)
-                     AS evidence_complete_links
+                   count(*) FILTER (
+                     WHERE status='ready' AND evidence_complete=TRUE
+                   ) AS verified_links,
+                   count(*) FILTER (
+                     WHERE status='ready' AND evidence_complete=FALSE
+                   ) AS provisional_links
               FROM {t("track_analysis_links")}
              WHERE catalog_instance_id=%s AND projection_generation=%s
             """,
@@ -205,7 +209,7 @@ def _link_coverage(db, source, eligible_track_count=0):
                 source.get("analysis", {}).get("generation", 0),
             ),
         )
-        row = cur.fetchone() or (0, 0, 0, 0, 0)
+        row = cur.fetchone() or (0, 0, 0, 0, 0, 0)
     finally:
         cur.close()
     eligible = int(eligible_track_count or 0)
@@ -216,6 +220,8 @@ def _link_coverage(db, source, eligible_track_count=0):
         "suspect_link_count": int(row[2] or 0),
         "missing_link_count": int(row[3] or 0),
         "evidence_complete_link_count": int(row[4] or 0),
+        "verified_link_count": int(row[4] or 0),
+        "provisional_link_count": int(row[5] or 0),
         "usable_analysis_coverage": ready / eligible if eligible else 0.0,
     }
 

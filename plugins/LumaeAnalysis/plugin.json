@@ -71,7 +71,7 @@
     {
       "version": "0.8.4",
       "min_core_version": "2.6.0",
-      "changelog": "Sync safe AudioMuse 3 sonic links progressively while Chromaprint backfills; isolate incomplete or disagreeing duplicate groups without blocking the Navidrome catalogue or unrelated analysis.",
+      "changelog": "Sync AudioMuse 3 sonic links progressively while Chromaprint backfills; keep threshold-qualified incomplete groups usable as provisional analysis and isolate only definite disagreements or provider contradictions.",
       "imageUrl": "",
       "sourceUrl": "",
       "checksum": ""

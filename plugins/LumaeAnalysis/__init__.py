@@ -2466,7 +2466,9 @@ def render_v3_readiness_panel():
         eligible = int(readiness.get("eligible_track_count") or 0)
         missing = int(readiness.get("missing_mapping_count") or 0)
         fingerprinted = int(readiness.get("chromaprint_track_count") or 0)
-        ready_links = int(readiness.get("ready_link_count") or 0)
+        usable_links = int(readiness.get("ready_link_count") or 0)
+        verified_links = int(readiness.get("verified_link_count") or 0)
+        provisional_links = int(readiness.get("provisional_link_count") or 0)
         pending_links = int(readiness.get("pending_link_count") or 0)
         suspect_links = int(readiness.get("suspect_link_count") or 0)
         missing_links = int(readiness.get("missing_link_count") or 0)
@@ -2534,10 +2536,12 @@ def render_v3_readiness_panel():
               <p class="lumae-help">Provider tracks eligible for analysis: {eligible:,}; currently
                 mapped: {mapped:,}; without analysis mapping: {missing:,}. Unmapped provider tracks
                 remain in the Lumae catalogue.</p>
-              <p class="lumae-help">Sonic links: {ready_links:,} ready; {pending_links:,} awaiting
-                evidence; {suspect_links:,} isolated for repair; {missing_links:,} not analyzed.</p>
+              <p class="lumae-help">Sonic links: {usable_links:,} usable
+                ({verified_links:,} verified; {provisional_links:,} provisional);
+                {pending_links:,} awaiting analysis; {suspect_links:,} isolated for repair;
+                {missing_links:,} not analyzed.</p>
               <p class="lumae-help">{(
-                  'Verified sonic links are syncing progressively while Chromaprint continues.'
+                  'Sonic links are syncing progressively; provisional matches remain usable while Chromaprint continues.'
                   if progressive
                   else 'Sonic sync is waiting for per-link safety evidence.'
               )}</p>

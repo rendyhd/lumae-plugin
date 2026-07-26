@@ -204,7 +204,7 @@ def _chromaprints_agree(left, right):
 
 
 def _apply_progressive_evidence(links, fingerprints, policy=None, compare=None):
-    """Admit safe links without waiting for whole-library Chromaprint coverage."""
+    """Use threshold-qualified links provisionally until Chromaprint disproves them."""
     policy = policy or dedup_policy()
     compare = compare or _chromaprints_agree
     candidates = defaultdict(list)
@@ -242,10 +242,10 @@ def _apply_progressive_evidence(links, fingerprints, policy=None, compare=None):
         missing = [track_id for track_id in track_ids if not fingerprints.get(track_id)]
         if missing:
             for track_id in track_ids:
-                links[track_id]["status"] = "pending"
                 links[track_id]["conflict_flags"] = [
                     "chromaprint_evidence_pending"
                 ]
+                links[track_id]["review_state"] = "provisional"
             continue
 
         verdicts = []
@@ -259,10 +259,10 @@ def _apply_progressive_evidence(links, fingerprints, policy=None, compare=None):
                 links[track_id]["review_state"] = "needs_repair"
         elif any(verdict is None for verdict in verdicts):
             for track_id in track_ids:
-                links[track_id]["status"] = "pending"
                 links[track_id]["conflict_flags"] = [
                     "chromaprint_evidence_inconclusive"
                 ]
+                links[track_id]["review_state"] = "provisional"
         else:
             for track_id in track_ids:
                 links[track_id]["evidence_complete"] = True
