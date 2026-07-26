@@ -74,8 +74,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Sync AudioMuse 3 sonic links progressively while Chromaprint backfills, keep incomplete groups usable unless they definitely disagree, and add a read-only source-scoped database state dashboard.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.4.zip",
+      "checksum": "59d867fa2ba0103ddf456a27edc84d7c"
     },
     {
       "version": "0.8.3",
