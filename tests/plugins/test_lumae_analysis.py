@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.2"
+    assert manifest["versions"][0]["version"] == "0.8.3"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -152,7 +152,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.2",
+        "plugin_version": "0.8.3",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -274,7 +274,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.2"
+    assert body["plugin_version"] == "0.8.3"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -377,6 +377,7 @@ def test_catalog_refresh_coalesces_to_selected_source(monkeypatch):
             {
                 "server_id": "server-a",
                 "catalog_instance_id": "catalog-a",
+                "rebind_status": "active",
                 "catalog": {
                     "generation": 3,
                     "status": "complete",
@@ -401,6 +402,39 @@ def test_catalog_refresh_coalesces_to_selected_source(monkeypatch):
     assert calls == [(mod.catalog_refresh_task, "server-a", "default")]
     assert "secret" not in response.get_data(as_text=True)
     assert "internal.invalid" not in response.get_data(as_text=True)
+
+
+def test_catalog_refresh_blocks_pending_v2_to_v3_rebind(monkeypatch):
+    mod = load_plugin()
+    calls = []
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(
+        mod,
+        "resolve_catalog_source",
+        lambda *_args, **_kwargs: [
+            {
+                "server_id": "legacy-default",
+                "candidate_server_id": "server-a",
+                "catalog_instance_id": "catalog-a",
+                "rebind_status": "rebind_required",
+                "catalog": {
+                    "generation": 3,
+                    "status": "complete",
+                    "completed_at": None,
+                },
+            }
+        ],
+    )
+    monkeypatch.setattr(mod, "enqueue", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    response = plugin_client(mod).post(
+        "/api/catalog/refresh",
+        json={"server_id": "legacy-default", "catalog_instance_id": "catalog-a"},
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "rebind_required"
+    assert calls == []
 
 
 @pytest.mark.parametrize(
@@ -2899,6 +2933,77 @@ def test_catalogue_source_resolution_hides_persisted_non_navidrome_sources():
         resolve_catalog_source(db, server_id="server-jelly")
 
 
+def _catalog_source_row(
+    server_id="server-a",
+    rebind_status="active",
+    continuity_from=None,
+    candidate_server_id=None,
+):
+    return (
+        "catalog-a",
+        server_id,
+        "navidrome",
+        "Main Navidrome",
+        True,
+        rebind_status,
+        17,
+        "catalog-epoch",
+        100,
+        0,
+        "complete",
+        {"track": 10},
+        {},
+        {},
+        None,
+        None,
+        None,
+        3,
+        "analysis-epoch",
+        50,
+        0,
+        "complete",
+        10,
+        10,
+        None,
+        None,
+        continuity_from,
+        candidate_server_id,
+        "provider-fp",
+        "scope-fp",
+        {"track_count": 10},
+    )
+
+
+def test_catalogue_source_accepts_only_a_proven_legacy_server_alias():
+    from plugins.LumaeAnalysis.catalog import resolve_catalog_source
+
+    db = FakeDb(
+        rows=[
+            _catalog_source_row(
+                server_id="server-a",
+                rebind_status="active",
+                continuity_from="legacy-default",
+            )
+        ]
+    )
+
+    source = resolve_catalog_source(
+        db,
+        server_id="legacy-default",
+        catalog_instance_id="catalog-a",
+    )[0]
+
+    assert source["server_id"] == "server-a"
+    assert source["catalog_instance_id"] == "catalog-a"
+    assert "catalog_instance_id=%s" in db.cursor_obj.executed[0][0]
+    with pytest.raises(KeyError, match="Unknown catalogue source"):
+        resolve_catalog_source(
+            db,
+            server_id="another-server",
+            catalog_instance_id="catalog-a",
+        )
+
+
 def test_catalogue_source_migration_does_not_create_non_navidrome_sources():
     from plugins.LumaeAnalysis.catalog import ensure_catalog_sources
 
@@ -3169,6 +3274,87 @@ def test_automatic_rebind_accepts_only_an_exact_provider_projection(monkeypatch)
     blocked = catalog.attempt_legacy_rebind(AttemptDb(), "catalog-a", "server-a", bridge=Bridge())
     assert blocked["status"] == "rebind_required"
     assert accepted == []
+
+
+def test_profile_source_accepts_proven_legacy_alias_but_rejects_other_servers(
+    monkeypatch,
+):
+    mod = load_plugin()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "rebind_status": "active",
+        "continuity_from": "legacy-default",
+    }
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+
+    assert (
+        mod.resolve_profile_source(
+            catalog_instance_id="catalog-a",
+            server_id="legacy-default",
+            db=object(),
+        )
+        == source
+    )
+    with pytest.raises(ValueError, match="music-server identity changed"):
+        mod.resolve_profile_source(
+            catalog_instance_id="catalog-a",
+            server_id="another-server",
+            db=object(),
+        )
+
+
+def test_stale_v2_worker_task_uses_only_the_proven_rebound_server(monkeypatch):
+    mod = load_plugin()
+    adapter = types.SimpleNamespace(
+        mode="v3_registry",
+        active_server_id=lambda: "server-a",
+        list_servers=lambda: [{"server_id": "server-a"}],
+    )
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "rebind_status": "active",
+        "continuity_from": "legacy-default",
+    }
+    calls = []
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: adapter)
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(
+        mod,
+        "refresh_catalog",
+        lambda server_id=None: calls.append(("catalog", server_id))
+        or {"status": "complete"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "project_analysis",
+        lambda server_id=None, adapter=None: calls.append(
+            ("analysis", server_id, adapter)
+        )
+        or {"status": "complete"},
+    )
+
+    assert mod.catalog_refresh_task("legacy-default") == {"status": "complete"}
+    assert mod.analysis_projection_task("legacy-default") == {"status": "complete"}
+    assert calls == [
+        ("catalog", "server-a"),
+        ("analysis", "server-a", adapter),
+    ]
+
+    pending = {
+        **source,
+        "server_id": "legacy-default",
+        "rebind_status": "rebind_required",
+        "continuity_from": None,
+    }
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [pending])
+    assert mod.catalog_refresh_task("legacy-default") == {
+        "status": "skipped",
+        "reason": "source_rebind_required",
+    }
+    assert len(calls) == 2
 
 
 @pytest.mark.parametrize(
@@ -3838,6 +4024,31 @@ def readiness_tasks():
     ]
 
 
+def test_v3_readiness_blocks_pending_source_rebind_before_database_queries():
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.5",
+        adapter="v3_registry",
+    )
+    source = {
+        **readiness_source(),
+        "server_id": "legacy-default",
+        "candidate_server_id": "server-a",
+        "rebind_status": "rebind_required",
+    }
+
+    result = readiness.v3_release_readiness(
+        None,
+        compatibility,
+        source,
+        readiness_policy(),
+    )
+
+    assert result["status"] == "source_rebind_required"
+    assert result["ready"] is False
+    assert result["blockers"] == ["source_rebind_required"]
+
+
 def test_v3_readiness_requires_source_scoped_admin_acknowledgement(monkeypatch):
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
@@ -4150,6 +4361,31 @@ def test_settings_page_explains_v3_readiness_modes_and_blockers(monkeypatch):
     assert "Confirm fresh installation" in body
     assert "Confirm upgraded installation" in body
     assert "Analysis, Cleaning, then Analysis again" in body
+
+
+def test_settings_page_defers_readiness_confirmation_until_source_rebind(monkeypatch):
+    mod = load_plugin()
+    source = {
+        **readiness_source(),
+        "server_id": "legacy-default",
+        "candidate_server_id": "server-a",
+        "rebind_status": "rebind_required",
+    }
+    readiness = {
+        "detected_core_version": "v3.0.5",
+        "status": "source_rebind_required",
+        "ready": False,
+        "administrator_acknowledged": False,
+        "blockers": ["source_rebind_required"],
+    }
+    monkeypatch.setattr(mod, "_v3_readiness_sources", lambda: [(source, readiness)])
+
+    body = mod.render_v3_readiness_panel()
+
+    assert "Confirm the AudioMuse v2-to-v3 source continuity" in body
+    assert "Run Lumae sync once" in body
+    assert "Confirm fresh installation" not in body
+    assert "Confirm upgraded installation" not in body
 
 
 def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypatch):

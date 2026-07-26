@@ -251,6 +251,13 @@ def v3_release_readiness(
             "ready": False,
             "blockers": ["core_release_unqualified"],
         }
+    if source.get("rebind_status") == "rebind_required":
+        return {
+            **base,
+            "status": "source_rebind_required",
+            "ready": False,
+            "blockers": ["source_rebind_required"],
+        }
     if not source.get("catalog_instance_id") or not source.get("server_id"):
         return {
             **base,

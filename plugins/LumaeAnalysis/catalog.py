@@ -1449,27 +1449,11 @@ def parse_opaque_cursor(value):
 def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=False):
     cur = db.cursor()
     suffix = " FOR UPDATE OF s, c" if lock else ""
-    if server_id:
-        cur.execute(
-            f"""
-            SELECT s.catalog_instance_id, s.current_core_server_id, s.provider_type,
-                   s.server_name, s.is_default, s.rebind_status,
-                   c.published_generation, c.catalog_epoch, c.catalog_head_seq,
-                   c.catalog_floor_seq, c.status, c.entity_counts, c.field_support,
-                   c.field_coverage, c.started_at, c.completed_at, c.last_error,
-                   a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
-                   a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
-                   a.completed_at, a.last_error, s.continuity_from,
-                   s.candidate_core_server_id, s.provider_instance_fp,
-                   s.library_scope_fp, c.scope_summary
-              FROM {t("catalog_sources")} s
-              JOIN {t("catalog_state")} c USING (catalog_instance_id)
-              LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
-             WHERE s.current_core_server_id=%s{suffix}
-            """,
-            (server_id,),
-        )
-    elif catalog_instance_id:
+    # Stable catalogue identity wins when both identifiers are supplied. After
+    # a proven v2→v3 rebind, an older client or queued task may still send the
+    # synthetic v2 server ID. Querying by that obsolete ID first would hide the
+    # same catalogue row before its continuity alias can be verified.
+    if catalog_instance_id:
         cur.execute(
             f"""
             SELECT s.catalog_instance_id, s.current_core_server_id, s.provider_type,
@@ -1488,6 +1472,26 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
              WHERE s.catalog_instance_id=%s{suffix}
             """,
             (catalog_instance_id,),
+        )
+    elif server_id:
+        cur.execute(
+            f"""
+            SELECT s.catalog_instance_id, s.current_core_server_id, s.provider_type,
+                   s.server_name, s.is_default, s.rebind_status,
+                   c.published_generation, c.catalog_epoch, c.catalog_head_seq,
+                   c.catalog_floor_seq, c.status, c.entity_counts, c.field_support,
+                   c.field_coverage, c.started_at, c.completed_at, c.last_error,
+                   a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
+                   a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
+                   a.completed_at, a.last_error, s.continuity_from,
+                   s.candidate_core_server_id, s.provider_instance_fp,
+                   s.library_scope_fp, c.scope_summary
+              FROM {t("catalog_sources")} s
+              JOIN {t("catalog_state")} c USING (catalog_instance_id)
+              LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
+             WHERE s.current_core_server_id=%s{suffix}
+            """,
+            (server_id,),
         )
     else:
         cur.execute(
@@ -1515,11 +1519,17 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
         for row in rows
         if str(row[2] or "").strip().lower() in SUPPORTED_PROVIDER_TYPES
     ]
-    if server_id or catalog_instance_id:
-        if not rows:
-            raise KeyError("Unknown catalogue source")
-        rows = rows[:1]
-    return [_source_dto(row) for row in rows]
+    sources = [_source_dto(row) for row in rows]
+    if not (server_id or catalog_instance_id):
+        return sources
+    if not sources:
+        raise KeyError("Unknown catalogue source")
+    source = sources[0]
+    if catalog_instance_id and source["catalog_instance_id"] != str(catalog_instance_id):
+        raise KeyError("Unknown catalogue source")
+    if server_id and not source_matches_server_id(source, server_id):
+        raise KeyError("Unknown catalogue source")
+    return [source]
 
 
 def _iso(value):
@@ -1568,6 +1578,21 @@ def _source_dto(row):
             "last_error": row[25],
         },
     }
+
+
+def source_matches_server_id(source, server_id):
+    """Accept the active server or one exact, proven continuity alias."""
+    requested = str(server_id or "")
+    return bool(
+        requested
+        and (
+            str(source.get("server_id") or "") == requested
+            or (
+                source.get("rebind_status") == "active"
+                and str(source.get("continuity_from") or "") == requested
+            )
+        )
+    )
 
 
 def _session_hash(token):

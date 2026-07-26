@@ -26,6 +26,7 @@ from .catalog import (
     refresh_catalog,
     release_bootstrap_session,
     resolve_catalog_source,
+    source_matches_server_id,
     verify_library_scope,
 )
 from .catalog_analysis import (
@@ -53,7 +54,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.2"
+PLUGIN_VERSION = "0.8.3"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -257,14 +258,46 @@ def ensure_analysis_projection_schedule(db):
     cur.close()
 
 
+def _resolve_task_server_id(adapter, server_id):
+    requested = str(server_id or adapter.active_server_id() or "")
+    if adapter.mode != "v3_registry" or requested != "legacy-default":
+        return requested or None
+    if any(
+        str(server.get("server_id") or "") == requested
+        for server in adapter.list_servers()
+    ):
+        return requested
+    try:
+        aliases = [
+            source
+            for source in resolve_catalog_source(get_db())
+            if source.get("rebind_status") == "active"
+            and source.get("continuity_from") == requested
+        ]
+    except Exception:
+        aliases = []
+    if len(aliases) == 1:
+        return aliases[0]["server_id"]
+    logger.warning(
+        "lumae_analysis skipped stale v2 task for legacy-default while v3 source rebind is pending"
+    )
+    return None
+
+
 def catalog_refresh_task(server_id=None):
     adapter = get_core_adapter()
-    return refresh_catalog(server_id=server_id or adapter.active_server_id())
+    resolved_server_id = _resolve_task_server_id(adapter, server_id)
+    if not resolved_server_id:
+        return {"status": "skipped", "reason": "source_rebind_required"}
+    return refresh_catalog(server_id=resolved_server_id)
 
 
 def analysis_projection_task(server_id=None):
     adapter = get_core_adapter()
-    return project_analysis(server_id=server_id or adapter.active_server_id(), adapter=adapter)
+    resolved_server_id = _resolve_task_server_id(adapter, server_id)
+    if not resolved_server_id:
+        return {"status": "skipped", "reason": "source_rebind_required"}
+    return project_analysis(server_id=resolved_server_id, adapter=adapter)
 
 
 def migrate(db):
@@ -778,7 +811,7 @@ def resolve_profile_source(catalog_instance_id=None, server_id=None, db=None):
     source = sources[0]
     if catalog_instance_id and source["catalog_instance_id"] != str(catalog_instance_id):
         raise ValueError("Profile catalogue source identity changed")
-    if server_id and source["server_id"] != str(server_id):
+    if server_id and not source_matches_server_id(source, server_id):
         raise ValueError("Profile music-server identity changed")
     return source
 
@@ -943,6 +976,12 @@ def catalog_refresh_api():
         source = sources[0]
         if catalog_instance_id and source["catalog_instance_id"] != catalog_instance_id:
             return _catalog_error("source_mismatch", "Catalogue source identity changed.", 409)
+        if source.get("rebind_status") != "active":
+            return _catalog_error(
+                "rebind_required",
+                "AudioMuse was upgraded; confirm source continuity before refreshing.",
+                409,
+            )
         stale_for = max(0, min(int(body.get("if_stale_for_seconds", 0) or 0), 604_800))
         completed_at = source["catalog"].get("completed_at")
         if stale_for and completed_at and source["catalog"]["status"] == "complete":
@@ -2384,6 +2423,7 @@ _READINESS_BLOCKER_LABELS = {
     "fp_4_not_active": "AudioMuse catalogue ID scheme fp_4 is not active.",
     "no_analysis_mappings": "No provider tracks have AudioMuse analysis mappings yet.",
     "readiness_unavailable": "The plugin could not read AudioMuse repair diagnostics.",
+    "source_rebind_required": "Confirm the AudioMuse v2-to-v3 source continuity before readiness.",
     "upgrade_repair_sequence_incomplete": "Run Analysis, then Cleaning, then Analysis again.",
 }
 
@@ -2436,7 +2476,12 @@ def render_v3_readiness_panel():
             f'<input type="hidden" name="catalog_instance_id" '
             f'value="{escape(str(source["catalog_instance_id"]))}">'
         )
-        if readiness.get("administrator_acknowledged"):
+        if "source_rebind_required" in blockers:
+            controls = """
+              <p class="lumae-help">Run Lumae sync once to prove and adopt the AudioMuse 3
+                server identity. Readiness confirmation will unlock after that succeeds.</p>
+            """
+        elif readiness.get("administrator_acknowledged"):
             controls = f"""
               <p class="lumae-help">Confirmed as {escape(str(readiness.get('verification_mode')))}
                 at {escape(str(readiness.get('acknowledged_at') or 'unknown time'))}.</p>
