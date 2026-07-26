@@ -552,6 +552,24 @@ def _workflow_line(label, state):
     )
 
 
+def _catalogue_track_count(source):
+    entity_counts = (source.get("catalog") or {}).get("entity_counts") or {}
+    value = entity_counts.get("track")
+    if value is None:
+        value = entity_counts.get("tracks")
+    if value is None:
+        value = (source.get("profiles") or {}).get("catalogue_tracks")
+    return max(int(value or 0), 0)
+
+
+def _app_sync_ready(source):
+    return bool(
+        _catalogue_track_count(source) > 0
+        and (source.get("catalog") or {}).get("status") == "complete"
+        and (source.get("analysis") or {}).get("status") == "complete"
+    )
+
+
 def _source_html(source):
     identity = source["identity"]
     catalog = source["catalog"]
@@ -564,15 +582,44 @@ def _source_html(source):
     workflow = source["workflow"]
     readiness = source["readiness"]
     entity_counts = catalog.get("entity_counts") or {}
-    tracks = int(
-        entity_counts.get("track")
-        or entity_counts.get("tracks")
-        or profiles.get("catalogue_tracks")
-        or 0
-    )
+    tracks = _catalogue_track_count(source)
     albums = entity_counts.get("album") or entity_counts.get("albums") or 0
     artists = entity_counts.get("artist") or entity_counts.get("artists") or 0
     libraries = entity_counts.get("library") or entity_counts.get("libraries") or 0
+    app_ready = _app_sync_ready(source)
+    empty_catalogue = catalog.get("status") == "complete" and tracks == 0
+    if app_ready:
+        source_state = "App sync ready"
+        source_state_class = "db-state-ready"
+    else:
+        source_state = "Not ready"
+        source_state_class = "db-state-danger"
+    if empty_catalogue:
+        catalogue_state = "empty - not ready"
+        sonic_state = "blocked by empty catalogue"
+        catalogue_notice = """
+          <div class="db-alert db-alert-danger" role="alert">
+            <strong>No Navidrome tracks were published.</strong>
+            <span>This catalogue is not usable by Lumae even though the previous publication job
+              recorded “complete.” Check Navidrome access and the Music Libraries selection in
+              AudioMuse, then return to settings and refresh required data.</span>
+          </div>
+        """
+    else:
+        catalogue_state = str(catalog.get("status") or "unknown")
+        sonic_state = str(analysis.get("status") or "unknown")
+        catalogue_notice = ""
+    preparation_workflow = workflow.get("preparation")
+    if (
+        empty_catalogue
+        and preparation_workflow
+        and preparation_workflow.get("status") == "ready"
+    ):
+        preparation_workflow = {
+            **preparation_workflow,
+            "status": "invalid (recorded ready)",
+            "phase": "empty catalogue",
+        }
     readiness_status = readiness.get("status") or (
         "not applicable" if core["mode"] == "single_server" else "unavailable"
     )
@@ -623,21 +670,23 @@ def _source_html(source):
             <span class="db-kicker">{escape(str(identity['provider_type']))} source</span>
             <h2>{escape(str(identity['name']))}</h2>
           </div>
-          <span class="db-state">{escape(str(identity['rebind_status']))}</span>
+          <span class="db-state {source_state_class}">{source_state}</span>
         </header>
         <dl class="db-identity">
           <div><dt>Catalogue instance</dt><dd>{escape(str(identity['catalog_instance_id']))}</dd></div>
           <div><dt>AudioMuse server</dt><dd>{escape(str(identity.get('server_id') or 'unbound'))}</dd></div>
+          <div><dt>Source binding</dt><dd>{escape(str(identity['rebind_status']))}</dd></div>
           <div><dt>Default source</dt><dd>{'yes' if identity.get('is_default') else 'no'}</dd></div>
         </dl>
 
         <section class="db-section">
           <div class="db-section-heading">
-            <div><span class="db-kicker">Published provider truth</span><h3>Catalogue</h3></div>
-            <span class="db-state">{escape(str(catalog.get('status') or 'unknown'))}</span>
+            <div><span class="db-kicker">Required for app sync</span><h3>1. Navidrome catalogue</h3></div>
+            <span class="db-state {'db-state-danger' if empty_catalogue else ''}">{escape(catalogue_state)}</span>
           </div>
+          {catalogue_notice}
           <div class="db-metrics">
-            {_metric("Tracks", _number(tracks), "ready")}
+            {_metric("Published tracks", _number(tracks), "ready" if tracks else "danger")}
             {_metric("Albums", _number(albums))}
             {_metric("Artists", _number(artists))}
             {_metric("Libraries", _number(libraries))}
@@ -654,8 +703,8 @@ def _source_html(source):
 
         <section class="db-section">
           <div class="db-section-heading">
-            <div><span class="db-kicker">What Lumae can sync now</span><h3>Sonic attribution</h3></div>
-            <span class="db-state">{escape(str(analysis.get('status') or 'unknown'))}</span>
+            <div><span class="db-kicker">Required projection</span><h3>2. Sonic attribution</h3></div>
+            <span class="db-state {'db-state-danger' if empty_catalogue else ''}">{escape(sonic_state)}</span>
           </div>
           {_meter("Usable sonic coverage", links["usable"], tracks)}
           <div class="db-metrics">
@@ -683,7 +732,7 @@ def _source_html(source):
 
         <section class="db-section">
           <div class="db-section-heading">
-            <div><span class="db-kicker">Upstream analysis database</span><h3>AudioMuse core</h3></div>
+            <div><span class="db-kicker">Separate verification evidence</span><h3>3. AudioMuse core</h3></div>
             <span class="db-state">{escape(str(core['mode']).replace('_', ' '))}</span>
           </div>
           <div class="db-metrics">
@@ -699,7 +748,7 @@ def _source_html(source):
 
         <section class="db-section">
           <div class="db-section-heading">
-            <div><span class="db-kicker">Optional playback enrichment</span><h3>Loudness &amp; SmoothFade</h3></div>
+            <div><span class="db-kicker">Optional playback enhancements</span><h3>4. Loudness &amp; SmoothFade</h3></div>
           </div>
           {_meter("Ready waveform profiles", profiles["ready"], profiles["catalogue_tracks"])}
           <div class="db-metrics">
@@ -711,7 +760,7 @@ def _source_html(source):
             {_metric("Missing / stale", _number(profiles["needs_attention"]))}
           </div>
           <ul class="db-workflows">
-            {_workflow_line("Prepare Lumae", workflow.get("preparation"))}
+            {_workflow_line("Prepare Lumae", preparation_workflow)}
             {_workflow_line("Profile backfill", workflow.get("backfill"))}
             <li><span>Analysis runs</span><strong>{escape(run_text)}</strong></li>
           </ul>
@@ -746,16 +795,19 @@ def _source_html(source):
 def render_database_state(snapshot):
     """Render the database snapshot as a standalone responsive admin screen."""
     sources = snapshot.get("sources") or []
-    total_tracks = sum(
-        int(
-            (row.get("catalog", {}).get("entity_counts") or {}).get("track")
-            or row.get("profiles", {}).get("catalogue_tracks")
-            or 0
-        )
-        for row in sources
-    )
+    total_tracks = sum(_catalogue_track_count(row) for row in sources)
     total_usable = sum(int(row.get("links", {}).get("usable") or 0) for row in sources)
     total_profiles = sum(int(row.get("profiles", {}).get("ready") or 0) for row in sources)
+    ready_sources = sum(1 for row in sources if _app_sync_ready(row))
+    overall_app_state = (
+        "ready" if sources and ready_sources == len(sources) else "not ready"
+    )
+    empty_sources = [
+        row
+        for row in sources
+        if (row.get("catalog") or {}).get("status") == "complete"
+        and _catalogue_track_count(row) == 0
+    ]
     compatibility = snapshot.get("core") or {}
     source_html = "".join(_source_html(source) for source in sources)
     if not source_html:
@@ -779,6 +831,29 @@ def render_database_state(snapshot):
         if state and state.get("last_error")
     )
     total_errors = len(snapshot_errors) + recorded_state_errors
+    if empty_sources:
+        names = ", ".join(
+            escape(str((row.get("identity") or {}).get("name") or "Navidrome"))
+            for row in empty_sources
+        )
+        readiness_notice = f"""
+          <section class="db-alert db-alert-danger" role="alert">
+            <strong>Lumae is not ready: the published catalogue is empty.</strong>
+            <span>{names} contains zero published tracks. A completed empty publication is not
+              usable. Check Navidrome access and AudioMuse Music Libraries, then return to settings
+              and refresh required data.</span>
+          </section>
+        """
+    elif sources and ready_sources < len(sources):
+        readiness_notice = """
+          <section class="db-alert" role="status">
+            <strong>One or more sources are not ready for app sync.</strong>
+            <span>Review the numbered source sections below. Waveform coverage is optional and does
+              not affect this status.</span>
+          </section>
+        """
+    else:
+        readiness_notice = ""
     partial_notice = (
         """
         <section class="db-alert" role="alert">
@@ -795,7 +870,9 @@ def render_database_state(snapshot):
           --db-ink:#17202a; --db-muted:#5f6f7f; --db-line:#d9e2ea;
           --db-soft:#f6f8fb; --db-ready:#247a5a; --db-warn:#b46b00;
           --db-danger:#b42318; --db-accent:#2f6fed;
-          color:var(--db-ink); display:grid; gap:20px; max-width:1120px;
+          background:#fff; border:1px solid var(--db-line); border-radius:12px;
+          box-sizing:border-box; color:var(--db-ink); display:grid; gap:20px;
+          max-width:1120px; padding:20px; width:100%;
         }}
         .db-topbar {{align-items:center; display:flex; flex-wrap:wrap; gap:10px;
           justify-content:space-between}}
@@ -805,7 +882,8 @@ def render_database_state(snapshot):
         .db-actions {{display:flex; gap:8px}}
         .db-hero {{border-bottom:1px solid var(--db-line); display:grid; gap:10px;
           padding-bottom:18px}}
-        .db-hero h1,.db-source h2,.db-section h3,.db-empty h2 {{margin:0}}
+        .db-hero h1,.db-source h2,.db-section h3,.db-empty h2 {{
+          color:var(--db-ink); margin:0}}
         .db-hero p,.db-muted,.db-empty p {{color:var(--db-muted); line-height:1.55; margin:0}}
         .db-kicker {{color:var(--db-muted); font-size:.75rem; font-weight:800;
           text-transform:uppercase}}
@@ -819,14 +897,19 @@ def render_database_state(snapshot):
         .db-metric-pending strong {{color:var(--db-warn)}}
         .db-metric-danger strong {{color:var(--db-danger)}}
         .db-alert {{background:#fff8eb; border:1px solid #f2c879; border-radius:8px;
-          display:grid; gap:4px; padding:13px}}
+          color:#6f4200; display:grid; gap:4px; padding:13px}}
+        .db-alert strong {{color:inherit}}
+        .db-alert-danger {{background:#fff0ed; border-color:#ffb4a8; color:var(--db-danger)}}
         .db-source {{border:1px solid var(--db-line); border-radius:10px; display:grid;
           gap:0; overflow:hidden}}
         .db-source-header,.db-section-heading {{align-items:center; display:flex; gap:12px;
           justify-content:space-between}}
         .db-source-header {{background:var(--db-soft); padding:18px}}
         .db-state {{background:#fff; border:1px solid var(--db-line); border-radius:999px;
-          font-size:.76rem; font-weight:800; padding:5px 9px; white-space:nowrap}}
+          color:var(--db-ink); font-size:.76rem; font-weight:800; padding:5px 9px;
+          white-space:nowrap}}
+        .db-state-ready {{background:#e9f6ef; border-color:#a7d8bd; color:#14543c}}
+        .db-state-danger {{background:#fff0ed; border-color:#ffb4a8; color:var(--db-danger)}}
         .db-identity {{background:var(--db-soft); display:grid; gap:8px;
           grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); margin:0; padding:0 18px 18px}}
         .db-identity div {{min-width:0}} .db-identity dt {{color:var(--db-muted);
@@ -838,8 +921,9 @@ def render_database_state(snapshot):
         .db-meter {{background:#dce5ed; border-radius:999px; height:10px; overflow:hidden}}
         .db-meter span {{background:linear-gradient(90deg,var(--db-ready),var(--db-accent));
           display:block; height:100%}}
-        details {{border:1px solid var(--db-line); border-radius:8px; padding:10px 12px}}
-        summary {{cursor:pointer; font-weight:700}}
+        .lumae-db details {{border:1px solid var(--db-line); border-radius:8px;
+          color:var(--db-ink); padding:10px 12px}}
+        .lumae-db summary {{color:var(--db-ink); cursor:pointer; font-weight:700}}
         .db-coverage-list,.db-workflows,.db-errors {{display:grid; gap:8px; list-style:none;
           margin:10px 0 0; padding:0}}
         .db-coverage-list li,.db-workflows li {{align-items:baseline; display:flex; gap:12px;
@@ -850,6 +934,7 @@ def render_database_state(snapshot):
         .db-empty {{background:var(--db-soft); border:1px solid var(--db-line);
           border-radius:10px; display:grid; gap:8px; padding:20px}}
         @media(max-width:620px) {{
+          .lumae-db {{padding:14px}}
           .db-source-header,.db-section-heading {{align-items:flex-start}}
           .db-metrics {{grid-template-columns:repeat(2,minmax(0,1fr))}}
           .db-coverage-list li,.db-workflows li {{align-items:flex-start; flex-direction:column;
@@ -857,10 +942,6 @@ def render_database_state(snapshot):
         }}
       </style>
       <main class="lumae-db" aria-label="Lumae database state">
-        <nav class="db-topbar">
-          <a class="db-button" href="settings">← Lumae Analysis settings</a>
-          <div class="db-actions"><a class="db-button" href="database-state">Refresh snapshot</a></div>
-        </nav>
         <header class="db-hero">
           <span class="db-kicker">Read-only diagnostics</span>
           <h1>Lumae database state</h1>
@@ -869,16 +950,23 @@ def render_database_state(snapshot):
           <p>Captured {escape(str(snapshot.get('captured_at') or 'unknown'))} ·
             AudioMuse {escape(str(compatibility.get('core_version') or 'unknown'))} ·
             {escape(str(compatibility.get('core_adapter') or 'no adapter'))} ·
-            snapshot {escape(str(snapshot.get('status') or 'unknown'))}</p>
+            diagnostic queries {escape(str(snapshot.get('status') or 'unknown'))} ·
+            app sync {overall_app_state}</p>
+          <nav class="db-topbar">
+            <a class="db-button" href="settings">← Lumae Analysis settings</a>
+            <div class="db-actions"><a class="db-button" href="database-state">Refresh snapshot</a></div>
+          </nav>
         </header>
+        {readiness_notice}
+        {partial_notice}
         <section class="db-summary" aria-label="Database summary">
           {_metric("Sources", _number(len(sources)))}
-          {_metric("Published tracks", _number(total_tracks))}
-          {_metric("Usable sonic links", _number(total_usable), "ready")}
-          {_metric("Ready waveform profiles", _number(total_profiles), "ready")}
-          {_metric("Recorded errors", _number(total_errors), "danger" if total_errors else "")}
+          {_metric("App-ready sources", f"{ready_sources} / {len(sources)}", "ready" if ready_sources == len(sources) and sources else "danger")}
+          {_metric("Published tracks", _number(total_tracks), "ready" if total_tracks else "danger")}
+          {_metric("Usable sonic links", _number(total_usable), "ready" if total_usable else "")}
+          {_metric("Ready waveform profiles", _number(total_profiles), "ready" if total_profiles else "")}
+          {_metric("Query / workflow errors", _number(total_errors), "danger" if total_errors else "")}
         </section>
-        {partial_notice}
         {source_html}
       </main>
     """

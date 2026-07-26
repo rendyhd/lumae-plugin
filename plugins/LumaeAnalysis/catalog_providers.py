@@ -123,40 +123,88 @@ def _fetch_navidrome(module, core, server_id):
     if callable(target):
         target_ids = target()
     tracks = []
-    offset = 0
     page_size = 500
-    while True:
-        response = request(
-            "search3",
-            {"query": "", "songCount": page_size, "songOffset": offset},
-        ) or {}
-        page = ((response.get("searchResult3") or {}).get("song") or [])
-        if isinstance(page, dict):
-            page = [page]
-        raw_page_size = len(page)
-        if target_ids is not None:
-            page = [
-                row for row in page
-                if str(row.get("musicFolderId")) in {str(value) for value in target_ids}
-            ]
-        tracks.extend(page)
-        if raw_page_size < page_size:
-            break
-        offset += raw_page_size
-    album_ids = list(dict.fromkeys(str(row.get("albumId")) for row in tracks if row.get("albumId")))
     albums = []
     hydrated_tracks = {}
+
+    if target_ids is None:
+        offset = 0
+        while True:
+            response = request(
+                "search3",
+                {"query": "", "songCount": page_size, "songOffset": offset},
+            ) or {}
+            page = ((response.get("searchResult3") or {}).get("song") or [])
+            if isinstance(page, dict):
+                page = [page]
+            tracks.extend(page)
+            if len(page) < page_size:
+                break
+            offset += len(page)
+        album_ids = list(
+            dict.fromkeys(str(row.get("albumId")) for row in tracks if row.get("albumId"))
+        )
+    else:
+        selected_folder_ids = {str(value) for value in target_ids}
+        if not selected_folder_ids:
+            raise CatalogProviderError(
+                "The configured Navidrome music-library names did not match any music folder. "
+                "Check Music Libraries in AudioMuse before preparing Lumae."
+            )
+        album_ids = []
+        albums_by_id = {}
+        for folder_id in sorted(selected_folder_ids):
+            offset = 0
+            while True:
+                response = request(
+                    "getAlbumList2",
+                    {
+                        "type": "newest",
+                        "size": page_size,
+                        "offset": offset,
+                        "musicFolderId": folder_id,
+                    },
+                ) or {}
+                album_list = response.get("albumList2")
+                if not isinstance(album_list, dict):
+                    raise CatalogProviderError(
+                        f"Navidrome did not return albums for selected music folder {folder_id}."
+                    )
+                page = album_list.get("album") or []
+                if isinstance(page, dict):
+                    page = [page]
+                for album in page:
+                    album_id = album.get("id")
+                    if album_id is None:
+                        continue
+                    album_id = str(album_id)
+                    if album_id not in albums_by_id:
+                        album_ids.append(album_id)
+                        albums_by_id[album_id] = album
+                if len(page) < page_size:
+                    break
+                offset += len(page)
+        albums.extend(albums_by_id.values())
+
     for album_id in album_ids:
         payload = request("getAlbum", {"id": album_id}) or {}
         album = payload.get("album") or {}
         songs = album.pop("song", []) if isinstance(album, dict) else []
-        if album:
+        if album and target_ids is None:
             albums.append(album)
         if isinstance(songs, dict):
             songs = [songs]
         for song in songs:
             if song.get("id"):
                 hydrated_tracks[str(song["id"])] = song
+    if target_ids is not None:
+        tracks = list(hydrated_tracks.values())
+    if not tracks:
+        scope = "the selected music folders" if target_ids is not None else "the server"
+        raise CatalogProviderError(
+            f"Navidrome returned no songs for {scope}. "
+            "The empty catalogue was not published; check Navidrome access and Music Libraries."
+        )
     return {
         "libraries": libraries,
         "albums": albums,
