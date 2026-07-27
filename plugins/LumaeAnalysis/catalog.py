@@ -17,6 +17,7 @@ from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
+CATALOG_BUILDER_VERSION = 3
 
 
 def t(name):
@@ -448,8 +449,11 @@ def normalize_provider_catalog(raw_catalog, provider_type):
                 "replay_gain": replay_gain,
             }
         )
-        library_id = _text(_value(raw, "musicFolderId", "LibraryId", "library_id"))
-        if library_id:
+        library_ids = _string_list(_value(raw, "_lumae_library_ids"))
+        if not library_ids:
+            library_id = _text(_value(raw, "musicFolderId", "LibraryId", "library_id"))
+            library_ids = [library_id] if library_id else []
+        for library_id in library_ids:
             entity_libraries.append(
                 {
                     "entity_type": "track",
@@ -804,6 +808,9 @@ def migrate_catalog(db):
             field_support JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             field_coverage JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             scope_summary JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            catalog_builder_version INTEGER NOT NULL DEFAULT 0,
+            refresh_required BOOLEAN NOT NULL DEFAULT TRUE,
+            refresh_reason TEXT,
             started_at TIMESTAMPTZ,
             completed_at TIMESTAMPTZ,
             last_error TEXT,
@@ -1018,6 +1025,28 @@ def migrate_catalog(db):
     ]
     for statement in statements:
         cur.execute(statement)
+    cur.execute(
+        f"ALTER TABLE {t('catalog_state')} "
+        "ADD COLUMN IF NOT EXISTS catalog_builder_version INTEGER NOT NULL DEFAULT 0"
+    )
+    cur.execute(
+        f"ALTER TABLE {t('catalog_state')} "
+        "ADD COLUMN IF NOT EXISTS refresh_required BOOLEAN NOT NULL DEFAULT TRUE"
+    )
+    cur.execute(
+        f"ALTER TABLE {t('catalog_state')} "
+        "ADD COLUMN IF NOT EXISTS refresh_reason TEXT"
+    )
+    cur.execute(
+        f"""
+        UPDATE {t("catalog_state")}
+           SET refresh_required=TRUE,
+               refresh_reason='catalog_builder_upgrade',
+               updated_at=now()
+         WHERE catalog_builder_version < %s
+        """,
+        (CATALOG_BUILDER_VERSION,),
+    )
     cur.close()
 
 
@@ -1292,8 +1321,12 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         (scan_id, catalog_instance_id, server_id),
     )
     cur.execute(
-        f"UPDATE {t('catalog_state')} SET status='scanning', started_at=now(), "
-        "last_error=NULL, updated_at=now() WHERE catalog_instance_id=%s",
+        f"""
+        UPDATE {t("catalog_state")}
+           SET status=CASE WHEN published_generation=0 THEN 'scanning' ELSE status END,
+               started_at=now(), last_error=NULL, updated_at=now()
+         WHERE catalog_instance_id=%s
+        """,
         (catalog_instance_id,),
     )
     cur.close()
@@ -1307,6 +1340,17 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             raise CatalogScanError(
                 "Navidrome returned no usable tracks. The empty catalogue was not published; "
                 "check Navidrome access and the Music Libraries selection in AudioMuse."
+            )
+        track_memberships = [
+            row
+            for row in normalized["entity_libraries"]
+            if row.get("entity_type") == "track"
+        ]
+        if normalized["libraries"] and not track_memberships:
+            raise CatalogScanError(
+                "Navidrome returned tracks and music libraries without any track-to-library "
+                "memberships. The corrupt catalogue was not published; Lumae will retry after "
+                "the provider catalogue metadata is repaired."
             )
 
         cur = db.cursor()
@@ -1368,6 +1412,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                SET published_generation=%s, catalog_head_seq=%s, status='complete',
                    entity_counts=%s::jsonb, field_support=%s::jsonb,
                    field_coverage=%s::jsonb, scope_summary=%s::jsonb,
+                   catalog_builder_version=%s, refresh_required=FALSE,
+                   refresh_reason=NULL,
                    completed_at=now(), last_error=NULL,
                    updated_at=now()
              WHERE catalog_instance_id=%s
@@ -1379,6 +1425,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 _json_param(field_support),
                 _json_param(coverage),
                 _json_param(scope["scope_summary"]),
+                CATALOG_BUILDER_VERSION,
                 catalog_instance_id,
             ),
         )
@@ -1414,8 +1461,14 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             rollback()
         cur = db.cursor()
         cur.execute(
-            f"UPDATE {t('catalog_state')} SET status='failed', last_error=%s, "
-            "updated_at=now() WHERE catalog_instance_id=%s",
+            f"""
+            UPDATE {t("catalog_state")}
+               SET status=CASE WHEN published_generation=0 THEN 'failed' ELSE status END,
+                   refresh_required=TRUE,
+                   refresh_reason=COALESCE(refresh_reason, 'refresh_failed'),
+                   last_error=%s, updated_at=now()
+             WHERE catalog_instance_id=%s
+            """,
             (str(exc)[:1000], catalog_instance_id),
         )
         cur.execute(
@@ -1467,7 +1520,8 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
-                   s.library_scope_fp, c.scope_summary
+                   s.library_scope_fp, c.scope_summary,
+                   c.catalog_builder_version, c.refresh_required, c.refresh_reason
               FROM {t("catalog_sources")} s
               JOIN {t("catalog_state")} c USING (catalog_instance_id)
               LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
@@ -1487,7 +1541,8 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
-                   s.library_scope_fp, c.scope_summary
+                   s.library_scope_fp, c.scope_summary,
+                   c.catalog_builder_version, c.refresh_required, c.refresh_reason
               FROM {t("catalog_sources")} s
               JOIN {t("catalog_state")} c USING (catalog_instance_id)
               LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
@@ -1507,7 +1562,8 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
-                   s.library_scope_fp, c.scope_summary
+                   s.library_scope_fp, c.scope_summary,
+                   c.catalog_builder_version, c.refresh_required, c.refresh_reason
               FROM {t("catalog_sources")} s
               JOIN {t("catalog_state")} c USING (catalog_instance_id)
               LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
@@ -1564,6 +1620,9 @@ def _source_dto(row):
             "entity_counts": _state_counts(row[11]),
             "field_support": _state_counts(row[12]),
             "field_coverage": _state_counts(row[13]),
+            "builder_version": int(row[31] or 0) if len(row) > 31 else 0,
+            "refresh_required": bool(row[32]) if len(row) > 32 else False,
+            "refresh_reason": row[33] if len(row) > 33 else None,
             "started_at": _iso(row[14]),
             "completed_at": _iso(row[15]),
             "last_error": row[16],
@@ -1638,7 +1697,7 @@ def create_bootstrap_session(
     if catalog_instance_id and source["catalog_instance_id"] != catalog_instance_id:
         raise ValueError("Catalogue source identity does not match the current server")
     state = source[stream]
-    if state["status"] not in ("complete", "ready"):
+    if int(state.get("generation") or 0) <= 0:
         raise CatalogScanError(f"{stream.capitalize()} bootstrap is not ready")
     cur = db.cursor()
     cur.execute(f"DELETE FROM {t('stream_bootstrap_sessions')} WHERE expires_at <= now() OR completed_at IS NOT NULL")

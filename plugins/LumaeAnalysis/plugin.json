@@ -36,6 +36,7 @@
     "catalog_mirror": {
       "catalog_schema_version": 2,
       "analysis_schema_version": 2,
+      "catalog_builder_version": 3,
       "supported_core_range": ">=2.6.0,<4.0.0",
       "supported_provider_types": [
         "navidrome"
@@ -65,11 +66,21 @@
         "analysis_run_finalization",
         "catalog_ready_before_profile_backfill",
         "interactive_profile_priority",
-        "bounded_profile_backfill"
+        "bounded_profile_backfill",
+        "automatic_catalog_preparation",
+        "catalog_builder_versioning"
       ]
     }
   },
   "versions": [
+    {
+      "version": "0.8.7",
+      "min_core_version": "2.6.0",
+      "changelog": "Preserve selected Navidrome folder memberships through catalogue hydration, automatically prepare and repair catalogues through an idempotent mobile API, keep published generations available during refresh, and rebuild safely after catalogue-builder upgrades.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.8.6",
       "min_core_version": "2.6.0",

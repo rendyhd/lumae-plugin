@@ -126,6 +126,7 @@ def _fetch_navidrome(module, core, server_id):
     page_size = 500
     albums = []
     hydrated_tracks = {}
+    album_library_ids = {}
 
     if target_ids is None:
         offset = 0
@@ -178,9 +179,13 @@ def _fetch_navidrome(module, core, server_id):
                     if album_id is None:
                         continue
                     album_id = str(album_id)
+                    album_library_ids.setdefault(album_id, set()).add(str(folder_id))
                     if album_id not in albums_by_id:
                         album_ids.append(album_id)
-                        albums_by_id[album_id] = album
+                        albums_by_id[album_id] = dict(album)
+                    albums_by_id[album_id]["_lumae_library_ids"] = sorted(
+                        album_library_ids[album_id]
+                    )
                 if len(page) < page_size:
                     break
                 offset += len(page)
@@ -188,15 +193,21 @@ def _fetch_navidrome(module, core, server_id):
 
     for album_id in album_ids:
         payload = request("getAlbum", {"id": album_id}) or {}
-        album = payload.get("album") or {}
+        album = dict(payload.get("album") or {})
         songs = album.pop("song", []) if isinstance(album, dict) else []
+        selected_library_ids = sorted(album_library_ids.get(str(album_id), set()))
+        if selected_library_ids:
+            album["_lumae_library_ids"] = selected_library_ids
         if album and target_ids is None:
             albums.append(album)
         if isinstance(songs, dict):
             songs = [songs]
         for song in songs:
             if song.get("id"):
-                hydrated_tracks[str(song["id"])] = song
+                hydrated = dict(song)
+                if selected_library_ids:
+                    hydrated["_lumae_library_ids"] = selected_library_ids
+                hydrated_tracks[str(song["id"])] = hydrated
     if target_ids is not None:
         tracks = list(hydrated_tracks.values())
     if not tracks:
@@ -208,7 +219,13 @@ def _fetch_navidrome(module, core, server_id):
     return {
         "libraries": libraries,
         "albums": albums,
-        "tracks": [hydrated_tracks.get(str(row.get("id")), row) for row in tracks],
+        # getAlbum is richer than search3, but Navidrome commonly omits
+        # musicFolderId from the hydrated songs. Merge instead of replacing so
+        # the provider-authoritative folder membership survives hydration.
+        "tracks": [
+            {**row, **hydrated_tracks.get(str(row.get("id")), {})}
+            for row in tracks
+        ],
     }
 
 

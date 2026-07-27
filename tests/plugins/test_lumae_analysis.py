@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.6"
+    assert manifest["versions"][0]["version"] == "0.8.7"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -114,6 +114,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["capabilities"]["catalog_mirror"] == {
         "catalog_schema_version": 2,
         "analysis_schema_version": 2,
+        "catalog_builder_version": 3,
         "supported_core_range": ">=2.6.0,<4.0.0",
         "supported_provider_types": ["navidrome"],
         "features": [
@@ -142,6 +143,8 @@ def test_plugin_manifest_has_lumae_identity():
             "catalog_ready_before_profile_backfill",
             "interactive_profile_priority",
             "bounded_profile_backfill",
+            "automatic_catalog_preparation",
+            "catalog_builder_versioning",
         ],
     }
 
@@ -155,7 +158,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.6",
+        "plugin_version": "0.8.7",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -277,7 +280,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.6"
+    assert body["plugin_version"] == "0.8.7"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -338,6 +341,42 @@ def test_bootstrap_session_api_keeps_token_out_of_url_and_private_cache(monkeypa
     assert response.headers["Cache-Control"] == "private, no-store"
     assert captured["server_id"] == "server-a"
     assert captured["principal"].startswith("client:")
+
+
+def test_bootstrap_session_uses_published_generation_during_refresh(monkeypatch):
+    import plugins.LumaeAnalysis.catalog as catalog
+
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "catalog": {
+            "generation": 7,
+            "epoch": "epoch-a",
+            "head_seq": 42,
+            "status": "scanning",
+            "entity_counts": {"track": 100},
+        },
+        "analysis": {
+            "generation": 0,
+            "epoch": "analysis-a",
+            "head_seq": 0,
+            "status": "not_initialized",
+        },
+    }
+    monkeypatch.setattr(catalog, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    db = FakeDb([(0,)])
+
+    result = catalog.create_bootstrap_session(
+        db,
+        "user:alice",
+        stream="catalog",
+        server_id="server-a",
+        catalog_instance_id="catalog-a",
+    )
+
+    assert result["generation"] == 7
+    assert result["snapshot_seq"] == 42
+    assert result["totals"] == {"track": 100}
 
 
 def test_bootstrap_page_requires_token_header_and_returns_410_after_expiry(monkeypatch):
@@ -438,6 +477,137 @@ def test_catalog_refresh_blocks_pending_v2_to_v3_rebind(monkeypatch):
     assert response.status_code == 409
     assert response.get_json()["error"] == "rebind_required"
     assert calls == []
+
+
+def test_catalog_prepare_api_queues_first_publication_and_returns_poll_location(monkeypatch):
+    mod = load_plugin()
+    source = {
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 0,
+            "status": "not_initialized",
+            "entity_counts": {},
+            "builder_version": 0,
+            "refresh_required": True,
+            "refresh_reason": "catalog_builder_upgrade",
+        },
+        "analysis": {"generation": 0, "status": "not_initialized"},
+    }
+    state = {"value": None}
+    queued = []
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: state["value"])
+
+    def claim(_source, db=None):
+        state["value"] = {
+            "status": "queued",
+            "phase": "queued",
+            "last_error": None,
+            "updated_at": "2026-07-27T12:00:00Z",
+        }
+        return True
+
+    monkeypatch.setattr(mod, "claim_preparation", claim)
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda func, server_id, catalog_id, queue="default": queued.append(
+            (func, server_id, catalog_id, queue)
+        ),
+    )
+
+    response = plugin_client(mod).post(
+        "/api/catalog/prepare",
+        json={"server_id": "server-a", "catalog_instance_id": "catalog-a"},
+    )
+
+    assert response.status_code == 202
+    assert response.headers["Retry-After"] == "2"
+    assert response.headers["Location"].endswith("/api/catalog/prepare/catalog-a")
+    assert response.get_json()["status"] == "queued"
+    assert response.get_json()["catalog_ready"] is False
+    assert queued == [(mod.prepare_lumae_task, "server-a", "catalog-a", "default")]
+
+
+def test_catalog_prepare_api_coalesces_active_operation(monkeypatch):
+    mod = load_plugin()
+    source = {
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 0,
+            "status": "scanning",
+            "entity_counts": {},
+            "builder_version": 0,
+            "refresh_required": True,
+        },
+        "analysis": {"generation": 0, "status": "not_initialized"},
+    }
+    state = {
+        "status": "running",
+        "phase": "catalog_refresh",
+        "last_error": None,
+        "updated_at": "2026-07-27T12:00:00Z",
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: state)
+    monkeypatch.setattr(
+        mod,
+        "claim_preparation",
+        lambda *_args, **_kwargs: pytest.fail("active preparation must coalesce"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *_args, **_kwargs: pytest.fail("active preparation must not enqueue twice"),
+    )
+
+    response = plugin_client(mod).post(
+        "/api/catalog/prepare",
+        json={"server_id": "server-a", "catalog_instance_id": "catalog-a"},
+    )
+
+    assert response.status_code == 202
+    assert response.get_json()["status"] == "running"
+
+
+def test_catalog_prepare_status_exposes_catalogue_before_analysis_finishes(monkeypatch):
+    mod = load_plugin()
+    source = {
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 4,
+            "status": "complete",
+            "entity_counts": {"track": 21_397},
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        },
+        "analysis": {"generation": 0, "status": "projecting"},
+    }
+    state = {
+        "status": "running",
+        "phase": "analysis_projection",
+        "last_error": None,
+        "updated_at": "2026-07-27T12:00:00Z",
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: state)
+
+    response = plugin_client(mod).get("/api/catalog/prepare/catalog-a")
+
+    assert response.status_code == 200
+    assert response.get_json()["catalog_ready"] is True
+    assert response.get_json()["analysis_ready"] is False
+    assert response.get_json()["phase"] == "analysis_projection"
+    assert response.get_json()["counts"]["track"] == 21_397
 
 
 @pytest.mark.parametrize(
@@ -2775,10 +2945,10 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
 
     assert db.commits == 1
     assert queued == [((mod.analysis_projection_task,), {"queue": "default"})]
-    assert db.cursor_obj.executed[-1] == (
+    assert (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
-    )
+    ) in db.cursor_obj.executed
     cron_inserts = [params for sql, params in db.cursor_obj.executed if "INSERT INTO cron" in sql]
     assert cron_inserts == [
         (
@@ -2837,6 +3007,41 @@ def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch)
     assert sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql, _ in db.cursor_obj.executed) == (
         2 * sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql in first_sql)
     )
+
+
+def test_builder_upgrade_queues_one_coalesced_catalogue_preparation(monkeypatch):
+    mod = load_plugin()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 3,
+            "builder_version": mod.CATALOG_BUILDER_VERSION - 1,
+            "refresh_required": True,
+        },
+    }
+    claimed = []
+    queued = []
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(
+        mod,
+        "claim_preparation",
+        lambda selected, db=None: claimed.append((selected, db)) or True,
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda func, server_id, catalog_id, queue="default": queued.append(
+            (func, server_id, catalog_id, queue)
+        ),
+    )
+
+    result = mod.enqueue_required_catalog_preparations(db=object())
+
+    assert result == 1
+    assert claimed[0][0] is source
+    assert queued == [(mod.prepare_lumae_task, "server-a", "catalog-a", "default")]
 
 
 def test_core_adapters_normalize_equivalent_v2_and_v3_analysis_events(monkeypatch):
@@ -2915,6 +3120,7 @@ def test_provider_bridge_admits_only_navidrome_sources():
 
 
 def test_navidrome_catalog_uses_folder_album_queries_when_song_rows_lack_folder_ids():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
     from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
 
     calls = []
@@ -2962,7 +3168,74 @@ def test_navidrome_catalog_uses_folder_album_queries_when_song_rows_lack_folder_
 
     assert [row["id"] for row in result["tracks"]] == ["track-a"]
     assert [row["id"] for row in result["albums"]] == ["album-a"]
+    assert result["tracks"][0]["_lumae_library_ids"] == ["folder-a"]
+    assert result["albums"][0]["_lumae_library_ids"] == ["folder-a"]
     assert all(endpoint != "search3" for endpoint, _params in calls)
+    normalized = normalize_provider_catalog(result, "navidrome")
+    assert normalized["tracks"][0]["payload"]["_lumae"]["library_ids"] == ["folder-a"]
+    assert normalized["albums"][0]["payload"]["_lumae"]["library_ids"] == ["folder-a"]
+    assert [
+        (row["entity_type"], row["entity_id"], row["library_id"])
+        for row in normalized["entity_libraries"]
+    ] == [
+        ("album", "album-a", "folder-a"),
+        ("track", "track-a", "folder-a"),
+    ]
+
+
+def test_navidrome_catalog_merges_search_membership_into_hydrated_songs():
+    from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
+
+    class Module:
+        @staticmethod
+        def list_libraries():
+            return [{"id": "folder-a", "name": "Music"}]
+
+        @staticmethod
+        def _get_target_music_folder_ids():
+            return None
+
+        @staticmethod
+        def _navidrome_request(endpoint, params=None):
+            if endpoint == "search3":
+                return {
+                    "searchResult3": {
+                        "song": [
+                            {
+                                "id": "track-a",
+                                "title": "Search title",
+                                "albumId": "album-a",
+                                "musicFolderId": "folder-a",
+                            }
+                        ]
+                    }
+                }
+            if endpoint == "getAlbum":
+                return {
+                    "album": {
+                        "id": "album-a",
+                        "name": "Album",
+                        "song": [
+                            {
+                                "id": "track-a",
+                                "title": "Hydrated title",
+                                "albumId": "album-a",
+                            }
+                        ],
+                    }
+                }
+            raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
+
+    result = _fetch_navidrome(Module(), object(), "server-a")
+
+    assert result["tracks"] == [
+        {
+            "id": "track-a",
+            "title": "Hydrated title",
+            "albumId": "album-a",
+            "musicFolderId": "folder-a",
+        }
+    ]
 
 
 def test_navidrome_catalog_rejects_an_unmatched_music_folder_filter():
@@ -3876,6 +4149,42 @@ def test_refresh_catalog_rejects_an_empty_first_generation():
         for sql, params in db.executed
         if params
     )
+
+
+def test_refresh_catalog_rejects_tracks_without_library_membership():
+    from plugins.LumaeAnalysis.catalog import CatalogScanError, refresh_catalog
+
+    db = RefreshDb()
+    payload = {
+        "libraries": [{"id": "library-1", "name": "Music"}],
+        "tracks": [{"id": "track-1", "title": "Song"}],
+    }
+
+    with pytest.raises(CatalogScanError, match="without any track-to-library memberships"):
+        refresh_catalog("server-a", db=db, bridge=RefreshBridge(payload))
+
+    assert db.rollbacks == 1
+    assert not any("SET published_generation" in sql for sql, _params in db.executed)
+
+
+def test_refresh_failure_preserves_published_readiness():
+    from plugins.LumaeAnalysis.catalog import refresh_catalog
+
+    db = RefreshDb(previous_counts={"track": 3})
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        refresh_catalog(
+            "server-a",
+            db=db,
+            bridge=RefreshBridge(error=RuntimeError("provider unavailable")),
+        )
+
+    failure_sql = next(
+        sql
+        for sql, params in db.executed
+        if params and params[0] == "provider unavailable" and "catalog_state" in sql
+    )
+    assert "CASE WHEN published_generation=0 THEN 'failed' ELSE status END" in failure_sql
 
 
 class ProjectionCursor(FakeCursor):

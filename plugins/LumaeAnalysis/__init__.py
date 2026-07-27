@@ -17,6 +17,7 @@ from .core_compat import (
 )
 from .catalog import (
     attempt_legacy_rebind,
+    CATALOG_BUILDER_VERSION,
     CatalogScanError,
     bootstrap_page,
     create_bootstrap_session,
@@ -55,7 +56,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.6"
+PLUGIN_VERSION = "0.8.7"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -84,6 +85,8 @@ CATALOG_FEATURES = (
     "catalog_ready_before_profile_backfill",
     "interactive_profile_priority",
     "bounded_profile_backfill",
+    "automatic_catalog_preparation",
+    "catalog_builder_versioning",
 )
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
@@ -315,6 +318,56 @@ def enqueue_post_migration_projection():
         return None
 
 
+def enqueue_required_catalog_preparations(db=None):
+    """Coalesce first-run and builder-upgrade preparation for active sources."""
+    db = db or get_db()
+    try:
+        sources = resolve_catalog_source(db)
+    except Exception:
+        logger.exception(
+            "lumae_analysis could not discover catalogues requiring post-install preparation"
+        )
+        return 0
+    queued = 0
+    for source in sources:
+        catalog = source.get("catalog") or {}
+        if source.get("rebind_status") != "active":
+            continue
+        if int(catalog.get("generation") or 0) > 0 and not catalog.get(
+            "refresh_required", False
+        ):
+            continue
+        try:
+            if not claim_preparation(source, db=db):
+                continue
+            enqueue(
+                prepare_lumae_task,
+                source["server_id"],
+                source["catalog_instance_id"],
+                queue="default",
+            )
+            queued += 1
+        except Exception as exc:
+            logger.exception(
+                "lumae_analysis could not queue required catalogue preparation"
+            )
+            try:
+                update_preparation_state(
+                    source["catalog_instance_id"],
+                    source["server_id"],
+                    "failed",
+                    "queue_failed",
+                    last_error=exc,
+                    completed=True,
+                    db=db,
+                )
+            except Exception:
+                logger.exception(
+                    "lumae_analysis could not record the failed preparation queue attempt"
+                )
+    return queued
+
+
 def migrate(db):
     cur = db.cursor()
     cur.execute(
@@ -470,7 +523,8 @@ def migrate(db):
     ensure_analysis_projection_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
-    enqueue_post_migration_projection()
+    if enqueue_required_catalog_preparations(db=db) == 0:
+        enqueue_post_migration_projection()
 
 
 def parse_ids(value):
@@ -807,6 +861,7 @@ def catalog_capability():
     return {
         "catalog_schema_version": CATALOG_SCHEMA_VERSION,
         "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+        "catalog_builder_version": CATALOG_BUILDER_VERSION,
         "supported_core_range": SUPPORTED_CORE_RANGE,
         "supported_provider_types": sorted(SUPPORTED_PROVIDER_TYPES),
         "features": list(CATALOG_FEATURES),
@@ -891,6 +946,16 @@ def catalog_health():
             logger.exception("lumae_analysis could not read persisted catalogue health")
     if persisted:
         servers = persisted
+        for server in servers:
+            catalog_instance_id = server.get("catalog_instance_id")
+            if not catalog_instance_id:
+                continue
+            try:
+                server["preparation"] = preparation_state(catalog_instance_id, db=db)
+            except Exception:
+                logger.exception(
+                    "lumae_analysis could not read catalogue preparation health"
+                )
     servers = [
         {
             **server,
@@ -932,6 +997,7 @@ def catalog_health():
             "plugin_version": PLUGIN_VERSION,
             "catalog_schema_version": CATALOG_SCHEMA_VERSION,
             "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
+            "catalog_builder_version": CATALOG_BUILDER_VERSION,
             "capability": catalog_capability(),
             "dedup_policy": policy,
             "servers": servers,
@@ -972,6 +1038,142 @@ def _json_body(max_bytes=16_384):
     if not isinstance(body, dict):
         raise ValueError("JSON body must be an object")
     return body
+
+
+def _preparation_api_payload(source, state=None):
+    catalog = source.get("catalog") or {}
+    analysis = source.get("analysis") or {}
+    state = state if state is not None else preparation_state(source["catalog_instance_id"])
+    catalog_ready = int(catalog.get("generation") or 0) > 0
+    current = (
+        catalog_ready
+        and int(catalog.get("builder_version") or 0) >= CATALOG_BUILDER_VERSION
+        and not catalog.get("refresh_required", False)
+    )
+    active = preparation_is_active(state)
+    if active:
+        status = state["status"]
+        phase = state["phase"]
+    elif current and analysis.get("status") == "complete":
+        status = "ready"
+        phase = "ready"
+    elif state and state.get("status") == "failed":
+        status = "failed"
+        phase = state.get("phase") or "failed"
+    else:
+        status = "required"
+        phase = (
+            catalog.get("refresh_reason")
+            or ("analysis_projection" if catalog_ready else "catalog_refresh")
+        )
+    return {
+        "operation_id": source["catalog_instance_id"],
+        "status": status,
+        "phase": phase,
+        "server_id": source["server_id"],
+        "catalog_instance_id": source["catalog_instance_id"],
+        "catalog_ready": catalog_ready,
+        "generation": int(catalog.get("generation") or 0),
+        "counts": catalog.get("entity_counts") or {},
+        "published_builder_version": int(catalog.get("builder_version") or 0),
+        "current_builder_version": CATALOG_BUILDER_VERSION,
+        "refresh_required": bool(catalog.get("refresh_required", False)),
+        "refresh_reason": catalog.get("refresh_reason"),
+        "analysis_ready": analysis.get("status") == "complete",
+        "last_error": (state or {}).get("last_error") or catalog.get("last_error"),
+        "updated_at": (state or {}).get("updated_at"),
+    }
+
+
+def _resolve_preparation_source(body):
+    sources = resolve_catalog_source(
+        get_db(),
+        server_id=body.get("server_id"),
+        catalog_instance_id=body.get("catalog_instance_id"),
+    )
+    if len(sources) != 1:
+        raise ValueError(
+            "An explicit server_id is required when multiple music servers are configured."
+        )
+    source = sources[0]
+    if source.get("rebind_status") != "active":
+        raise CatalogScanError(
+            "AudioMuse was upgraded; confirm source continuity before preparing Lumae."
+        )
+    return source
+
+
+@bp.post("/api/catalog/prepare")
+def catalog_prepare_api():
+    try:
+        body = _json_body()
+        source = _resolve_preparation_source(body)
+        initial = _preparation_api_payload(source)
+        if (
+            initial["status"] == "ready"
+            and initial["catalog_ready"]
+            and initial["analysis_ready"]
+        ):
+            return _private_json(initial, 200)
+        if not preparation_is_active(preparation_state(source["catalog_instance_id"])):
+            if claim_preparation(source):
+                try:
+                    enqueue(
+                        prepare_lumae_task,
+                        source["server_id"],
+                        source["catalog_instance_id"],
+                        queue="default",
+                    )
+                except Exception as exc:
+                    update_preparation_state(
+                        source["catalog_instance_id"],
+                        source["server_id"],
+                        "failed",
+                        "queue_failed",
+                        last_error=exc,
+                        completed=True,
+                    )
+                    raise
+        payload = _preparation_api_payload(
+            source, preparation_state(source["catalog_instance_id"])
+        )
+        response = _private_json(payload, 202)
+        response.headers["Retry-After"] = "2"
+        response.headers["Location"] = (
+            f"/plugins/lumae_analysis/api/catalog/prepare/{source['catalog_instance_id']}"
+        )
+        return response
+    except KeyError:
+        return _catalog_error("source_not_found", "Catalogue source was not found.", 404)
+    except CatalogScanError as exc:
+        return _catalog_error("preparation_blocked", str(exc), 409)
+    except ValueError as exc:
+        return _catalog_error("invalid_preparation", str(exc), 400)
+    except Exception:
+        logger.exception("lumae_analysis could not queue catalogue preparation")
+        return _catalog_error(
+            "preparation_queue_failed",
+            "Catalogue preparation could not be queued. Try again in a moment.",
+            503,
+        )
+
+
+@bp.get("/api/catalog/prepare/<operation_id>")
+def catalog_prepare_status_api(operation_id):
+    try:
+        sources = resolve_catalog_source(get_db(), catalog_instance_id=operation_id)
+        if len(sources) != 1:
+            raise KeyError("Unknown catalogue source")
+        source = sources[0]
+        payload = _preparation_api_payload(
+            source, preparation_state(source["catalog_instance_id"])
+        )
+        response = _private_json(payload, 200, no_store=False)
+        if payload["status"] in ("queued", "running"):
+            response.headers["Retry-After"] = "2"
+        return response
+    except KeyError:
+        return _catalog_error("source_not_found", "Catalogue source was not found.", 404)
 
 
 @bp.post("/api/catalog/refresh")
