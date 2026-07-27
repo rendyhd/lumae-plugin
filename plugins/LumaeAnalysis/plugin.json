@@ -78,8 +78,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Map every Navidrome track to provider music folders even when no folder filter is configured, replace large N+1 album hydration scans with bounded folder and song pagination, reject partial or unknown memberships, and automatically rebuild affected catalogue generations.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.8.zip",
+      "checksum": "120eac2b3cd463e8c36351caa64983e7"
     },
     {
       "version": "0.8.7",
