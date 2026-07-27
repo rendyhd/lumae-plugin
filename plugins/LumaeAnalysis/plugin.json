@@ -36,7 +36,7 @@
     "catalog_mirror": {
       "catalog_schema_version": 2,
       "analysis_schema_version": 2,
-      "catalog_builder_version": 3,
+      "catalog_builder_version": 4,
       "supported_core_range": ">=2.6.0,<4.0.0",
       "supported_provider_types": [
         "navidrome"
@@ -73,6 +73,14 @@
     }
   },
   "versions": [
+    {
+      "version": "0.8.8",
+      "min_core_version": "2.6.0",
+      "changelog": "Map every Navidrome track to provider music folders even when no folder filter is configured, replace large N+1 album hydration scans with bounded folder and song pagination, reject partial or unknown memberships, and automatically rebuild affected catalogue generations.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.8.7",
       "min_core_version": "2.6.0",

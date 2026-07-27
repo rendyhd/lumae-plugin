@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.7"
+    assert manifest["versions"][0]["version"] == "0.8.8"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -114,7 +114,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["capabilities"]["catalog_mirror"] == {
         "catalog_schema_version": 2,
         "analysis_schema_version": 2,
-        "catalog_builder_version": 3,
+        "catalog_builder_version": 4,
         "supported_core_range": ">=2.6.0,<4.0.0",
         "supported_provider_types": ["navidrome"],
         "features": [
@@ -158,7 +158,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.7",
+        "plugin_version": "0.8.8",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -280,7 +280,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.7"
+    assert body["plugin_version"] == "0.8.8"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -506,7 +506,7 @@ def test_catalog_prepare_api_queues_first_publication_and_returns_poll_location(
             "status": "queued",
             "phase": "queued",
             "last_error": None,
-            "updated_at": "2026-07-27T12:00:00Z",
+            "updated_at": "2099-07-27T12:00:00Z",
         }
         return True
 
@@ -551,7 +551,7 @@ def test_catalog_prepare_api_coalesces_active_operation(monkeypatch):
         "status": "running",
         "phase": "catalog_refresh",
         "last_error": None,
-        "updated_at": "2026-07-27T12:00:00Z",
+        "updated_at": "2099-07-27T12:00:00Z",
     }
     monkeypatch.setattr(mod, "get_db", lambda: object())
     monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
@@ -595,7 +595,7 @@ def test_catalog_prepare_status_exposes_catalogue_before_analysis_finishes(monke
         "status": "running",
         "phase": "analysis_projection",
         "last_error": None,
-        "updated_at": "2026-07-27T12:00:00Z",
+        "updated_at": "2099-07-27T12:00:00Z",
     }
     monkeypatch.setattr(mod, "get_db", lambda: object())
     monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
@@ -3183,7 +3183,7 @@ def test_navidrome_catalog_uses_folder_album_queries_when_song_rows_lack_folder_
     ]
 
 
-def test_navidrome_catalog_merges_search_membership_into_hydrated_songs():
+def test_navidrome_catalog_maps_unfiltered_music_folders_when_song_rows_omit_folder_ids():
     from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
 
     class Module:
@@ -3197,17 +3197,11 @@ def test_navidrome_catalog_merges_search_membership_into_hydrated_songs():
 
         @staticmethod
         def _navidrome_request(endpoint, params=None):
-            if endpoint == "search3":
+            if endpoint == "getAlbumList2":
+                assert params["musicFolderId"] == "folder-a"
                 return {
-                    "searchResult3": {
-                        "song": [
-                            {
-                                "id": "track-a",
-                                "title": "Search title",
-                                "albumId": "album-a",
-                                "musicFolderId": "folder-a",
-                            }
-                        ]
+                    "albumList2": {
+                        "album": [{"id": "album-a", "name": "Album", "songCount": 1}]
                     }
                 }
             if endpoint == "getAlbum":
@@ -3233,9 +3227,57 @@ def test_navidrome_catalog_merges_search_membership_into_hydrated_songs():
             "id": "track-a",
             "title": "Hydrated title",
             "albumId": "album-a",
-            "musicFolderId": "folder-a",
+            "_lumae_library_ids": ["folder-a"],
         }
     ]
+    assert result["albums"][0]["_lumae_library_ids"] == ["folder-a"]
+
+
+def test_navidrome_catalog_joins_large_folder_scope_onto_search_rows_without_n_plus_one():
+    from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
+
+    album_rows = [
+        {"id": f"album-{index}", "name": f"Album {index}", "songCount": 1}
+        for index in range(33)
+    ]
+    calls = []
+
+    class Module:
+        @staticmethod
+        def list_libraries():
+            return [{"id": "folder-a", "name": "Music"}]
+
+        @staticmethod
+        def _get_target_music_folder_ids():
+            return None
+
+        @staticmethod
+        def _navidrome_request(endpoint, params=None):
+            calls.append((endpoint, params))
+            if endpoint == "getAlbumList2":
+                return {"albumList2": {"album": album_rows}}
+            if endpoint == "search3":
+                return {
+                    "searchResult3": {
+                        "song": [
+                            {
+                                "id": f"track-{index}",
+                                "title": f"Track {index}",
+                                "albumId": f"album-{index}",
+                            }
+                            for index in range(33)
+                        ]
+                    }
+                }
+            raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
+
+    result = _fetch_navidrome(Module(), object(), "server-a")
+
+    assert len(result["tracks"]) == 33
+    assert all(row["_lumae_library_ids"] == ["folder-a"] for row in result["tracks"])
+    assert [endpoint for endpoint, _params in calls].count("getAlbumList2") == 1
+    assert [endpoint for endpoint, _params in calls].count("search3") == 1
+    assert all(endpoint != "getAlbum" for endpoint, _params in calls)
 
 
 def test_navidrome_catalog_rejects_an_unmatched_music_folder_filter():
@@ -4160,7 +4202,38 @@ def test_refresh_catalog_rejects_tracks_without_library_membership():
         "tracks": [{"id": "track-1", "title": "Song"}],
     }
 
-    with pytest.raises(CatalogScanError, match="without any track-to-library memberships"):
+    with pytest.raises(CatalogScanError, match="0 of 1 tracks had valid"):
+        refresh_catalog("server-a", db=db, bridge=RefreshBridge(payload))
+
+    assert db.rollbacks == 1
+    assert not any("SET published_generation" in sql for sql, _params in db.executed)
+
+
+def test_refresh_catalog_rejects_partial_or_unknown_library_memberships():
+    from plugins.LumaeAnalysis.catalog import CatalogScanError, refresh_catalog
+
+    db = RefreshDb()
+    payload = {
+        "libraries": [{"id": "library-1", "name": "Music"}],
+        "tracks": [
+            {
+                "id": "track-1",
+                "title": "Mapped",
+                "_lumae_library_ids": ["library-1"],
+            },
+            {
+                "id": "track-2",
+                "title": "Wrong library",
+                "_lumae_library_ids": ["library-2"],
+            },
+            {"id": "track-3", "title": "Unmapped"},
+        ],
+    }
+
+    with pytest.raises(
+        CatalogScanError,
+        match="1 of 3 tracks had valid.*1 unknown library IDs",
+    ):
         refresh_catalog("server-a", db=db, bridge=RefreshBridge(payload))
 
     assert db.rollbacks == 1

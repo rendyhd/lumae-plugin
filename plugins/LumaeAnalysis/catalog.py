@@ -17,7 +17,7 @@ from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
-CATALOG_BUILDER_VERSION = 3
+CATALOG_BUILDER_VERSION = 4
 
 
 def t(name):
@@ -1346,12 +1346,32 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             for row in normalized["entity_libraries"]
             if row.get("entity_type") == "track"
         ]
-        if normalized["libraries"] and not track_memberships:
-            raise CatalogScanError(
-                "Navidrome returned tracks and music libraries without any track-to-library "
-                "memberships. The corrupt catalogue was not published; Lumae will retry after "
-                "the provider catalogue metadata is repaired."
-            )
+        if normalized["libraries"]:
+            track_ids = {str(row["track_id"]) for row in normalized["tracks"]}
+            library_ids = {str(row["library_id"]) for row in normalized["libraries"]}
+            mapped_track_ids = {
+                str(row["entity_id"])
+                for row in track_memberships
+                if str(row.get("library_id")) in library_ids
+            }
+            invalid_library_ids = {
+                str(row.get("library_id"))
+                for row in track_memberships
+                if str(row.get("library_id")) not in library_ids
+            }
+            unmapped_track_count = len(track_ids - mapped_track_ids)
+            if invalid_library_ids or unmapped_track_count:
+                detail = (
+                    f"{len(mapped_track_ids):,} of {len(track_ids):,} tracks had valid "
+                    "track-to-library memberships"
+                )
+                if invalid_library_ids:
+                    detail += f"; {len(invalid_library_ids):,} unknown library IDs were rejected"
+                raise CatalogScanError(
+                    f"Navidrome catalogue membership is incomplete: {detail}. "
+                    "The corrupt refresh was not published and the previous catalogue remains "
+                    "available. Update Lumae Analysis before retrying."
+                )
 
         cur = db.cursor()
         cur.execute(
