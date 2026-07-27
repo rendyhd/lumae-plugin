@@ -78,8 +78,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Preserve selected Navidrome folder memberships through catalogue hydration, automatically prepare and repair catalogues through an idempotent mobile API, keep published generations available during refresh, and rebuild safely after catalogue-builder upgrades.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.7.zip",
+      "checksum": "003ccc39cde29454199a5c205154c209"
     },
     {
       "version": "0.8.6",
