@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.8"
+    assert manifest["versions"][0]["version"] == "0.8.9"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -94,6 +94,7 @@ def test_plugin_manifest_has_lumae_identity():
             "prepare_lumae",
             "interactive_profile_priority",
             "bounded_profile_backfill",
+            "profile_cursor_stream",
         ],
     }
     assert manifest["capabilities"]["living_collections"] == {
@@ -145,6 +146,10 @@ def test_plugin_manifest_has_lumae_identity():
             "bounded_profile_backfill",
             "automatic_catalog_preparation",
             "catalog_builder_versioning",
+            "profile_cursor_stream",
+            "server_album_artist_relationships",
+            "relationship_cursor_stream",
+            "nonblocking_enrichment",
         ],
     }
 
@@ -158,7 +163,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.8",
+        "plugin_version": "0.8.9",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -280,7 +285,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.8"
+    assert body["plugin_version"] == "0.8.9"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -315,6 +320,280 @@ def test_catalog_cursor_is_opaque_round_trippable_and_source_bound():
     }
     with pytest.raises(ValueError, match="Malformed"):
         parse_opaque_cursor("not-a-cursor")
+
+
+def test_profile_stream_serializes_waveform_payload_without_device_analysis():
+    from plugins.LumaeAnalysis.catalog_enrichment import serialize_profile
+
+    payload = serialize_profile(
+        "track-a",
+        44100,
+        123000,
+        -14.25,
+        b"\x01\x02",
+        b"\x03\x04",
+        1,
+        "2026-07-27T12:00:00Z",
+        "catalog-media:abc",
+    )
+
+    assert payload == {
+        "track_id": "track-a",
+        "source": "waveform",
+        "sample_rate": 44100,
+        "duration_ms": 123000,
+        "ref_lufs": -14.25,
+        "start_ramp": "AQI=",
+        "end_ramp": "AwQ=",
+        "analyzer_ver": 1,
+        "analyzed_at": "2026-07-27T12:00:00Z",
+        "media_signature": "catalog-media:abc",
+    }
+
+
+def test_server_album_and_artist_relationships_use_lumae_native_rankers():
+    from plugins.LumaeAnalysis.catalog_enrichment import (
+        _album_fingerprint,
+        _artist_fingerprint,
+        _rank_albums,
+        _rank_artists,
+    )
+
+    def track(track_id, embedding, order, album, year):
+        return {
+            "id": track_id,
+            "embedding": embedding,
+            "energy": 0.5,
+            "mood": [0.5] * 6,
+            "order": order,
+            "album": album,
+            "year": year,
+        }
+
+    album_rows = [
+        {
+            "key": "artist-a::source",
+            "album": "Source",
+            "artist": "Artist A",
+            "cover": "a1",
+            "fingerprint": _album_fingerprint(
+                "artist-a::source",
+                [track("a1", [1.0, 0.0], 0, "Source", 2020)],
+            ),
+        },
+        {
+            "key": "artist-b::near",
+            "album": "Near",
+            "artist": "Artist B",
+            "cover": "b1",
+            "fingerprint": _album_fingerprint(
+                "artist-b::near",
+                [track("b1", [0.99, 0.1], 0, "Near", 2021)],
+            ),
+        },
+        {
+            "key": "artist-c::far",
+            "album": "Far",
+            "artist": "Artist C",
+            "cover": "c1",
+            "fingerprint": _album_fingerprint(
+                "artist-c::far",
+                [track("c1", [0.0, 1.0], 0, "Far", 2022)],
+            ),
+        },
+    ]
+    assert [row["albumKey"] for row in _rank_albums(album_rows[0], album_rows)] == [
+        "artist-b::near",
+        "artist-c::far",
+    ]
+    assert _rank_albums(album_rows[0], album_rows)[0]["reasons"][0] == "core"
+
+    artist_rows = [
+        {
+            "key": "artist-a",
+            "artist": "Artist A",
+            "cover": "a1",
+            "fingerprint": _artist_fingerprint(
+                "artist-a",
+                [track("a1", [1.0, 0.0], 0, "Source", 2020)],
+            ),
+        },
+        {
+            "key": "artist-b",
+            "artist": "Artist B",
+            "cover": "b1",
+            "fingerprint": _artist_fingerprint(
+                "artist-b",
+                [track("b1", [0.99, 0.1], 0, "Near", 2021)],
+            ),
+        },
+        {
+            "key": "artist-c",
+            "artist": "Artist C",
+            "cover": "c1",
+            "fingerprint": _artist_fingerprint(
+                "artist-c",
+                [track("c1", [0.0, 1.0], 0, "Far", 2022)],
+            ),
+        },
+    ]
+    assert [row["artistKey"] for row in _rank_artists(artist_rows[0], artist_rows)] == [
+        "artist-b",
+        "artist-c",
+    ]
+
+
+def test_relationship_bootstrap_rejects_a_page_token_from_an_old_generation(
+    monkeypatch,
+):
+    from plugins.LumaeAnalysis import catalog_enrichment
+    from plugins.LumaeAnalysis.catalog import opaque_cursor
+
+    cursor = opaque_cursor("catalog-a", "epoch-a", 12)
+    monkeypatch.setattr(
+        catalog_enrichment,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "catalog_instance_id": "catalog-a",
+            "schema_version": 1,
+            "algorithm_version": 1,
+            "generation": 3,
+            "cursor": cursor,
+            "status": "complete",
+        },
+    )
+    page_token = catalog_enrichment._encode_page_token(
+        {
+            "catalog_instance_id": "catalog-a",
+            "epoch": "epoch-a",
+            "generation": 2,
+            "entity_type": "album",
+            "entity_id": "artist::album",
+        }
+    )
+
+    with pytest.raises(KeyError, match="bootstrap_required"):
+        catalog_enrichment.relationship_bootstrap_page(
+            object(), "catalog-a", page_token=page_token
+        )
+
+
+def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch):
+    from plugins.LumaeAnalysis import catalog_enrichment
+    from plugins.LumaeAnalysis.catalog import opaque_cursor
+
+    class Cursor:
+        def __init__(self, state_row=None):
+            self.state_row = state_row
+            self.calls = []
+
+        def execute(self, sql, args):
+            self.calls.append((" ".join(sql.split()), args))
+
+        def fetchone(self):
+            return self.state_row
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            return None
+
+    profile_cursor = Cursor(("profile-epoch", 10, 0))
+    profile_db = type("Db", (), {"cursor": lambda _self: profile_cursor})()
+    monkeypatch.setattr(
+        catalog_enrichment,
+        "resolve_catalog_source",
+        lambda _db, **_kwargs: [{"catalog_instance_id": "catalog-a"}],
+    )
+
+    profile_page = catalog_enrichment.read_profile_changes(
+        profile_db,
+        opaque_cursor("catalog-a", "profile-epoch", 2),
+        catalog_instance_id="catalog-a",
+    )
+
+    assert profile_page["has_more"] is True
+    assert "seq>%s AND seq<=%s" in profile_cursor.calls[-1][0]
+    assert profile_cursor.calls[-1][1][2:4] == (2, 10)
+
+    relationship_cursor = Cursor()
+    relationship_db = type(
+        "Db", (), {"cursor": lambda _self: relationship_cursor}
+    )()
+    monkeypatch.setattr(
+        catalog_enrichment,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "catalog_instance_id": "catalog-a",
+            "schema_version": 1,
+            "algorithm_version": 1,
+            "generation": 4,
+            "cursor": opaque_cursor("catalog-a", "relationship-epoch", 20),
+            "floor_seq": 0,
+            "status": "complete",
+        },
+    )
+
+    relationship_page = catalog_enrichment.read_relationship_changes(
+        relationship_db,
+        opaque_cursor("catalog-a", "relationship-epoch", 3),
+        catalog_instance_id="catalog-a",
+    )
+
+    assert relationship_page["has_more"] is True
+    assert "seq>%s AND seq<=%s" in relationship_cursor.calls[-1][0]
+    assert relationship_cursor.calls[-1][1][2:4] == (3, 20)
+
+
+def test_enrichment_stream_endpoints_are_source_scoped_and_nonblocking(monkeypatch):
+    mod = load_plugin()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(
+        mod,
+        "start_relationship_preparation",
+        lambda **_kwargs: {"queued": True, "coalesced": False, "job_id": "job-a"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda _db, catalog_instance_id: {
+            "catalog_instance_id": catalog_instance_id,
+            "status": "queued",
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "profile_bootstrap_page",
+        lambda _db, catalog_instance_id, **_kwargs: {
+            "catalog_instance_id": catalog_instance_id,
+            "profiles": [{"track_id": "track-a"}],
+            "cursor": "profile-cursor",
+            "has_more": False,
+            "next_page_token": None,
+        },
+    )
+    client = plugin_client(mod)
+
+    queued = client.post(
+        "/api/catalog/relationships/prepare",
+        json={"catalog_instance_id": "catalog-a"},
+    )
+    profiles = client.get(
+        "/api/profiles/bootstrap?catalog_instance_id=catalog-a"
+    )
+
+    assert queued.status_code == 200
+    assert queued.get_json()["job_id"] == "job-a"
+    assert queued.get_json()["relationships"]["status"] == "queued"
+    assert profiles.status_code == 200
+    assert profiles.get_json()["profiles"] == [{"track_id": "track-a"}]
+    assert profiles.headers["Cache-Control"] == "private, no-cache"
 
 
 def test_bootstrap_session_api_keeps_token_out_of_url_and_private_cache(monkeypatch):
@@ -1459,7 +1738,11 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
     assert seen["path"] == str(audio)
     assert seen["run"] == ("legacy-default", "catalog-a", "analysis-run-a")
     assert audio.exists()
-    params = db.cursor_obj.executed[-1][1]
+    params = next(
+        params
+        for sql, params in db.cursor_obj.executed
+        if "INSERT INTO plugin_lumae_analysis__source_profiles" in sql
+    )
     assert params[0] == "catalog-a"
     assert params[1] == "track-a"
     assert params[2] == 44100
@@ -1579,6 +1862,12 @@ def test_analysis_run_finalizer_refreshes_projects_then_queues_only_needed_profi
         lambda **kwargs: calls.append(("profiles", kwargs))
         or {"queued": True, "coalesced": False, "batch_size": 4},
     )
+    monkeypatch.setattr(
+        mod,
+        "start_relationship_preparation",
+        lambda **kwargs: calls.append(("relationships", kwargs))
+        or {"queued": True, "coalesced": False},
+    )
 
     result = mod.finalize_analysis_run_task("server-a", "catalog-a", "run-a")
 
@@ -1587,6 +1876,7 @@ def test_analysis_run_finalizer_refreshes_projects_then_queues_only_needed_profi
         "refresh",
         "project",
         "profiles",
+        "relationships",
     ]
     assert result["songs_seen"] == 37
     assert result["status"] == "complete"
@@ -1631,6 +1921,11 @@ def test_analysis_run_finalizer_failure_is_recorded_and_can_be_retried(monkeypat
         mod,
         "start_profile_backfill",
         lambda **_kwargs: {"queued": False, "coalesced": True, "batch_size": 10},
+    )
+    monkeypatch.setattr(
+        mod,
+        "start_relationship_preparation",
+        lambda **_kwargs: {"queued": False, "coalesced": True},
     )
 
     with pytest.raises(RuntimeError, match="temporarily unavailable"):
@@ -5149,6 +5444,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("prepare", mod.prepare_lumae_task, "default"),
         ("profile_backfill", mod.profile_backfill_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
+        ("relationship_preparation", mod.relationship_preparation_task, "default"),
     ]
     assert ctx.cron_tasks == [
         ("catalog_refresh", mod.catalog_refresh_task, "default"),

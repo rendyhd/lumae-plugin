@@ -18,6 +18,9 @@ The plugin provides:
 * progressive sonic admission that keeps repair-flagged AudioMuse 3 mappings usable while preserving their uncertainty evidence for later replacement;
 * one bounded background-enrichment chain per source, using small worker jobs instead of flooding the queue;
 * high-priority, idempotent promotion for the current playback window, so a requested track is not trapped behind a library backfill.
+* cursor-based playback-profile delivery, so phones install only newly ready or removed profiles after the first bootstrap;
+* server-owned album and artist relationship generations using Lumae's native scoring model, published as resumable snapshots and deltas;
+* nonblocking enrichment: a complete provider catalogue is app-ready while waveform and relationship backlogs continue.
 
 ## Layout
 

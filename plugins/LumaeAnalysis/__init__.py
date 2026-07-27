@@ -37,6 +37,20 @@ from .catalog_analysis import (
     scalar_batch,
     vector_batch,
 )
+from .catalog_enrichment import (
+    RELATIONSHIP_ALGORITHM_VERSION,
+    RELATIONSHIP_SCHEMA_VERSION,
+    claim_relationship_preparation,
+    migrate_enrichment,
+    prepare_relationships,
+    profile_bootstrap_page,
+    read_profile_changes,
+    read_relationship_changes,
+    record_profile_change,
+    relationship_bootstrap_page,
+    relationship_status,
+    serialize_profile,
+)
 from .catalog_readiness import (
     acknowledge_v3_release,
     clear_v3_release_acknowledgement,
@@ -56,7 +70,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.8"
+PLUGIN_VERSION = "0.8.9"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -87,6 +101,10 @@ CATALOG_FEATURES = (
     "bounded_profile_backfill",
     "automatic_catalog_preparation",
     "catalog_builder_versioning",
+    "profile_cursor_stream",
+    "server_album_artist_relationships",
+    "relationship_cursor_stream",
+    "nonblocking_enrichment",
 )
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
@@ -304,7 +322,24 @@ def analysis_projection_task(server_id=None):
     resolved_server_id = _resolve_task_server_id(adapter, server_id)
     if not resolved_server_id:
         return {"status": "skipped", "reason": "source_rebind_required"}
-    return project_analysis(server_id=resolved_server_id, adapter=adapter)
+    result = project_analysis(server_id=resolved_server_id, adapter=adapter)
+    if not result.get("catalog_instance_id"):
+        return result
+    try:
+        result["relationships"] = start_relationship_preparation(
+            catalog_instance_id=result["catalog_instance_id"],
+            server_id=resolved_server_id,
+        )
+    except Exception as exc:
+        logger.exception(
+            "lumae_analysis could not queue album and artist relationship preparation"
+        )
+        result["relationships"] = {
+            "queued": False,
+            "coalesced": False,
+            "error": str(exc),
+        }
+    return result
 
 
 def enqueue_post_migration_projection():
@@ -518,6 +553,7 @@ def migrate(db):
         f"ON {analysis_runs_table()} (status, updated_at)"
     )
     cur.close()
+    migrate_enrichment(db)
     migrate_collections(db)
     ensure_catalog_refresh_schedule(db)
     ensure_analysis_projection_schedule(db)
@@ -808,6 +844,18 @@ def upsert_profile(
 ):
     db = get_db()
     cur = db.cursor()
+    previous = None
+    if catalog_instance_id:
+        cur.execute(
+            f"""
+            SELECT sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
+                   analyzer_ver, media_signature, status
+              FROM {source_profiles_table()}
+             WHERE catalog_instance_id=%s AND track_id=%s
+            """,
+            (catalog_instance_id, track_id),
+        )
+        previous = cur.fetchone()
     values = (
         track_id,
         int(getattr(result, "sample_rate", 0)),
@@ -853,6 +901,41 @@ def upsert_profile(
         """,
         values,
     )
+    if catalog_instance_id:
+        public_payload = None
+        if status == "ready":
+            public_payload = serialize_profile(
+                track_id,
+                int(getattr(result, "sample_rate", 0)),
+                int(getattr(result, "duration_ms", 0)),
+                float(getattr(result, "ref_lufs", 0.0)),
+                getattr(result, "start_ramp_blob", b""),
+                getattr(result, "end_ramp_blob", b""),
+                ANALYZER_VERSION,
+                values[-3],
+                media_sig,
+            )
+        ready_unchanged = (
+            status == "ready"
+            and previous is not None
+            and previous[7] == "ready"
+            and int(previous[0]) == int(getattr(result, "sample_rate", 0))
+            and int(previous[1]) == int(getattr(result, "duration_ms", 0))
+            and float(previous[2]) == float(getattr(result, "ref_lufs", 0.0))
+            and _bytes(previous[3]) == getattr(result, "start_ramp_blob", b"")
+            and _bytes(previous[4]) == getattr(result, "end_ramp_blob", b"")
+            and int(previous[5]) == ANALYZER_VERSION
+            and previous[6] == media_sig
+        )
+        removing_ready = previous is not None and previous[7] == "ready" and status != "ready"
+        if not ready_unchanged and (status == "ready" or removing_ready):
+            record_profile_change(
+                cur,
+                catalog_instance_id,
+                track_id,
+                status,
+                public_payload,
+            )
     db.commit()
     cur.close()
 
@@ -1449,6 +1532,137 @@ def profiles():
     )
 
 
+@bp.get("/api/profiles/bootstrap")
+def profiles_bootstrap_api():
+    try:
+        catalog_instance_id = str(request.args.get("catalog_instance_id") or "")
+        if not catalog_instance_id:
+            raise ValueError("catalog_instance_id is required")
+        return _private_json(
+            profile_bootstrap_page(
+                get_db(),
+                catalog_instance_id,
+                page_token=request.args.get("page_token"),
+                limit=request.args.get("limit", 250),
+            ),
+            no_store=False,
+        )
+    except KeyError:
+        return _catalog_error(
+            "bootstrap_required", "Profile bootstrap cursor expired.", 410
+        )
+    except (CatalogScanError, ValueError) as exc:
+        return _catalog_error("invalid_profile_bootstrap", str(exc), 400)
+
+
+@bp.get("/api/profiles/changes")
+def profile_changes_api():
+    cursor = request.args.get("cursor")
+    if not cursor:
+        return _catalog_error("cursor_required", "Profile cursor is required.", 400)
+    try:
+        return _private_json(
+            read_profile_changes(
+                get_db(),
+                cursor,
+                catalog_instance_id=request.args.get("catalog_instance_id"),
+                limit=request.args.get("limit", 250),
+            ),
+            no_store=False,
+        )
+    except KeyError:
+        return _catalog_error(
+            "bootstrap_required", "Profile cursor expired or belongs to an old epoch.", 410
+        )
+    except (CatalogScanError, ValueError) as exc:
+        return _catalog_error("invalid_cursor", str(exc), 400)
+
+
+@bp.post("/api/catalog/relationships/prepare")
+def relationships_prepare_api():
+    try:
+        body = _json_body(max_bytes=16_000)
+        source = resolve_profile_source(
+            catalog_instance_id=body.get("catalog_instance_id"),
+            server_id=body.get("server_id"),
+        )
+        result = start_relationship_preparation(
+            catalog_instance_id=source["catalog_instance_id"],
+            server_id=source["server_id"],
+        )
+        return _private_json(
+            {
+                **result,
+                "relationships": relationship_status(
+                    get_db(), source["catalog_instance_id"]
+                ),
+            }
+        )
+    except (CatalogScanError, KeyError, ValueError) as exc:
+        return _catalog_error("source_required", str(exc), 409)
+
+
+@bp.get("/api/catalog/relationships/status")
+def relationships_status_api():
+    try:
+        catalog_instance_id = str(request.args.get("catalog_instance_id") or "")
+        if not catalog_instance_id:
+            raise ValueError("catalog_instance_id is required")
+        return _private_json(relationship_status(get_db(), catalog_instance_id))
+    except (CatalogScanError, KeyError, ValueError) as exc:
+        return _catalog_error("source_required", str(exc), 409)
+
+
+@bp.get("/api/catalog/relationships/bootstrap")
+def relationships_bootstrap_api():
+    try:
+        catalog_instance_id = str(request.args.get("catalog_instance_id") or "")
+        if not catalog_instance_id:
+            raise ValueError("catalog_instance_id is required")
+        return _private_json(
+            relationship_bootstrap_page(
+                get_db(),
+                catalog_instance_id,
+                page_token=request.args.get("page_token"),
+                limit=request.args.get("limit", 100),
+            ),
+            no_store=False,
+        )
+    except KeyError:
+        return _catalog_error(
+            "bootstrap_required", "Relationship bootstrap cursor expired.", 410
+        )
+    except (CatalogScanError, ValueError) as exc:
+        return _catalog_error("invalid_relationship_bootstrap", str(exc), 400)
+
+
+@bp.get("/api/catalog/relationships/changes")
+def relationship_changes_api():
+    cursor = request.args.get("cursor")
+    if not cursor:
+        return _catalog_error(
+            "cursor_required", "Relationship cursor is required.", 400
+        )
+    try:
+        return _private_json(
+            read_relationship_changes(
+                get_db(),
+                cursor,
+                catalog_instance_id=request.args.get("catalog_instance_id"),
+                limit=request.args.get("limit", 250),
+            ),
+            no_store=False,
+        )
+    except KeyError:
+        return _catalog_error(
+            "bootstrap_required",
+            "Relationship cursor expired or belongs to an old epoch.",
+            410,
+        )
+    except (CatalogScanError, ValueError) as exc:
+        return _catalog_error("invalid_cursor", str(exc), 400)
+
+
 @bp.post("/api/analyze")
 def analyze():
     body = request.get_json(silent=True) or {}
@@ -1797,6 +2011,20 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
         )
+        try:
+            relationship_result = start_relationship_preparation(
+                catalog_instance_id=catalog_instance_id,
+                server_id=server_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "lumae_analysis could not start relationship enrichment after analysis"
+            )
+            relationship_result = {
+                "queued": False,
+                "coalesced": False,
+                "error": str(exc),
+            }
         update_analysis_run(
             catalog_instance_id,
             run_id,
@@ -1812,6 +2040,7 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
             "catalog": catalog_result,
             "analysis": projection_result,
             "profiles": profile_result,
+            "relationships": relationship_result,
         }
     except Exception as exc:
         update_analysis_run(
@@ -2294,7 +2523,7 @@ def profile_backfill_task(server_id, catalog_instance_id):
     """Process one small batch, then yield the worker before queueing the next."""
     claimed_ids = []
     try:
-        source = resolve_profile_source(
+        resolve_profile_source(
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
         )
@@ -2397,6 +2626,72 @@ def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=No
             server_id=server_id,
         )
     return analyze_tracks_task(ids)
+
+
+def relationship_preparation_task(server_id, catalog_instance_id):
+    source = resolve_profile_source(
+        catalog_instance_id=catalog_instance_id,
+        server_id=server_id,
+    )
+    if source["catalog_instance_id"] != catalog_instance_id:
+        raise CatalogScanError("Catalogue identity changed before relationship preparation")
+    return prepare_relationships(catalog_instance_id)
+
+
+def start_relationship_preparation(catalog_instance_id=None, server_id=None):
+    """Queue one coalesced relationship build without delaying app readiness."""
+    source = resolve_profile_source(
+        catalog_instance_id=catalog_instance_id,
+        server_id=server_id,
+    )
+    current = relationship_status(get_db(), source["catalog_instance_id"])
+    catalog_generation = int(source["catalog"]["generation"])
+    analysis_generation = int(source["analysis"]["generation"])
+    already_current = (
+        current.get("status") == "complete"
+        and int(current.get("source_catalog_generation") or 0) == catalog_generation
+        and int(current.get("source_analysis_generation") or 0) == analysis_generation
+        and int(current.get("schema_version") or 0) == RELATIONSHIP_SCHEMA_VERSION
+        and int(current.get("algorithm_version") or 0) == RELATIONSHIP_ALGORITHM_VERSION
+    )
+    if already_current:
+        return {
+            "queued": False,
+            "coalesced": True,
+            "reason": "already_current",
+        }
+    if not claim_relationship_preparation(get_db(), source["catalog_instance_id"]):
+        return {
+            "queued": False,
+            "coalesced": True,
+            "reason": "already_running",
+        }
+    try:
+        job = enqueue(
+            relationship_preparation_task,
+            source["server_id"],
+            source["catalog_instance_id"],
+            queue="default",
+        )
+    except Exception as exc:
+        db = get_db()
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            UPDATE {table("relationship_state")}
+               SET status='failed', last_error=%s, completed_at=now(), updated_at=now()
+             WHERE catalog_instance_id=%s
+            """,
+            (str(exc)[:2000], source["catalog_instance_id"]),
+        )
+        db.commit()
+        cur.close()
+        raise
+    return {
+        "queued": True,
+        "coalesced": False,
+        "job_id": getattr(job, "id", None),
+    }
 
 
 def preparation_state(catalog_instance_id, db=None):
@@ -2609,10 +2904,25 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
             # remain visible in their own state and never roll readiness back.
             logger.exception("lumae_analysis could not start background profile enrichment")
             profile_result = {"queued": False, "coalesced": False, "error": str(exc)}
+        try:
+            relationship_result = start_relationship_preparation(
+                catalog_instance_id=resolved_catalog_instance_id,
+                server_id=resolved_server_id,
+            )
+        except Exception as exc:
+            logger.exception(
+                "lumae_analysis could not start background relationship enrichment"
+            )
+            relationship_result = {
+                "queued": False,
+                "coalesced": False,
+                "error": str(exc),
+            }
         return {
             "catalog": catalog_result,
             "analysis": projection_result,
             "profiles": profile_result,
+            "relationships": relationship_result,
             "preparation": preparation_state(resolved_catalog_instance_id),
         }
     except Exception as exc:
@@ -3560,5 +3870,8 @@ def register(ctx):
     ctx.add_task("prepare", prepare_lumae_task, queue="default")
     ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
+    ctx.add_task(
+        "relationship_preparation", relationship_preparation_task, queue="default"
+    )
     ctx.add_cron_task("catalog_refresh", catalog_refresh_task, queue="default")
     ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")

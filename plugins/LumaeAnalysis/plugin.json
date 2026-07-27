@@ -2,7 +2,7 @@
   "id": "lumae_analysis",
   "name": "Lumae Analysis",
   "author": "Lumae",
-  "description": "Mirrors supported Navidrome catalogues and precomputes Lumae loudness and MixRamp profiles for volume normalization and SmoothFade.",
+  "description": "Mirrors supported Navidrome catalogues and prepares Lumae volume, SmoothFade, album-similarity, and artist-similarity data away from the phone.",
   "requirements": [],
   "capabilities": {
     "lumae_analysis_profiles": {
@@ -15,7 +15,8 @@
         "source_scoped_profiles",
         "prepare_lumae",
         "interactive_profile_priority",
-        "bounded_profile_backfill"
+        "bounded_profile_backfill",
+        "profile_cursor_stream"
       ]
     },
     "living_collections": {
@@ -68,11 +69,23 @@
         "interactive_profile_priority",
         "bounded_profile_backfill",
         "automatic_catalog_preparation",
-        "catalog_builder_versioning"
+        "catalog_builder_versioning",
+        "profile_cursor_stream",
+        "server_album_artist_relationships",
+        "relationship_cursor_stream",
+        "nonblocking_enrichment"
       ]
     }
   },
   "versions": [
+    {
+      "version": "0.8.9",
+      "min_core_version": "2.6.0",
+      "changelog": "Move album and artist relationship preparation to AudioMuse using Lumae's native scoring model, publish relationship and playback-profile cursor streams, and keep all enrichment asynchronous so catalogue setup finishes immediately.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.8.8",
       "min_core_version": "2.6.0",
