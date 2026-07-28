@@ -86,8 +86,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Replace manual fresh/upgrade attestations with automatic evidence-based verification, and present four clear statuses for Library, AudioMuse source analysis, Volume & ramps, and Lumae similar-album/artist relationships.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.11.zip",
+      "checksum": "d4ebf28d191d486ab15f60d2ae592464"
     },
     {
       "version": "0.8.10",
