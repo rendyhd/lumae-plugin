@@ -70,7 +70,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.9"
+PLUGIN_VERSION = "0.8.10"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -101,6 +101,8 @@ CATALOG_FEATURES = (
     "bounded_profile_backfill",
     "automatic_catalog_preparation",
     "catalog_builder_versioning",
+    "durable_catalog_reconciliation",
+    "preparation_worker_attestation",
     "profile_cursor_stream",
     "server_album_artist_relationships",
     "relationship_cursor_stream",
@@ -108,6 +110,7 @@ CATALOG_FEATURES = (
 )
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
+CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
 ANALYSIS_PROJECTION_TASK_TYPE = "plugin.lumae_analysis.analysis_projection"
 DEFAULT_BACKFILL_BATCH_SIZE = 10
 MAX_BACKFILL_BATCH_SIZE = 25
@@ -273,6 +276,27 @@ def ensure_catalog_refresh_schedule(db):
     cur.close()
 
 
+def ensure_catalog_reconcile_schedule(db):
+    """Keep a cheap repair watchdog enabled without periodically rebuilding."""
+    cur = db.cursor()
+    cur.execute(
+        """
+        INSERT INTO cron (name, task_type, cron_expr, enabled)
+        VALUES (%s, %s, %s, TRUE)
+        ON CONFLICT (task_type) DO UPDATE SET
+            name=EXCLUDED.name,
+            cron_expr=EXCLUDED.cron_expr,
+            enabled=TRUE
+        """,
+        (
+            CATALOG_RECONCILE_TASK_TYPE,
+            CATALOG_RECONCILE_TASK_TYPE,
+            "*/15 * * * *",
+        ),
+    )
+    cur.close()
+
+
 def ensure_analysis_projection_schedule(db):
     cur = db.cursor()
     cur.execute(
@@ -315,6 +339,17 @@ def catalog_refresh_task(server_id=None):
     if not resolved_server_id:
         return {"status": "skipped", "reason": "source_rebind_required"}
     return refresh_catalog(server_id=resolved_server_id)
+
+
+def catalog_reconcile_task():
+    """Retry only missing, stale, or unattested catalogue publications."""
+    queued = enqueue_required_catalog_preparations()
+    return {
+        "status": "queued" if queued else "current",
+        "queued": int(queued),
+        "plugin_version": PLUGIN_VERSION,
+        "catalog_builder_version": CATALOG_BUILDER_VERSION,
+    }
 
 
 def analysis_projection_task(server_id=None):
@@ -368,9 +403,13 @@ def enqueue_required_catalog_preparations(db=None):
         catalog = source.get("catalog") or {}
         if source.get("rebind_status") != "active":
             continue
-        if int(catalog.get("generation") or 0) > 0 and not catalog.get(
-            "refresh_required", False
-        ):
+        state = preparation_state(source["catalog_instance_id"], db=db)
+        requires_publication = (
+            int(catalog.get("generation") or 0) <= 0
+            or bool(catalog.get("refresh_required", False))
+            or not preparation_attestation_is_current(state)
+        )
+        if not requires_publication:
             continue
         try:
             if not claim_preparation(source, db=db):
@@ -503,6 +542,10 @@ def migrate(db):
             phase TEXT NOT NULL,
             queued_profiles INTEGER NOT NULL DEFAULT 0,
             profile_jobs INTEGER NOT NULL DEFAULT 0,
+            target_plugin_version TEXT,
+            target_catalog_builder_version INTEGER,
+            worker_plugin_version TEXT,
+            worker_catalog_builder_version INTEGER,
             last_error TEXT,
             started_at TIMESTAMP,
             completed_at TIMESTAMP,
@@ -510,6 +553,16 @@ def migrate(db):
         )
         """
     )
+    for column in (
+        "target_plugin_version TEXT",
+        "target_catalog_builder_version INTEGER",
+        "worker_plugin_version TEXT",
+        "worker_catalog_builder_version INTEGER",
+    ):
+        cur.execute(
+            f"ALTER TABLE {preparation_state_table()} "
+            f"ADD COLUMN IF NOT EXISTS {column}"
+        )
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {profile_backfill_state_table()} (
@@ -556,6 +609,7 @@ def migrate(db):
     migrate_enrichment(db)
     migrate_collections(db)
     ensure_catalog_refresh_schedule(db)
+    ensure_catalog_reconcile_schedule(db)
     ensure_analysis_projection_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
@@ -1034,7 +1088,11 @@ def catalog_health():
             if not catalog_instance_id:
                 continue
             try:
-                server["preparation"] = preparation_state(catalog_instance_id, db=db)
+                state = preparation_state(catalog_instance_id, db=db)
+                server["preparation"] = state
+                if not preparation_attestation_is_current(state):
+                    server["catalog"]["refresh_required"] = True
+                    server["catalog"]["refresh_reason"] = "worker_version_mismatch"
             except Exception:
                 logger.exception(
                     "lumae_analysis could not read catalogue preparation health"
@@ -1128,16 +1186,25 @@ def _preparation_api_payload(source, state=None):
     analysis = source.get("analysis") or {}
     state = state if state is not None else preparation_state(source["catalog_instance_id"])
     catalog_ready = int(catalog.get("generation") or 0) > 0
+    attestation_current = preparation_attestation_is_current(state)
+    effective_refresh_required = bool(catalog.get("refresh_required", False)) or not (
+        attestation_current
+    )
+    effective_refresh_reason = (
+        "worker_version_mismatch"
+        if not attestation_current
+        else catalog.get("refresh_reason")
+    )
     current = (
         catalog_ready
         and int(catalog.get("builder_version") or 0) >= CATALOG_BUILDER_VERSION
-        and not catalog.get("refresh_required", False)
+        and not effective_refresh_required
     )
     active = preparation_is_active(state)
     if active:
         status = state["status"]
         phase = state["phase"]
-    elif current and analysis.get("status") == "complete":
+    elif current:
         status = "ready"
         phase = "ready"
     elif state and state.get("status") == "failed":
@@ -1146,8 +1213,14 @@ def _preparation_api_payload(source, state=None):
     else:
         status = "required"
         phase = (
-            catalog.get("refresh_reason")
+            effective_refresh_reason
             or ("analysis_projection" if catalog_ready else "catalog_refresh")
+        )
+    attestation_error = None
+    if not attestation_current and not active:
+        attestation_error = (
+            "The catalogue worker did not attest the plugin version requested by the "
+            "AudioMuse API. Restart AudioMuse workers; repair will retry automatically."
         )
     return {
         "operation_id": source["catalog_instance_id"],
@@ -1156,14 +1229,28 @@ def _preparation_api_payload(source, state=None):
         "server_id": source["server_id"],
         "catalog_instance_id": source["catalog_instance_id"],
         "catalog_ready": catalog_ready,
+        "publication_current": current,
         "generation": int(catalog.get("generation") or 0),
         "counts": catalog.get("entity_counts") or {},
         "published_builder_version": int(catalog.get("builder_version") or 0),
         "current_builder_version": CATALOG_BUILDER_VERSION,
-        "refresh_required": bool(catalog.get("refresh_required", False)),
-        "refresh_reason": catalog.get("refresh_reason"),
+        "refresh_required": effective_refresh_required,
+        "refresh_reason": effective_refresh_reason,
         "analysis_ready": analysis.get("status") == "complete",
-        "last_error": (state or {}).get("last_error") or catalog.get("last_error"),
+        "target_plugin_version": (state or {}).get("target_plugin_version"),
+        "target_catalog_builder_version": (state or {}).get(
+            "target_catalog_builder_version"
+        ),
+        "worker_plugin_version": (state or {}).get("worker_plugin_version"),
+        "worker_catalog_builder_version": (state or {}).get(
+            "worker_catalog_builder_version"
+        ),
+        "worker_attested": attestation_current,
+        "last_error": (
+            (state or {}).get("last_error")
+            or attestation_error
+            or catalog.get("last_error")
+        ),
         "updated_at": (state or {}).get("updated_at"),
     }
 
@@ -1192,11 +1279,7 @@ def catalog_prepare_api():
         body = _json_body()
         source = _resolve_preparation_source(body)
         initial = _preparation_api_payload(source)
-        if (
-            initial["status"] == "ready"
-            and initial["catalog_ready"]
-            and initial["analysis_ready"]
-        ):
+        if initial["publication_current"]:
             return _private_json(initial, 200)
         if not preparation_is_active(preparation_state(source["catalog_instance_id"])):
             if claim_preparation(source):
@@ -2700,6 +2783,8 @@ def preparation_state(catalog_instance_id, db=None):
     cur.execute(
         f"""
         SELECT server_id, status, phase, queued_profiles, profile_jobs,
+               target_plugin_version, target_catalog_builder_version,
+               worker_plugin_version, worker_catalog_builder_version,
                last_error, started_at, completed_at, updated_at
           FROM {preparation_state_table()}
          WHERE catalog_instance_id=%s
@@ -2717,11 +2802,42 @@ def preparation_state(catalog_instance_id, db=None):
         "phase": str(row[2]),
         "queued_profiles": int(row[3] or 0),
         "profile_jobs": int(row[4] or 0),
-        "last_error": str(row[5]) if row[5] else None,
-        "started_at": str(row[6]) if row[6] else None,
-        "completed_at": str(row[7]) if row[7] else None,
-        "updated_at": str(row[8]) if row[8] else None,
+        "target_plugin_version": str(row[5]) if row[5] else None,
+        "target_catalog_builder_version": int(row[6]) if row[6] is not None else None,
+        "worker_plugin_version": str(row[7]) if row[7] else None,
+        "worker_catalog_builder_version": int(row[8]) if row[8] is not None else None,
+        "last_error": str(row[9]) if row[9] else None,
+        "started_at": str(row[10]) if row[10] else None,
+        "completed_at": str(row[11]) if row[11] else None,
+        "updated_at": str(row[12]) if row[12] else None,
     }
+
+
+def preparation_attestation_is_current(state):
+    """Legacy completed rows are accepted; newly claimed work must attest."""
+    if not state or not state.get("target_plugin_version"):
+        return True
+    target_builder = int(state.get("target_catalog_builder_version") or 0)
+    worker_builder = int(state.get("worker_catalog_builder_version") or 0)
+    return (
+        state.get("worker_plugin_version") == state.get("target_plugin_version")
+        and worker_builder >= target_builder
+    )
+
+
+def assert_preparation_worker_current(catalog_instance_id):
+    state = preparation_state(catalog_instance_id)
+    if not state or not state.get("target_plugin_version"):
+        return
+    expected_plugin = str(state["target_plugin_version"])
+    expected_builder = int(state.get("target_catalog_builder_version") or 0)
+    if PLUGIN_VERSION != expected_plugin or CATALOG_BUILDER_VERSION < expected_builder:
+        raise RuntimeError(
+            "AudioMuse queued catalogue preparation for Lumae Analysis "
+            f"{expected_plugin} (builder {expected_builder}), but this worker is still "
+            f"running {PLUGIN_VERSION} (builder {CATALOG_BUILDER_VERSION}). "
+            "Restart the AudioMuse workers; the repair watchdog will retry automatically."
+        )
 
 
 def preparation_is_active(state, now=None):
@@ -2745,17 +2861,28 @@ def claim_preparation(source, db=None):
         f"""
         INSERT INTO {preparation_state_table()}
             (catalog_instance_id, server_id, status, phase, queued_profiles,
-             profile_jobs, last_error, started_at, completed_at, updated_at)
-        VALUES (%s, %s, 'queued', 'queued', 0, 0, NULL, now(), NULL, now())
+             profile_jobs, target_plugin_version, target_catalog_builder_version,
+             worker_plugin_version, worker_catalog_builder_version,
+             last_error, started_at, completed_at, updated_at)
+        VALUES (%s, %s, 'queued', 'queued', 0, 0, %s, %s, NULL, NULL,
+                NULL, now(), NULL, now())
         ON CONFLICT (catalog_instance_id) DO UPDATE SET
             server_id=EXCLUDED.server_id,
             status='queued', phase='queued', queued_profiles=0, profile_jobs=0,
+            target_plugin_version=EXCLUDED.target_plugin_version,
+            target_catalog_builder_version=EXCLUDED.target_catalog_builder_version,
+            worker_plugin_version=NULL, worker_catalog_builder_version=NULL,
             last_error=NULL, started_at=now(), completed_at=NULL, updated_at=now()
         WHERE {preparation_state_table()}.status NOT IN ('queued', 'running')
            OR {preparation_state_table()}.updated_at < now() - interval '{PREPARATION_STALE_HOURS} hours'
         RETURNING catalog_instance_id
         """,
-        (source["catalog_instance_id"], source["server_id"]),
+        (
+            source["catalog_instance_id"],
+            source["server_id"],
+            PLUGIN_VERSION,
+            CATALOG_BUILDER_VERSION,
+        ),
     )
     claimed = cur.fetchone() is not None
     db.commit()
@@ -2798,8 +2925,10 @@ def update_preparation_state(
         f"""
         INSERT INTO {preparation_state_table()}
             (catalog_instance_id, server_id, status, phase, queued_profiles,
-             profile_jobs, last_error, started_at, completed_at, updated_at)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, now(),
+             profile_jobs, target_plugin_version, target_catalog_builder_version,
+             worker_plugin_version, worker_catalog_builder_version,
+             last_error, started_at, completed_at, updated_at)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now(),
                 CASE WHEN %s THEN now() ELSE NULL END, now())
         ON CONFLICT (catalog_instance_id) DO UPDATE SET
             server_id=EXCLUDED.server_id,
@@ -2807,6 +2936,16 @@ def update_preparation_state(
             phase=EXCLUDED.phase,
             queued_profiles=EXCLUDED.queued_profiles,
             profile_jobs=EXCLUDED.profile_jobs,
+            target_plugin_version=COALESCE(
+                {preparation_state_table()}.target_plugin_version,
+                EXCLUDED.target_plugin_version
+            ),
+            target_catalog_builder_version=COALESCE(
+                {preparation_state_table()}.target_catalog_builder_version,
+                EXCLUDED.target_catalog_builder_version
+            ),
+            worker_plugin_version=EXCLUDED.worker_plugin_version,
+            worker_catalog_builder_version=EXCLUDED.worker_catalog_builder_version,
             last_error=EXCLUDED.last_error,
             completed_at=EXCLUDED.completed_at,
             updated_at=now()
@@ -2818,6 +2957,10 @@ def update_preparation_state(
             phase,
             int(queued_profiles or 0),
             int(profile_jobs or 0),
+            PLUGIN_VERSION,
+            CATALOG_BUILDER_VERSION,
+            PLUGIN_VERSION,
+            CATALOG_BUILDER_VERSION,
             str(last_error)[:2000] if last_error else None,
             bool(completed),
         ),
@@ -2866,6 +3009,7 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
         )
         resolved_catalog_instance_id = source["catalog_instance_id"]
         resolved_server_id = source["server_id"]
+        assert_preparation_worker_current(resolved_catalog_instance_id)
         update_preparation_state(
             resolved_catalog_instance_id,
             resolved_server_id,
@@ -2875,6 +3019,13 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
         catalog_result = refresh_catalog(server_id=resolved_server_id)
         if catalog_result["catalog_instance_id"] != resolved_catalog_instance_id:
             raise CatalogScanError("Catalogue identity changed during preparation")
+        if (
+            int(catalog_result.get("builder_version") or 0) < CATALOG_BUILDER_VERSION
+            or catalog_result.get("refresh_required") is not False
+        ):
+            raise CatalogScanError(
+                "Catalogue refresh finished without publishing the current builder version"
+            )
         update_preparation_state(
             resolved_catalog_instance_id,
             resolved_server_id,
@@ -3873,5 +4024,6 @@ def register(ctx):
     ctx.add_task(
         "relationship_preparation", relationship_preparation_task, queue="default"
     )
+    ctx.add_cron_task("catalog_reconcile", catalog_reconcile_task, queue="default")
     ctx.add_cron_task("catalog_refresh", catalog_refresh_task, queue="default")
     ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")

@@ -70,6 +70,8 @@
         "bounded_profile_backfill",
         "automatic_catalog_preparation",
         "catalog_builder_versioning",
+        "durable_catalog_reconciliation",
+        "preparation_worker_attestation",
         "profile_cursor_stream",
         "server_album_artist_relationships",
         "relationship_cursor_stream",
@@ -78,6 +80,14 @@
     }
   },
   "versions": [
+    {
+      "version": "0.8.10",
+      "min_core_version": "2.6.0",
+      "changelog": "Durably reconcile missed and failed catalogue repairs, attest the worker and catalogue-builder versions before declaring publication current, and keep repeated setup checks idempotent.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.8.9",
       "min_core_version": "2.6.0",

@@ -1370,7 +1370,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 raise CatalogScanError(
                     f"Navidrome catalogue membership is incomplete: {detail}. "
                     "The corrupt refresh was not published and the previous catalogue remains "
-                    "available. Update Lumae Analysis before retrying."
+                    "available. Lumae Analysis will retry automatically; check AudioMuse Music "
+                    "Libraries if the repair keeps failing."
                 )
 
         cur = db.cursor()
@@ -1469,6 +1470,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             "catalog_instance_id": catalog_instance_id,
             "server_id": server_id,
             "generation": generation,
+            "builder_version": CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
             "cursor": {"epoch": str(epoch), "seq": next_seq},
             "counts": counts,
             "field_coverage": coverage,

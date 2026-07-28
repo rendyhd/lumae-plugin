@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.9"
+    assert manifest["versions"][0]["version"] == "0.8.10"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -146,6 +146,8 @@ def test_plugin_manifest_has_lumae_identity():
             "bounded_profile_backfill",
             "automatic_catalog_preparation",
             "catalog_builder_versioning",
+            "durable_catalog_reconciliation",
+            "preparation_worker_attestation",
             "profile_cursor_stream",
             "server_album_artist_relationships",
             "relationship_cursor_stream",
@@ -163,7 +165,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.9",
+        "plugin_version": "0.8.10",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -285,7 +287,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.9"
+    assert body["plugin_version"] == "0.8.10"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -887,6 +889,96 @@ def test_catalog_prepare_status_exposes_catalogue_before_analysis_finishes(monke
     assert response.get_json()["analysis_ready"] is False
     assert response.get_json()["phase"] == "analysis_projection"
     assert response.get_json()["counts"]["track"] == 21_397
+
+
+def test_catalog_prepare_is_idempotent_when_catalogue_is_current_but_analysis_is_pending(
+    monkeypatch,
+):
+    mod = load_plugin()
+    source = {
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 4,
+            "status": "complete",
+            "entity_counts": {"track": 21_397},
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        },
+        "analysis": {"generation": 0, "status": "projecting"},
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *_args, **_kwargs: pytest.fail("a current catalogue must not rebuild"),
+    )
+
+    response = plugin_client(mod).post(
+        "/api/catalog/prepare",
+        json={"server_id": "server-a", "catalog_instance_id": "catalog-a"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "operation_id": "catalog-a",
+        "status": "ready",
+        "phase": "ready",
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "catalog_ready": True,
+        "publication_current": True,
+        "generation": 4,
+        "counts": {"track": 21_397},
+        "published_builder_version": mod.CATALOG_BUILDER_VERSION,
+        "current_builder_version": mod.CATALOG_BUILDER_VERSION,
+        "refresh_required": False,
+        "refresh_reason": None,
+        "analysis_ready": False,
+        "target_plugin_version": None,
+        "target_catalog_builder_version": None,
+        "worker_plugin_version": None,
+        "worker_catalog_builder_version": None,
+        "worker_attested": True,
+        "last_error": None,
+        "updated_at": None,
+    }
+
+
+def test_catalog_health_marks_unattested_worker_publication_for_repair(monkeypatch):
+    mod = load_plugin()
+    source = settings_catalog_source()
+    source["catalog"].update(
+        {
+            "generation": 4,
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        }
+    )
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(
+        mod,
+        "preparation_state",
+        lambda *_args, **_kwargs: {
+            "status": "ready",
+            "phase": "catalog_ready",
+            "target_plugin_version": mod.PLUGIN_VERSION,
+            "target_catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+            "worker_plugin_version": "0.8.9",
+            "worker_catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+        },
+    )
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 200
+    catalog = response.get_json()["servers"][0]["catalog"]
+    assert catalog["refresh_required"] is True
+    assert catalog["refresh_reason"] == "worker_version_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -3115,7 +3207,11 @@ def test_prepare_lumae_marks_catalog_ready_before_background_profiles(monkeypatc
         mod,
         "refresh_catalog",
         lambda server_id=None: calls.append(("catalog", server_id))
-        or {"catalog_instance_id": "catalog-a"},
+        or {
+            "catalog_instance_id": "catalog-a",
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        },
     )
     monkeypatch.setattr(
         mod,
@@ -3168,8 +3264,13 @@ def test_prepare_lumae_records_failure_and_does_not_queue_profiles(monkeypatch):
     monkeypatch.setattr(
         mod,
         "refresh_catalog",
-        lambda server_id=None: {"catalog_instance_id": "catalog-a"},
+        lambda server_id=None: {
+            "catalog_instance_id": "catalog-a",
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        },
     )
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         mod,
         "project_analysis",
@@ -3252,6 +3353,11 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
             "17 */6 * * *",
         ),
         (
+            mod.CATALOG_RECONCILE_TASK_TYPE,
+            mod.CATALOG_RECONCILE_TASK_TYPE,
+            "*/15 * * * *",
+        ),
+        (
             mod.ANALYSIS_PROJECTION_TASK_TYPE,
             mod.ANALYSIS_PROJECTION_TASK_TYPE,
             "47 */6 * * *",
@@ -3319,6 +3425,7 @@ def test_builder_upgrade_queues_one_coalesced_catalogue_preparation(monkeypatch)
     claimed = []
     queued = []
     monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         mod,
         "claim_preparation",
@@ -3337,6 +3444,75 @@ def test_builder_upgrade_queues_one_coalesced_catalogue_preparation(monkeypatch)
     assert result == 1
     assert claimed[0][0] is source
     assert queued == [(mod.prepare_lumae_task, "server-a", "catalog-a", "default")]
+
+
+def test_reconcile_retries_an_unattested_catalogue_even_when_generation_is_current(
+    monkeypatch,
+):
+    mod = load_plugin()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 4,
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        },
+    }
+    queued = []
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(
+        mod,
+        "preparation_state",
+        lambda *_args, **_kwargs: {
+            "status": "ready",
+            "target_plugin_version": mod.PLUGIN_VERSION,
+            "target_catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+            "worker_plugin_version": "0.8.9",
+            "worker_catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+        },
+    )
+    monkeypatch.setattr(mod, "claim_preparation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda func, server_id, catalog_id, queue="default": queued.append(
+            (func, server_id, catalog_id, queue)
+        ),
+    )
+
+    assert mod.enqueue_required_catalog_preparations(db=object()) == 1
+    assert queued == [(mod.prepare_lumae_task, "server-a", "catalog-a", "default")]
+
+
+def test_reconcile_watchdog_is_a_noop_for_current_attested_catalogues(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda: 0)
+
+    assert mod.catalog_reconcile_task() == {
+        "status": "current",
+        "queued": 0,
+        "plugin_version": mod.PLUGIN_VERSION,
+        "catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+    }
+
+
+def test_worker_attestation_rejects_a_stale_audio_muse_worker(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(
+        mod,
+        "preparation_state",
+        lambda *_args, **_kwargs: {
+            "target_plugin_version": "0.8.11",
+            "target_catalog_builder_version": mod.CATALOG_BUILDER_VERSION + 1,
+            "worker_plugin_version": None,
+            "worker_catalog_builder_version": None,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="worker is still running"):
+        mod.assert_preparation_worker_current("catalog-a")
 
 
 def test_core_adapters_normalize_equivalent_v2_and_v3_analysis_events(monkeypatch):
@@ -5447,6 +5623,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("relationship_preparation", mod.relationship_preparation_task, "default"),
     ]
     assert ctx.cron_tasks == [
+        ("catalog_reconcile", mod.catalog_reconcile_task, "default"),
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
     ]
