@@ -5497,14 +5497,14 @@ def test_settings_page_explains_automatic_sonic_status_and_blockers(monkeypatch)
     body = mod.render_v3_readiness_panel()
     compact = " ".join(body.split())
 
-    assert "3. Sonic analysis status" in body
-    assert "Preparing in the background" in body
+    assert "2. AudioMuse source analysis" in body
+    assert "AudioMuse source analysis is still filling in" in body
     assert "Chromaprint: 8 of 10 mapped tracks (80.00%)" in compact
     assert "without analysis mapping: 2" in compact
     assert "Full-library verification is still waiting for Chromaprint" in body
-    assert "Sonic links: 7 usable (5 verified; 2 provisional)" in compact
+    assert "Source-analysis links: 7 usable (5 verified; 2 provisional)" in compact
     assert "1 flagged for repair" in compact
-    assert "there is nothing to confirm manually" in body
+    assert "Analysis task or schedule produces the missing source" in compact
     assert "Technical details" in body
     assert "diagnostic only; it does not gate readiness" in compact
     assert "Confirm fresh installation" not in body
@@ -5536,6 +5536,93 @@ def test_settings_page_explains_automatic_source_rebind(monkeypatch):
     assert "No manual confirmation is needed" in body
     assert "Confirm fresh installation" not in body
     assert "Confirm upgraded installation" not in body
+
+
+def test_source_analysis_status_remains_visible_on_legacy_core(monkeypatch):
+    mod = load_plugin()
+    source = {
+        **readiness_source(),
+        "analysis": {
+            "status": "complete",
+            "mapped_track_count": 96,
+            "item_count": 94,
+        },
+    }
+    monkeypatch.setattr(mod, "_v3_readiness_sources", lambda: [])
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+
+    body = mod.render_v3_readiness_panel()
+    compact = " ".join(body.split())
+
+    assert "2. AudioMuse source analysis" in body
+    assert "published for 96 provider tracks" in compact
+    assert "AudioMuse analysis items: 94" in compact
+
+
+def test_settings_page_reports_lumae_relationship_generation_separately(monkeypatch):
+    mod = load_plugin()
+    source = {
+        **readiness_source(),
+        "catalog": {"generation": 7, "status": "complete"},
+        "analysis": {"generation": 9, "status": "complete"},
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "status": "complete",
+            "schema_version": mod.RELATIONSHIP_SCHEMA_VERSION,
+            "algorithm_version": mod.RELATIONSHIP_ALGORITHM_VERSION,
+            "source_catalog_generation": 7,
+            "source_analysis_generation": 9,
+            "generation": 4,
+            "album_count": 2400,
+            "artist_count": 870,
+        },
+    )
+
+    body = mod.render_relationship_status_panel()
+    compact = " ".join(body.split())
+
+    assert "4. Similar albums &amp; artists" in body
+    assert "Similarities are ready for 2,400 albums and 870 artists" in compact
+    assert "Lumae’s own ranking algorithm" in body
+    assert "does no relationship matching on the phone" in compact
+    assert "Built from library generation 7 of 7" in compact
+
+
+def test_relationship_status_refreshes_while_automatic_build_runs(monkeypatch):
+    mod = load_plugin()
+    source = {
+        **readiness_source(),
+        "catalog": {"generation": 7, "status": "complete"},
+        "analysis": {"generation": 9, "status": "complete"},
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "status": "running",
+            "schema_version": mod.RELATIONSHIP_SCHEMA_VERSION,
+            "algorithm_version": mod.RELATIONSHIP_ALGORITHM_VERSION,
+            "source_catalog_generation": 6,
+            "source_analysis_generation": 8,
+            "generation": 3,
+            "album_count": 2300,
+            "artist_count": 840,
+        },
+    )
+
+    body = mod.render_relationship_status_panel()
+
+    assert "Similar album and artist relationships are being prepared automatically" in body
+    assert "currently published relationship generation" in body
+    assert "_lumae_relationship_refresh" in body
 
 
 def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypatch):
@@ -6233,6 +6320,25 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
             "needs_analysis": 11,
         },
     )
+    monkeypatch.setattr(
+        mod,
+        "render_v3_readiness_panel",
+        lambda: '<section><h3>2. AudioMuse source analysis</h3></section>',
+    )
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "status": "complete",
+            "schema_version": mod.RELATIONSHIP_SCHEMA_VERSION,
+            "algorithm_version": mod.RELATIONSHIP_ALGORITHM_VERSION,
+            "source_catalog_generation": 0,
+            "source_analysis_generation": 0,
+            "generation": 1,
+            "album_count": 50,
+            "artist_count": 20,
+        },
+    )
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
     client = plugin_client(mod)
 
@@ -6245,13 +6351,21 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
     assert "82 of 100 volume and ramp profiles ready" in body
     assert "11 need analysis" in body
     assert "1. Library status" in body
-    assert "2. Volume &amp; ramp status" in body
+    assert "2. AudioMuse source analysis" in body
+    assert "3. Volume &amp; ramp status" in body
+    assert "4. Similar albums &amp; artists" in body
     assert "App sync index" in body
     assert "Ready for app sync: 100 Navidrome tracks are published" in body
-    assert "do not block library sync or sonic analysis" in compact
+    assert "do not block library sync, AudioMuse source analysis, or Lumae relationships" in compact
     assert "location.reload" not in body
     assert 'u.searchParams.set("_lumae_refresh",Date.now().toString())' in body
     assert "location.replace(u.href)" in body
+    assert (
+        body.index("1. Library status")
+        < body.index("2. AudioMuse source analysis")
+        < body.index("3. Volume &amp; ramp status")
+        < body.index("4. Similar albums &amp; artists")
+    )
 
 
 def test_settings_page_never_labels_a_completed_empty_catalogue_ready(monkeypatch):
@@ -6287,7 +6401,7 @@ def test_settings_page_never_labels_a_completed_empty_catalogue_ready(monkeypatc
     assert "Not ready: no Navidrome tracks were published" in body
     assert "A completed job with zero tracks is not ready" in body
     assert "Refresh required data" in body
-    assert body.index("1. Library status") < body.index("2. Volume &amp; ramp status")
+    assert body.index("1. Library status") < body.index("3. Volume &amp; ramp status")
 
 
 def test_settings_page_starts_bounded_background_enrichment(

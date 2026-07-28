@@ -84,7 +84,7 @@
     {
       "version": "0.8.11",
       "min_core_version": "2.6.0",
-      "changelog": "Replace manual fresh/upgrade attestations with automatic evidence-based sonic verification, and present clear independent Library, Volume & ramp, and Sonic analysis statuses.",
+      "changelog": "Replace manual fresh/upgrade attestations with automatic evidence-based verification, and present four clear statuses for Library, AudioMuse source analysis, Volume & ramps, and Lumae similar-album/artist relationships.",
       "imageUrl": "",
       "sourceUrl": "",
       "checksum": ""

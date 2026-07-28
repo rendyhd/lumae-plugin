@@ -3088,7 +3088,7 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
 
 _READINESS_BLOCKER_LABELS = {
     "analysis_links_missing": "Some eligible tracks do not have AudioMuse analysis yet.",
-    "analysis_links_need_repair": "Some sonic links are flagged for automatic repair.",
+    "analysis_links_need_repair": "Some source-analysis links are flagged for automatic repair.",
     "analysis_links_pending": "Some eligible tracks are still awaiting AudioMuse analysis.",
     "analysis_mapping_incomplete": "Some eligible provider tracks do not have an AudioMuse mapping yet.",
     "analysis_projection_incomplete": "The plugin analysis projection is not complete.",
@@ -3101,7 +3101,7 @@ _READINESS_BLOCKER_LABELS = {
     "fp_4_not_active": "AudioMuse catalogue ID scheme fp_4 is not active.",
     "no_analysis_mappings": "No provider tracks have AudioMuse analysis mappings yet.",
     "per_link_evidence_unavailable": "This plugin cannot qualify AudioMuse analysis links individually.",
-    "provisional_links_remaining": "Some usable sonic links still have provisional evidence.",
+    "provisional_links_remaining": "Some usable source-analysis links still have provisional evidence.",
     "readiness_unavailable": "The plugin could not read AudioMuse repair diagnostics.",
     "sonic_evidence_incomplete": "Full per-track sonic evidence is not complete yet.",
     "source_rebind_required": "Lumae still needs to verify the AudioMuse source identity during app sync.",
@@ -3125,14 +3125,100 @@ def _v3_readiness_sources():
     ]
 
 
+def _render_basic_source_analysis_panel():
+    try:
+        sources = resolve_catalog_source(get_db())
+    except Exception:
+        logger.exception("lumae_analysis could not render basic source analysis")
+        sources = []
+    cards = []
+    for source in sources:
+        analysis = source.get("analysis") or {}
+        status = str(analysis.get("status") or "not_initialized")
+        mapped = int(analysis.get("mapped_track_count") or 0)
+        items = int(analysis.get("item_count") or 0)
+        if status == "complete" and mapped > 0:
+            status_label = "Ready"
+            status_class = "lumae-source-state-ready"
+            summary = f"""
+              <div class="lumae-notice lumae-notice-success" role="status">
+                <strong>AudioMuse source analysis is published for {mapped:,} provider tracks.</strong>
+                <span>Lumae can consume these source features without repeating analysis on the
+                  phone.</span>
+              </div>
+            """
+        elif status in ("scanning", "building"):
+            status_label = "Preparing"
+            status_class = "lumae-source-state-working"
+            summary = """
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>AudioMuse source analysis is being projected.</strong>
+                <span>Available source features will be adopted automatically.</span>
+              </div>
+            """
+        else:
+            status_label = "Waiting for analysis"
+            status_class = "lumae-source-state-working"
+            summary = """
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>No usable AudioMuse source analysis is published yet.</strong>
+                <span>Run AudioMuse Analysis or enable its analysis schedule. Lumae will adopt
+                  the results automatically.</span>
+              </div>
+            """
+        cards.append(
+            f"""
+            <article class="lumae-source-card"
+              aria-label="AudioMuse source analysis for {escape(str(source.get('name') or source['server_id']))}">
+              <header class="lumae-source-header">
+                <div>
+                  <span class="lumae-kicker">Music source</span>
+                  <h4>{escape(str(source.get('name') or source['server_id']))}</h4>
+                </div>
+                <span class="lumae-source-state {status_class}">{status_label}</span>
+              </header>
+              {summary}
+              <details>
+                <summary>Technical details</summary>
+                <div class="lumae-technical-details">
+                  <p class="lumae-help">Projection status: {escape(status.replace('_', ' '))};
+                    mapped provider tracks: {mapped:,}; AudioMuse analysis items: {items:,}.</p>
+                </div>
+              </details>
+            </article>
+            """
+        )
+    if not cards:
+        cards.append(
+            """
+            <article class="lumae-source-card">
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>Waiting for a supported music source.</strong>
+                <span>Source-analysis status appears automatically after the library source is
+                  initialized.</span>
+              </div>
+            </article>
+            """
+        )
+    return f"""
+      <section class="lumae-panel" aria-label="AudioMuse source analysis status">
+        <span class="lumae-section-priority lumae-section-advanced">2 - AudioMuse managed</span>
+        <h3>2. AudioMuse source analysis</h3>
+        <p class="lumae-action-copy">AudioMuse generates the raw MusiCNN, mood, energy, and
+          fingerprint inputs. Lumae adopts them; the app does not repeat this work on the phone.</p>
+        {''.join(cards)}
+      </section>
+    """
+
+
 def render_v3_readiness_panel():
     try:
         sources = _v3_readiness_sources()
     except Exception:
         logger.exception("lumae_analysis could not render AudioMuse 3 readiness")
-        return ""
+        return _render_basic_source_analysis_panel()
     if not sources:
-        return ""
+        return _render_basic_source_analysis_panel()
     cards = []
     for source, readiness in sources:
         blockers = readiness.get("blockers") or []
@@ -3175,10 +3261,10 @@ def render_v3_readiness_panel():
             status_class = "lumae-source-state-ready"
             summary = f"""
               <div class="lumae-notice lumae-notice-success" role="status">
-                <strong>Fully verified automatically: {verified_links:,} eligible sonic links
-                  have complete evidence.</strong>
-                <span>The app can use the complete sonic catalogue. No administrator action is
-                  required.</span>
+                <strong>AudioMuse source analysis is complete for {verified_links:,} eligible
+                  tracks.</strong>
+                <span>Mappings and fingerprint evidence are fully verified. Lumae can use the
+                  complete source dataset without doing this work on the phone.</span>
               </div>
             """
         elif analysis_sync_allowed:
@@ -3186,10 +3272,11 @@ def render_v3_readiness_panel():
             status_class = "lumae-source-state-working"
             summary = f"""
               <div class="lumae-notice lumae-notice-warning" role="status">
-                <strong>Preparing in the background: {usable_links:,} sonic links are usable now.</strong>
+                <strong>AudioMuse source analysis is still filling in; {usable_links:,} tracks
+                  are usable now.</strong>
                 <span>{verified_links:,} are fully verified and {provisional_links:,} remain
-                  provisional. The app can use safe links while AudioMuse finishes the rest;
-                  there is nothing to confirm manually.</span>
+                  provisional. AudioMuse’s Analysis task or schedule produces the missing source
+                  data; Lumae adopts safe results automatically.</span>
               </div>
             """
         else:
@@ -3197,7 +3284,7 @@ def render_v3_readiness_panel():
             status_class = "lumae-source-state-danger"
             summary = """
               <div class="lumae-notice lumae-notice-error" role="alert">
-                <strong>Sonic analysis is not safe to sync yet.</strong>
+                <strong>AudioMuse source analysis is not safe to use yet.</strong>
                 <span>Resolve the measurable issues listed in the technical details below.
                   A manual fresh/upgrade confirmation cannot override them.</span>
               </div>
@@ -3205,7 +3292,7 @@ def render_v3_readiness_panel():
         cards.append(
             f"""
             <article class="lumae-source-card"
-              aria-label="Sonic analysis for {escape(str(source.get('name') or source['server_id']))}">
+              aria-label="AudioMuse source analysis for {escape(str(source.get('name') or source['server_id']))}">
               <header class="lumae-source-header">
                 <div>
                   <span class="lumae-kicker">Music source</span>
@@ -3222,7 +3309,7 @@ def render_v3_readiness_panel():
                   <p class="lumae-help">Provider tracks eligible for analysis: {eligible:,};
                     mapped: {mapped:,}; without analysis mapping: {missing:,}. Unmapped provider
                     tracks remain in the Lumae library.</p>
-                  <p class="lumae-help">Sonic links: {usable_links:,} usable
+                  <p class="lumae-help">Source-analysis links: {usable_links:,} usable
                     ({verified_links:,} verified; {provisional_links:,} provisional);
                     {pending_links:,} awaiting analysis; {suspect_links:,} flagged for repair;
                     {missing_links:,} not analyzed.</p>
@@ -3235,13 +3322,137 @@ def render_v3_readiness_panel():
             """
         )
     return f"""
-      <section class="lumae-panel" aria-label="Sonic analysis status">
-        <span class="lumae-section-priority lumae-section-advanced">3 - Automatic</span>
-        <h3>3. Sonic analysis status</h3>
-        <p class="lumae-action-copy">Lumae verifies mappings, Chromaprint coverage, and every
-          per-track sonic link automatically. Safe links are available progressively; there are
-          no fresh-install or upgrade checkboxes.</p>
+      <section class="lumae-panel" aria-label="AudioMuse source analysis status">
+        <span class="lumae-section-priority lumae-section-advanced">2 - AudioMuse managed</span>
+        <h3>2. AudioMuse source analysis</h3>
+        <p class="lumae-action-copy">AudioMuse generates the raw MusiCNN, mood, energy, and
+          Chromaprint inputs. Lumae verifies and adopts them progressively; the app does not
+          repeat this analysis on the phone.</p>
         {''.join(cards)}
+      </section>
+    """
+
+
+def render_relationship_status_panel():
+    try:
+        db = get_db()
+        sources = resolve_catalog_source(db)
+    except Exception:
+        logger.exception("lumae_analysis could not render relationship preparation")
+        return ""
+    if not sources:
+        return ""
+    cards = []
+    auto_refresh = False
+    for source in sources:
+        catalog_instance_id = source["catalog_instance_id"]
+        try:
+            state = relationship_status(db, catalog_instance_id)
+        except Exception as exc:
+            logger.exception(
+                "lumae_analysis could not read relationship status for %s",
+                catalog_instance_id,
+            )
+            state = {
+                "status": "failed",
+                "last_error": str(exc),
+            }
+        status = str(state.get("status") or "not_initialized")
+        catalog_generation = int(source.get("catalog", {}).get("generation") or 0)
+        analysis_generation = int(source.get("analysis", {}).get("generation") or 0)
+        current = (
+            status == "complete"
+            and int(state.get("source_catalog_generation") or 0) == catalog_generation
+            and int(state.get("source_analysis_generation") or 0) == analysis_generation
+            and int(state.get("schema_version") or 0) == RELATIONSHIP_SCHEMA_VERSION
+            and int(state.get("algorithm_version") or 0) == RELATIONSHIP_ALGORITHM_VERSION
+        )
+        active = status in ("queued", "running")
+        auto_refresh = auto_refresh or active
+        albums = int(state.get("album_count") or 0)
+        artists = int(state.get("artist_count") or 0)
+        if current:
+            status_label = "Ready"
+            status_class = "lumae-source-state-ready"
+            summary = f"""
+              <div class="lumae-notice lumae-notice-success" role="status">
+                <strong>Similarities are ready for {albums:,} albums and {artists:,} artists.</strong>
+                <span>The plugin calculated these with Lumae’s own ranking algorithm. The app
+                  downloads the results and does no relationship matching on the phone.</span>
+              </div>
+            """
+        elif active:
+            status_label = "Preparing"
+            status_class = "lumae-source-state-working"
+            summary = """
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>Similar album and artist relationships are being prepared automatically.</strong>
+                <span>This runs in the background and does not block library sync, playback,
+                  or the currently published relationship generation.</span>
+              </div>
+            """
+        elif status == "failed":
+            status_label = "Needs attention"
+            status_class = "lumae-source-state-danger"
+            summary = f"""
+              <div class="lumae-notice lumae-notice-error" role="alert">
+                <strong>The last relationship build failed.</strong>
+                <span>{escape(str(state.get('last_error') or 'The background worker will retry after the next source update.'))}</span>
+              </div>
+            """
+        else:
+            status_label = "Waiting for inputs" if catalog_generation == 0 else "Update pending"
+            status_class = "lumae-source-state-working"
+            summary = """
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>The automatic relationship build is waiting for published inputs.</strong>
+                <span>Once the library and AudioMuse source generation are available, the plugin
+                  queues Lumae’s album and artist algorithm automatically.</span>
+              </div>
+            """
+        cards.append(
+            f"""
+            <article class="lumae-source-card"
+              aria-label="Similar albums and artists for {escape(str(source.get('name') or source['server_id']))}">
+              <header class="lumae-source-header">
+                <div>
+                  <span class="lumae-kicker">Music source</span>
+                  <h4>{escape(str(source.get('name') or source['server_id']))}</h4>
+                </div>
+                <span class="lumae-source-state {status_class}">{status_label}</span>
+              </header>
+              {summary}
+              <details>
+                <summary>Technical details</summary>
+                <div class="lumae-technical-details">
+                  <p class="lumae-help">Relationship status: {escape(status.replace('_', ' '))};
+                    result generation: {int(state.get('generation') or 0):,};
+                    albums: {albums:,}; artists: {artists:,}.</p>
+                  <p class="lumae-help">Built from library generation
+                    {int(state.get('source_catalog_generation') or 0):,} of {catalog_generation:,}
+                    and source-analysis generation
+                    {int(state.get('source_analysis_generation') or 0):,} of {analysis_generation:,}.
+                    Algorithm version: {int(state.get('algorithm_version') or 0):,}.</p>
+                </div>
+              </details>
+            </article>
+            """
+        )
+    return f"""
+      <section class="lumae-panel" aria-label="Similar albums and artists status">
+        <span class="lumae-section-priority lumae-section-optional">4 - Automatic background</span>
+        <h3>4. Similar albums &amp; artists</h3>
+        <p class="lumae-action-copy">The plugin runs Lumae’s own album and artist relationship
+          algorithm from the published library and AudioMuse source inputs. It automatically
+          rebuilds when either input generation changes.</p>
+        {''.join(cards)}
+        {(
+            '<script>setTimeout(()=>{const u=new URL(location.href);'
+            'u.searchParams.set("_lumae_relationship_refresh",Date.now().toString());'
+            'location.replace(u.href)},5000)</script>'
+            if auto_refresh
+            else ""
+        )}
       </section>
     """
 
@@ -3414,7 +3625,7 @@ def render_source_preparation_sections(batch_size):
                 Background worker: {escape(backfill_status.replace('_', ' '))}.</p>
               <p class="lumae-help">These profiles power volume normalization and SmoothFade
                 ramps. They are prepared from audio waveforms in the background and do not block
-                library sync or sonic analysis.</p>
+                library sync, AudioMuse source analysis, or Lumae relationships.</p>
               {f'<p class="lumae-notice lumae-notice-error">Volume and ramp preparation: {escape(backfill_error)}</p>' if backfill_error else ''}
               <form class="lumae-form" method="post">
                 {hidden}
@@ -3450,10 +3661,11 @@ def render_source_preparation_sections(batch_size):
     """
     waveform_html = f"""
       <section class="lumae-panel" aria-label="Volume and ramp status">
-        <span class="lumae-section-priority lumae-section-optional">2 - Background enhancement</span>
-        <h3>2. Volume &amp; ramp status</h3>
+        <span class="lumae-section-priority lumae-section-optional">3 - Automatic background</span>
+        <h3>3. Volume &amp; ramp status</h3>
         <p class="lumae-action-copy">Loudness profiles normalize volume and MixRamp profiles power
-          SmoothFade. Their progress is independent from both library readiness and sonic analysis.</p>
+          SmoothFade. Their progress is independent from library readiness, AudioMuse source
+          analysis, and the similar-album/artist relationship build.</p>
         {''.join(waveform_cards)}
         {(
             '<script>setTimeout(()=>{const u=new URL(location.href);'
@@ -3494,6 +3706,7 @@ def render_settings(message=None, error=None):
         else ""
     )
     readiness_html = render_v3_readiness_panel()
+    relationships_html = render_relationship_status_panel()
     catalogue_html, waveform_html = render_source_preparation_sections(batch_size)
     return render_page(
         f"""
@@ -3882,10 +4095,10 @@ def render_settings(message=None, error=None):
 
           <header class="lumae-hero">
             <span class="lumae-kicker">Lumae status</span>
-            <h2>Library, playback profiles, and sonic analysis at a glance.</h2>
-            <p>These three statuses are independent. Library readiness controls app sync;
-              volume and ramp profiles improve playback in the background; sonic links are
-              verified automatically. Ready never means a completed but empty library.</p>
+            <h2>Four clear stages from library to Lumae recommendations.</h2>
+            <p>Library readiness controls app sync. AudioMuse supplies raw source analysis;
+              volume and ramp profiles improve playback; Lumae then prepares similar albums and
+              artists with its own algorithm. Ready never means a completed but empty library.</p>
             <div class="lumae-actions">
               <a class="lumae-button lumae-button-secondary" href="database-state">
                 View database state
@@ -3894,8 +4107,9 @@ def render_settings(message=None, error=None):
           </header>
 
           {catalogue_html}
-          {waveform_html}
           {readiness_html}
+          {waveform_html}
+          {relationships_html}
           {render_collections_settings_panel()}
         </section>
         """,
