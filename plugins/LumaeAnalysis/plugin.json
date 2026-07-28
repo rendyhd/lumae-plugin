@@ -58,6 +58,7 @@
         "shared_analysis",
         "binary_vectors",
         "v3_release_readiness",
+        "automatic_sonic_verification",
         "progressive_analysis_admission",
         "repair_flagged_analysis_admission",
         "database_state_dashboard",
@@ -80,6 +81,14 @@
     }
   },
   "versions": [
+    {
+      "version": "0.8.11",
+      "min_core_version": "2.6.0",
+      "changelog": "Replace manual fresh/upgrade attestations with automatic evidence-based sonic verification, and present clear independent Library, Volume & ramp, and Sonic analysis statuses.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.8.10",
       "min_core_version": "2.6.0",

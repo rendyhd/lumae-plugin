@@ -732,7 +732,7 @@ def _source_html(source):
 
         <section class="db-section">
           <div class="db-section-heading">
-            <div><span class="db-kicker">Separate verification evidence</span><h3>3. AudioMuse core</h3></div>
+            <div><span class="db-kicker">Automatic sonic evidence</span><h3>3. AudioMuse core</h3></div>
             <span class="db-state">{escape(str(core['mode']).replace('_', ' '))}</span>
           </div>
           <div class="db-metrics">

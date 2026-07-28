@@ -1,29 +1,23 @@
-"""AudioMuse 3 catalogue-repair readiness diagnostics.
+"""Automatic AudioMuse 3 sonic-analysis readiness diagnostics.
 
-AudioMuse owns analysis identity, but it does not expose one durable flag that
-proves an upgraded installation completed Chromaprint backfill, Cleaning, and
-the following analysis run.  This module combines measurable core state with a
-source-scoped administrator acknowledgement.  V2 never executes these queries.
+AudioMuse owns analysis identity. Lumae therefore derives readiness from the
+current catalogue, mapping, Chromaprint, and per-link evidence instead of asking
+an administrator to attest to historical installation steps. V2 never executes
+these queries.
 """
 
-from datetime import datetime, timezone
 import json
 import re
 
-from plugin.api import get_setting, set_setting, table
+from plugin.api import table
 
 
-ACKNOWLEDGEMENT_SETTING = "v3_catalogue_repair_acknowledgements"
 QUALIFIED_CORE_VERSIONS = ("v3.0.3", "v3.0.4", "v3.0.5")
 LATEST_QUALIFIED_CORE_VERSION = QUALIFIED_CORE_VERSIONS[-1]
 
 
 def t(name):
     return table(name)
-
-
-def _iso_now():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def _normalized_core_version(compatibility):
@@ -39,19 +33,6 @@ def _qualified_core_version(compatibility):
 
 def _qualified_release(compatibility):
     return _qualified_core_version(compatibility) is not None
-
-
-def _setting_map():
-    raw = get_setting(ACKNOWLEDGEMENT_SETTING, {})
-    if isinstance(raw, dict):
-        return dict(raw)
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            return dict(parsed) if isinstance(parsed, dict) else {}
-        except (TypeError, ValueError):
-            return {}
-    return {}
 
 
 def _task_details(value):
@@ -138,6 +119,7 @@ def _task_evidence(db):
         "cleaning": cleaning,
         "analysis_after_cleaning": after,
         "upgrade_sequence_complete": bool(before and cleaning and after),
+        "diagnostics_available": True,
     }
 
 
@@ -245,29 +227,8 @@ def _policy_blockers(policy):
     return blockers
 
 
-def _valid_acknowledgement(source, compatibility, acknowledgement):
-    qualified_core_version = _qualified_core_version(compatibility)
-    return bool(
-        isinstance(acknowledgement, dict)
-        and qualified_core_version is not None
-        and acknowledgement.get("core_version") == qualified_core_version
-        and acknowledgement.get("catalog_instance_id")
-        == source.get("catalog_instance_id")
-        and acknowledgement.get("server_id") == source.get("server_id")
-        and acknowledgement.get("verification_mode") in {"fresh", "upgraded"}
-        and _qualified_release(compatibility)
-    )
-
-
-def v3_release_readiness(
-    db,
-    compatibility,
-    source,
-    policy,
-    acknowledgement=None,
-    requested_mode=None,
-):
-    """Return source-scoped, fail-closed v3 release readiness."""
+def v3_release_readiness(db, compatibility, source, policy):
+    """Return source-scoped, fail-closed automatic v3 readiness."""
     qualified_core_version = _qualified_core_version(compatibility)
     detected_core_version = _normalized_core_version(compatibility) or str(
         getattr(compatibility, "core_version", "") or ""
@@ -317,13 +278,22 @@ def v3_release_readiness(
         link_coverage = _link_coverage(
             db, source, coverage["eligible_track_count"]
         )
-        tasks = _task_evidence(db)
     except Exception:
         return {
             **base,
             "status": "readiness_unavailable",
             "ready": False,
             "blockers": ["readiness_unavailable"],
+        }
+    try:
+        tasks = _task_evidence(db)
+    except Exception:
+        tasks = {
+            "analysis_before_cleaning": None,
+            "cleaning": None,
+            "analysis_after_cleaning": None,
+            "upgrade_sequence_complete": False,
+            "diagnostics_available": False,
         }
 
     cleaning = tasks.get("cleaning") or {}
@@ -340,12 +310,6 @@ def v3_release_readiness(
         task_order_complete and chromaprint_complete_before_cleaning
     )
 
-    if acknowledgement is None:
-        acknowledgement = _setting_map().get(source["catalog_instance_id"])
-    acknowledged = _valid_acknowledgement(source, compatibility, acknowledgement)
-    mode = requested_mode or (
-        acknowledgement.get("verification_mode") if acknowledged else None
-    )
     blockers = _policy_blockers(policy)
     progressive_blockers = list(blockers)
     if source.get("catalog", {}).get("status") != "complete":
@@ -357,24 +321,44 @@ def v3_release_readiness(
     if coverage["mapped_track_count"] == 0:
         blockers.append("no_analysis_mappings")
         progressive_blockers.append("no_analysis_mappings")
-    elif coverage["chromaprint_missing_count"]:
-        blockers.append("chromaprint_backfill_incomplete")
+    else:
+        if coverage["missing_mapping_count"]:
+            blockers.append("analysis_mapping_incomplete")
+        if coverage["chromaprint_missing_count"]:
+            blockers.append("chromaprint_backfill_incomplete")
+    if link_coverage["pending_link_count"]:
+        blockers.append("analysis_links_pending")
+    if link_coverage["suspect_link_count"]:
+        blockers.append("analysis_links_need_repair")
+    if link_coverage["missing_link_count"]:
+        blockers.append("analysis_links_missing")
+    if link_coverage["provisional_link_count"]:
+        blockers.append("provisional_links_remaining")
+    if (
+        link_coverage["verified_link_count"]
+        != coverage["eligible_track_count"]
+        and not any(
+            code
+            in blockers
+            for code in (
+                "no_analysis_mappings",
+                "analysis_mapping_incomplete",
+                "analysis_links_pending",
+                "analysis_links_need_repair",
+                "analysis_links_missing",
+                "provisional_links_remaining",
+            )
+        )
+    ):
+        blockers.append("sonic_evidence_incomplete")
     if policy.get("per_link_chromaprint_evidence_available") is not True:
+        blockers.append("per_link_evidence_unavailable")
         progressive_blockers.append("per_link_evidence_unavailable")
-    if mode == "upgraded" and not acknowledged:
-        if not task_order_complete:
-            blockers.append("upgrade_repair_sequence_incomplete")
-        elif not chromaprint_complete_before_cleaning:
-            blockers.append("cleaning_predates_chromaprint_completion")
-    if requested_mode is None and not acknowledged:
-        blockers.append("administrator_acknowledgement_required")
 
     analysis_sync_allowed = not progressive_blockers
-    ready = not blockers and (acknowledged or requested_mode is not None)
+    ready = analysis_sync_allowed and not blockers
     if ready:
         status = "ready"
-    elif blockers == ["administrator_acknowledgement_required"]:
-        status = "acknowledgement_required"
     elif analysis_sync_allowed:
         status = "progressive"
     else:
@@ -388,59 +372,9 @@ def v3_release_readiness(
         "fully_verified": ready,
         "analysis_sync_allowed": analysis_sync_allowed,
         "progressive_analysis": analysis_sync_allowed and not ready,
-        "verification_mode": mode,
-        "administrator_acknowledged": acknowledged,
-        "acknowledged_at": (
-            acknowledgement.get("acknowledged_at") if acknowledged else None
-        ),
+        "verification_mode": "automatic" if ready else None,
+        "administrator_acknowledged": False,
+        "acknowledged_at": None,
         "task_evidence": tasks,
         "blockers": blockers,
     }
-
-
-def acknowledge_v3_release(db, compatibility, source, policy, mode):
-    if mode not in {"fresh", "upgraded"}:
-        raise ValueError("Choose fresh or upgraded AudioMuse 3 verification")
-    candidate = v3_release_readiness(
-        db,
-        compatibility,
-        source,
-        policy,
-        acknowledgement={},
-        requested_mode=mode,
-    )
-    if not candidate["ready"]:
-        raise ValueError(
-            "AudioMuse 3 is not ready: " + ", ".join(candidate["blockers"])
-        )
-    acknowledgements = _setting_map()
-    acknowledgements[source["catalog_instance_id"]] = {
-        "core_version": candidate["qualified_core_version"],
-        "catalog_instance_id": source["catalog_instance_id"],
-        "server_id": source["server_id"],
-        "verification_mode": mode,
-        "acknowledged_at": _iso_now(),
-        "cleaning_task_id": (
-            (candidate.get("task_evidence", {}).get("cleaning") or {}).get("task_id")
-        ),
-        "post_clean_analysis_task_id": (
-            (
-                candidate.get("task_evidence", {}).get("analysis_after_cleaning") or {}
-            ).get("task_id")
-        ),
-    }
-    set_setting(ACKNOWLEDGEMENT_SETTING, acknowledgements)
-    return v3_release_readiness(
-        db,
-        compatibility,
-        source,
-        policy,
-        acknowledgement=acknowledgements[source["catalog_instance_id"]],
-    )
-
-
-def clear_v3_release_acknowledgement(catalog_instance_id):
-    acknowledgements = _setting_map()
-    removed = acknowledgements.pop(str(catalog_instance_id), None) is not None
-    set_setting(ACKNOWLEDGEMENT_SETTING, acknowledgements)
-    return removed

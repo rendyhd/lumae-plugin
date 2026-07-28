@@ -51,11 +51,7 @@ from .catalog_enrichment import (
     relationship_status,
     serialize_profile,
 )
-from .catalog_readiness import (
-    acknowledge_v3_release,
-    clear_v3_release_acknowledgement,
-    v3_release_readiness,
-)
+from .catalog_readiness import v3_release_readiness
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .database_state import collect_database_state, render_database_state
 from .collection_manager import (
@@ -70,7 +66,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.10"
+PLUGIN_VERSION = "0.8.11"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -89,6 +85,7 @@ CATALOG_FEATURES = (
     "shared_analysis",
     "binary_vectors",
     "v3_release_readiness",
+    "automatic_sonic_verification",
     "progressive_analysis_admission",
     "repair_flagged_analysis_admission",
     "database_state_dashboard",
@@ -3090,21 +3087,24 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
 
 
 _READINESS_BLOCKER_LABELS = {
-    "administrator_acknowledgement_required": "Administrator confirmation is still required.",
+    "analysis_links_missing": "Some eligible tracks do not have AudioMuse analysis yet.",
+    "analysis_links_need_repair": "Some sonic links are flagged for automatic repair.",
+    "analysis_links_pending": "Some eligible tracks are still awaiting AudioMuse analysis.",
+    "analysis_mapping_incomplete": "Some eligible provider tracks do not have an AudioMuse mapping yet.",
     "analysis_projection_incomplete": "The plugin analysis projection is not complete.",
     "catalog_generation_incomplete": "The provider catalogue generation is not complete.",
     "chromaprint_backfill_incomplete": "Full-library verification is still waiting for Chromaprint; affected collision groups remain usable but provisional.",
     "chromaprint_collection_disabled": "Chromaprint collection is disabled in AudioMuse.",
     "chromaprint_gate_disabled": "Chromaprint duplicate validation is disabled in AudioMuse.",
-    "cleaning_predates_chromaprint_completion": "Chromaprint completed after Cleaning; run Cleaning and then Analysis again.",
     "duration_tolerance_too_wide": "The AudioMuse duplicate duration tolerance is wider than one second.",
     "folder_gate_not_active": "The fp_4 folder-aware duplicate rule is not active.",
     "fp_4_not_active": "AudioMuse catalogue ID scheme fp_4 is not active.",
     "no_analysis_mappings": "No provider tracks have AudioMuse analysis mappings yet.",
     "per_link_evidence_unavailable": "This plugin cannot qualify AudioMuse analysis links individually.",
+    "provisional_links_remaining": "Some usable sonic links still have provisional evidence.",
     "readiness_unavailable": "The plugin could not read AudioMuse repair diagnostics.",
-    "source_rebind_required": "Confirm the AudioMuse v2-to-v3 source continuity before readiness.",
-    "upgrade_repair_sequence_incomplete": "Run Analysis, then Cleaning, then Analysis again.",
+    "sonic_evidence_incomplete": "Full per-track sonic evidence is not complete yet.",
+    "source_rebind_required": "Lumae still needs to verify the AudioMuse source identity during app sync.",
 }
 
 
@@ -3151,91 +3151,96 @@ def render_v3_readiness_panel():
         suspect_links = int(readiness.get("suspect_link_count") or 0)
         missing_links = int(readiness.get("missing_link_count") or 0)
         coverage = float(readiness.get("chromaprint_coverage") or 0) * 100
-        sequence = bool(
-            (readiness.get("task_evidence") or {}).get("upgrade_sequence_complete")
+        task_evidence = readiness.get("task_evidence") or {}
+        sequence = bool(task_evidence.get("upgrade_sequence_complete"))
+        sequence_label = (
+            "unavailable"
+            if task_evidence.get("diagnostics_available") is False
+            else ("yes" if sequence else "no")
         )
-        progressive = bool(readiness.get("analysis_sync_allowed"))
-        detected_version = escape(
-            str(readiness.get("detected_core_version") or "AudioMuse 3")
-        )
-        hidden = (
-            f'<input type="hidden" name="server_id" value="{escape(str(source["server_id"]))}">'
-            f'<input type="hidden" name="catalog_instance_id" '
-            f'value="{escape(str(source["catalog_instance_id"]))}">'
-        )
+        fully_verified = bool(readiness.get("ready"))
+        analysis_sync_allowed = bool(readiness.get("analysis_sync_allowed"))
         if "source_rebind_required" in blockers:
-            controls = """
-              <p class="lumae-help">Run Lumae sync once to prove and adopt the AudioMuse 3
-                server identity. Readiness confirmation will unlock after that succeeds.</p>
+            status_label = "Waiting for source check"
+            status_class = "lumae-source-state-working"
+            summary = """
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>Waiting for Lumae app sync to verify this source automatically.</strong>
+                <span>No manual confirmation is needed. The next app sync will prove and adopt
+                  the AudioMuse server identity when it matches.</span>
+              </div>
             """
-        elif readiness.get("administrator_acknowledged"):
-            controls = f"""
-              <p class="lumae-help">Confirmed as {escape(str(readiness.get('verification_mode')))}
-                at {escape(str(readiness.get('acknowledged_at') or 'unknown time'))}.</p>
-              <form class="lumae-form" method="post">
-                {hidden}
-                <button class="lumae-button-secondary" type="submit" name="action"
-                  value="clear_v3_readiness">Revoke confirmation</button>
-              </form>
+        elif fully_verified:
+            status_label = "Ready"
+            status_class = "lumae-source-state-ready"
+            summary = f"""
+              <div class="lumae-notice lumae-notice-success" role="status">
+                <strong>Fully verified automatically: {verified_links:,} eligible sonic links
+                  have complete evidence.</strong>
+                <span>The app can use the complete sonic catalogue. No administrator action is
+                  required.</span>
+              </div>
+            """
+        elif analysis_sync_allowed:
+            status_label = "Preparing"
+            status_class = "lumae-source-state-working"
+            summary = f"""
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>Preparing in the background: {usable_links:,} sonic links are usable now.</strong>
+                <span>{verified_links:,} are fully verified and {provisional_links:,} remain
+                  provisional. The app can use safe links while AudioMuse finishes the rest;
+                  there is nothing to confirm manually.</span>
+              </div>
             """
         else:
-            controls = f"""
-              <form class="lumae-form" method="post">
-                {hidden}
-                <label class="lumae-toggle">
-                  <input type="checkbox" name="confirm" required>
-                  I confirm this is a fresh {detected_version} database with no pre-3.x catalogue.
-                </label>
-                <input type="hidden" name="verification_mode" value="fresh">
-                <button class="lumae-button-secondary" type="submit" name="action"
-                  value="ack_v3_readiness">Confirm fresh installation</button>
-              </form>
-              <form class="lumae-form" method="post">
-                {hidden}
-                <label class="lumae-toggle">
-                  <input type="checkbox" name="confirm" required>
-                  I completed Analysis, Cleaning, then Analysis again after the original
-                  AudioMuse 3 upgrade, and this {detected_version} source now passes the checks.
-                </label>
-                <input type="hidden" name="verification_mode" value="upgraded">
-                <button class="lumae-button-caution" type="submit" name="action"
-                  value="ack_v3_readiness">Confirm upgraded installation</button>
-              </form>
+            status_label = "Needs attention"
+            status_class = "lumae-source-state-danger"
+            summary = """
+              <div class="lumae-notice lumae-notice-error" role="alert">
+                <strong>Sonic analysis is not safe to sync yet.</strong>
+                <span>Resolve the measurable issues listed in the technical details below.
+                  A manual fresh/upgrade confirmation cannot override them.</span>
+              </div>
             """
         cards.append(
             f"""
-            <article class="lumae-coverage">
-              <div class="lumae-coverage-row">
-                <strong>{escape(str(source.get('name') or source['server_id']))}</strong>
-                <span>{escape(str(readiness.get('status') or 'unknown'))}</span>
-              </div>
-              <p class="lumae-help">Chromaprint: {fingerprinted:,} of {mapped:,} mapped tracks
-                ({coverage:.2f}%). Upgrade repair sequence detected: {'yes' if sequence else 'no'}.</p>
-              <p class="lumae-help">Provider tracks eligible for analysis: {eligible:,}; currently
-                mapped: {mapped:,}; without analysis mapping: {missing:,}. Unmapped provider tracks
-                remain in the Lumae catalogue.</p>
-              <p class="lumae-help">Sonic links: {usable_links:,} usable
-                ({verified_links:,} verified; {provisional_links:,} provisional);
-                {pending_links:,} awaiting analysis; of the usable links,
-                {suspect_links:,} flagged for repair;
-                {missing_links:,} not analyzed.</p>
-              <p class="lumae-help">{(
-                  'Sonic links are syncing progressively; provisional matches remain usable while Chromaprint continues.'
-                  if progressive
-                  else 'Sonic sync is waiting for per-link safety evidence.'
-              )}</p>
-              {f'<ul class="lumae-help">{blocker_html}</ul>' if blocker_html else ''}
-              {controls}
+            <article class="lumae-source-card"
+              aria-label="Sonic analysis for {escape(str(source.get('name') or source['server_id']))}">
+              <header class="lumae-source-header">
+                <div>
+                  <span class="lumae-kicker">Music source</span>
+                  <h4>{escape(str(source.get('name') or source['server_id']))}</h4>
+                </div>
+                <span class="lumae-source-state {status_class}">{status_label}</span>
+              </header>
+              {summary}
+              <details>
+                <summary>Technical details</summary>
+                <div class="lumae-technical-details">
+                  <p class="lumae-help">Chromaprint: {fingerprinted:,} of {mapped:,} mapped tracks
+                    ({coverage:.2f}%).</p>
+                  <p class="lumae-help">Provider tracks eligible for analysis: {eligible:,};
+                    mapped: {mapped:,}; without analysis mapping: {missing:,}. Unmapped provider
+                    tracks remain in the Lumae library.</p>
+                  <p class="lumae-help">Sonic links: {usable_links:,} usable
+                    ({verified_links:,} verified; {provisional_links:,} provisional);
+                    {pending_links:,} awaiting analysis; {suspect_links:,} flagged for repair;
+                    {missing_links:,} not analyzed.</p>
+                  <p class="lumae-help">Historical AudioMuse upgrade sequence observed:
+                    {sequence_label} (diagnostic only; it does not gate readiness).</p>
+                  {f'<ul class="lumae-help">{blocker_html}</ul>' if blocker_html else ''}
+                </div>
+              </details>
             </article>
             """
         )
     return f"""
-      <section class="lumae-panel" aria-label="AudioMuse 3 release readiness">
-        <span class="lumae-section-priority lumae-section-advanced">Separate verification</span>
-        <h3>AudioMuse 3 sonic verification</h3>
-        <p class="lumae-action-copy">This is separate from app-sync readiness above. Lumae publishes
-          safe sonic links progressively; full coverage and administrator confirmation mark the
-          source fully verified without blocking already-qualified links.</p>
+      <section class="lumae-panel" aria-label="Sonic analysis status">
+        <span class="lumae-section-priority lumae-section-advanced">3 - Automatic</span>
+        <h3>3. Sonic analysis status</h3>
+        <p class="lumae-action-copy">Lumae verifies mappings, Chromaprint coverage, and every
+          per-track sonic link automatically. Safe links are available progressively; there are
+          no fresh-install or upgrade checkboxes.</p>
         {''.join(cards)}
       </section>
     """
@@ -3298,8 +3303,8 @@ def render_source_preparation_sections(batch_size):
             readiness_notice = f"""
               <div class="lumae-notice lumae-notice-success" role="status">
                 <strong>Ready for app sync: {published_tracks:,} Navidrome tracks are published.</strong>
-                <span>The catalogue and AudioMuse projection are complete. Waveform coverage is
-                  optional and is reported separately below.</span>
+                <span>The library catalogue and app sync index are complete. Volume, ramp, and
+                  sonic coverage are reported separately below.</span>
               </div>
             """
         elif catalog_status == "complete" and published_tracks == 0:
@@ -3328,10 +3333,26 @@ def render_source_preparation_sections(batch_size):
             readiness_notice = """
               <div class="lumae-notice lumae-notice-warning" role="status">
                 <strong>Not ready for app sync.</strong>
-                <span>Publish a non-empty Navidrome catalogue and complete the AudioMuse
-                  projection by refreshing the required data.</span>
+                <span>Publish a non-empty Navidrome catalogue and complete the app sync
+                  index by refreshing the required data.</span>
               </div>
             """
+        profiles_complete = total > 0 and ready >= total
+        if profiles_complete:
+            profile_status = "Ready"
+            profile_status_class = "lumae-source-state-ready"
+        elif backfill_active:
+            profile_status = "Preparing"
+            profile_status_class = "lumae-source-state-working"
+        elif int(counts["failed"]) > 0 and queueable == 0:
+            profile_status = "Needs attention"
+            profile_status_class = "lumae-source-state-danger"
+        elif total == 0:
+            profile_status = "Waiting for library"
+            profile_status_class = "lumae-source-state-working"
+        else:
+            profile_status = "Not complete"
+            profile_status_class = "lumae-source-state-working"
         catalogue_cards.append(
             f"""
             <article class="lumae-source-card"
@@ -3350,11 +3371,11 @@ def render_source_preparation_sections(batch_size):
                   <strong>{published_tracks:,}</strong>
                 </div>
                 <div class="lumae-status-card {'lumae-status-ready' if catalogue_ready else 'lumae-status-attention'}">
-                  <span>Catalogue job</span>
+                  <span>Library catalogue</span>
                   <strong>{escape(catalog_status.replace('_', ' '))}</strong>
                 </div>
                 <div class="lumae-status-card {'lumae-status-ready' if projection_status == 'complete' else 'lumae-status-attention'}">
-                  <span>AudioMuse projection</span>
+                  <span>App sync index</span>
                   <strong>{escape(projection_status.replace('_', ' '))}</strong>
                 </div>
               </div>
@@ -3367,33 +3388,34 @@ def render_source_preparation_sections(batch_size):
                 </div>
               </form>
               <p class="lumae-help">This refresh imports the selected Navidrome libraries first,
-                then publishes the AudioMuse projection. Optional waveform enrichment can continue
-                in the background after the source becomes ready.</p>
+                then publishes the app sync index. Volume, ramp, and sonic work can continue in
+                the background after the library becomes ready.</p>
             </article>
             """
         )
         waveform_cards.append(
             f"""
             <article class="lumae-source-card"
-              aria-label="Waveform enrichment for {escape(str(source['name']))}">
+              aria-label="Volume and ramp status for {escape(str(source['name']))}">
               <header class="lumae-source-header">
                 <div>
                   <span class="lumae-kicker">Navidrome source</span>
                   <h4>{escape(str(source.get('name') or server_id))}</h4>
                 </div>
-                <span class="lumae-source-state">Optional</span>
+                <span class="lumae-source-state {profile_status_class}">{profile_status}</span>
               </header>
-              <div class="lumae-meter" role="progressbar" aria-label="Ready waveform profiles"
+              <div class="lumae-meter" role="progressbar" aria-label="Ready volume and ramp profiles"
                 aria-valuemin="0" aria-valuemax="100" aria-valuenow="{coverage}">
                 <div class="lumae-meter-fill" style="width: {coverage}%;"></div>
               </div>
-              <p class="lumae-help"><strong>{ready:,} of {total:,} waveform profiles ready.</strong>
+              <p class="lumae-help"><strong>{ready:,} of {total:,} volume and ramp profiles ready.</strong>
                 {counts['pending']:,} pending; {queueable:,} need analysis;
                 {counts['failed']:,} failed; {counts['skipped']:,} skipped.
                 Background worker: {escape(backfill_status.replace('_', ' '))}.</p>
-              <p class="lumae-help">Waveforms improve volume normalization and SmoothFade.
-                They do not decide whether the catalogue is ready for app sync.</p>
-              {f'<p class="lumae-notice lumae-notice-error">Waveform catch-up: {escape(backfill_error)}</p>' if backfill_error else ''}
+              <p class="lumae-help">These profiles power volume normalization and SmoothFade
+                ramps. They are prepared from audio waveforms in the background and do not block
+                library sync or sonic analysis.</p>
+              {f'<p class="lumae-notice lumae-notice-error">Volume and ramp preparation: {escape(backfill_error)}</p>' if backfill_error else ''}
               <form class="lumae-form" method="post">
                 {hidden}
                 <label class="lumae-field">
@@ -3402,7 +3424,7 @@ def render_source_preparation_sections(batch_size):
                 </label>
                 <div class="lumae-actions">
                   <button class="lumae-button-secondary" type="submit" name="action"
-                    value="start_backfill"{backfill_disabled}>Start waveform enrichment</button>
+                    value="start_backfill"{backfill_disabled}>Prepare missing volume &amp; ramps</button>
                 </div>
               </form>
             </article>
@@ -3410,28 +3432,28 @@ def render_source_preparation_sections(batch_size):
         )
     if not catalogue_cards:
         return """
-          <section class="lumae-panel" aria-label="Prepare Lumae">
-            <span class="lumae-section-priority">Required</span>
-            <h3>Catalogue and app sync</h3>
+          <section class="lumae-panel" aria-label="Library status">
+            <span class="lumae-section-priority">1 - Required</span>
+            <h3>1. Library status</h3>
             <p class="lumae-help">No supported AudioMuse music server is available yet.</p>
           </section>
         """, ""
     catalogue_html = f"""
-      <section class="lumae-panel" aria-label="Catalogue and app sync">
-        <span class="lumae-section-priority">Required - start here</span>
-        <h3>Catalogue and app sync</h3>
+      <section class="lumae-panel" aria-label="Library status">
+        <span class="lumae-section-priority">1 - Required</span>
+        <h3>1. Library status</h3>
         <p class="lumae-action-copy">“Ready for app sync” has one precise meaning: at least one
-          Navidrome track is published and the matching AudioMuse projection is complete.
+          Navidrome track is published and the matching app sync index is complete.
           A completed job with zero tracks is not ready.</p>
         {''.join(catalogue_cards)}
       </section>
     """
     waveform_html = f"""
-      <section class="lumae-panel" aria-label="Waveform playback enhancements">
-        <span class="lumae-section-priority lumae-section-optional">Optional</span>
-        <h3>Waveform playback enhancements</h3>
-        <p class="lumae-action-copy">Loudness and MixRamp profiles improve playback after app sync
-          is already available. Their progress never changes the required readiness status above.</p>
+      <section class="lumae-panel" aria-label="Volume and ramp status">
+        <span class="lumae-section-priority lumae-section-optional">2 - Background enhancement</span>
+        <h3>2. Volume &amp; ramp status</h3>
+        <p class="lumae-action-copy">Loudness profiles normalize volume and MixRamp profiles power
+          SmoothFade. Their progress is independent from both library readiness and sonic analysis.</p>
         {''.join(waveform_cards)}
         {(
             '<script>setTimeout(()=>{const u=new URL(location.href);'
@@ -3679,6 +3701,23 @@ def render_settings(message=None, error=None):
             margin: 0;
           }}
 
+          .lumae-panel details {{
+            border-top: 1px solid var(--lumae-line);
+            padding-top: 10px;
+          }}
+
+          .lumae-panel summary {{
+            color: var(--lumae-ink);
+            cursor: pointer;
+            font-weight: 700;
+          }}
+
+          .lumae-technical-details {{
+            display: grid;
+            gap: 8px;
+            padding-top: 10px;
+          }}
+
           .lumae-section-priority {{
             color: var(--lumae-accent);
             font-size: 0.72rem;
@@ -3842,11 +3881,11 @@ def render_settings(message=None, error=None):
           {error_html}
 
           <header class="lumae-hero">
-            <span class="lumae-kicker">Setup and readiness</span>
-            <h2>Prepare the Lumae catalogue before optional playback enhancements.</h2>
-            <p>Read this page from top to bottom. Required app data comes first, separate
-              AudioMuse 3 verification follows when applicable, and optional waveform work comes
-              last. “Ready” never means a completed but empty catalogue.</p>
+            <span class="lumae-kicker">Lumae status</span>
+            <h2>Library, playback profiles, and sonic analysis at a glance.</h2>
+            <p>These three statuses are independent. Library readiness controls app sync;
+              volume and ramp profiles improve playback in the background; sonic links are
+              verified automatically. Ready never means a completed but empty library.</p>
             <div class="lumae-actions">
               <a class="lumae-button lumae-button-secondary" href="database-state">
                 View database state
@@ -3855,8 +3894,8 @@ def render_settings(message=None, error=None):
           </header>
 
           {catalogue_html}
-          {readiness_html}
           {waveform_html}
+          {readiness_html}
           {render_collections_settings_panel()}
         </section>
         """,
@@ -3876,38 +3915,11 @@ def settings():
                 set_setting("collection_manager_enabled", enabled)
                 sync_collections_menu(enabled)
                 message = f"Living Collections {'enabled' if enabled else 'disabled'}."
-            elif action == "ack_v3_readiness":
-                if request.form.get("confirm") != "on":
-                    raise ValueError("Explicit AudioMuse 3 confirmation is required")
-                compatibility = detect_core()
-                db = get_db()
-                sources = resolve_catalog_source(db, server_id=request.form.get("server_id"))
-                if (
-                    len(sources) != 1
-                    or sources[0]["catalog_instance_id"]
-                    != request.form.get("catalog_instance_id")
-                ):
-                    raise ValueError("The selected catalogue source changed; reload and retry")
-                result = acknowledge_v3_release(
-                    db,
-                    compatibility,
-                    sources[0],
-                    dedup_policy(),
-                    request.form.get("verification_mode"),
-                )
-                confirmed_version = result.get(
-                    "detected_core_version", compatibility.core_version
-                )
+            elif action in ("ack_v3_readiness", "clear_v3_readiness"):
                 message = (
-                    f"{confirmed_version} sync readiness confirmed for "
-                    f"{sources[0]['name']} "
-                    f"({result['verification_mode']})."
+                    "Manual AudioMuse verification is no longer required. "
+                    "Lumae now verifies sonic readiness automatically from current evidence."
                 )
-            elif action == "clear_v3_readiness":
-                clear_v3_release_acknowledgement(
-                    request.form.get("catalog_instance_id") or ""
-                )
-                message = "AudioMuse 3 sync readiness confirmation revoked."
             elif action in ("prepare_lumae", "start_backfill", "catch_up", "queue_all"):
                 batch_size = normalize_backfill_limit(
                     request.form.get("backfill_batch_size") or DEFAULT_BACKFILL_BATCH_SIZE
@@ -3941,8 +3953,8 @@ def settings():
                             )
                             raise
                         message = (
-                            f"Preparing {source['name']}: catalogue refresh, analysis projection, "
-                            "then fair background waveform enrichment. Lumae can sync as soon as "
+                            f"Preparing {source['name']}: library refresh and app sync index first, "
+                            "then fair background volume and ramp work. Lumae can sync as soon as "
                             "the first two phases complete."
                         )
                 else:
