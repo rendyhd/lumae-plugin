@@ -83,8 +83,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Move album and artist relationship preparation to AudioMuse using Lumae's native scoring model, publish relationship and playback-profile cursor streams, and keep all enrichment asynchronous so catalogue setup finishes immediately.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.9.zip",
+      "checksum": "4fc7fa86e5328eae1f975c76effbbfd8"
     },
     {
       "version": "0.8.8",
