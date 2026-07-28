@@ -85,8 +85,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Durably reconcile missed and failed catalogue repairs, attest the worker and catalogue-builder versions before declaring publication current, and keep repeated setup checks idempotent.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.8.10.zip",
+      "checksum": "1d0dea096c2352f99eb9123946f510dc"
     },
     {
       "version": "0.8.9",
