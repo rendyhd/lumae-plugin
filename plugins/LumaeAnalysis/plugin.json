@@ -37,7 +37,7 @@
     "catalog_mirror": {
       "catalog_schema_version": 2,
       "analysis_schema_version": 2,
-      "catalog_builder_version": 4,
+      "catalog_builder_version": 5,
       "supported_core_range": ">=2.6.0,<4.0.0",
       "supported_provider_types": [
         "navidrome"
@@ -82,6 +82,14 @@
     }
   },
   "versions": [
+    {
+      "version": "0.9.1",
+      "min_core_version": "2.6.0",
+      "changelog": "Normalize structured provider artist identities before publishing catalogue and relationship data, and rebuild existing catalogues so similar-artist keys remain readable and addressable.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.9.0",
       "min_core_version": "2.6.0",

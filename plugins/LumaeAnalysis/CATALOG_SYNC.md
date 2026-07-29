@@ -1,7 +1,9 @@
 # Catalogue sync operations
 
-Lumae Analysis 0.9.0 adds transfer-cost and scan diagnostics without changing
-catalogue schema major 2. The migration is additive and idempotent.
+Lumae Analysis 0.9.1 normalizes structured provider artist identities before
+publishing catalogue display fields and relationship keys. Its catalogue
+builder version bump forces existing malformed rows to be rebuilt. The 0.9.0
+transfer-cost and scan diagnostics remain additive and idempotent.
 
 ## Fingerprint migration
 

@@ -18,7 +18,7 @@ from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
-CATALOG_BUILDER_VERSION = 4
+CATALOG_BUILDER_VERSION = 5
 CATALOG_FINGERPRINT_SCHEMA_VERSION = 2
 CHANGE_EVENT_OVERHEAD_BYTES = 192
 SNAPSHOT_ENTITY_OVERHEAD_BYTES = 96
@@ -67,6 +67,22 @@ def _text(value):
     if value is None:
         return None
     return unicodedata.normalize("NFC", str(value)).strip() or None
+
+
+def _artist_display(value):
+    """Return provider artist names without serializing structured identities."""
+    if value in (None, ""):
+        return None
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    names = []
+    for item in values:
+        if isinstance(item, dict):
+            name = _text(_value(item, "Name", "name", "display_name", "Artist", "artist"))
+        else:
+            name = _text(item)
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names) or None
 
 
 def _integer(value):
@@ -149,24 +165,29 @@ def fingerprint(value):
 
 def _artist_rows(row, fallback_name=None, default_role="artist"):
     raw_items = _value(row, "ArtistItems", "artistItems")
+    if raw_items and not isinstance(raw_items, (list, tuple, set)):
+        raw_items = [raw_items]
     if not raw_items:
         names = _value(row, "Artists", "artists")
-        if isinstance(names, str):
-            names = [names]
         if names:
-            raw_items = [{"Name": name} for name in names]
+            raw_items = names if isinstance(names, (list, tuple, set)) else [names]
     if not raw_items:
         name = _value(row, "artist", "Artist", "AlbumArtist", "albumartist", default=fallback_name)
         artist_id = _value(row, "artistId", "ArtistId", "albumArtistId")
-        raw_items = [{"Id": artist_id, "Name": name}] if name else []
+        if isinstance(name, dict):
+            raw_items = [name]
+        elif isinstance(name, (list, tuple, set)):
+            raw_items = name
+        else:
+            raw_items = [{"Id": artist_id, "Name": name}] if name else []
     result = []
     for position, item in enumerate(raw_items or []):
         if not isinstance(item, dict):
             item = {"Name": item}
-        name = _text(_value(item, "Name", "name"))
+        name = _artist_display(item)
         if not name:
             continue
-        native_id = _text(_value(item, "Id", "id"))
+        native_id = _text(_value(item, "Id", "id", "ArtistId", "artistId"))
         provenance = "provider_id" if native_id else "derived_display_name"
         artist_id = native_id or f"derived:{fingerprint({'name': name.casefold()})[:24]}"
         result.append(
@@ -352,7 +373,9 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         metadata = {
             "name": name,
             "sort_name": _text(_value(raw, "SortName", "sortName")),
-            "album_artist_display": _text(_value(raw, "AlbumArtist", "albumArtist", "albumartist"))
+            "album_artist_display": _artist_display(
+                _value(raw, "AlbumArtist", "albumArtist", "albumartist")
+            )
             or ", ".join(artist["name"] for artist in artists)
             or None,
             "added_at": _text(_value(raw, "created", "DateCreated", "added_at")),
@@ -414,10 +437,12 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         metadata = {
             "album_id": album_id,
             "title": title,
-            "artist_display": _text(_value(raw, "artist", "Artist", "AlbumArtist"))
+            "artist_display": _artist_display(_value(raw, "artist", "Artist", "AlbumArtist"))
             or ", ".join(artist["name"] for artist in artists)
             or None,
-            "album_artist_display": _text(_value(raw, "albumArtist", "AlbumArtist", "albumartist"))
+            "album_artist_display": _artist_display(
+                _value(raw, "albumArtist", "AlbumArtist", "albumartist")
+            )
             or (albums_by_id.get(album_id, {}).get("album_artist_display") if album_id else None),
             "disc_number": _integer(_value(raw, "discNumber", "ParentIndexNumber", "disc", "discnumber")),
             "track_number": _integer(_value(raw, "track", "trackNumber", "IndexNumber", "tracknum")),

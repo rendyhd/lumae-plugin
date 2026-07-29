@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.9.0"
+    assert manifest["versions"][0]["version"] == "0.9.1"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -115,7 +115,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["capabilities"]["catalog_mirror"] == {
         "catalog_schema_version": 2,
         "analysis_schema_version": 2,
-        "catalog_builder_version": 4,
+        "catalog_builder_version": 5,
         "supported_core_range": ">=2.6.0,<4.0.0",
         "supported_provider_types": ["navidrome"],
         "features": [
@@ -167,7 +167,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.9.0",
+        "plugin_version": "0.9.1",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -289,7 +289,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.9.0"
+    assert body["plugin_version"] == "0.9.1"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -4396,6 +4396,53 @@ def test_provider_catalog_accepts_v3_duration_seconds_field():
     )
 
     assert normalized["tracks"][0]["duration_ms"] == 201250
+
+
+def test_provider_catalog_normalizes_structured_navidrome_artist_identities():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    normalized = normalize_provider_catalog(
+        {
+            "albums": [
+                {
+                    "id": "album-1",
+                    "name": "Lux",
+                    "AlbumArtist": {
+                        "id": "7na6296tJwTG4kzEPL94VM",
+                        "name": "ROSALÍA",
+                    },
+                }
+            ],
+            "tracks": [
+                {
+                    "id": "track-1",
+                    "title": "Berghain",
+                    "albumId": "album-1",
+                    "album": "Lux",
+                    "artist": {
+                        "id": "7na6296tJwTG4kzEPL94VM",
+                        "name": "Rosalía",
+                    },
+                    "albumArtist": [
+                        {
+                            "id": "7na6296tJwTG4kzEPL94VM",
+                            "name": "ROSALÍA",
+                        }
+                    ],
+                }
+            ],
+        },
+        "navidrome",
+    )
+
+    assert normalized["albums"][0]["album_artist_display"] == "ROSALÍA"
+    assert normalized["tracks"][0]["artist_display"] == "Rosalía"
+    assert normalized["tracks"][0]["album_artist_display"] == "ROSALÍA"
+    assert len(normalized["artists"]) == 1
+    assert normalized["artists"][0]["artist_id"] == "7na6296tJwTG4kzEPL94VM"
+    assert normalized["artists"][0]["name"] == "ROSALÍA"
+    assert normalized["artists"][0]["identity_provenance"] == "provider_id"
+    assert "{'id':" not in json.dumps(normalized, ensure_ascii=False)
 
 
 def test_provider_catalog_publishes_relationships_and_rich_enrichment_in_stream_payloads():
