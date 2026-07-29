@@ -16,6 +16,7 @@ from .core_compat import (
     sanitized_server_summaries,
 )
 from .catalog import (
+    CATALOG_FINGERPRINT_SCHEMA_VERSION,
     attempt_legacy_rebind,
     CatalogScanError,
     bootstrap_page,
@@ -53,9 +54,10 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.1"
+PLUGIN_VERSION = "0.9.0"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
+CATALOG_BUILDER_VERSION = 1
 CATALOG_FEATURES = (
     "dual_core_compat",
     "stable_catalog_instance",
@@ -75,8 +77,29 @@ CATALOG_FEATURES = (
     "provider_track_scope_verification",
     "source_scoped_profiles",
     "prepare_lumae",
+    "catalog_prepare_api",
     "analysis_run_finalization",
 )
+CATALOG_FEATURE_ROUTES = {
+    "bootstrap_leases": (
+        ("/api/catalog/bootstrap-sessions", "POST"),
+        ("/api/catalog/bootstrap-sessions", "DELETE"),
+        ("/api/catalog/bootstrap", "GET"),
+    ),
+    "cursor_changes": (("/api/catalog/changes", "GET"),),
+    "refresh_on_demand": (("/api/catalog/refresh", "POST"),),
+    "provider_track_scope_verification": (("/api/catalog/verify-scope", "POST"),),
+    "source_scoped_profiles": (("/api/profiles", "GET"),),
+    "shared_analysis": (
+        ("/api/catalog/analysis/changes", "GET"),
+        ("/api/catalog/analysis/scalars", "POST"),
+        ("/api/catalog/analysis/vectors", "POST"),
+    ),
+    "catalog_prepare_api": (
+        ("/api/catalog/prepare", "POST"),
+        ("/api/catalog/prepare/<operation_id>", "GET"),
+    ),
+}
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
 ANALYSIS_PROJECTION_TASK_TYPE = "plugin.lumae_analysis.analysis_projection"
@@ -931,6 +954,164 @@ def catalog_refresh_api():
         )
     except (KeyError, ValueError, CatalogScanError) as exc:
         return _catalog_error("invalid_refresh", str(exc), 400)
+
+
+def _catalog_preparation_dto(source, state=None):
+    catalog = source.get("catalog") or {}
+    analysis = source.get("analysis") or {}
+    generation = int(catalog.get("generation", 0) or 0)
+    fingerprint_schema_version = int(
+        catalog.get(
+            "fingerprint_schema_version",
+            CATALOG_FINGERPRINT_SCHEMA_VERSION,
+        )
+        or 1
+    )
+    catalog_ready = (
+        generation > 0
+        and catalog.get("status") in ("complete", "ready")
+        and fingerprint_schema_version == CATALOG_FINGERPRINT_SCHEMA_VERSION
+    )
+    raw_status = str((state or {}).get("status") or "")
+    status_map = {
+        "queued": "queued",
+        "running": "running",
+        "profiles_queued": "running",
+        "ready": "ready",
+        "needs_attention": "ready" if catalog_ready else "failed",
+        "failed": "failed",
+    }
+    status = status_map.get(raw_status, "ready" if catalog_ready else "required")
+    payload = {
+        "operation_id": source["catalog_instance_id"],
+        "catalog_instance_id": source["catalog_instance_id"],
+        "server_id": source["server_id"],
+        "status": status,
+        "phase": str((state or {}).get("phase") or ("complete" if catalog_ready else "required")),
+        "catalog_ready": catalog_ready,
+        "publication_current": catalog_ready,
+        "refresh_required": not catalog_ready,
+        "generation": generation,
+        "counts": catalog.get("entity_counts") or catalog.get("counts") or {},
+        "published_builder_version": CATALOG_BUILDER_VERSION if catalog_ready else 0,
+        "current_builder_version": CATALOG_BUILDER_VERSION,
+        "fingerprint_schema_version": fingerprint_schema_version,
+        "analysis_ready": analysis.get("status") in ("complete", "ready"),
+        "worker_attested": True,
+        "queued_profiles": int((state or {}).get("queued_profiles", 0) or 0),
+        "profile_jobs": int((state or {}).get("profile_jobs", 0) or 0),
+        "last_error": (state or {}).get("last_error") or catalog.get("last_error"),
+        "started_at": (state or {}).get("started_at"),
+        "completed_at": (state or {}).get("completed_at"),
+        "updated_at": (state or {}).get("updated_at") or catalog.get("completed_at"),
+    }
+    if not catalog_ready:
+        if fingerprint_schema_version != CATALOG_FINGERPRINT_SCHEMA_VERSION:
+            payload["refresh_reason"] = "fingerprint_schema_rebase"
+        elif generation == 0:
+            payload["refresh_reason"] = "first_publication"
+        else:
+            payload["refresh_reason"] = "refresh_required"
+    return payload
+
+
+def _resolve_preparation_source(db, server_id=None, catalog_instance_id=None):
+    sources = resolve_catalog_source(
+        db,
+        server_id=str(server_id) if server_id else None,
+        catalog_instance_id=str(catalog_instance_id) if catalog_instance_id else None,
+    )
+    if len(sources) != 1:
+        raise ValueError(
+            "An explicit server_id is required when multiple music servers are configured."
+        )
+    source = sources[0]
+    if catalog_instance_id and source["catalog_instance_id"] != str(catalog_instance_id):
+        raise CatalogScanError("Catalogue source identity changed")
+    if server_id and source["server_id"] != str(server_id):
+        raise CatalogScanError("Music-server identity changed")
+    return source
+
+
+@bp.post("/api/catalog/prepare")
+def catalog_prepare_api():
+    try:
+        body = _json_body()
+        db = get_db()
+        source = _resolve_preparation_source(
+            db,
+            server_id=body.get("server_id"),
+            catalog_instance_id=body.get("catalog_instance_id"),
+        )
+        state = preparation_state(source["catalog_instance_id"], db=db)
+        if not preparation_is_active(state):
+            if claim_preparation(source, db=db):
+                state = {
+                    "status": "queued",
+                    "phase": "queued",
+                    "queued_profiles": 0,
+                    "profile_jobs": 0,
+                    "last_error": None,
+                    "started_at": None,
+                    "completed_at": None,
+                    "updated_at": None,
+                }
+                try:
+                    enqueue(
+                        prepare_lumae_task,
+                        source["server_id"],
+                        source["catalog_instance_id"],
+                        queue="default",
+                    )
+                except Exception as exc:
+                    update_preparation_state(
+                        source["catalog_instance_id"],
+                        source["server_id"],
+                        "failed",
+                        "failed",
+                        last_error=exc,
+                        completed=True,
+                        db=db,
+                    )
+                    logger.exception("lumae_analysis could not enqueue catalogue preparation")
+                    return _catalog_error(
+                        "preparation_enqueue_failed",
+                        "Catalogue preparation could not be queued. Retry after checking the AudioMuse worker.",
+                        503,
+                    )
+            else:
+                state = preparation_state(source["catalog_instance_id"], db=db)
+                if state is None:
+                    return _catalog_error(
+                        "preparation_busy",
+                        "Catalogue preparation was claimed by another worker; retry status.",
+                        409,
+                    )
+        return _private_json(_catalog_preparation_dto(source, state), 202)
+    except KeyError:
+        return _catalog_error("source_not_found", "Catalogue source was not found.", 404)
+    except ValueError as exc:
+        return _catalog_error("invalid_preparation", str(exc), 400)
+    except CatalogScanError as exc:
+        return _catalog_error("source_mismatch", str(exc), 409)
+
+
+@bp.get("/api/catalog/prepare/<operation_id>")
+def catalog_prepare_status_api(operation_id):
+    try:
+        operation_id = str(operation_id or "").strip()
+        if not operation_id or len(operation_id) > 255:
+            raise ValueError("Preparation operation ID is invalid")
+        db = get_db()
+        source = _resolve_preparation_source(db, catalog_instance_id=operation_id)
+        state = preparation_state(source["catalog_instance_id"], db=db)
+        return _private_json(_catalog_preparation_dto(source, state))
+    except KeyError:
+        return _catalog_error("operation_not_found", "Preparation operation was not found.", 404)
+    except ValueError as exc:
+        return _catalog_error("invalid_operation", str(exc), 400)
+    except CatalogScanError as exc:
+        return _catalog_error("source_mismatch", str(exc), 409)
 
 
 @bp.post("/api/catalog/rebind")
