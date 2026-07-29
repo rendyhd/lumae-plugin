@@ -87,8 +87,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Normalize structured provider artist identities before publishing catalogue and relationship data, and rebuild existing catalogues so similar-artist keys remain readable and addressable.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.9.1.zip",
+      "checksum": "bcb067ac470dfbaa796bb101a028c4e8"
     },
     {
       "version": "0.9.0",
