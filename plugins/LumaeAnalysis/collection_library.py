@@ -43,8 +43,8 @@ def catalog_track_view_sql():
                t.track_number, t.disc_number, t.duration_ms,
                t.content_kind, t.release_type, t.cover_art_id,
                l.status AS analysis_status,
-               lower(concat_ws(' ', t.title, t.artist_display,
-                               t.album_artist_display, al.name)) AS search_u,
+               lower(unaccent(concat_ws(' ', t.title, t.artist_display,
+                                        t.album_artist_display, al.name))) AS search_u,
                source.provider_type
           FROM selected_source source
           JOIN {tracks} t

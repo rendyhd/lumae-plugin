@@ -1,7 +1,7 @@
 """Optional execution tests for the collection browser against real PostgreSQL.
 
 Run with LUMAE_POSTGRES_TEST_DSN set to a test database. The fixture uses an
-isolated schema containing the score table used by AudioMuse's library browser.
+isolated schema containing the current provider-catalogue projection.
 """
 
 import importlib.util
@@ -32,6 +32,7 @@ def _load_collection_library():
             warning=lambda *args, **kwargs: None,
             exception=lambda *args, **kwargs: None,
         )
+        plugin_api.table = lambda name: name
         sys.modules["plugin"] = plugin_module
         sys.modules["plugin.api"] = plugin_api
 
@@ -53,58 +54,118 @@ def _load_collection_library():
 def postgres_library():
     connection = psycopg2.connect(POSTGRES_DSN)
     cursor = connection.cursor()
+    library = _load_collection_library()
+    sources = library.table("catalog_sources")
+    state = library.table("catalog_state")
+    analysis_state = library.table("analysis_state")
+    tracks = library.table("catalog_tracks")
+    albums = library.table("catalog_albums")
+    links = library.table("track_analysis_links")
+
     cursor.execute("CREATE EXTENSION IF NOT EXISTS unaccent")
-    cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
     cursor.execute("DROP SCHEMA IF EXISTS lumae_collection_integration CASCADE")
     cursor.execute("CREATE SCHEMA lumae_collection_integration")
     cursor.execute("SET search_path TO lumae_collection_integration, public")
     cursor.execute(
-        """
-        CREATE TABLE score (
-            item_id TEXT PRIMARY KEY,
-            title TEXT,
-            author TEXT,
-            album TEXT,
-            album_artist TEXT,
-            year INTEGER,
-            rating INTEGER,
-            search_u TEXT
+        f"""
+        CREATE TABLE {sources} (
+            catalog_instance_id TEXT PRIMARY KEY,
+            provider_type TEXT NOT NULL,
+            server_name TEXT NOT NULL,
+            is_default BOOLEAN NOT NULL,
+            rebind_status TEXT NOT NULL
+        );
+        CREATE TABLE {state} (
+            catalog_instance_id TEXT PRIMARY KEY,
+            published_generation BIGINT NOT NULL,
+            status TEXT NOT NULL
+        );
+        CREATE TABLE {analysis_state} (
+            catalog_instance_id TEXT PRIMARY KEY,
+            projection_generation BIGINT NOT NULL
+        );
+        CREATE TABLE {albums} (
+            catalog_instance_id TEXT NOT NULL,
+            published_generation BIGINT NOT NULL,
+            album_id TEXT NOT NULL,
+            name TEXT NOT NULL,
+            available BOOLEAN NOT NULL,
+            PRIMARY KEY (catalog_instance_id, published_generation, album_id)
+        );
+        CREATE TABLE {tracks} (
+            catalog_instance_id TEXT NOT NULL,
+            published_generation BIGINT NOT NULL,
+            track_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            artist_display TEXT,
+            album_artist_display TEXT,
+            album_id TEXT,
+            track_number INTEGER,
+            disc_number INTEGER,
+            duration_ms BIGINT,
+            content_kind TEXT,
+            release_type TEXT,
+            cover_art_id TEXT,
+            available BOOLEAN NOT NULL,
+            PRIMARY KEY (catalog_instance_id, published_generation, track_id)
+        );
+        CREATE TABLE {links} (
+            catalog_instance_id TEXT NOT NULL,
+            projection_generation BIGINT NOT NULL,
+            provider_track_id TEXT NOT NULL,
+            status TEXT,
+            PRIMARY KEY (
+                catalog_instance_id, projection_generation, provider_track_id
+            )
         )
         """
     )
-    rows = [
-        ("rh-1", "15 Step", "Radiohead", "In Rainbows", "Radiohead", 2007, 5),
-        ("rh-2", "Reckoner", "Radiohead", "In Rainbows", "Radiohead", 2007, 5),
-        (
-            "rh-3",
-            "Burn the Witch",
-            "Radiohead",
-            "A Moon Shaped Pool",
-            "Radiohead",
-            2016,
-            4,
-        ),
-        ("meiko-1", "Reasons to Love You", "Meiko", "The Bright Side", "Meiko", 2012, 4),
-        ("meiko-2", "Stuck on You", "Meiko", "The Bright Side", "Meiko", 2012, 3),
-        ("bey-1", "Hold Up", "Beyoncé", "Lemonade", "Beyoncé", 2016, 5),
-        ("single-1", "Loose Track", "Solo Artist", None, None, 2020, None),
-    ]
-    cursor.executemany(
-        """
-        INSERT INTO score
-            (item_id, title, author, album, album_artist, year, rating, search_u)
-        VALUES (%s, %s, %s, %s, %s, %s, %s,
-                lower(unaccent(concat_ws(' ', %s, %s, %s))))
-        """,
-        [row + (row[1], row[2], row[3]) for row in rows],
-    )
     cursor.execute(
-        "CREATE INDEX score_search_u_trgm ON score USING gin (search_u gin_trgm_ops)"
+        f"""
+        INSERT INTO {sources}
+            (catalog_instance_id, provider_type, server_name, is_default, rebind_status)
+        VALUES ('catalog-a', 'navidrome', 'Main Navidrome', TRUE, 'active');
+        INSERT INTO {state}
+            (catalog_instance_id, published_generation, status)
+        VALUES ('catalog-a', 1, 'complete');
+        INSERT INTO {analysis_state}
+            (catalog_instance_id, projection_generation)
+        VALUES ('catalog-a', 1)
+        """
+    )
+    cursor.executemany(
+        f"""
+        INSERT INTO {albums}
+            (catalog_instance_id, published_generation, album_id, name, available)
+        VALUES ('catalog-a', 1, %s, %s, TRUE)
+        """,
+        [
+            ("album-rh-rainbows", "In Rainbows"),
+            ("album-rh-moon", "A Moon Shaped Pool"),
+            ("album-meiko", "The Bright Side"),
+            ("album-bey", "Lemonade"),
+        ],
+    )
+    cursor.executemany(
+        f"""
+        INSERT INTO {tracks}
+            (catalog_instance_id, published_generation, track_id, title,
+             artist_display, album_artist_display, album_id, available)
+        VALUES ('catalog-a', 1, %s, %s, %s, %s, %s, TRUE)
+        """,
+        [
+            ("rh-1", "15 Step", "Radiohead", "Radiohead", "album-rh-rainbows"),
+            ("rh-2", "Reckoner", "Radiohead", "Radiohead", "album-rh-rainbows"),
+            ("rh-3", "Burn the Witch", "Radiohead", "Radiohead", "album-rh-moon"),
+            ("meiko-1", "Reasons to Love You", "Meiko", "Meiko", "album-meiko"),
+            ("meiko-2", "Stuck on You", "Meiko", "Meiko", "album-meiko"),
+            ("bey-1", "Hold Up", "Beyoncé", "Beyoncé", "album-bey"),
+            ("single-1", "Loose Track", "Solo Artist", None, None),
+        ],
     )
     connection.commit()
     cursor.close()
 
-    library = _load_collection_library()
     library.get_db = lambda: connection
     try:
         yield library, connection
@@ -203,17 +264,20 @@ def test_collection_library_flask_routes_execute_real_queries(postgres_library):
     }
 
 
-def test_collection_search_condition_can_use_audiomuse_trigram_index(
-    postgres_library,
-):
-    _, connection = postgres_library
+def test_collection_search_uses_the_active_catalogue_projection(postgres_library):
+    library, connection = postgres_library
     cursor = connection.cursor()
-    cursor.execute("SET LOCAL enable_seqscan = off")
     cursor.execute(
-        "EXPLAIN SELECT item_id FROM score WHERE search_u LIKE unaccent(%s)",
+        f"""
+        EXPLAIN
+        SELECT item_id
+          FROM ({library.catalog_track_view_sql()}) score
+         WHERE search_u LIKE unaccent(%s)
+        """,
         ("%meiko%",),
     )
     plan = "\n".join(row[0] for row in cursor.fetchall())
     cursor.close()
 
-    assert "score_search_u_trgm" in plan
+    assert library.table("catalog_tracks") in plan
+    assert library.table("catalog_state") in plan

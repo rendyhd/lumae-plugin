@@ -1476,6 +1476,14 @@ def test_collection_track_sorts_use_source_columns_not_nested_select_aliases():
     assert all("author" in order for order in orders)
 
 
+def test_collection_catalogue_search_projection_normalizes_accents():
+    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
+
+    sql = " ".join(library.catalog_track_view_sql().split())
+
+    assert "lower(unaccent(concat_ws(" in sql
+
+
 def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch):
     mod = load_plugin()
     collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
