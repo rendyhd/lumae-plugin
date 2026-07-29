@@ -16,6 +16,7 @@ from .core_compat import (
     sanitized_server_summaries,
 )
 from .catalog import (
+    CATALOG_FINGERPRINT_SCHEMA_VERSION,
     attempt_legacy_rebind,
     CATALOG_BUILDER_VERSION,
     CatalogScanError,
@@ -66,7 +67,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.8.11"
+PLUGIN_VERSION = "0.9.0"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -92,6 +93,7 @@ CATALOG_FEATURES = (
     "provider_track_scope_verification",
     "source_scoped_profiles",
     "prepare_lumae",
+    "catalog_prepare_api",
     "analysis_run_finalization",
     "catalog_ready_before_profile_backfill",
     "interactive_profile_priority",
@@ -105,6 +107,26 @@ CATALOG_FEATURES = (
     "relationship_cursor_stream",
     "nonblocking_enrichment",
 )
+CATALOG_FEATURE_ROUTES = {
+    "bootstrap_leases": (
+        ("/api/catalog/bootstrap-sessions", "POST"),
+        ("/api/catalog/bootstrap-sessions", "DELETE"),
+        ("/api/catalog/bootstrap", "GET"),
+    ),
+    "cursor_changes": (("/api/catalog/changes", "GET"),),
+    "refresh_on_demand": (("/api/catalog/refresh", "POST"),),
+    "provider_track_scope_verification": (("/api/catalog/verify-scope", "POST"),),
+    "source_scoped_profiles": (("/api/profiles", "GET"),),
+    "shared_analysis": (
+        ("/api/catalog/analysis/changes", "GET"),
+        ("/api/catalog/analysis/scalars", "POST"),
+        ("/api/catalog/analysis/vectors", "POST"),
+    ),
+    "catalog_prepare_api": (
+        ("/api/catalog/prepare", "POST"),
+        ("/api/catalog/prepare/<operation_id>", "GET"),
+    ),
+}
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
@@ -1183,14 +1205,26 @@ def _preparation_api_payload(source, state=None):
     analysis = source.get("analysis") or {}
     state = state if state is not None else preparation_state(source["catalog_instance_id"])
     catalog_ready = int(catalog.get("generation") or 0) > 0
+    fingerprint_schema_version = int(
+        catalog.get("fingerprint_schema_version", 1) or 1
+    )
+    fingerprint_current = (
+        fingerprint_schema_version == CATALOG_FINGERPRINT_SCHEMA_VERSION
+    )
     attestation_current = preparation_attestation_is_current(state)
-    effective_refresh_required = bool(catalog.get("refresh_required", False)) or not (
-        attestation_current
+    effective_refresh_required = (
+        bool(catalog.get("refresh_required", False))
+        or not fingerprint_current
+        or not attestation_current
     )
     effective_refresh_reason = (
-        "worker_version_mismatch"
-        if not attestation_current
-        else catalog.get("refresh_reason")
+        "fingerprint_schema_rebase"
+        if not fingerprint_current
+        else (
+            "worker_version_mismatch"
+            if not attestation_current
+            else catalog.get("refresh_reason")
+        )
     )
     current = (
         catalog_ready
@@ -1231,6 +1265,14 @@ def _preparation_api_payload(source, state=None):
         "counts": catalog.get("entity_counts") or {},
         "published_builder_version": int(catalog.get("builder_version") or 0),
         "current_builder_version": CATALOG_BUILDER_VERSION,
+        "fingerprint_schema_version": fingerprint_schema_version,
+        "current_fingerprint_schema_version": CATALOG_FINGERPRINT_SCHEMA_VERSION,
+        "snapshot_estimated_bytes": int(
+            catalog.get("snapshot_estimated_bytes", 0) or 0
+        ),
+        "last_scan_change_counts": catalog.get("last_scan_change_counts") or {},
+        "last_scan_change_reason": catalog.get("last_scan_change_reason"),
+        "last_scan_duration_ms": catalog.get("last_scan_duration_ms"),
         "refresh_required": effective_refresh_required,
         "refresh_reason": effective_refresh_reason,
         "analysis_ready": analysis.get("status") == "complete",

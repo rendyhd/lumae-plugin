@@ -81,7 +81,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.8.11"
+    assert manifest["versions"][0]["version"] == "0.9.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -141,6 +141,7 @@ def test_plugin_manifest_has_lumae_identity():
             "provider_track_scope_verification",
             "source_scoped_profiles",
             "prepare_lumae",
+            "catalog_prepare_api",
             "analysis_run_finalization",
             "catalog_ready_before_profile_backfill",
             "interactive_profile_priority",
@@ -166,7 +167,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.8.11",
+        "plugin_version": "0.9.0",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -288,7 +289,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.8.11"
+    assert body["plugin_version"] == "0.9.0"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -690,6 +691,51 @@ def test_catalog_changes_rejects_malformed_cursor_without_reading_database(monke
     assert response.get_json()["error"] == "invalid_cursor"
 
 
+def test_catalog_changes_report_remaining_events_and_estimated_bytes(monkeypatch):
+    import plugins.LumaeAnalysis.catalog as catalog
+
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "catalog": {
+            "epoch": "epoch-a",
+            "floor_seq": 0,
+            "head_seq": 10,
+        },
+    }
+    monkeypatch.setattr(catalog, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    db = FakeDb(
+        [
+            (
+                3,
+                8,
+                "track",
+                "track-1",
+                "upsert",
+                None,
+                {"track_id": "track-1", "title": "Song"},
+                None,
+                "2026-07-29T12:00:00Z",
+                "provider_diff",
+            )
+        ]
+    )
+
+    result = catalog.read_catalog_changes(
+        db,
+        catalog.opaque_cursor("catalog-a", "epoch-a", 2),
+    )
+
+    assert result["remaining_events"] == 7
+    assert result["estimated_remaining_bytes"] > 0
+    assert result["page_estimated_bytes"] > 0
+    assert result["fingerprint_schema_version"] == 1
+    assert result["snapshot_generation"] == 0
+    assert result["snapshot_entity_counts"] == {}
+    assert result["snapshot_estimated_bytes"] == 0
+    assert result["changes"][0]["change_reason"] == "provider_diff"
+
+
 def test_catalog_refresh_coalesces_to_selected_source(monkeypatch):
     mod = load_plugin()
     calls = []
@@ -869,6 +915,7 @@ def test_catalog_prepare_status_exposes_catalogue_before_analysis_finishes(monke
             "status": "complete",
             "entity_counts": {"track": 21_397},
             "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "fingerprint_schema_version": mod.CATALOG_FINGERPRINT_SCHEMA_VERSION,
             "refresh_required": False,
         },
         "analysis": {"generation": 0, "status": "projecting"},
@@ -905,6 +952,7 @@ def test_catalog_prepare_is_idempotent_when_catalogue_is_current_but_analysis_is
             "status": "complete",
             "entity_counts": {"track": 21_397},
             "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "fingerprint_schema_version": mod.CATALOG_FINGERPRINT_SCHEMA_VERSION,
             "refresh_required": False,
         },
         "analysis": {"generation": 0, "status": "projecting"},
@@ -936,6 +984,12 @@ def test_catalog_prepare_is_idempotent_when_catalogue_is_current_but_analysis_is
         "counts": {"track": 21_397},
         "published_builder_version": mod.CATALOG_BUILDER_VERSION,
         "current_builder_version": mod.CATALOG_BUILDER_VERSION,
+        "fingerprint_schema_version": mod.CATALOG_FINGERPRINT_SCHEMA_VERSION,
+        "current_fingerprint_schema_version": mod.CATALOG_FINGERPRINT_SCHEMA_VERSION,
+        "snapshot_estimated_bytes": 0,
+        "last_scan_change_counts": {},
+        "last_scan_change_reason": None,
+        "last_scan_duration_ms": None,
         "refresh_required": False,
         "refresh_reason": None,
         "analysis_ready": False,
@@ -3366,6 +3420,12 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     ]
     migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
     assert "rebind_status='active' AND provider_type='navidrome'" in migration_sql
+    assert "fingerprint_schema_version" in migration_sql
+    assert "snapshot_estimated_bytes" in migration_sql
+    assert "last_scan_change_counts" in migration_sql
+    assert "last_scan_change_reason" in migration_sql
+    assert "last_scan_duration_ms" in migration_sql
+    assert "change_reason" in migration_sql
     assert "plugin_lumae_analysis__collections" in migration_sql
     assert "plugin_lumae_analysis__profile_backfill_state" in migration_sql
     assert "plugin_lumae_analysis__collection_items" in migration_sql
@@ -4544,11 +4604,42 @@ class RefreshCursor(FakeCursor):
         elif "SELECT catalog_instance_id FROM" in sql and "catalog_sources" in sql:
             self.rows = [("catalog-a",)]
         elif "published_generation, catalog_epoch, catalog_head_seq, entity_counts" in sql:
-            self.rows = [(0, "epoch-a", 0, self.db.previous_counts)]
+            self.rows = [
+                (
+                    self.db.previous_generation,
+                    self.db.epoch,
+                    self.db.head_seq,
+                    self.db.previous_counts,
+                    self.db.fingerprint_schema_version,
+                )
+            ]
         elif "published_generation, catalog_epoch, catalog_head_seq" in sql:
-            self.rows = [(0, "epoch-a", 0)]
+            self.rows = [
+                (
+                    self.db.previous_generation,
+                    self.db.epoch,
+                    self.db.head_seq,
+                    self.db.fingerprint_schema_version,
+                )
+            ]
+        elif sql.lstrip().startswith("SELECT DISTINCT"):
+            self.rows = next(
+                (
+                    [(entity_id,) for entity_id in entity_ids]
+                    for table_name, entity_ids in self.db.historical_entity_ids.items()
+                    if table_name in sql
+                ),
+                [],
+            )
         elif sql.lstrip().startswith("SELECT") and "available=TRUE" in sql:
-            self.rows = []
+            self.rows = next(
+                (
+                    rows
+                    for table_name, rows in self.db.published_fingerprints.items()
+                    if table_name in sql
+                ),
+                [],
+            )
         else:
             self.rows = []
 
@@ -4558,8 +4649,23 @@ class RefreshCursor(FakeCursor):
 
 
 class RefreshDb:
-    def __init__(self, previous_counts=None):
+    def __init__(
+        self,
+        previous_counts=None,
+        previous_generation=0,
+        epoch="epoch-a",
+        head_seq=0,
+        fingerprint_schema_version=2,
+        published_fingerprints=None,
+        historical_entity_ids=None,
+    ):
         self.previous_counts = previous_counts or {}
+        self.previous_generation = previous_generation
+        self.epoch = epoch
+        self.head_seq = head_seq
+        self.fingerprint_schema_version = fingerprint_schema_version
+        self.published_fingerprints = published_fingerprints or {}
+        self.historical_entity_ids = historical_entity_ids or {}
         self.executed = []
         self.commits = 0
         self.rollbacks = 0
@@ -4633,7 +4739,7 @@ def test_refresh_catalog_publishes_complete_generation_and_coverage():
 def test_refresh_catalog_failure_keeps_prior_generation_and_records_error():
     from plugins.LumaeAnalysis.catalog import refresh_catalog
 
-    db = RefreshDb(previous_counts={"track": 3})
+    db = RefreshDb(previous_counts={"track": 3}, previous_generation=7)
     bridge = RefreshBridge(error=RuntimeError("provider unavailable"))
 
     with pytest.raises(RuntimeError, match="provider unavailable"):
@@ -4643,7 +4749,231 @@ def test_refresh_catalog_failure_keeps_prior_generation_and_records_error():
     assert db.commits == 2
     assert not any("SET published_generation" in sql for sql, _params in db.executed)
     assert any(
-        "status='failed'" in sql and params[0] == "provider unavailable" for sql, params in db.executed if params
+        "CASE WHEN published_generation=0 THEN 'failed' ELSE status END" in sql
+        and params[0] == "provider unavailable"
+        for sql, params in db.executed
+        if params
+    )
+
+
+def test_no_change_refresh_keeps_generation_and_emits_no_catalogue_writes():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog, refresh_catalog
+
+    payload = {"tracks": [{"id": "track-1", "title": "Song", "duration": 123}]}
+    normalized = normalize_provider_catalog(payload, "navidrome")
+    track = normalized["tracks"][0]
+    db = RefreshDb(
+        previous_counts={"track": 1},
+        previous_generation=7,
+        epoch="epoch-a",
+        head_seq=75_098,
+        published_fingerprints={
+            "catalog_tracks": [
+                (
+                    track["track_id"],
+                    track["metadata_fp"],
+                    track["media_fp"],
+                    track["artwork_fp"],
+                )
+            ]
+        },
+    )
+
+    result = refresh_catalog("server-a", db=db, bridge=RefreshBridge(payload))
+
+    assert result["generation"] == 7
+    assert result["cursor"] == {"epoch": "epoch-a", "seq": 75_098}
+    assert result["changes"] == 0
+    assert result["change_reason"] == "no_change"
+    assert not any(
+        sql.lstrip().startswith(("INSERT INTO", "DELETE FROM"))
+        and any(
+            table_name in sql
+            for table_name in (
+                "catalog_tracks",
+                "catalog_albums",
+                "catalog_artists",
+                "catalog_libraries",
+                "catalog_changes",
+            )
+        )
+        for sql, _params in db.executed
+    )
+
+
+@pytest.mark.parametrize(
+    "changed_payload",
+    [
+        {"id": "track-1", "title": "Renamed", "duration": 123},
+        {"id": "track-1", "title": "Song", "duration": 124},
+        {"id": "track-1", "title": "Song", "duration": 123, "coverArt": "cover-b"},
+    ],
+)
+def test_one_track_fingerprint_change_emits_one_scoped_event(changed_payload):
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog, refresh_catalog
+
+    original = normalize_provider_catalog(
+        {"tracks": [{"id": "track-1", "title": "Song", "duration": 123}]},
+        "navidrome",
+    )["tracks"][0]
+    db = RefreshDb(
+        previous_counts={"track": 1},
+        previous_generation=7,
+        published_fingerprints={
+            "catalog_tracks": [
+                (
+                    original["track_id"],
+                    original["metadata_fp"],
+                    original["media_fp"],
+                    original["artwork_fp"],
+                )
+            ]
+        },
+    )
+
+    result = refresh_catalog(
+        "server-a",
+        db=db,
+        bridge=RefreshBridge({"tracks": [changed_payload]}),
+    )
+
+    change_inserts = [
+        params
+        for sql, params in db.executed
+        if sql.lstrip().startswith("INSERT INTO") and "catalog_changes" in sql
+    ]
+    assert result["changes"] == 1
+    assert result["change_counts"]["by_entity"]["track"]["total"] == 1
+    assert len(change_inserts) == 1
+    assert change_inserts[0][4:8] == ("track", "track-1", "upsert", "provider_diff")
+
+
+def test_refresh_records_exact_deletion_and_reactivation_counts():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog, refresh_catalog
+
+    original_rows = normalize_provider_catalog(
+        {
+            "tracks": [
+                {"id": "track-1", "title": "One"},
+                {"id": "track-2", "title": "Two"},
+            ]
+        },
+        "navidrome",
+    )["tracks"]
+    published = {
+        "catalog_tracks": [
+            (
+                track["track_id"],
+                track["metadata_fp"],
+                track["media_fp"],
+                track["artwork_fp"],
+            )
+            for track in original_rows
+        ]
+    }
+    deletion_db = RefreshDb(
+        previous_counts={"track": 2},
+        previous_generation=7,
+        published_fingerprints=published,
+    )
+
+    deleted = refresh_catalog(
+        "server-a",
+        db=deletion_db,
+        bridge=RefreshBridge({"tracks": [{"id": "track-1", "title": "One"}]}),
+    )
+
+    assert deleted["change_counts"]["deletions"] == 1
+    assert deleted["change_counts"]["reactivations"] == 0
+    assert deleted["change_counts"]["by_entity"]["track"]["deletions"] == 1
+
+    reactivation_db = RefreshDb(
+        previous_counts={},
+        previous_generation=8,
+        historical_entity_ids={"catalog_tracks": ["track-2"]},
+    )
+    reactivated = refresh_catalog(
+        "server-a",
+        db=reactivation_db,
+        bridge=RefreshBridge({"tracks": [{"id": "track-2", "title": "Two"}]}),
+    )
+
+    assert reactivated["change_counts"]["upserts"] == 1
+    assert reactivated["change_counts"]["reactivations"] == 1
+    assert reactivated["change_counts"]["by_entity"]["track"]["reactivations"] == 1
+
+
+def test_fingerprint_schema_rebase_rotates_epoch_without_ordinary_change_events():
+    from plugins.LumaeAnalysis.catalog import refresh_catalog
+
+    db = RefreshDb(
+        previous_counts={"track": 1},
+        previous_generation=7,
+        epoch="old-epoch",
+        head_seq=75_098,
+        fingerprint_schema_version=1,
+    )
+    bridge = RefreshBridge(
+        {
+            "tracks": [
+                {
+                    "id": "track-1",
+                    "title": "Song",
+                    "duration": 123,
+                }
+            ]
+        }
+    )
+
+    result = refresh_catalog("server-a", db=db, bridge=bridge)
+
+    assert result["generation"] == 8
+    assert result["change_reason"] == "fingerprint_schema_rebase"
+    assert result["changes"] == 0
+    assert result["cursor"]["seq"] == 0
+    assert result["cursor"]["epoch"] != "old-epoch"
+    assert not any(
+        sql.lstrip().startswith("INSERT INTO") and "catalog_changes" in sql
+        for sql, _params in db.executed
+    )
+    assert any(
+        sql.lstrip().startswith("DELETE FROM") and "catalog_changes" in sql
+        for sql, _params in db.executed
+    )
+    assert any(
+        "stream_bootstrap_sessions" in sql and "completed_at=now()" in sql
+        for sql, _params in db.executed
+    )
+
+
+def test_interrupted_fingerprint_rebase_keeps_previous_generation_and_epoch(monkeypatch):
+    import plugins.LumaeAnalysis.catalog as catalog
+
+    db = RefreshDb(
+        previous_counts={"track": 1},
+        previous_generation=7,
+        epoch="old-epoch",
+        head_seq=75_098,
+        fingerprint_schema_version=1,
+    )
+    bridge = RefreshBridge({"tracks": [{"id": "track-1", "title": "Song"}]})
+    monkeypatch.setattr(
+        catalog,
+        "_insert_generation_rows",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("publication interrupted")),
+    )
+
+    with pytest.raises(RuntimeError, match="publication interrupted"):
+        catalog.refresh_catalog("server-a", db=db, bridge=bridge)
+
+    assert db.rollbacks == 1
+    assert not any("SET published_generation=" in sql for sql, _params in db.executed)
+    assert not any("SET catalog_epoch=" in sql for sql, _params in db.executed)
+    assert any(
+        "CASE WHEN published_generation=0 THEN 'failed' ELSE status END" in sql
+        and params[0] == "publication interrupted"
+        for sql, params in db.executed
+        if params
     )
 
 

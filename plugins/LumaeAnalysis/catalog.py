@@ -7,6 +7,7 @@ import hmac
 import json
 import re
 import secrets
+import time
 import unicodedata
 import uuid
 
@@ -18,6 +19,9 @@ from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_BUILDER_VERSION = 4
+CATALOG_FINGERPRINT_SCHEMA_VERSION = 2
+CHANGE_EVENT_OVERHEAD_BYTES = 192
+SNAPSHOT_ENTITY_OVERHEAD_BYTES = 96
 
 
 def t(name):
@@ -798,6 +802,7 @@ def migrate_catalog(db):
             current_core_server_id TEXT,
             provider_type TEXT NOT NULL,
             catalog_schema_version INTEGER NOT NULL DEFAULT {CATALOG_SCHEMA_VERSION},
+            fingerprint_schema_version INTEGER NOT NULL DEFAULT {CATALOG_FINGERPRINT_SCHEMA_VERSION},
             published_generation BIGINT NOT NULL DEFAULT 0,
             catalog_epoch TEXT NOT NULL,
             catalog_head_seq BIGINT NOT NULL DEFAULT 0,
@@ -811,6 +816,10 @@ def migrate_catalog(db):
             catalog_builder_version INTEGER NOT NULL DEFAULT 0,
             refresh_required BOOLEAN NOT NULL DEFAULT TRUE,
             refresh_reason TEXT,
+            snapshot_estimated_bytes BIGINT NOT NULL DEFAULT 0,
+            last_scan_change_counts JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            last_scan_change_reason TEXT,
+            last_scan_duration_ms BIGINT,
             started_at TIMESTAMPTZ,
             completed_at TIMESTAMPTZ,
             last_error TEXT,
@@ -933,12 +942,42 @@ def migrate_catalog(db):
             entity_type TEXT NOT NULL,
             entity_id TEXT NOT NULL,
             operation TEXT NOT NULL,
+            change_reason TEXT NOT NULL DEFAULT 'provider_diff',
             old_entity_id TEXT,
             payload JSONB,
             evidence JSONB,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (catalog_instance_id, epoch, seq)
         )
+        """,
+        f"""
+        ALTER TABLE {t("catalog_state")}
+        ADD COLUMN IF NOT EXISTS fingerprint_schema_version INTEGER NOT NULL DEFAULT 1
+        """,
+        f"""
+        ALTER TABLE {t("catalog_state")}
+        ALTER COLUMN fingerprint_schema_version
+        SET DEFAULT {CATALOG_FINGERPRINT_SCHEMA_VERSION}
+        """,
+        f"""
+        ALTER TABLE {t("catalog_state")}
+        ADD COLUMN IF NOT EXISTS snapshot_estimated_bytes BIGINT NOT NULL DEFAULT 0
+        """,
+        f"""
+        ALTER TABLE {t("catalog_state")}
+        ADD COLUMN IF NOT EXISTS last_scan_change_counts JSONB NOT NULL DEFAULT '{{}}'::jsonb
+        """,
+        f"""
+        ALTER TABLE {t("catalog_state")}
+        ADD COLUMN IF NOT EXISTS last_scan_change_reason TEXT
+        """,
+        f"""
+        ALTER TABLE {t("catalog_state")}
+        ADD COLUMN IF NOT EXISTS last_scan_duration_ms BIGINT
+        """,
+        f"""
+        ALTER TABLE {t("catalog_changes")}
+        ADD COLUMN IF NOT EXISTS change_reason TEXT NOT NULL DEFAULT 'provider_diff'
         """,
         f"""
         CREATE TABLE IF NOT EXISTS {t("stream_bootstrap_sessions")} (
@@ -1278,8 +1317,63 @@ def _state_counts(value):
     return {}
 
 
+def _estimate_snapshot_bytes(normalized):
+    """Estimate encoded transfer size without serializing one catalogue-wide value."""
+    row_groups = (
+        *(normalized[ENTITY_COLLECTIONS[entity]] for entity in ENTITY_ORDER),
+        normalized["track_artists"],
+        normalized["album_artists"],
+        normalized["entity_libraries"],
+    )
+    return sum(
+        len(canonical_json(row).encode("utf-8")) + SNAPSHOT_ENTITY_OVERHEAD_BYTES
+        for rows in row_groups
+        for row in rows
+    )
+
+
+def _historical_entity_ids(cur, entity_type, catalog_instance_id, generation, entity_ids):
+    if not entity_ids or generation <= 0:
+        return set()
+    table_name, id_column = ENTITY_TABLES[entity_type]
+    cur.execute(
+        f"SELECT DISTINCT {id_column} FROM {t(table_name)} "
+        "WHERE catalog_instance_id=%s AND published_generation < %s "
+        f"AND {id_column} = ANY(%s)",
+        (catalog_instance_id, generation, list(entity_ids)),
+    )
+    return {str(row[0]) for row in cur.fetchall()}
+
+
+def _change_counts(changes, snapshot_counts):
+    by_entity = {
+        entity: {
+            "snapshot_rows": int(snapshot_counts.get(entity, 0) or 0),
+            "upserts": 0,
+            "deletions": 0,
+            "reactivations": 0,
+            "total": 0,
+        }
+        for entity in ENTITY_ORDER
+    }
+    for entity_type, _entity_id, operation, _payload, reactivated in changes:
+        bucket = by_entity[entity_type]
+        bucket["upserts" if operation == "upsert" else "deletions"] += 1
+        if reactivated:
+            bucket["reactivations"] += 1
+        bucket["total"] += 1
+    return {
+        "by_entity": by_entity,
+        "upserts": sum(bucket["upserts"] for bucket in by_entity.values()),
+        "deletions": sum(bucket["deletions"] for bucket in by_entity.values()),
+        "reactivations": sum(bucket["reactivations"] for bucket in by_entity.values()),
+        "total": sum(bucket["total"] for bucket in by_entity.values()),
+    }
+
+
 def refresh_catalog(server_id=None, db=None, bridge=None):
     """Fetch, validate, and atomically publish one provider catalogue generation."""
+    scan_started = time.monotonic()
     if db is None:
         from plugin.api import get_db
 
@@ -1305,7 +1399,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
     catalog_instance_id = str(source[0])
     scan_id = str(uuid.uuid4())
     cur.execute(
-        f"SELECT published_generation, catalog_epoch, catalog_head_seq, entity_counts "
+        f"SELECT published_generation, catalog_epoch, catalog_head_seq, entity_counts, "
+        f"fingerprint_schema_version "
         f"FROM {t('catalog_state')} WHERE catalog_instance_id=%s FOR UPDATE",
         (catalog_instance_id,),
     )
@@ -1313,7 +1408,10 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
     if state is None:
         cur.close()
         raise CatalogScanError("Catalogue state is missing")
-    previous_generation, epoch, head_seq, _previous_counts = state
+    previous_generation, epoch, head_seq, previous_counts, previous_fingerprint_schema = state
+    previous_generation = int(previous_generation)
+    head_seq = int(head_seq)
+    previous_fingerprint_schema = int(previous_fingerprint_schema or 1)
     cur.execute(
         f"INSERT INTO {t('catalog_scans')} "
         "(scan_id, catalog_instance_id, core_server_id, status, progress) "
@@ -1336,6 +1434,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         raw = provider_bridge.fetch_catalog(server_id)
         normalized = normalize_provider_catalog(raw, server["provider_type"])
         counts = {entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER}
+        snapshot_estimated_bytes = _estimate_snapshot_bytes(normalized)
         if counts["track"] == 0:
             raise CatalogScanError(
                 "Navidrome returned no usable tracks. The empty catalogue was not published; "
@@ -1376,80 +1475,227 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
 
         cur = db.cursor()
         cur.execute(
-            f"SELECT published_generation, catalog_epoch, catalog_head_seq "
+            f"SELECT published_generation, catalog_epoch, catalog_head_seq, "
+            f"fingerprint_schema_version "
             f"FROM {t('catalog_state')} WHERE catalog_instance_id=%s FOR UPDATE",
             (catalog_instance_id,),
         )
-        locked_generation, locked_epoch, locked_head = cur.fetchone()
-        if int(locked_generation) != int(previous_generation) or str(locked_epoch) != str(epoch):
+        locked_generation, locked_epoch, locked_head, locked_fingerprint_schema = cur.fetchone()
+        if (
+            int(locked_generation) != previous_generation
+            or str(locked_epoch) != str(epoch)
+            or int(locked_fingerprint_schema or 1) != previous_fingerprint_schema
+        ):
             raise CatalogScanError("Catalogue publication moved while this scan was running")
-        generation = int(previous_generation) + 1
+        generation = previous_generation + 1
         now = utc_now()
         changes = []
+        fingerprint_rebase = (
+            previous_generation > 0
+            and previous_fingerprint_schema != CATALOG_FINGERPRINT_SCHEMA_VERSION
+        )
         for entity_type in ENTITY_ORDER:
             rows = normalized[ENTITY_COLLECTIONS[entity_type]]
-            old = _published_fingerprints(cur, entity_type, catalog_instance_id, previous_generation)
             current = {row[ENTITY_TABLES[entity_type][1]]: row for row in rows}
-            for entity_id, row in current.items():
-                if old.get(entity_id) != _row_fingerprints(entity_type, row):
-                    changes.append((entity_type, entity_id, "upsert", row))
+            old = (
+                {}
+                if fingerprint_rebase
+                else _published_fingerprints(
+                    cur, entity_type, catalog_instance_id, previous_generation
+                )
+            )
+            new_ids = set(current) - set(old)
+            historical_ids = (
+                set()
+                if fingerprint_rebase
+                else _historical_entity_ids(
+                    cur,
+                    entity_type,
+                    catalog_instance_id,
+                    previous_generation,
+                    new_ids,
+                )
+            )
+            if not fingerprint_rebase:
+                for entity_id, row in current.items():
+                    if old.get(entity_id) != _row_fingerprints(entity_type, row):
+                        changes.append(
+                            (
+                                entity_type,
+                                entity_id,
+                                "upsert",
+                                row,
+                                entity_id in historical_ids,
+                            )
+                        )
+                for entity_id in sorted(set(old) - set(current)):
+                    changes.append((entity_type, entity_id, "delete", None, False))
+        change_reason = (
+            "fingerprint_schema_rebase"
+            if fingerprint_rebase
+            else ("provider_diff" if changes or previous_generation == 0 else "no_change")
+        )
+        change_counts = _change_counts(changes, counts)
+        coverage = _coverage(normalized)
+        scope = catalog_scope_evidence(normalized, server["provider_type"])
+        field_support = {
+            name: "observed" if value["present"] else "not_observed"
+            for name, value in coverage.items()
+        }
+
+        if change_reason == "no_change":
+            duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))
+            cur.execute(
+                f"""
+                UPDATE {t("catalog_state")}
+                   SET status='complete',
+                       fingerprint_schema_version=%s,
+                       catalog_builder_version=%s,
+                       refresh_required=FALSE,
+                       refresh_reason=NULL,
+                       snapshot_estimated_bytes=%s,
+                       last_scan_change_counts=%s::jsonb,
+                       last_scan_change_reason=%s,
+                       last_scan_duration_ms=%s,
+                       completed_at=now(), last_error=NULL, updated_at=now()
+                 WHERE catalog_instance_id=%s
+                """,
+                (
+                    CATALOG_FINGERPRINT_SCHEMA_VERSION,
+                    CATALOG_BUILDER_VERSION,
+                    snapshot_estimated_bytes,
+                    _json_param(change_counts),
+                    change_reason,
+                    duration_ms,
+                    catalog_instance_id,
+                ),
+            )
+            progress = {
+                "input_counts": counts,
+                "change_counts": change_counts,
+                "change_reason": change_reason,
+                "duration_ms": duration_ms,
+                "generation": previous_generation,
+                "head_seq": head_seq,
+                "fingerprint_schema_version": CATALOG_FINGERPRINT_SCHEMA_VERSION,
+                "snapshot_estimated_bytes": snapshot_estimated_bytes,
+            }
+            cur.execute(
+                f"UPDATE {t('catalog_scans')} SET status='complete', completed_at=now(), "
+                "progress=%s::jsonb WHERE scan_id=%s",
+                (_json_param(progress), scan_id),
+            )
+            cur.close()
+            db.commit()
+            return {
+                "catalog_instance_id": catalog_instance_id,
+                "server_id": server_id,
+                "generation": previous_generation,
+                "builder_version": CATALOG_BUILDER_VERSION,
+                "refresh_required": False,
+                "cursor": {"epoch": str(epoch), "seq": head_seq},
+                "counts": counts,
+                "field_coverage": coverage,
+                "scope_summary": scope["scope_summary"],
+                "snapshot_estimated_bytes": snapshot_estimated_bytes,
+                "fingerprint_schema_version": CATALOG_FINGERPRINT_SCHEMA_VERSION,
+                "change_counts": change_counts,
+                "change_reason": change_reason,
+                "duration_ms": duration_ms,
+                "changes": 0,
+            }
+
+        for entity_type in ENTITY_ORDER:
+            rows = normalized[ENTITY_COLLECTIONS[entity_type]]
             _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, rows, now)
-            for entity_id in sorted(set(old) - set(current)):
-                changes.append((entity_type, entity_id, "delete", None))
         _insert_relationship_rows(cur, catalog_instance_id, generation, normalized)
 
-        ordered_changes = [c for c in changes if c[2] == "upsert"]
+        ordered_changes = [change for change in changes if change[2] == "upsert"]
         ordered_changes.sort(key=lambda c: (ENTITY_ORDER.index(c[0]), c[1]))
-        deletes = [c for c in changes if c[2] == "delete"]
+        deletes = [change for change in changes if change[2] == "delete"]
         deletes.sort(key=lambda c: (-ENTITY_ORDER.index(c[0]), c[1]))
         ordered_changes.extend(deletes)
-        next_seq = int(locked_head)
-        for entity_type, entity_id, operation, payload in ordered_changes:
+        publication_epoch = str(uuid.uuid4()) if fingerprint_rebase else str(locked_epoch)
+        next_seq = 0 if fingerprint_rebase else int(locked_head)
+        if fingerprint_rebase:
+            cur.execute(
+                f"DELETE FROM {t('catalog_changes')} WHERE catalog_instance_id=%s",
+                (catalog_instance_id,),
+            )
+            cur.execute(
+                f"UPDATE {t('stream_bootstrap_sessions')} SET completed_at=now() "
+                "WHERE catalog_instance_id=%s AND completed_at IS NULL",
+                (catalog_instance_id,),
+            )
+        for entity_type, entity_id, operation, payload, _reactivated in ordered_changes:
             next_seq += 1
             cur.execute(
                 f"""
                 INSERT INTO {t("catalog_changes")}
                     (catalog_instance_id, epoch, seq, generation, entity_type,
-                     entity_id, operation, payload)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                     entity_id, operation, change_reason, payload)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
                 """,
                 (
                     catalog_instance_id,
-                    epoch,
+                    publication_epoch,
                     next_seq,
                     generation,
                     entity_type,
                     entity_id,
                     operation,
+                    change_reason,
                     _json_param(payload) if payload is not None else None,
                 ),
             )
-        coverage = _coverage(normalized)
-        scope = catalog_scope_evidence(normalized, server["provider_type"])
-        field_support = {name: "observed" if value["present"] else "not_observed" for name, value in coverage.items()}
+        duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))
         cur.execute(
             f"""
             UPDATE {t("catalog_state")}
-               SET published_generation=%s, catalog_head_seq=%s, status='complete',
+               SET published_generation=%s, catalog_epoch=%s, catalog_head_seq=%s,
+                   catalog_floor_seq=CASE WHEN %s THEN 0 ELSE catalog_floor_seq END,
+                   status='complete',
+                   fingerprint_schema_version=%s,
                    entity_counts=%s::jsonb, field_support=%s::jsonb,
                    field_coverage=%s::jsonb, scope_summary=%s::jsonb,
                    catalog_builder_version=%s, refresh_required=FALSE,
                    refresh_reason=NULL,
+                   snapshot_estimated_bytes=%s,
+                   last_scan_change_counts=%s::jsonb,
+                   last_scan_change_reason=%s,
+                   last_scan_duration_ms=%s,
                    completed_at=now(), last_error=NULL,
                    updated_at=now()
              WHERE catalog_instance_id=%s
             """,
             (
                 generation,
+                publication_epoch,
                 next_seq,
+                fingerprint_rebase,
+                CATALOG_FINGERPRINT_SCHEMA_VERSION,
                 _json_param(counts),
                 _json_param(field_support),
                 _json_param(coverage),
                 _json_param(scope["scope_summary"]),
                 CATALOG_BUILDER_VERSION,
+                snapshot_estimated_bytes,
+                _json_param(change_counts),
+                change_reason,
+                duration_ms,
                 catalog_instance_id,
             ),
         )
+        progress = {
+            "input_counts": counts,
+            "change_counts": change_counts,
+            "change_reason": change_reason,
+            "duration_ms": duration_ms,
+            "generation": generation,
+            "head_seq": next_seq,
+            "fingerprint_schema_version": CATALOG_FINGERPRINT_SCHEMA_VERSION,
+            "snapshot_estimated_bytes": snapshot_estimated_bytes,
+        }
         cur.execute(
             f"UPDATE {t('catalog_sources')} SET provider_instance_fp=%s, "
             "library_scope_fp=%s, updated_at=now() WHERE catalog_instance_id=%s",
@@ -1462,7 +1708,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         cur.execute(
             f"UPDATE {t('catalog_scans')} SET status='complete', completed_at=now(), "
             "progress=%s::jsonb WHERE scan_id=%s",
-            (_json_param(counts), scan_id),
+            (_json_param(progress), scan_id),
         )
         cur.close()
         db.commit()
@@ -1472,16 +1718,22 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             "generation": generation,
             "builder_version": CATALOG_BUILDER_VERSION,
             "refresh_required": False,
-            "cursor": {"epoch": str(epoch), "seq": next_seq},
+            "cursor": {"epoch": publication_epoch, "seq": next_seq},
             "counts": counts,
             "field_coverage": coverage,
             "scope_summary": scope["scope_summary"],
+            "snapshot_estimated_bytes": snapshot_estimated_bytes,
+            "fingerprint_schema_version": CATALOG_FINGERPRINT_SCHEMA_VERSION,
+            "change_counts": change_counts,
+            "change_reason": change_reason,
+            "duration_ms": duration_ms,
             "changes": len(ordered_changes),
         }
     except Exception as exc:
         rollback = getattr(db, "rollback", None)
         if callable(rollback):
             rollback()
+        failure_duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))
         cur = db.cursor()
         cur.execute(
             f"""
@@ -1489,14 +1741,31 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                SET status=CASE WHEN published_generation=0 THEN 'failed' ELSE status END,
                    refresh_required=TRUE,
                    refresh_reason=COALESCE(refresh_reason, 'refresh_failed'),
-                   last_error=%s, updated_at=now()
+                   last_error=%s,
+                   last_scan_change_reason='scan_failed',
+                   last_scan_duration_ms=%s,
+                   updated_at=now()
              WHERE catalog_instance_id=%s
             """,
-            (str(exc)[:1000], catalog_instance_id),
+            (
+                str(exc)[:1000],
+                failure_duration_ms,
+                catalog_instance_id,
+            ),
         )
         cur.execute(
-            f"UPDATE {t('catalog_scans')} SET status='failed', completed_at=now(), last_error=%s WHERE scan_id=%s",
-            (str(exc)[:1000], scan_id),
+            f"UPDATE {t('catalog_scans')} SET status='failed', completed_at=now(), "
+            "last_error=%s, progress=%s::jsonb WHERE scan_id=%s",
+            (
+                str(exc)[:1000],
+                _json_param(
+                    {
+                        "change_reason": "scan_failed",
+                        "duration_ms": failure_duration_ms,
+                    }
+                ),
+                scan_id,
+            ),
         )
         cur.close()
         db.commit()
@@ -1544,7 +1813,10 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
                    s.library_scope_fp, c.scope_summary,
-                   c.catalog_builder_version, c.refresh_required, c.refresh_reason
+                   c.catalog_builder_version, c.refresh_required, c.refresh_reason,
+                   c.fingerprint_schema_version, c.snapshot_estimated_bytes,
+                   c.last_scan_change_counts, c.last_scan_change_reason,
+                   c.last_scan_duration_ms
               FROM {t("catalog_sources")} s
               JOIN {t("catalog_state")} c USING (catalog_instance_id)
               LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
@@ -1565,7 +1837,10 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
                    s.library_scope_fp, c.scope_summary,
-                   c.catalog_builder_version, c.refresh_required, c.refresh_reason
+                   c.catalog_builder_version, c.refresh_required, c.refresh_reason,
+                   c.fingerprint_schema_version, c.snapshot_estimated_bytes,
+                   c.last_scan_change_counts, c.last_scan_change_reason,
+                   c.last_scan_duration_ms
               FROM {t("catalog_sources")} s
               JOIN {t("catalog_state")} c USING (catalog_instance_id)
               LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
@@ -1586,7 +1861,10 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
                    s.library_scope_fp, c.scope_summary,
-                   c.catalog_builder_version, c.refresh_required, c.refresh_reason
+                   c.catalog_builder_version, c.refresh_required, c.refresh_reason,
+                   c.fingerprint_schema_version, c.snapshot_estimated_bytes,
+                   c.last_scan_change_counts, c.last_scan_change_reason,
+                   c.last_scan_duration_ms
               FROM {t("catalog_sources")} s
               JOIN {t("catalog_state")} c USING (catalog_instance_id)
               LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
@@ -1636,11 +1914,14 @@ def _source_dto(row):
         "scope_summary": _state_counts(row[30]) if len(row) > 30 else {},
         "catalog": {
             "generation": int(row[6]),
+            "snapshot_generation": int(row[6]),
             "epoch": str(row[7]),
             "head_seq": int(row[8]),
             "floor_seq": int(row[9]),
+            "retained_floor_seq": int(row[9]),
             "status": row[10],
             "entity_counts": _state_counts(row[11]),
+            "snapshot_entity_counts": _state_counts(row[11]),
             "field_support": _state_counts(row[12]),
             "field_coverage": _state_counts(row[13]),
             "builder_version": int(row[31] or 0) if len(row) > 31 else 0,
@@ -1649,6 +1930,15 @@ def _source_dto(row):
             "started_at": _iso(row[14]),
             "completed_at": _iso(row[15]),
             "last_error": row[16],
+            "fingerprint_schema_version": int(row[34] or 1) if len(row) > 34 else 1,
+            "snapshot_estimated_bytes": int(row[35] or 0) if len(row) > 35 else 0,
+            "last_scan_change_counts": (
+                _state_counts(row[36]) if len(row) > 36 else {}
+            ),
+            "last_scan_change_reason": row[37] if len(row) > 37 else None,
+            "last_scan_duration_ms": (
+                int(row[38]) if len(row) > 38 and row[38] is not None else None
+            ),
         },
         "analysis": {
             "generation": int(row[17] or 0),
@@ -1773,6 +2063,11 @@ def create_bootstrap_session(
         "snapshot_cursor": opaque_cursor(source["catalog_instance_id"], epoch, seq),
         "snapshot_seq": seq,
         "totals": totals,
+        "snapshot_estimated_bytes": (
+            int(state.get("snapshot_estimated_bytes", 0) or 0)
+            if stream == "catalog"
+            else None
+        ),
         "expires_in_seconds": max(5, min(int(lifetime_minutes), 60)) * 60,
     }
 
@@ -1927,7 +2222,7 @@ def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=N
     cur.execute(
         f"""
         SELECT seq, generation, entity_type, entity_id, operation, old_entity_id,
-               payload, evidence, created_at
+               payload, evidence, created_at, change_reason
           FROM {t("catalog_changes")}
          WHERE catalog_instance_id=%s AND epoch=%s AND seq > %s
          ORDER BY seq
@@ -1953,17 +2248,39 @@ def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=N
             "payload": row[6] if isinstance(row[6], dict) or row[6] is None else json.loads(row[6]),
             "evidence": row[7] if isinstance(row[7], dict) or row[7] is None else json.loads(row[7]),
             "created_at": _iso(row[8]),
+            "change_reason": str(row[9] or "provider_diff") if len(row) > 9 else "provider_diff",
         }
         for row in rows
     ]
     next_seq = changes[-1]["seq"] if changes else cursor["seq"]
+    remaining_events = max(0, int(state["head_seq"]) - int(next_seq))
+    page_estimated_bytes = sum(
+        len(canonical_json(change).encode("utf-8")) + CHANGE_EVENT_OVERHEAD_BYTES
+        for change in changes
+    )
+    average_event_bytes = (
+        max(CHANGE_EVENT_OVERHEAD_BYTES, page_estimated_bytes // len(changes))
+        if changes
+        else CHANGE_EVENT_OVERHEAD_BYTES
+    )
     return {
         "catalog_instance_id": source["catalog_instance_id"],
         "server_id": source["server_id"],
+        "fingerprint_schema_version": int(
+            state.get("fingerprint_schema_version", 1) or 1
+        ),
+        "snapshot_generation": int(state.get("generation", 0) or 0),
+        "snapshot_entity_counts": state.get("entity_counts") or {},
+        "snapshot_estimated_bytes": int(
+            state.get("snapshot_estimated_bytes", 0) or 0
+        ),
         "changes": changes,
         "cursor": opaque_cursor(source["catalog_instance_id"], state["epoch"], next_seq),
         "head_cursor": opaque_cursor(source["catalog_instance_id"], state["epoch"], state["head_seq"]),
         "has_more": next_seq < state["head_seq"],
+        "remaining_events": remaining_events,
+        "page_estimated_bytes": page_estimated_bytes,
+        "estimated_remaining_bytes": remaining_events * average_event_bytes,
     }
 
 

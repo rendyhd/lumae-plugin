@@ -65,6 +65,7 @@
         "provider_track_scope_verification",
         "source_scoped_profiles",
         "prepare_lumae",
+        "catalog_prepare_api",
         "analysis_run_finalization",
         "catalog_ready_before_profile_backfill",
         "interactive_profile_priority",
@@ -81,6 +82,14 @@
     }
   },
   "versions": [
+    {
+      "version": "0.9.0",
+      "min_core_version": "2.6.0",
+      "changelog": "Version catalogue fingerprints with atomic epoch rebases, expose preparation start/status routes, and publish transfer-cost diagnostics for safe mobile planning.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "0.8.11",
       "min_core_version": "2.6.0",
