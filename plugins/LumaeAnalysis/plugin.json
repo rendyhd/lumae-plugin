@@ -87,8 +87,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Version catalogue fingerprints with atomic epoch rebases, expose preparation start/status routes, and publish transfer-cost diagnostics for safe mobile planning.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_0.9.0.zip",
+      "checksum": "06012a624d6644cb955e6ac0d294b31f"
     },
     {
       "version": "0.8.11",
