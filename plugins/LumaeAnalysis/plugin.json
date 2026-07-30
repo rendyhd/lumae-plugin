@@ -91,8 +91,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Replace release-number approval with live API and data-contract admission, while preserving independent catalogue browsing and progressive sonic enrichment.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.0.0.zip",
+      "checksum": "2952998d1b8b40fcbf6c059eee63f340"
     },
     {
       "version": "0.9.1",
