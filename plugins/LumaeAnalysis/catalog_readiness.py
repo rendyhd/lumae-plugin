@@ -1,63 +1,30 @@
-"""AudioMuse 3 catalogue-repair readiness diagnostics.
+"""Runtime catalogue and analysis admission for AudioMuse 3.
 
-AudioMuse owns analysis identity, but it does not expose one durable flag that
-proves an upgraded installation completed Chromaprint backfill, Cleaning, and
-the following analysis run.  This module combines measurable core state with a
-source-scoped administrator acknowledgement.  V2 never executes these queries.
+Core versions are diagnostic inputs, never allow-list decisions.  Catalogue
+and analysis are admitted independently from observable source, projection,
+policy, and repair evidence.  V2 never executes the AudioMuse 3 queries.
 """
 
-from datetime import datetime, timezone
-import json
-import re
-
-from plugin.api import get_setting, set_setting, table
+from plugin.api import table
 
 
-ACKNOWLEDGEMENT_SETTING = "v3_catalogue_repair_acknowledgements"
-QUALIFIED_CORE_VERSIONS = ("v3.0.3", "v3.0.4", "v3.0.5")
-LATEST_QUALIFIED_CORE_VERSION = QUALIFIED_CORE_VERSIONS[-1]
+CONTRACT_REVISION = 1
 
 
 def t(name):
     return table(name)
 
 
-def _iso_now():
-    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-
-
-def _normalized_core_version(compatibility):
-    raw = str(getattr(compatibility, "core_version", "") or "").strip().lower()
-    match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", raw)
-    return f"v{match.group(1)}" if match else None
-
-
-def _qualified_core_version(compatibility):
-    version = _normalized_core_version(compatibility)
-    return version if version in QUALIFIED_CORE_VERSIONS else None
-
-
-def _qualified_release(compatibility):
-    return _qualified_core_version(compatibility) is not None
-
-
-def _setting_map():
-    raw = get_setting(ACKNOWLEDGEMENT_SETTING, {})
-    if isinstance(raw, dict):
-        return dict(raw)
-    if isinstance(raw, str):
-        try:
-            parsed = json.loads(raw)
-            return dict(parsed) if isinstance(parsed, dict) else {}
-        except (TypeError, ValueError):
-            return {}
-    return {}
+def _detected_core_version(compatibility):
+    return str(getattr(compatibility, "core_version", "") or "").strip()
 
 
 def _task_details(value):
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
+        import json
+
         try:
             parsed = json.loads(value)
             return parsed if isinstance(parsed, dict) else {}
@@ -137,6 +104,8 @@ def _task_evidence(db):
         "analysis_before_cleaning": before,
         "cleaning": cleaning,
         "analysis_after_cleaning": after,
+        # Kept for older diagnostics; final automatic verification also
+        # requires Chromaprint completion to predate Cleaning.
         "upgrade_sequence_complete": bool(before and cleaning and after),
     }
 
@@ -186,7 +155,7 @@ def _coverage(db, source):
     }
 
 
-def _policy_blockers(policy):
+def _analysis_policy_blockers(policy):
     blockers = []
     if policy.get("catalogue_id_scheme_version") != 4:
         blockers.append("fp_4_not_active")
@@ -202,17 +171,109 @@ def _policy_blockers(policy):
     return blockers
 
 
-def _valid_acknowledgement(source, compatibility, acknowledgement):
-    qualified_core_version = _qualified_core_version(compatibility)
-    return bool(
-        isinstance(acknowledgement, dict)
-        and qualified_core_version is not None
-        and acknowledgement.get("core_version") == qualified_core_version
-        and acknowledgement.get("catalog_instance_id")
-        == source.get("catalog_instance_id")
-        and acknowledgement.get("server_id") == source.get("server_id")
-        and acknowledgement.get("verification_mode") in {"fresh", "upgraded"}
-        and _qualified_release(compatibility)
+def _catalogue_admission(source):
+    blockers = []
+    if not source.get("catalog_instance_id") or not source.get("server_id"):
+        blockers.append("catalog_not_initialized")
+    if (source.get("catalog") or {}).get("status") != "complete":
+        blockers.append("catalog_generation_incomplete")
+    admitted = not blockers
+    return {
+        "contract_revision": CONTRACT_REVISION,
+        "schema_version": 2,
+        "status": "ready" if admitted else "not_ready",
+        "admitted": admitted,
+        "semantic_contracts": [
+            "provider_track_ids_v1",
+            "complete_catalog_generation_v1",
+            "contiguous_change_journal_v1",
+        ],
+        "blockers": blockers,
+    }
+
+
+def _analysis_admission(db, source, policy):
+    blockers = _analysis_policy_blockers(policy)
+    if (source.get("analysis") or {}).get("status") != "complete":
+        blockers.append("analysis_projection_incomplete")
+
+    try:
+        coverage = _coverage(db, source)
+        tasks = _task_evidence(db)
+    except Exception:
+        return (
+            {
+                "eligible_track_count": 0,
+                "mapped_track_count": 0,
+                "missing_mapping_count": 0,
+                "chromaprint_track_count": 0,
+                "chromaprint_missing_count": 0,
+                "chromaprint_coverage": 0.0,
+                "latest_chromaprint_at_unix": None,
+            },
+            {},
+            {
+                "contract_revision": CONTRACT_REVISION,
+                "schema_version": 2,
+                "status": "not_ready",
+                "admitted": False,
+                "semantic_contracts": [
+                    "analysis_link_evidence_v1",
+                    "musicnn_f32le_200_v1",
+                    "clap_f32le_512_v1",
+                    "audiomuse_musicnn_scalars_v1",
+                ],
+                "blockers": ["readiness_unavailable"],
+            },
+        )
+
+    if coverage["eligible_track_count"] > 0 and coverage["mapped_track_count"] == 0:
+        blockers.append("no_analysis_mappings")
+    elif coverage["chromaprint_missing_count"]:
+        blockers.append("chromaprint_backfill_incomplete")
+
+    cleaning = tasks.get("cleaning") or {}
+    analysis_after = tasks.get("analysis_after_cleaning") or {}
+    cleaning_time = cleaning.get("completed_at_unix")
+    latest_chromaprint_at = coverage.get("latest_chromaprint_at_unix")
+    chromaprint_complete_before_cleaning = bool(
+        coverage["mapped_track_count"] == 0
+        or (
+            cleaning_time is not None
+            and latest_chromaprint_at is not None
+            and latest_chromaprint_at <= cleaning_time
+        )
+    )
+    verification_sequence_complete = bool(
+        coverage["mapped_track_count"] == 0
+        or (
+            chromaprint_complete_before_cleaning
+            and analysis_after.get("completed_at_unix") is not None
+        )
+    )
+    tasks["chromaprint_complete_before_cleaning"] = chromaprint_complete_before_cleaning
+    tasks["verification_sequence_complete"] = verification_sequence_complete
+    tasks["upgrade_sequence_complete"] = verification_sequence_complete
+    if coverage["mapped_track_count"] > 0 and not verification_sequence_complete:
+        blockers.append("analysis_verification_sequence_incomplete")
+
+    admitted = not blockers
+    return (
+        coverage,
+        tasks,
+        {
+            "contract_revision": CONTRACT_REVISION,
+            "schema_version": 2,
+            "status": "ready" if admitted else "not_ready",
+            "admitted": admitted,
+            "semantic_contracts": [
+                "analysis_link_evidence_v1",
+                "musicnn_f32le_200_v1",
+                "clap_f32le_512_v1",
+                "audiomuse_musicnn_scalars_v1",
+            ],
+            "blockers": blockers,
+        },
     )
 
 
@@ -224,19 +285,26 @@ def v3_release_readiness(
     acknowledgement=None,
     requested_mode=None,
 ):
-    """Return source-scoped, fail-closed v3 release readiness."""
-    qualified_core_version = _qualified_core_version(compatibility)
-    detected_core_version = _normalized_core_version(compatibility) or str(
-        getattr(compatibility, "core_version", "") or ""
-    ).strip()
+    """Return automatic source-scoped stream admission.
+
+    ``acknowledgement`` and ``requested_mode`` remain accepted for one plugin
+    release so callers compiled against the old helper do not break.  They no
+    longer influence admission.
+    """
+
+    del acknowledgement, requested_mode
+    detected_core_version = _detected_core_version(compatibility)
     base = {
-        "qualified_core_version": (
-            qualified_core_version or LATEST_QUALIFIED_CORE_VERSION
-        ),
+        # Legacy fields remain additive/backwards-compatible.  New clients use
+        # the explicit per-stream admission object below.
+        "qualified_core_version": detected_core_version,
         "detected_core_version": detected_core_version,
         "applicable": compatibility.adapter == "v3_registry",
         "status": "not_applicable",
         "ready": compatibility.adapter != "v3_registry",
+        "fully_verified": compatibility.adapter != "v3_registry",
+        "analysis_sync_allowed": compatibility.adapter != "v3_registry",
+        "progressive_analysis": False,
         "verification_mode": None,
         "administrator_acknowledged": False,
         "acknowledged_at": None,
@@ -244,134 +312,40 @@ def v3_release_readiness(
     }
     if compatibility.adapter != "v3_registry":
         return base
-    if not _qualified_release(compatibility):
+
+    catalog_admission = _catalogue_admission(source)
+    if not catalog_admission["admitted"]:
         return {
             **base,
-            "status": "core_release_unqualified",
-            "ready": False,
-            "blockers": ["core_release_unqualified"],
-        }
-    if not source.get("catalog_instance_id") or not source.get("server_id"):
-        return {
-            **base,
-            "status": "catalog_not_initialized",
-            "ready": False,
-            "blockers": ["catalog_not_initialized"],
-        }
-
-    try:
-        coverage = _coverage(db, source)
-        tasks = _task_evidence(db)
-    except Exception:
-        return {
-            **base,
-            "status": "readiness_unavailable",
-            "ready": False,
-            "blockers": ["readiness_unavailable"],
+            "status": "catalog_not_ready",
+            "blockers": list(catalog_admission["blockers"]),
+            "admission": {
+                "catalog": catalog_admission,
+                "analysis": {
+                    "contract_revision": CONTRACT_REVISION,
+                    "schema_version": 2,
+                    "status": "not_ready",
+                    "admitted": False,
+                    "semantic_contracts": [],
+                    "blockers": ["catalog_not_ready"],
+                },
+            },
         }
 
-    cleaning = tasks.get("cleaning") or {}
-    cleaning_time = cleaning.get("completed_at_unix")
-    latest_chromaprint_at = coverage.get("latest_chromaprint_at_unix")
-    chromaprint_complete_before_cleaning = bool(
-        cleaning_time is not None
-        and latest_chromaprint_at is not None
-        and latest_chromaprint_at <= cleaning_time
-    )
-    task_order_complete = tasks["upgrade_sequence_complete"]
-    tasks["chromaprint_complete_before_cleaning"] = chromaprint_complete_before_cleaning
-    tasks["upgrade_sequence_complete"] = bool(
-        task_order_complete and chromaprint_complete_before_cleaning
-    )
-
-    if acknowledgement is None:
-        acknowledgement = _setting_map().get(source["catalog_instance_id"])
-    acknowledged = _valid_acknowledgement(source, compatibility, acknowledgement)
-    mode = requested_mode or (
-        acknowledgement.get("verification_mode") if acknowledged else None
-    )
-    blockers = _policy_blockers(policy)
-    if source.get("catalog", {}).get("status") != "complete":
-        blockers.append("catalog_generation_incomplete")
-    if source.get("analysis", {}).get("status") != "complete":
-        blockers.append("analysis_projection_incomplete")
-    if coverage["mapped_track_count"] == 0:
-        blockers.append("no_analysis_mappings")
-    elif coverage["chromaprint_missing_count"]:
-        blockers.append("chromaprint_backfill_incomplete")
-    if mode == "upgraded" and not acknowledged:
-        if not task_order_complete:
-            blockers.append("upgrade_repair_sequence_incomplete")
-        elif not chromaprint_complete_before_cleaning:
-            blockers.append("cleaning_predates_chromaprint_completion")
-    if requested_mode is None and not acknowledged:
-        blockers.append("administrator_acknowledgement_required")
-
-    ready = not blockers and (acknowledged or requested_mode is not None)
-    if ready:
-        status = "ready"
-    elif blockers == ["administrator_acknowledgement_required"]:
-        status = "acknowledgement_required"
-    else:
-        status = "repair_incomplete"
+    coverage, tasks, analysis_admission = _analysis_admission(db, source, policy)
+    ready = analysis_admission["admitted"]
     return {
         **base,
         **coverage,
-        "status": status,
+        "status": "ready" if ready else "repair_incomplete",
         "ready": ready,
-        "verification_mode": mode,
-        "administrator_acknowledged": acknowledged,
-        "acknowledged_at": (
-            acknowledgement.get("acknowledged_at") if acknowledged else None
-        ),
+        "fully_verified": ready,
+        "analysis_sync_allowed": ready,
+        "verification_mode": "automatic",
         "task_evidence": tasks,
-        "blockers": blockers,
+        "blockers": list(analysis_admission["blockers"]),
+        "admission": {
+            "catalog": catalog_admission,
+            "analysis": analysis_admission,
+        },
     }
-
-
-def acknowledge_v3_release(db, compatibility, source, policy, mode):
-    if mode not in {"fresh", "upgraded"}:
-        raise ValueError("Choose fresh or upgraded AudioMuse 3 verification")
-    candidate = v3_release_readiness(
-        db,
-        compatibility,
-        source,
-        policy,
-        acknowledgement={},
-        requested_mode=mode,
-    )
-    if not candidate["ready"]:
-        raise ValueError(
-            "AudioMuse 3 is not ready: " + ", ".join(candidate["blockers"])
-        )
-    acknowledgements = _setting_map()
-    acknowledgements[source["catalog_instance_id"]] = {
-        "core_version": candidate["qualified_core_version"],
-        "catalog_instance_id": source["catalog_instance_id"],
-        "server_id": source["server_id"],
-        "verification_mode": mode,
-        "acknowledged_at": _iso_now(),
-        "cleaning_task_id": (
-            (candidate.get("task_evidence", {}).get("cleaning") or {}).get("task_id")
-        ),
-        "post_clean_analysis_task_id": (
-            (
-                candidate.get("task_evidence", {}).get("analysis_after_cleaning") or {}
-            ).get("task_id")
-        ),
-    }
-    set_setting(ACKNOWLEDGEMENT_SETTING, acknowledgements)
-    return v3_release_readiness(
-        db,
-        compatibility,
-        source,
-        policy,
-        acknowledgement=acknowledgements[source["catalog_instance_id"]],
-    )
-
-
-def clear_v3_release_acknowledgement(catalog_instance_id):
-    acknowledgements = _setting_map()
-    removed = acknowledgements.pop(str(catalog_instance_id), None) is not None
-    set_setting(ACKNOWLEDGEMENT_SETTING, acknowledgements)
-    return removed
