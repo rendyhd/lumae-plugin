@@ -1,8 +1,8 @@
 """AudioMuse core compatibility detection for the Lumae Analysis plugin.
 
 This module deliberately imports only the plugin API that exists in AudioMuse
-2.6. Optional v3 symbols are inspected lazily so importing the plugin can never
-fail before health has a chance to explain an unsupported core.
+2.6. Core versions remain useful diagnostics, but the v3 adapter is admitted
+from its observable registry API instead of an exact release list.
 """
 
 from dataclasses import dataclass
@@ -12,8 +12,11 @@ from plugin.api import config
 
 
 SUPPORTED_CORE_MIN = (2, 6, 0)
-SUPPORTED_CORE_MAX_EXCLUSIVE = (4, 0, 0)
+# Retained as the historically tested range for older clients and diagnostics.
+# It is not an admission rule.
 SUPPORTED_CORE_RANGE = ">=2.6.0,<4.0.0"
+V2_API_CONTRACT = "audiomuse_v2_single_server_v1"
+V3_API_CONTRACT = "audiomuse_v3_registry_v1"
 
 
 def parse_core_version(value):
@@ -34,6 +37,32 @@ def _has_v3_server_api(api_module=None):
     )
 
 
+def _probe_v3_server_api(api_module=None):
+    """Read-only proof that the advertised registry has the expected shape."""
+    if api_module is None:
+        import plugin.api as api_module
+
+    if not _has_v3_server_api(api_module):
+        return False
+    try:
+        servers = api_module.list_servers()
+        active = api_module.active_server_id()
+    except Exception:
+        return False
+    if servers is None:
+        servers = []
+    if not isinstance(servers, (list, tuple)):
+        return False
+    ids = set()
+    for raw in servers:
+        if not isinstance(raw, dict):
+            return False
+        server_id = raw.get("server_id") or raw.get("id")
+        if server_id is not None:
+            ids.add(str(server_id))
+    return active is None or not ids or str(active) in ids
+
+
 @dataclass(frozen=True)
 class CoreCompatibility:
     core_version: str
@@ -42,11 +71,13 @@ class CoreCompatibility:
     status: str
     supported: bool
     reason: str | None = None
+    api_contract: str | None = None
 
     def as_dict(self):
         return {
             "core_version": self.core_version,
             "core_adapter": self.adapter,
+            "core_api_contract": self.api_contract,
             "supported_core_range": SUPPORTED_CORE_RANGE,
             "status": self.status,
             "supported": self.supported,
@@ -55,11 +86,45 @@ class CoreCompatibility:
 
 
 def detect_core(api_module=None, config_obj=None):
-    """Select the v2 or v3 adapter without importing version-specific code."""
+    """Select an adapter from observable API capabilities.
+
+    A version change invalidates and reruns this probe, but never admits or
+    rejects an otherwise identical API contract by itself.
+    """
+
     cfg = config_obj or config
     raw_version = str(getattr(cfg, "APP_VERSION", "") or "unknown")
     parsed = parse_core_version(raw_version)
     has_v3_api = _has_v3_server_api(api_module)
+
+    if has_v3_api and parsed is not None and parsed[0] < 3:
+        return CoreCompatibility(
+            raw_version,
+            parsed,
+            None,
+            "core_api_inconsistent",
+            False,
+            "The reported pre-v3 core unexpectedly exposes the v3 server API.",
+        )
+
+    if has_v3_api:
+        if not _probe_v3_server_api(api_module):
+            return CoreCompatibility(
+                raw_version,
+                parsed,
+                None,
+                "core_api_incomplete",
+                False,
+                "AudioMuse-AI exposes the v3 registry API but its live response is incompatible.",
+            )
+        return CoreCompatibility(
+            raw_version,
+            parsed,
+            "v3_registry",
+            "compatible",
+            True,
+            api_contract=V3_API_CONTRACT,
+        )
 
     if parsed is None:
         return CoreCompatibility(
@@ -68,7 +133,7 @@ def detect_core(api_module=None, config_obj=None):
             None,
             "core_untested",
             False,
-            "AudioMuse-AI did not expose a parseable core version.",
+            "AudioMuse-AI did not expose a parseable legacy core version or the v3 registry API.",
         )
 
     if parsed < SUPPORTED_CORE_MIN:
@@ -81,47 +146,23 @@ def detect_core(api_module=None, config_obj=None):
             "Lumae Analysis catalogue sync requires AudioMuse-AI 2.6.0 or newer.",
         )
 
-    if parsed >= SUPPORTED_CORE_MAX_EXCLUSIVE:
+    if parsed[0] == 2:
         return CoreCompatibility(
             raw_version,
             parsed,
-            None,
-            "core_untested",
-            False,
-            "This AudioMuse-AI major version has not passed the Lumae compatibility matrix.",
+            "v2_single_server",
+            "compatible",
+            True,
+            api_contract=V2_API_CONTRACT,
         )
-
-    if parsed[0] == 2:
-        if has_v3_api:
-            return CoreCompatibility(
-                raw_version,
-                parsed,
-                None,
-                "core_api_inconsistent",
-                False,
-                "The reported v2 core unexpectedly exposes the v3 server API.",
-            )
-        return CoreCompatibility(raw_version, parsed, "v2_single_server", "compatible", True)
-
-    if parsed[0] == 3:
-        if not has_v3_api:
-            return CoreCompatibility(
-                raw_version,
-                parsed,
-                None,
-                "core_api_incomplete",
-                False,
-                "AudioMuse-AI v3 is missing its required plugin server-context API.",
-            )
-        return CoreCompatibility(raw_version, parsed, "v3_registry", "compatible", True)
 
     return CoreCompatibility(
         raw_version,
         parsed,
         None,
-        "core_untested",
+        "core_api_incomplete",
         False,
-        "This AudioMuse-AI core line is outside the supported compatibility matrix.",
+        "AudioMuse-AI is missing the required v3 plugin server-context API.",
     )
 
 

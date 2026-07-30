@@ -52,7 +52,7 @@ from .catalog_enrichment import (
     relationship_status,
     serialize_profile,
 )
-from .catalog_readiness import v3_release_readiness
+from .catalog_readiness import CONTRACT_REVISION, v3_release_readiness
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .database_state import collect_database_state, render_database_state
 from .collection_manager import (
@@ -67,7 +67,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "0.9.1"
+PLUGIN_VERSION = "1.0.0"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -86,7 +86,10 @@ CATALOG_FEATURES = (
     "shared_analysis",
     "binary_vectors",
     "v3_release_readiness",
+    "contract_admission_v1",
+    "independent_stream_admission",
     "automatic_sonic_verification",
+    "semantic_contracts_v1",
     "progressive_analysis_admission",
     "repair_flagged_analysis_admission",
     "database_state_dashboard",
@@ -1015,12 +1018,51 @@ def upsert_profile(
 
 def catalog_capability():
     return {
+        "contract_revision": CONTRACT_REVISION,
         "catalog_schema_version": CATALOG_SCHEMA_VERSION,
         "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
         "catalog_builder_version": CATALOG_BUILDER_VERSION,
         "supported_core_range": SUPPORTED_CORE_RANGE,
         "supported_provider_types": sorted(SUPPORTED_PROVIDER_TYPES),
         "features": list(CATALOG_FEATURES),
+    }
+
+
+def sync_contract(compatibility):
+    """Describe breaking schemas and semantic formats independently of core version."""
+    return {
+        "revision": CONTRACT_REVISION,
+        "producer": "lumae_analysis",
+        "core_api_contract": compatibility.api_contract,
+        "streams": {
+            "catalog": {
+                "schema_version": CATALOG_SCHEMA_VERSION,
+                "semantic_contracts": [
+                    "provider_track_ids_v1",
+                    "complete_catalog_generation_v1",
+                    "contiguous_change_journal_v1",
+                ],
+            },
+            "analysis": {
+                "schema_version": ANALYSIS_SCHEMA_VERSION,
+                "semantic_contracts": [
+                    "analysis_link_evidence_v1",
+                    "musicnn_f32le_200_v1",
+                    "clap_f32le_512_v1",
+                    "audiomuse_musicnn_scalars_v1",
+                ],
+            },
+            "profiles": {
+                "schema_version": SCHEMA_VERSION,
+                "analyzer_version": ANALYZER_VERSION,
+                "semantic_contracts": ["lumae_playback_profile_v1"],
+            },
+            "relationships": {
+                "schema_version": RELATIONSHIP_SCHEMA_VERSION,
+                "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
+                "semantic_contracts": ["lumae_album_artist_relationships_v1"],
+            },
+        },
     }
 
 
@@ -1053,6 +1095,7 @@ def health():
             "core_version": compatibility.core_version,
             "core_adapter": compatibility.adapter,
             "supported_core_range": SUPPORTED_CORE_RANGE,
+            "sync_contract": sync_contract(compatibility),
             "schema_version": SCHEMA_VERSION,
             "analyzer_version": ANALYZER_VERSION,
             "capabilities": {
@@ -1085,6 +1128,7 @@ def catalog_health():
                 "catalog_schema_version": CATALOG_SCHEMA_VERSION,
                 "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
                 "capability": catalog_capability(),
+                "sync_contract": sync_contract(compatibility),
                 "servers": [],
                 "status": "server_discovery_failed",
                 "reason": str(exc),
@@ -1159,6 +1203,7 @@ def catalog_health():
             "analysis_schema_version": ANALYSIS_SCHEMA_VERSION,
             "catalog_builder_version": CATALOG_BUILDER_VERSION,
             "capability": catalog_capability(),
+            "sync_contract": sync_contract(compatibility),
             "dedup_policy": policy,
             "servers": servers,
         }

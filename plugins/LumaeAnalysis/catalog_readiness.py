@@ -1,38 +1,35 @@
-"""Automatic AudioMuse 3 sonic-analysis readiness diagnostics.
+"""Runtime catalogue and sonic-analysis admission for AudioMuse 3.
 
-AudioMuse owns analysis identity. Lumae therefore derives readiness from the
-current catalogue, mapping, Chromaprint, and per-link evidence instead of asking
-an administrator to attest to historical installation steps. V2 never executes
-these queries.
+Core versions are diagnostic inputs, never allow-list decisions. Catalogue and
+analysis are admitted independently from observable source, projection, policy,
+and per-link evidence. V2 never executes these queries.
 """
 
 import json
-import re
 
 from plugin.api import table
 
 
-QUALIFIED_CORE_VERSIONS = ("v3.0.3", "v3.0.4", "v3.0.5")
-LATEST_QUALIFIED_CORE_VERSION = QUALIFIED_CORE_VERSIONS[-1]
+CONTRACT_REVISION = 1
+CATALOG_SEMANTIC_CONTRACTS = [
+    "provider_track_ids_v1",
+    "complete_catalog_generation_v1",
+    "contiguous_change_journal_v1",
+]
+ANALYSIS_SEMANTIC_CONTRACTS = [
+    "analysis_link_evidence_v1",
+    "musicnn_f32le_200_v1",
+    "clap_f32le_512_v1",
+    "audiomuse_musicnn_scalars_v1",
+]
 
 
 def t(name):
     return table(name)
 
 
-def _normalized_core_version(compatibility):
-    raw = str(getattr(compatibility, "core_version", "") or "").strip().lower()
-    match = re.fullmatch(r"v?(\d+\.\d+\.\d+)", raw)
-    return f"v{match.group(1)}" if match else None
-
-
-def _qualified_core_version(compatibility):
-    version = _normalized_core_version(compatibility)
-    return version if version in QUALIFIED_CORE_VERSIONS else None
-
-
-def _qualified_release(compatibility):
-    return _qualified_core_version(compatibility) is not None
+def _detected_core_version(compatibility):
+    return str(getattr(compatibility, "core_version", "") or "").strip()
 
 
 def _task_details(value):
@@ -227,16 +224,56 @@ def _policy_blockers(policy):
     return blockers
 
 
-def v3_release_readiness(db, compatibility, source, policy):
-    """Return source-scoped, fail-closed automatic v3 readiness."""
-    qualified_core_version = _qualified_core_version(compatibility)
-    detected_core_version = _normalized_core_version(compatibility) or str(
-        getattr(compatibility, "core_version", "") or ""
-    ).strip()
+def _stream_admission(admitted, semantics, blockers, status=None):
+    return {
+        "contract_revision": CONTRACT_REVISION,
+        "schema_version": 2,
+        "status": status or ("ready" if admitted else "not_ready"),
+        "admitted": admitted,
+        "semantic_contracts": list(semantics),
+        "blockers": list(blockers),
+    }
+
+
+def _catalogue_admission(source):
+    blockers = []
+    if source.get("rebind_status") == "rebind_required":
+        blockers.append("source_rebind_required")
+    if not source.get("catalog_instance_id") or not source.get("server_id"):
+        blockers.append("catalog_not_initialized")
+    catalog = source.get("catalog") or {}
+    if catalog.get("status") != "complete":
+        blockers.append("catalog_generation_incomplete")
+    if catalog.get("refresh_required") is True:
+        blockers.append("catalog_refresh_required")
+    return _stream_admission(
+        not blockers,
+        CATALOG_SEMANTIC_CONTRACTS,
+        blockers,
+        blockers[0] if blockers else "ready",
+    )
+
+
+def v3_release_readiness(
+    db,
+    compatibility,
+    source,
+    policy,
+    acknowledgement=None,
+    requested_mode=None,
+):
+    """Return automatic, source-scoped stream admission.
+
+    The obsolete acknowledgement arguments remain accepted for one plugin
+    release so older callers do not break. They never influence admission.
+    """
+
+    del acknowledgement, requested_mode
+    detected_core_version = _detected_core_version(compatibility)
     base = {
-        "qualified_core_version": (
-            qualified_core_version or LATEST_QUALIFIED_CORE_VERSION
-        ),
+        # These legacy fields remain additive for older app releases. They now
+        # report the detected version rather than an allow-listed release.
+        "qualified_core_version": detected_core_version,
         "detected_core_version": detected_core_version,
         "applicable": compatibility.adapter == "v3_registry",
         "status": "not_applicable",
@@ -251,39 +288,45 @@ def v3_release_readiness(db, compatibility, source, policy):
     }
     if compatibility.adapter != "v3_registry":
         return base
-    if not _qualified_release(compatibility):
+
+    catalog_admission = _catalogue_admission(source)
+    if not catalog_admission["admitted"]:
+        analysis_admission = _stream_admission(
+            False,
+            ANALYSIS_SEMANTIC_CONTRACTS,
+            ["catalog_not_ready"],
+        )
         return {
             **base,
-            "status": "core_release_unqualified",
-            "ready": False,
-            "blockers": ["core_release_unqualified"],
-        }
-    if source.get("rebind_status") == "rebind_required":
-        return {
-            **base,
-            "status": "source_rebind_required",
-            "ready": False,
-            "blockers": ["source_rebind_required"],
-        }
-    if not source.get("catalog_instance_id") or not source.get("server_id"):
-        return {
-            **base,
-            "status": "catalog_not_initialized",
-            "ready": False,
-            "blockers": ["catalog_not_initialized"],
+            "status": catalog_admission["status"],
+            "blockers": list(catalog_admission["blockers"]),
+            "admission": {
+                "catalog": catalog_admission,
+                "analysis": analysis_admission,
+            },
         }
 
     try:
         coverage = _coverage(db, source)
         link_coverage = _link_coverage(
-            db, source, coverage["eligible_track_count"]
+            db,
+            source,
+            coverage["eligible_track_count"],
         )
     except Exception:
+        analysis_admission = _stream_admission(
+            False,
+            ANALYSIS_SEMANTIC_CONTRACTS,
+            ["readiness_unavailable"],
+        )
         return {
             **base,
             "status": "readiness_unavailable",
-            "ready": False,
             "blockers": ["readiness_unavailable"],
+            "admission": {
+                "catalog": catalog_admission,
+                "analysis": analysis_admission,
+            },
         }
     try:
         tasks = _task_evidence(db)
@@ -311,16 +354,13 @@ def v3_release_readiness(db, compatibility, source, policy):
     )
 
     blockers = _policy_blockers(policy)
-    progressive_blockers = list(blockers)
-    if source.get("catalog", {}).get("status") != "complete":
-        blockers.append("catalog_generation_incomplete")
-        progressive_blockers.append("catalog_generation_incomplete")
+    admission_blockers = list(blockers)
     if source.get("analysis", {}).get("status") != "complete":
         blockers.append("analysis_projection_incomplete")
-        progressive_blockers.append("analysis_projection_incomplete")
+        admission_blockers.append("analysis_projection_incomplete")
     if coverage["mapped_track_count"] == 0:
         blockers.append("no_analysis_mappings")
-        progressive_blockers.append("no_analysis_mappings")
+        admission_blockers.append("no_analysis_mappings")
     else:
         if coverage["missing_mapping_count"]:
             blockers.append("analysis_mapping_incomplete")
@@ -335,11 +375,9 @@ def v3_release_readiness(db, compatibility, source, policy):
     if link_coverage["provisional_link_count"]:
         blockers.append("provisional_links_remaining")
     if (
-        link_coverage["verified_link_count"]
-        != coverage["eligible_track_count"]
+        link_coverage["verified_link_count"] != coverage["eligible_track_count"]
         and not any(
-            code
-            in blockers
+            code in blockers
             for code in (
                 "no_analysis_mappings",
                 "analysis_mapping_incomplete",
@@ -353,9 +391,9 @@ def v3_release_readiness(db, compatibility, source, policy):
         blockers.append("sonic_evidence_incomplete")
     if policy.get("per_link_chromaprint_evidence_available") is not True:
         blockers.append("per_link_evidence_unavailable")
-        progressive_blockers.append("per_link_evidence_unavailable")
+        admission_blockers.append("per_link_evidence_unavailable")
 
-    analysis_sync_allowed = not progressive_blockers
+    analysis_sync_allowed = not admission_blockers
     ready = analysis_sync_allowed and not blockers
     if ready:
         status = "ready"
@@ -363,6 +401,12 @@ def v3_release_readiness(db, compatibility, source, policy):
         status = "progressive"
     else:
         status = "repair_incomplete"
+    analysis_admission = _stream_admission(
+        analysis_sync_allowed,
+        ANALYSIS_SEMANTIC_CONTRACTS,
+        admission_blockers,
+        status,
+    )
     return {
         **base,
         **coverage,
@@ -372,9 +416,13 @@ def v3_release_readiness(db, compatibility, source, policy):
         "fully_verified": ready,
         "analysis_sync_allowed": analysis_sync_allowed,
         "progressive_analysis": analysis_sync_allowed and not ready,
-        "verification_mode": "automatic" if ready else None,
+        "verification_mode": "automatic" if analysis_sync_allowed else None,
         "administrator_acknowledged": False,
         "acknowledged_at": None,
         "task_evidence": tasks,
         "blockers": blockers,
+        "admission": {
+            "catalog": catalog_admission,
+            "analysis": analysis_admission,
+        },
     }

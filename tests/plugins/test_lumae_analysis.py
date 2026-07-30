@@ -58,19 +58,16 @@ def settings_catalog_source():
 
 
 def expect_v3_readiness(core_version):
-    qualified_versions = {"v3.0.3", "v3.0.4", "v3.0.5"}
-    qualified = core_version in qualified_versions
-    blocker = "catalog_not_initialized" if qualified else "core_release_unqualified"
     return {
-        "qualified_core_version": core_version if qualified else "v3.0.5",
+        "qualified_core_version": core_version,
         "detected_core_version": core_version,
         "applicable": True,
-        "status": blocker,
+        "status": "catalog_not_initialized",
         "ready": False,
         "verification_mode": None,
         "administrator_acknowledged": False,
         "acknowledged_at": None,
-        "blockers": [blocker],
+        "blockers": ["catalog_not_initialized"],
     }
 
 
@@ -81,7 +78,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "0.9.1"
+    assert manifest["versions"][0]["version"] == "1.0.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -113,6 +110,7 @@ def test_plugin_manifest_has_lumae_identity():
         ],
     }
     assert manifest["capabilities"]["catalog_mirror"] == {
+        "contract_revision": 1,
         "catalog_schema_version": 2,
         "analysis_schema_version": 2,
         "catalog_builder_version": 5,
@@ -134,7 +132,10 @@ def test_plugin_manifest_has_lumae_identity():
             "shared_analysis",
             "binary_vectors",
             "v3_release_readiness",
+            "contract_admission_v1",
+            "independent_stream_admission",
             "automatic_sonic_verification",
+            "semantic_contracts_v1",
             "progressive_analysis_admission",
             "repair_flagged_analysis_admission",
             "database_state_dashboard",
@@ -167,10 +168,11 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "0.9.1",
+        "plugin_version": "1.0.0",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
+        "sync_contract": mod.sync_contract(mod.detect_core()),
         "schema_version": 1,
         "analyzer_version": 1,
         "capabilities": {
@@ -193,6 +195,14 @@ def test_catalog_health_uses_v2_single_server_adapter():
     assert response.status_code == 200
     body = response.get_json()
     assert body["core_adapter"] == "v2_single_server"
+    assert body["core_api_contract"] == "audiomuse_v2_single_server_v1"
+    assert body["sync_contract"]["revision"] == 1
+    assert body["sync_contract"]["core_api_contract"] == body["core_api_contract"]
+    assert body["sync_contract"]["streams"]["catalog"]["semantic_contracts"] == [
+        "provider_track_ids_v1",
+        "complete_catalog_generation_v1",
+        "contiguous_change_journal_v1",
+    ]
     assert body["supported"] is True
     assert body["servers"] == [
         {
@@ -289,7 +299,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "0.9.1"
+    assert body["plugin_version"] == "1.0.0"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -1038,7 +1048,7 @@ def test_catalog_health_marks_unattested_worker_publication_for_repair(monkeypat
 
 @pytest.mark.parametrize(
     ("version", "expected_status"),
-    [("v2.5.0", "core_too_old"), ("v4.0.0", "core_untested")],
+    [("v2.5.0", "core_too_old"), ("v4.0.0", "core_api_incomplete")],
 )
 def test_catalog_health_rejects_unsupported_core_before_server_work(monkeypatch, version, expected_status):
     mod = load_plugin()
@@ -1049,6 +1059,47 @@ def test_catalog_health_rejects_unsupported_core_before_server_work(monkeypatch,
     assert response.status_code == 409
     assert response.get_json()["status"] == expected_status
     assert response.get_json()["servers"] == []
+
+
+@pytest.mark.parametrize("version", ["v3.0.6", "v4.0.0", "development-build"])
+def test_catalog_health_admits_future_core_when_live_v3_contract_passes(monkeypatch, version):
+    mod = load_plugin()
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", version)
+    monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
+    monkeypatch.setattr(plugin_api_module, "use_server", lambda _server_id: None, raising=False)
+    monkeypatch.setattr(
+        plugin_api_module,
+        "list_servers",
+        lambda: [{"server_id": "server-a", "server_type": "navidrome"}],
+        raising=False,
+    )
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 200
+    body = response.get_json()
+    assert body["supported"] is True
+    assert body["core_api_contract"] == "audiomuse_v3_registry_v1"
+    assert body["sync_contract"]["core_api_contract"] == body["core_api_contract"]
+    assert body["capability"]["contract_revision"] == 1
+
+
+def test_catalog_health_rejects_malformed_live_v3_registry(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", "v3.99.0")
+    monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
+    monkeypatch.setattr(plugin_api_module, "use_server", lambda _server_id: None, raising=False)
+    monkeypatch.setattr(
+        plugin_api_module,
+        "list_servers",
+        lambda: {"server-a": {"server_type": "navidrome"}},
+        raising=False,
+    )
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 409
+    assert response.get_json()["status"] == "core_api_incomplete"
 
 
 def test_collections_api_is_hidden_until_enabled():
@@ -5586,6 +5637,9 @@ def test_v3_readiness_blocks_pending_source_rebind_before_database_queries():
     assert result["status"] == "source_rebind_required"
     assert result["ready"] is False
     assert result["blockers"] == ["source_rebind_required"]
+    assert result["admission"]["catalog"]["admitted"] is False
+    assert result["admission"]["analysis"]["admitted"] is False
+    assert result["admission"]["analysis"]["semantic_contracts"]
 
 
 def test_v3_readiness_is_derived_automatically_from_complete_evidence():
@@ -5614,6 +5668,8 @@ def test_v3_readiness_is_derived_automatically_from_complete_evidence():
     assert result["administrator_acknowledged"] is False
     assert result["acknowledged_at"] is None
     assert result["blockers"] == []
+    assert result["admission"]["catalog"]["admitted"] is True
+    assert result["admission"]["analysis"]["admitted"] is True
 
 
 def test_v3_readiness_keeps_incomplete_evidence_progressively_usable():
@@ -5636,7 +5692,11 @@ def test_v3_readiness_keeps_incomplete_evidence_progressively_usable():
     assert result["fully_verified"] is False
     assert result["analysis_sync_allowed"] is True
     assert result["progressive_analysis"] is True
-    assert result["verification_mode"] is None
+    assert result["verification_mode"] == "automatic"
+    assert result["admission"]["catalog"]["admitted"] is True
+    assert result["admission"]["analysis"]["admitted"] is True
+    assert result["admission"]["analysis"]["status"] == "progressive"
+    assert result["admission"]["analysis"]["blockers"] == []
     assert result["ready_link_count"] == 8
     assert result["pending_link_count"] == 1
     assert result["missing_link_count"] == 1
@@ -5712,17 +5772,10 @@ def test_v3_readiness_does_not_depend_on_historical_task_diagnostics():
 
 
 @pytest.mark.parametrize(
-    ("core_version", "qualified_version"),
-    [
-        ("v3.0.3", "v3.0.3"),
-        ("v3.0.4", "v3.0.4"),
-        ("v3.0.5", "v3.0.5"),
-        ("3.0.5", "v3.0.5"),
-    ],
+    "core_version",
+    ["v3.0.3", "v3.0.5", "v3.0.6", "v4.0.0"],
 )
-def test_v3_complete_evidence_is_automatic_across_qualified_patches(
-    core_version, qualified_version
-):
+def test_v3_complete_evidence_is_automatic_across_core_releases(core_version):
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
         core_version=core_version,
@@ -5741,7 +5794,8 @@ def test_v3_complete_evidence_is_automatic_across_qualified_patches(
 
     assert result["ready"] is True
     assert result["verification_mode"] == "automatic"
-    assert result["qualified_core_version"] == qualified_version
+    assert result["qualified_core_version"] == core_version
+    assert result["admission"]["analysis"]["admitted"] is True
 
 
 def test_v3_readiness_ignores_obsolete_acknowledgement_settings(monkeypatch):
@@ -5775,7 +5829,7 @@ def test_v3_readiness_ignores_obsolete_acknowledgement_settings(monkeypatch):
     assert result["verification_mode"] == "automatic"
 
 
-def test_v3_readiness_rejects_unqualified_future_patch_before_database_access():
+def test_v3_readiness_admits_future_patch_from_complete_runtime_evidence():
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
         core_version="v3.0.6",
@@ -5783,17 +5837,45 @@ def test_v3_readiness_rejects_unqualified_future_patch_before_database_access():
     )
 
     result = readiness.v3_release_readiness(
-        None,
+        ReadinessDb(
+            coverage=(10, 10, 10, 150.0),
+            tasks=[],
+            link_counts=(10, 0, 0, 0, 10, 0),
+        ),
         compatibility,
         readiness_source(),
         readiness_policy(),
     )
 
-    assert result["qualified_core_version"] == "v3.0.5"
+    assert result["qualified_core_version"] == "v3.0.6"
     assert result["detected_core_version"] == "v3.0.6"
-    assert result["status"] == "core_release_unqualified"
-    assert result["ready"] is False
-    assert result["blockers"] == ["core_release_unqualified"]
+    assert result["status"] == "ready"
+    assert result["ready"] is True
+    assert result["blockers"] == []
+    assert result["admission"]["catalog"]["admitted"] is True
+    assert result["admission"]["analysis"]["admitted"] is True
+
+
+def test_v3_readiness_blocks_analysis_but_keeps_catalogue_when_safety_contract_fails():
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    policy = {**readiness_policy(), "chromaprint_gate_enabled": False}
+
+    result = readiness.v3_release_readiness(
+        ReadinessDb(
+            coverage=(10, 10, 10, 150.0),
+            tasks=[],
+            link_counts=(10, 0, 0, 0, 10, 0),
+        ),
+        types.SimpleNamespace(core_version="v3.99.0", adapter="v3_registry"),
+        readiness_source(),
+        policy,
+    )
+
+    assert result["admission"]["catalog"]["admitted"] is True
+    assert result["admission"]["analysis"]["admitted"] is False
+    assert result["admission"]["analysis"]["blockers"] == [
+        "chromaprint_gate_disabled"
+    ]
 
 
 def test_v2_readiness_is_not_applicable_without_database_access():
