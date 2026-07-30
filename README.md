@@ -22,6 +22,25 @@ The plugin provides:
 * server-owned album and artist relationship generations using Lumae's native scoring model, published as resumable snapshots and deltas;
 * nonblocking enrichment: a complete provider catalogue is app-ready while waveform and relationship backlogs continue.
 
+### Resource safety in 1.0.1
+
+Waveform analysis now decodes and filters audio incrementally. Its working
+memory is bounded by decoder blocks instead of growing with the duration and
+native sample rate of the media file. Background batches default to three
+tracks and are capped at ten, every heavy queue job has a finite timeout, and
+backfill candidates are selected with a SQL `LIMIT`.
+
+Album and artist matching now asks AudioMuse's MusicNN IVF index for a bounded
+shortlist and never falls back to an all-pairs comparison. If the index is not
+ready, the build waits while the last published relationship generation stays
+available. Installing or upgrading the plugin does not force a new projection
+when the current catalogue is already valid.
+
+Administrators can pause Lumae background maintenance from the plugin settings
+page. Pausing stops new catalogue, projection, waveform, and relationship work;
+it does not delete or hide already published catalogue, profile, collection, or
+relationship data.
+
 ## Layout
 
 * `manifest.json` - the AudioMuse plugin catalog.

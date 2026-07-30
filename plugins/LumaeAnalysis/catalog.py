@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import base64
 import hashlib
 import hmac
+import itertools
 import json
 import re
 import secrets
@@ -518,10 +519,12 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         track_libraries.setdefault(membership["entity_id"], set()).add(membership["library_id"])
     album_libraries = {}
     artist_libraries = {}
+    tracks_by_album = {}
     for track in tracks:
         library_ids = sorted(track_libraries.get(track["track_id"], set()))
         if track.get("album_id"):
             album_libraries.setdefault(track["album_id"], set()).update(library_ids)
+            tracks_by_album.setdefault(track["album_id"], []).append(track)
         for credit in track_credits.get(track["track_id"], []):
             artist_libraries.setdefault(credit["artist_id"], set()).update(library_ids)
         catalogue_enrichment = {
@@ -561,7 +564,7 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             artist_libraries.setdefault(credit["artist_id"], set()).update(album_libraries.get(album_id, set()))
 
     for album in albums_by_id.values():
-        album_tracks = [track for track in tracks if track.get("album_id") == album["album_id"]]
+        album_tracks = tracks_by_album.get(album["album_id"], [])
         disc_titles = {}
         for track in album_tracks:
             if track.get("disc_number") is None:
@@ -608,10 +611,10 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             "disc_count": disc_count,
             "duration_ms": duration_ms if any(track.get("duration_ms") is not None for track in album_tracks) else None,
             "compilation": any(
-                track.get("compilation", False) for track in tracks if track.get("album_id") == album["album_id"]
+                track.get("compilation", False) for track in album_tracks
             ),
             "explicit": any(
-                track.get("explicit", False) for track in tracks if track.get("album_id") == album["album_id"]
+                track.get("explicit", False) for track in album_tracks
             ),
         }
         album["payload"]["_lumae"] = enrichment
@@ -1115,8 +1118,12 @@ def migrate_catalog(db):
 
 
 def _chunks(rows, size=1000):
-    for offset in range(0, len(rows), size):
-        yield rows[offset : offset + size]
+    iterator = iter(rows)
+    while True:
+        batch = list(itertools.islice(iterator, size))
+        if not batch:
+            return
+        yield batch
 
 
 def _json_param(value):
@@ -1174,14 +1181,16 @@ def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, r
     placeholders = ["%s"] * len(columns)
     placeholders[columns.index("payload")] = "%s::jsonb"
     sql = f"INSERT INTO {t(table_name)} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
-    params = []
-    for row in rows:
-        values = [catalog_instance_id, generation, row[id_column]]
-        for field in fields:
-            value = row.get(field)
-            values.append(_json_param(value) if field == "payload" else value)
-        values.extend([True, now, now, None])
-        params.append(tuple(values))
+    def parameters():
+        for row in rows:
+            values = [catalog_instance_id, generation, row[id_column]]
+            for field in fields:
+                value = row.get(field)
+                values.append(_json_param(value) if field == "payload" else value)
+            values.extend([True, now, now, None])
+            yield tuple(values)
+
+    params = parameters()
     for batch in _chunks(params):
         cur.executemany(sql, batch)
 
@@ -1211,7 +1220,7 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
                  artist_id, display_name, role, identity_provenance, payload)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
         """
-        params = [
+        params = (
             (
                 catalog_instance_id,
                 generation,
@@ -1224,7 +1233,7 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
                 "{}",
             )
             for row in rows
-        ]
+        )
         for batch in _chunks(params):
             cur.executemany(sql, batch)
     membership = normalized["entity_libraries"]
@@ -1234,19 +1243,18 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
                 (catalog_instance_id, published_generation, entity_type, entity_id, library_id)
             VALUES (%s, %s, %s, %s, %s)
         """
-        cur.executemany(
-            sql,
-            [
-                (
-                    catalog_instance_id,
-                    generation,
-                    row["entity_type"],
-                    row["entity_id"],
-                    row["library_id"],
-                )
-                for row in membership
-            ],
+        params = (
+            (
+                catalog_instance_id,
+                generation,
+                row["entity_type"],
+                row["entity_id"],
+                row["library_id"],
+            )
+            for row in membership
         )
+        for batch in _chunks(params):
+            cur.executemany(sql, batch)
 
 
 def _published_fingerprints(cur, entity_type, catalog_instance_id, generation):

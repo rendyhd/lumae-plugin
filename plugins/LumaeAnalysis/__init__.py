@@ -8,7 +8,12 @@ from flask import Blueprint, Response, g, jsonify, request
 
 from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
 
-from .loudness import SilentAudioError, analyze_file
+from .loudness import (
+    ProfileAnalysisTimeout,
+    ProfileResourceLimitError,
+    SilentAudioError,
+    analyze_file,
+)
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -67,7 +72,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.0.0"
+PLUGIN_VERSION = "1.0.1"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -134,17 +139,45 @@ BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
 ANALYSIS_PROJECTION_TASK_TYPE = "plugin.lumae_analysis.analysis_projection"
-DEFAULT_BACKFILL_BATCH_SIZE = 10
-MAX_BACKFILL_BATCH_SIZE = 25
+DEFAULT_BACKFILL_BATCH_SIZE = 3
+MAX_BACKFILL_BATCH_SIZE = 10
 INTERACTIVE_PROFILE_CHUNK_SIZE = 3
 MAX_INTERACTIVE_PROFILE_IDS = 12
 PREPARATION_STALE_HOURS = 1
 BACKFILL_STALE_MINUTES = 30
+PROFILE_JOB_TIMEOUT_SECONDS = 20 * 60
+PROFILE_BACKFILL_JOB_TIMEOUT_SECONDS = 30 * 60
+CATALOG_JOB_TIMEOUT_SECONDS = 90 * 60
+PROJECTION_JOB_TIMEOUT_SECONDS = 60 * 60
+RELATIONSHIP_JOB_TIMEOUT_SECONDS = 60 * 60
+FINALIZER_JOB_TIMEOUT_SECONDS = 30 * 60
 COLLECTIONS_MENU_LABEL = "Living Collections"
 COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
 
 bp = Blueprint("lumae_analysis", __name__)
 register_collection_routes(bp)
+
+
+def enqueue_bounded(func, *args, queue="default", timeout=None, **kwargs):
+    """Queue plugin work with a finite RQ timeout.
+
+    AudioMuse's compatibility ``enqueue`` helper deliberately uses an infinite
+    timeout. Heavy Lumae tasks use the same app-context wrapper directly so a
+    corrupt decoder or provider request cannot occupy a worker forever. The
+    fallback keeps older test and core shims import-compatible.
+    """
+    timeout = max(1, int(timeout or PROFILE_JOB_TIMEOUT_SECONDS))
+    try:
+        from plugin.api import dotted_path, rq_queue_default, rq_queue_high
+    except (AttributeError, ImportError):
+        return enqueue(func, *args, queue=queue, **kwargs)
+    selected_queue = rq_queue_high if queue == "high" else rq_queue_default
+    return selected_queue.enqueue(
+        "plugin.manager.run_plugin_task",
+        args=(dotted_path(func),) + tuple(args),
+        kwargs=kwargs,
+        job_timeout=timeout,
+    )
 
 
 def sync_collections_menu(enabled, manager=None):
@@ -261,6 +294,13 @@ def configured_backfill_limit():
     return normalize_backfill_limit(raw)
 
 
+def maintenance_paused():
+    value = get_setting("maintenance_paused", False)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
 def normalize_backfill_limit(raw):
     try:
         value = int(raw)
@@ -356,6 +396,8 @@ def _resolve_task_server_id(adapter, server_id):
 
 
 def catalog_refresh_task(server_id=None):
+    if maintenance_paused():
+        return {"status": "paused", "reason": "maintenance_paused"}
     adapter = get_core_adapter()
     resolved_server_id = _resolve_task_server_id(adapter, server_id)
     if not resolved_server_id:
@@ -365,6 +407,13 @@ def catalog_refresh_task(server_id=None):
 
 def catalog_reconcile_task():
     """Retry only missing, stale, or unattested catalogue publications."""
+    if maintenance_paused():
+        return {
+            "status": "paused",
+            "queued": 0,
+            "plugin_version": PLUGIN_VERSION,
+            "catalog_builder_version": CATALOG_BUILDER_VERSION,
+        }
     queued = enqueue_required_catalog_preparations()
     return {
         "status": "queued" if queued else "current",
@@ -375,6 +424,8 @@ def catalog_reconcile_task():
 
 
 def analysis_projection_task(server_id=None):
+    if maintenance_paused():
+        return {"status": "paused", "reason": "maintenance_paused"}
     adapter = get_core_adapter()
     resolved_server_id = _resolve_task_server_id(adapter, server_id)
     if not resolved_server_id:
@@ -399,19 +450,10 @@ def analysis_projection_task(server_id=None):
     return result
 
 
-def enqueue_post_migration_projection():
-    """Apply projection-policy changes without waiting for another analysis run."""
-    try:
-        return enqueue(analysis_projection_task, queue="default")
-    except Exception:
-        logger.exception(
-            "lumae_analysis could not queue its post-install analysis projection"
-        )
-        return None
-
-
 def enqueue_required_catalog_preparations(db=None):
     """Coalesce first-run and builder-upgrade preparation for active sources."""
+    if maintenance_paused():
+        return 0
     db = db or get_db()
     try:
         sources = resolve_catalog_source(db)
@@ -436,11 +478,12 @@ def enqueue_required_catalog_preparations(db=None):
         try:
             if not claim_preparation(source, db=db):
                 continue
-            enqueue(
+            enqueue_bounded(
                 prepare_lumae_task,
                 source["server_id"],
                 source["catalog_instance_id"],
                 queue="default",
+                timeout=CATALOG_JOB_TIMEOUT_SECONDS,
             )
             queued += 1
         except Exception as exc:
@@ -635,8 +678,11 @@ def migrate(db):
     ensure_analysis_projection_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
-    if enqueue_required_catalog_preparations(db=db) == 0:
-        enqueue_post_migration_projection()
+    # Installation is schema work, not a reason to rebuild the full analysis
+    # and relationship projections. Only a missing/stale catalogue publication
+    # is admitted here; ordinary analysis hooks and explicit prepare requests
+    # own later enrichment.
+    enqueue_required_catalog_preparations(db=db)
 
 
 def parse_ids(value):
@@ -813,15 +859,24 @@ def enqueue_profile_analysis(
         mark_pending(ids, priority=priority)
     try:
         if catalog_instance_id:
-            return enqueue(
+            return enqueue_bounded(
                 analyze_tracks_task,
                 ids,
                 catalog_instance_id,
                 server_id,
                 priority,
                 queue=queue_name,
+                timeout=PROFILE_JOB_TIMEOUT_SECONDS,
             )
-        return enqueue(analyze_tracks_task, ids, None, None, priority, queue=queue_name)
+        return enqueue_bounded(
+            analyze_tracks_task,
+            ids,
+            None,
+            None,
+            priority,
+            queue=queue_name,
+            timeout=PROFILE_JOB_TIMEOUT_SECONDS,
+        )
     except Exception as exc:
         release_pending(
             ids,
@@ -1368,11 +1423,12 @@ def catalog_prepare_api():
         if not preparation_is_active(preparation_state(source["catalog_instance_id"])):
             if claim_preparation(source):
                 try:
-                    enqueue(
+                    enqueue_bounded(
                         prepare_lumae_task,
                         source["server_id"],
                         source["catalog_instance_id"],
                         queue="default",
+                        timeout=CATALOG_JOB_TIMEOUT_SECONDS,
                     )
                 except Exception as exc:
                     update_preparation_state(
@@ -1468,7 +1524,12 @@ def catalog_refresh_api():
                     )
             except ValueError:
                 pass
-        enqueue(catalog_refresh_task, source["server_id"], queue="default")
+        enqueue_bounded(
+            catalog_refresh_task,
+            source["server_id"],
+            queue="default",
+            timeout=CATALOG_JOB_TIMEOUT_SECONDS,
+        )
         return _private_json(
             {
                 "status": "queued",
@@ -1832,6 +1893,12 @@ def relationship_changes_api():
 
 @bp.post("/api/analyze")
 def analyze():
+    if maintenance_paused():
+        return _catalog_error(
+            "maintenance_paused",
+            "Lumae background analysis is paused by the administrator.",
+            503,
+        )
     body = request.get_json(silent=True) or {}
     try:
         source = resolve_profile_source(catalog_instance_id=body.get("catalog_instance_id"))
@@ -1866,6 +1933,13 @@ def analyze():
 
 
 def analyze_one_track(track_id, catalog_instance_id=None, server_id=None):
+    if maintenance_paused():
+        release_pending(
+            [track_id],
+            catalog_instance_id=catalog_instance_id,
+            reason="Lumae background maintenance is paused",
+        )
+        return {"track_id": track_id, "status": "skipped_maintenance_paused"}
     try:
         info = load_track_file(
             track_id,
@@ -1904,6 +1978,17 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None):
         )
         return {"track_id": track_id, "status": "ready"}
     except SilentAudioError as exc:
+        upsert_profile(
+            track_id,
+            object(),
+            "failed",
+            str(exc),
+            info["media_signature"],
+            catalog_instance_id=catalog_instance_id,
+        )
+        return {"track_id": track_id, "status": "failed"}
+    except (ProfileAnalysisTimeout, ProfileResourceLimitError) as exc:
+        logger.warning("lumae_analysis bounded profile rejection for %s: %s", track_id, exc)
         upsert_profile(
             track_id,
             object(),
@@ -2004,7 +2089,7 @@ def enqueue_analysis_run_finalizer(server_id, catalog_instance_id, run_id):
         ),
         depends_on=Dependency(run_id, allow_failure=True),
         job_id=job_id,
-        job_timeout=-1,
+        job_timeout=FINALIZER_JOB_TIMEOUT_SECONDS,
         retry=Retry(max=2),
         description=f"Finalize Lumae analysis run {run_id}",
     )
@@ -2144,6 +2229,12 @@ def claim_analysis_run(catalog_instance_id, run_id, finalizer_job_id=None, db=No
 
 def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
     """Publish one complete source update after an AudioMuse analysis run settles."""
+    if maintenance_paused():
+        return {
+            "status": "paused",
+            "reason": "maintenance_paused",
+            "run_id": run_id,
+        }
     try:
         from rq import get_current_job
 
@@ -2231,6 +2322,11 @@ def analyze_song_hook(song):
         ]
     except Exception:
         logger.exception("lumae_analysis could not resolve the analysis source")
+    if catalog_instance_id and maintenance_paused():
+        return {
+            "track_id": hook_track_id(song),
+            "status": "skipped_maintenance_paused",
+        }
     if catalog_instance_id:
         run_id = str((event or {}).get("run_id") or "").strip()
         if run_id:
@@ -2251,6 +2347,8 @@ def analyze_song_hook(song):
     if not catalog_instance_id:
         logger.warning("lumae_analysis song hook skipped %s without an exact source", track_id)
         return {"track_id": track_id, "status": "skipped_source_unresolved"}
+    if maintenance_paused():
+        return {"track_id": track_id, "status": "skipped_maintenance_paused"}
     if not audio_path or not os.path.exists(audio_path):
         upsert_profile(
             track_id,
@@ -2276,6 +2374,17 @@ def analyze_song_hook(song):
         )
         return {"track_id": track_id, "status": "ready"}
     except SilentAudioError as exc:
+        upsert_profile(
+            track_id,
+            object(),
+            "failed",
+            str(exc),
+            media_sig,
+            catalog_instance_id=catalog_instance_id,
+        )
+        return {"track_id": track_id, "status": "failed"}
+    except (ProfileAnalysisTimeout, ProfileResourceLimitError) as exc:
+        logger.warning("lumae_analysis bounded profile rejection for %s: %s", track_id, exc)
         upsert_profile(
             track_id,
             object(),
@@ -2321,6 +2430,21 @@ def analyze_tracks_task(
     priority="background",
 ):
     ids = parse_ids(",".join(ids or []))
+    if maintenance_paused():
+        release_pending(
+            ids,
+            catalog_instance_id=catalog_instance_id,
+            reason="Lumae background maintenance is paused",
+        )
+        return {
+            "ready": 0,
+            "already_ready": 0,
+            "promoted": 0,
+            "failed": 0,
+            "skipped": len(ids),
+            "deferred": len(ids),
+            "paused": True,
+        }
     if priority == "background" and len(ids) > MAX_BACKFILL_BATCH_SIZE:
         # Drain 0.8.0's already-persisted 250-track RQ jobs quickly after an
         # upgrade. Their rows become retryable and one bounded chain owns the
@@ -2347,7 +2471,19 @@ def analyze_tracks_task(
             "deferred": len(ids),
         }
     results = []
-    for track_id in ids:
+    for index, track_id in enumerate(ids):
+        if maintenance_paused():
+            remaining = ids[index:]
+            release_pending(
+                remaining,
+                catalog_instance_id=catalog_instance_id,
+                reason="Lumae background maintenance was paused during the batch",
+            )
+            results.extend(
+                {"track_id": item_id, "status": "skipped_maintenance_paused"}
+                for item_id in remaining
+            )
+            break
         disposition = profile_task_disposition(
             track_id,
             catalog_instance_id=catalog_instance_id,
@@ -2443,6 +2579,83 @@ def fetch_analysis_rows(catalog_instance_id=None, server_id=None):
     return rows
 
 
+def fetch_backfill_rows(
+    limit,
+    catalog_instance_id=None,
+    server_id=None,
+    include_failed=False,
+):
+    """Select only one retryable profile batch in PostgreSQL."""
+    db = get_db()
+    cur = db.cursor()
+    profile_table = source_profiles_table() if catalog_instance_id else profiles_table()
+    profile_source_join = (
+        "AND p.catalog_instance_id=source.catalog_instance_id" if catalog_instance_id else ""
+    )
+    source_filters = ""
+    params = []
+    if catalog_instance_id or server_id:
+        source_filters = """
+               AND (%s IS NULL OR s.catalog_instance_id=%s)
+               AND (%s IS NULL OR s.current_core_server_id=%s)
+        """
+        params.extend((catalog_instance_id, catalog_instance_id, server_id, server_id))
+    # Published catalogue occurrences are downloaded through
+    # ProviderCatalogBridge. This must remain retryable even when a v3 registry
+    # source has no matching legacy global MEDIASERVER_* configuration.
+    retry_skipped = True
+    params.extend(
+        (
+            ANALYZER_VERSION,
+            bool(include_failed),
+            retry_skipped,
+            max(1, int(limit)),
+        )
+    )
+    cur.execute(
+        f"""
+        WITH source AS (
+            SELECT s.catalog_instance_id, c.published_generation
+              FROM {table('catalog_sources')} s
+              JOIN {table('catalog_state')} c USING (catalog_instance_id)
+             WHERE s.rebind_status='active' AND c.status='complete'
+               {source_filters}
+             ORDER BY s.is_default DESC, s.server_name, s.catalog_instance_id
+             LIMIT 1
+        )
+        SELECT t.track_id, 'catalog-media:' || COALESCE(t.media_fp, ''),
+               p.media_signature, p.analyzer_ver, p.status
+          FROM source
+          JOIN {table('catalog_tracks')} t
+            ON t.catalog_instance_id=source.catalog_instance_id
+           AND t.published_generation=source.published_generation
+          LEFT JOIN {profile_table} p ON p.track_id=t.track_id
+               {profile_source_join}
+         WHERE t.available=TRUE AND t.analysis_eligible=TRUE
+           AND COALESCE(p.status, '') NOT IN ('pending', 'pending_interactive')
+           AND (
+                p.track_id IS NULL
+                OR p.analyzer_ver IS NULL
+                OR p.analyzer_ver < %s
+                OR p.status='stale'
+                OR (
+                    p.status='ready'
+                    AND p.media_signature IS DISTINCT FROM
+                        ('catalog-media:' || COALESCE(t.media_fp, ''))
+                )
+                OR (%s AND p.status='failed')
+                OR (%s AND p.status='skipped_no_file')
+           )
+         ORDER BY t.track_id
+         LIMIT %s
+        """,
+        tuple(params),
+    )
+    rows = cur.fetchall()
+    cur.close()
+    return rows
+
+
 def find_backfill_ids(
     limit=25,
     catalog_instance_id=None,
@@ -2451,10 +2664,11 @@ def find_backfill_ids(
 ):
     batch_limit = normalize_backfill_limit(limit or configured_backfill_limit())
     ids = []
-    rows = (
-        fetch_analysis_rows(catalog_instance_id=catalog_instance_id, server_id=server_id)
-        if catalog_instance_id or server_id
-        else fetch_analysis_rows()
+    rows = fetch_backfill_rows(
+        batch_limit,
+        catalog_instance_id=catalog_instance_id,
+        server_id=server_id,
+        include_failed=include_failed,
     )
     for item_id, file_path, stored_sig, analyzer_ver, status in rows:
         if (include_failed and status == "failed") or is_backfill_candidate(
@@ -2482,34 +2696,72 @@ def find_all_backfill_ids(catalog_instance_id=None, server_id=None, include_fail
 
 
 def analysis_status_counts(catalog_instance_id=None, server_id=None):
-    counts = {
-        "total_with_files": 0,
-        "ready_current": 0,
-        "pending": 0,
-        "failed": 0,
-        "skipped": 0,
-        "needs_analysis": 0,
-    }
-    rows = (
-        fetch_analysis_rows(catalog_instance_id=catalog_instance_id, server_id=server_id)
-        if catalog_instance_id or server_id
-        else fetch_analysis_rows()
+    db = get_db()
+    cur = db.cursor()
+    profile_table = source_profiles_table() if catalog_instance_id else profiles_table()
+    profile_source_join = (
+        "AND p.catalog_instance_id=source.catalog_instance_id" if catalog_instance_id else ""
     )
-    for _item_id, file_path, stored_sig, analyzer_ver, status in rows:
-        counts["total_with_files"] += 1
-        if is_pending_profile_status(status):
-            counts["pending"] += 1
-        elif status == "failed":
-            counts["failed"] += 1
-        elif is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
-            counts["needs_analysis"] += 1
-        elif status == "skipped_no_file":
-            counts["skipped"] += 1
-        elif status == "ready":
-            counts["ready_current"] += 1
-        else:
-            counts["needs_analysis"] += 1
-    return counts
+    source_filters = ""
+    params = []
+    if catalog_instance_id or server_id:
+        source_filters = """
+               AND (%s IS NULL OR s.catalog_instance_id=%s)
+               AND (%s IS NULL OR s.current_core_server_id=%s)
+        """
+        params.extend((catalog_instance_id, catalog_instance_id, server_id, server_id))
+    # A published catalogue occurrence is retried through ProviderCatalogBridge,
+    # including v3 registry sources whose credentials are not represented by
+    # the legacy global MEDIASERVER_* configuration fields.
+    retry_skipped = True
+    params.extend((ANALYZER_VERSION, retry_skipped))
+    cur.execute(
+        f"""
+        WITH source AS (
+            SELECT s.catalog_instance_id, c.published_generation
+              FROM {table('catalog_sources')} s
+              JOIN {table('catalog_state')} c USING (catalog_instance_id)
+             WHERE s.rebind_status='active' AND c.status='complete'
+               {source_filters}
+             ORDER BY s.is_default DESC, s.server_name, s.catalog_instance_id
+             LIMIT 1
+        )
+        SELECT
+            COUNT(*)::BIGINT,
+            COUNT(*) FILTER (
+                WHERE p.status='ready'
+                  AND p.analyzer_ver >= %s
+                  AND p.media_signature IS NOT DISTINCT FROM
+                      ('catalog-media:' || COALESCE(t.media_fp, ''))
+            )::BIGINT,
+            COUNT(*) FILTER (
+                WHERE p.status IN ('pending', 'pending_interactive')
+            )::BIGINT,
+            COUNT(*) FILTER (WHERE p.status='failed')::BIGINT,
+            COUNT(*) FILTER (
+                WHERE p.status='skipped_no_file' AND NOT %s
+            )::BIGINT
+          FROM source
+          JOIN {table('catalog_tracks')} t
+            ON t.catalog_instance_id=source.catalog_instance_id
+           AND t.published_generation=source.published_generation
+          LEFT JOIN {profile_table} p ON p.track_id=t.track_id
+               {profile_source_join}
+         WHERE t.available=TRUE AND t.analysis_eligible=TRUE
+        """,
+        tuple(params),
+    )
+    row = cur.fetchone() or (0, 0, 0, 0, 0)
+    cur.close()
+    total, ready, pending, failed, skipped = (int(value or 0) for value in row)
+    return {
+        "total_with_files": total,
+        "ready_current": ready,
+        "pending": pending,
+        "failed": failed,
+        "skipped": skipped,
+        "needs_analysis": max(0, total - ready - pending - failed - skipped),
+    }
 
 
 def queue_backfill_batch(
@@ -2652,15 +2904,23 @@ def update_profile_backfill_state(
 
 
 def enqueue_next_profile_backfill(server_id, catalog_instance_id):
-    return enqueue(
+    return enqueue_bounded(
         profile_backfill_task,
         server_id,
         catalog_instance_id,
         queue="default",
+        timeout=PROFILE_BACKFILL_JOB_TIMEOUT_SECONDS,
     )
 
 
 def start_profile_backfill(catalog_instance_id=None, server_id=None):
+    if maintenance_paused():
+        return {
+            "queued": False,
+            "coalesced": True,
+            "paused": True,
+            "batch_size": configured_backfill_limit(),
+        }
     source = resolve_profile_source(
         catalog_instance_id=catalog_instance_id,
         server_id=server_id,
@@ -2688,6 +2948,14 @@ def start_profile_backfill(catalog_instance_id=None, server_id=None):
 
 def profile_backfill_task(server_id, catalog_instance_id):
     """Process one small batch, then yield the worker before queueing the next."""
+    if maintenance_paused():
+        update_profile_backfill_state(
+            catalog_instance_id,
+            server_id,
+            "paused",
+            last_error=None,
+        )
+        return {"status": "paused", "processed": 0, "queued_next": False}
     claimed_ids = []
     try:
         resolve_profile_source(
@@ -2796,6 +3064,8 @@ def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=No
 
 
 def relationship_preparation_task(server_id, catalog_instance_id):
+    if maintenance_paused():
+        return {"status": "paused", "reason": "maintenance_paused"}
     source = resolve_profile_source(
         catalog_instance_id=catalog_instance_id,
         server_id=server_id,
@@ -2807,6 +3077,13 @@ def relationship_preparation_task(server_id, catalog_instance_id):
 
 def start_relationship_preparation(catalog_instance_id=None, server_id=None):
     """Queue one coalesced relationship build without delaying app readiness."""
+    if maintenance_paused():
+        return {
+            "queued": False,
+            "coalesced": True,
+            "paused": True,
+            "reason": "maintenance_paused",
+        }
     source = resolve_profile_source(
         catalog_instance_id=catalog_instance_id,
         server_id=server_id,
@@ -2834,11 +3111,12 @@ def start_relationship_preparation(catalog_instance_id=None, server_id=None):
             "reason": "already_running",
         }
     try:
-        job = enqueue(
+        job = enqueue_bounded(
             relationship_preparation_task,
             source["server_id"],
             source["catalog_instance_id"],
             queue="default",
+            timeout=RELATIONSHIP_JOB_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         db = get_db()
@@ -3083,6 +3361,8 @@ def finalize_preparation_if_settled(catalog_instance_id):
 
 def prepare_lumae_task(server_id=None, catalog_instance_id=None):
     """Publish the app-ready catalogue first, then start optional enrichment."""
+    if maintenance_paused():
+        return {"status": "paused", "reason": "maintenance_paused"}
     resolved_server_id = server_id
     resolved_catalog_instance_id = catalog_instance_id
     try:
@@ -3478,6 +3758,16 @@ def render_relationship_status_panel():
                   or the currently published relationship generation.</span>
               </div>
             """
+        elif status == "waiting_for_index":
+            status_label = "Waiting for AudioMuse index"
+            status_class = "lumae-source-state-working"
+            summary = """
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>The bounded relationship build is waiting for AudioMuse's MusicNN index.</strong>
+                <span>The previous published relationship generation remains available. Lumae
+                  never falls back to an unbounded all-pairs scan.</span>
+              </div>
+            """
         elif status == "failed":
             status_label = "Needs attention"
             status_class = "lumae-source-state-danger"
@@ -3561,6 +3851,7 @@ def render_source_preparation_sections(batch_size):
     catalogue_cards = []
     waveform_cards = []
     auto_refresh = False
+    paused = maintenance_paused()
     for source in sources:
         catalog_instance_id = source["catalog_instance_id"]
         server_id = source["server_id"]
@@ -3593,8 +3884,10 @@ def render_source_preparation_sections(batch_size):
             f'<input type="hidden" name="catalog_instance_id" '
             f'value="{escape(str(catalog_instance_id))}">'
         )
-        prepare_disabled = " disabled" if preparation_active else ""
-        backfill_disabled = " disabled" if backfill_active or queueable == 0 else ""
+        prepare_disabled = " disabled" if preparation_active or paused else ""
+        backfill_disabled = (
+            " disabled" if backfill_active or queueable == 0 or paused else ""
+        )
         if app_ready:
             source_status = "Ready for app sync"
             source_status_class = "lumae-source-state-ready"
@@ -3774,6 +4067,7 @@ def render_source_preparation_panel(batch_size):
 
 def render_settings(message=None, error=None):
     batch_size = configured_backfill_limit()
+    paused = maintenance_paused()
     message_html = (
         f"""
         <div class="lumae-notice lumae-notice-success" role="status">
@@ -3795,6 +4089,20 @@ def render_settings(message=None, error=None):
     readiness_html = render_v3_readiness_panel()
     relationships_html = render_relationship_status_panel()
     catalogue_html, waveform_html = render_source_preparation_sections(batch_size)
+    maintenance_html = f"""
+      <section class="lumae-panel" aria-label="Background maintenance control">
+        <span class="lumae-section-priority">Safety control</span>
+        <h3>Background maintenance is {'paused' if paused else 'enabled'}</h3>
+        <p class="lumae-action-copy">Pausing prevents new catalogue, projection, waveform,
+          and relationship work from starting. Already published app data remains available.</p>
+        <form class="lumae-form" method="post">
+          <button class="lumae-button-secondary" type="submit" name="action"
+            value="{'resume_maintenance' if paused else 'pause_maintenance'}">
+            {'Resume background maintenance' if paused else 'Pause background maintenance'}
+          </button>
+        </form>
+      </section>
+    """
     return render_page(
         f"""
         <style>
@@ -4193,6 +4501,7 @@ def render_settings(message=None, error=None):
             </div>
           </header>
 
+          {maintenance_html}
           {catalogue_html}
           {readiness_html}
           {waveform_html}
@@ -4211,7 +4520,15 @@ def settings():
     if request.method == "POST":
         try:
             action = request.form.get("action")
-            if action == "save_collections":
+            if action in ("pause_maintenance", "resume_maintenance"):
+                paused = action == "pause_maintenance"
+                set_setting("maintenance_paused", paused)
+                message = (
+                    "Background maintenance paused. Published Lumae data remains available."
+                    if paused
+                    else "Background maintenance resumed."
+                )
+            elif action == "save_collections":
                 enabled = request.form.get("collection_manager_enabled") == "on"
                 set_setting("collection_manager_enabled", enabled)
                 sync_collections_menu(enabled)
@@ -4237,11 +4554,12 @@ def settings():
                         message = f"Preparation is already running for {source['name']}."
                     else:
                         try:
-                            enqueue(
+                            enqueue_bounded(
                                 prepare_lumae_task,
                                 server_id,
                                 catalog_instance_id,
                                 queue="default",
+                                timeout=CATALOG_JOB_TIMEOUT_SECONDS,
                             )
                         except Exception as exc:
                             update_preparation_state(

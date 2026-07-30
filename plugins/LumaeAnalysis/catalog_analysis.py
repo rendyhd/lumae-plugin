@@ -479,6 +479,48 @@ def project_analysis(server_id=None, db=None, adapter=None):
         fps = (item["scalar_fp"], item["umap_fp"], item["musicnn_fp"], item["clap_fp"])
         if old_items.get(analysis_id) != fps:
             item_changes.append(("analysis_item", analysis_id, "upsert", item))
+    for removed_id in sorted(set(old_items) - set(analysis)):
+        item_changes.append(("analysis_item", removed_id, "delete", None))
+
+    link_changes = []
+    for track_id, link in links.items():
+        link_fp = fingerprint(link)
+        if old_links.get(track_id) != link_fp:
+            link_changes.append(("analysis_link", track_id, "upsert", link))
+    for removed_id in sorted(set(old_links) - set(links)):
+        link_changes.append(("analysis_link", removed_id, "delete", None))
+
+    # A version install or analysis finalizer may ask for a projection even
+    # though its material inputs are unchanged. Do not manufacture a new
+    # generation: that used to duplicate every projected row and force an
+    # otherwise unnecessary quadratic relationship rebuild.
+    if (
+        previous_generation > 0
+        and source.get("analysis", {}).get("status") == "complete"
+        and not item_changes
+        and not link_changes
+    ):
+        cur.close()
+        db.commit()
+        return {
+            "catalog_instance_id": catalog_instance_id,
+            "server_id": server_id,
+            "generation": previous_generation,
+            "cursor": opaque_cursor(catalog_instance_id, epoch, head_seq),
+            "item_count": len(analysis),
+            "link_count": len(links),
+            "ready_count": sum(link["status"] == "ready" for link in links.values()),
+            "pending_count": sum(link["status"] == "pending" for link in links.values()),
+            "missing_count": sum(link["status"] == "missing" for link in links.values()),
+            "suspect_count": sum(_link_requires_repair(link) for link in links.values()),
+            "evidence_complete_count": sum(
+                link["evidence_complete"] for link in links.values()
+            ),
+            "changes": 0,
+            "unchanged": True,
+        }
+
+    for analysis_id, item in analysis.items():
         musicnn = item["musicnn_vector"]
         clap = item["clap_vector"]
         cur.execute(
@@ -510,14 +552,8 @@ def project_analysis(server_id=None, db=None, adapter=None):
                 ),
             ),
         )
-    for removed_id in sorted(set(old_items) - set(analysis)):
-        item_changes.append(("analysis_item", removed_id, "delete", None))
 
-    link_changes = []
     for track_id, link in links.items():
-        link_fp = fingerprint(link)
-        if old_links.get(track_id) != link_fp:
-            link_changes.append(("analysis_link", track_id, "upsert", link))
         cur.execute(
             f"""
             INSERT INTO {t('track_analysis_links')}
@@ -541,8 +577,6 @@ def project_analysis(server_id=None, db=None, adapter=None):
                 link["review_state"],
             ),
         )
-    for removed_id in sorted(set(old_links) - set(links)):
-        link_changes.append(("analysis_link", removed_id, "delete", None))
 
     next_seq = head_seq
     for entity_type, entity_id, operation, payload in item_changes + link_changes:

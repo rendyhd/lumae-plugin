@@ -19,8 +19,9 @@ import hashlib
 import json
 import math
 import re
-import struct
 import uuid
+
+import numpy as np
 
 from plugin.api import get_db, table
 
@@ -36,6 +37,9 @@ from .catalog import (
 RELATIONSHIP_SCHEMA_VERSION = 1
 RELATIONSHIP_ALGORITHM_VERSION = 1
 RELATIONSHIP_LIMIT = 12
+RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR = 96
+RELATIONSHIP_MAX_CANDIDATE_ENTITIES = 384
+RELATIONSHIP_ENTITY_SAMPLE_LIMIT = 160
 ENRICHMENT_STALE_HOURS = 2
 MOOD_FEATURE_NAMES = ("danceable", "aggressive", "happy", "party", "relaxed", "sad")
 
@@ -61,6 +65,10 @@ _EDITION_SUFFIX = re.compile(
     r"\s*\(([^)]*(deluxe|japanese|remastered|expanded)[^)]*)\)\s*$",
     re.IGNORECASE,
 )
+
+
+class RelationshipIndexUnavailable(RuntimeError):
+    pass
 
 
 def t(name):
@@ -204,8 +212,16 @@ def migrate_enrichment(db):
                  algorithm_version, epoch)
             VALUES (%s, %s, %s, %s)
             ON CONFLICT (catalog_instance_id) DO UPDATE SET
-                relationship_schema_version=EXCLUDED.relationship_schema_version,
-                algorithm_version=EXCLUDED.algorithm_version,
+                relationship_schema_version=CASE
+                    WHEN {t("relationship_state")}.result_generation = 0
+                    THEN EXCLUDED.relationship_schema_version
+                    ELSE {t("relationship_state")}.relationship_schema_version
+                END,
+                algorithm_version=CASE
+                    WHEN {t("relationship_state")}.result_generation = 0
+                    THEN EXCLUDED.algorithm_version
+                    ELSE {t("relationship_state")}.algorithm_version
+                END,
                 status=CASE
                     WHEN {t("relationship_state")}.relationship_schema_version
                            <> EXCLUDED.relationship_schema_version
@@ -433,7 +449,7 @@ def _vector(blob, dimensions):
     dimensions = int(dimensions or 0)
     if dimensions <= 0 or len(raw) != dimensions * 4:
         return None
-    return list(struct.unpack(f"<{dimensions}f", raw))
+    return np.frombuffer(raw, dtype="<f4")
 
 
 def _parse_features(value):
@@ -500,20 +516,26 @@ def _range_stats(values):
 
 def _vector_mean(vectors):
     if not vectors:
-        return []
-    result = [0.0] * len(vectors[0])
+        return np.asarray([], dtype=np.float32)
+    mean = np.zeros(len(vectors[0]), dtype=np.float64)
     for vector in vectors:
-        for index, value in enumerate(vector):
-            result[index] += value
-    return [value / len(vectors) for value in result]
+        current = np.asarray(vector, dtype=np.float32)
+        if len(current) != len(mean):
+            raise ValueError("embedding dimensions changed within one entity")
+        np.add(mean, current, out=mean)
+    return (mean / len(vectors)).astype(np.float32)
 
 
 def _cosine_distance(left, right):
-    if not left or not right or len(left) != len(right):
+    if left is None or right is None or len(left) == 0 or len(right) == 0:
         return 1.0
-    dot = sum(a * b for a, b in zip(left, right))
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
+    if len(left) != len(right):
+        return 1.0
+    left = np.asarray(left, dtype=np.float32)
+    right = np.asarray(right, dtype=np.float32)
+    dot = float(np.dot(left, right))
+    left_norm = float(np.linalg.norm(left))
+    right_norm = float(np.linalg.norm(right))
     if left_norm == 0 or right_norm == 0:
         return 1.0
     return max(0.0, min(2.0, 1.0 - dot / (left_norm * right_norm)))
@@ -591,6 +613,7 @@ def _album_fingerprint(key, tracks):
     if not tracks:
         return None
     tracks = sorted(tracks, key=lambda row: (row["order"], row["id"]))
+    tracks = _representative_tracks(tracks)
     mean = _vector_mean([track["embedding"] for track in tracks])
     pairwise = _pairwise(tracks)
     center = min(
@@ -653,7 +676,7 @@ def _album_fingerprint(key, tracks):
 
 
 def _representative_tracks(tracks):
-    if len(tracks) <= 160:
+    if len(tracks) <= RELATIONSHIP_ENTITY_SAMPLE_LIMIT:
         return tracks
     mean = _vector_mean([track["embedding"] for track in tracks])
     edges = sorted(
@@ -665,11 +688,14 @@ def _representative_tracks(tracks):
         ),
     )[:12]
     selected = set(edges)
-    remaining = 160 - len(selected)
+    remaining = RELATIONSHIP_ENTITY_SAMPLE_LIMIT - len(selected)
     for index in range(remaining):
         ratio = 0 if remaining == 1 else index / (remaining - 1)
         selected.add(round(ratio * (len(tracks) - 1)))
-    return [tracks[index] for index in sorted(selected)[:160]]
+    return [
+        tracks[index]
+        for index in sorted(selected)[:RELATIONSHIP_ENTITY_SAMPLE_LIMIT]
+    ]
 
 
 def _artist_fingerprint(key, tracks):
@@ -799,7 +825,6 @@ def _artist_fingerprint(key, tracks):
                 tracks[medoid_indices[-1]]["embedding"],
             ),
         }
-    embeddings = {track["id"]: track["embedding"] for track in tracks}
     return {
         "key": key,
         "core": [representative[index]["embedding"] for index in core],
@@ -809,7 +834,6 @@ def _artist_fingerprint(key, tracks):
         "energy": _range_stats([track.get("energy") for track in tracks]),
         "mood": _mood_stats(tracks, artist=True),
         "trajectory": trajectory,
-        "embeddings": embeddings,
     }
 
 
@@ -1162,7 +1186,7 @@ def _load_relationship_inputs(cur, source):
     tracks = []
     for order, row in enumerate(rows):
         embedding = _vector(row[11], row[12])
-        if not embedding:
+        if embedding is None or len(embedding) == 0:
             continue
         scalar = _json(row[10], {}) or {}
         payload = _json(row[8], {}) or {}
@@ -1220,6 +1244,85 @@ def _build_entities(tracks):
             }
         )
     return albums, artists
+
+
+def _fingerprint_query_vectors(entity_type, fingerprint):
+    if entity_type == "album":
+        vectors = [fingerprint.get("mean")]
+        vectors.extend(pole.get("embedding") for pole in fingerprint.get("poles", []))
+    else:
+        vectors = list(fingerprint.get("core", []))
+        vectors.extend(pole.get("embedding") for pole in fingerprint.get("poles", []))
+        vectors.extend(fingerprint.get("outliers", []))
+    return [
+        np.asarray(vector, dtype=np.float32)
+        for vector in vectors
+        if vector is not None and len(vector)
+    ][:8]
+
+
+def _ivf_candidate_track_ids(query_vectors, per_vector_n):
+    """Return a bounded provider-track shortlist from AudioMuse's paged IVF."""
+    try:
+        from tasks import ivf_manager
+    except (AttributeError, ImportError) as exc:
+        raise RelationshipIndexUnavailable(
+            "AudioMuse's MusicNN IVF index is not available"
+        ) from exc
+    if getattr(ivf_manager, "ivf_index", None) is None:
+        loader = getattr(ivf_manager, "load_ivf_index_for_querying", None)
+        if callable(loader):
+            try:
+                loader()
+            except Exception as exc:
+                raise RelationshipIndexUnavailable(
+                    "AudioMuse's MusicNN IVF index could not be loaded"
+                ) from exc
+    index = getattr(ivf_manager, "ivf_index", None)
+    if index is None:
+        raise RelationshipIndexUnavailable(
+            "AudioMuse's MusicNN IVF index is not ready"
+        )
+    try:
+        index_size = len(index)
+    except (TypeError, AttributeError):
+        index_size = int(per_vector_n)
+    if index_size <= 0:
+        raise RelationshipIndexUnavailable(
+            "AudioMuse's MusicNN IVF index is empty"
+        )
+    ids = ivf_manager.multi_query_ids(
+        query_vectors,
+        min(max(1, int(per_vector_n)), index_size),
+    )
+    return [str(item_id) for item_id in ids]
+
+
+def _relationship_candidates(
+    source,
+    entity_type,
+    entities_by_key,
+    track_to_entity,
+    candidate_lookup,
+):
+    query_vectors = _fingerprint_query_vectors(entity_type, source["fingerprint"])
+    if not query_vectors:
+        return []
+    track_ids = candidate_lookup(
+        query_vectors,
+        RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR,
+    )
+    candidate_keys = []
+    seen = set()
+    for track_id in track_ids:
+        key = track_to_entity.get(str(track_id))
+        if key is None or key == source["key"] or key in seen:
+            continue
+        seen.add(key)
+        candidate_keys.append(key)
+        if len(candidate_keys) >= RELATIONSHIP_MAX_CANDIDATE_ENTITIES:
+            break
+    return [entities_by_key[key] for key in candidate_keys if key in entities_by_key]
 
 
 def relationship_status(db, catalog_instance_id):
@@ -1286,9 +1389,10 @@ def claim_relationship_preparation(db, catalog_instance_id):
     return claimed
 
 
-def prepare_relationships(catalog_instance_id, db=None):
-    """Build one complete, immutable relationship generation on the server."""
+def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None):
+    """Build one bounded, atomically published relationship generation."""
     db = db or get_db()
+    candidate_lookup = candidate_lookup or _ivf_candidate_track_ids
     sources = resolve_catalog_source(db, catalog_instance_id=catalog_instance_id)
     if len(sources) != 1:
         raise ValueError("An explicit catalogue source is required")
@@ -1309,38 +1413,15 @@ def prepare_relationships(catalog_instance_id, db=None):
     try:
         tracks = _load_relationship_inputs(cur, source)
         albums, artists = _build_entities(tracks)
-        result_rows = []
-        for album in albums:
-            result_rows.append(
-                (
-                    "album",
-                    album["key"],
-                    {
-                        "entity_type": "album",
-                        "entity_id": album["key"],
-                        "album": album["album"],
-                        "artist": album["artist"],
-                        "coverItemId": album["cover"],
-                        "candidates": _rank_albums(album, albums),
-                        "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
-                    },
-                )
-            )
-        for artist in artists:
-            result_rows.append(
-                (
-                    "artist",
-                    artist["key"],
-                    {
-                        "entity_type": "artist",
-                        "entity_id": artist["key"],
-                        "artist": artist["artist"],
-                        "coverItemId": artist["cover"],
-                        "candidates": _rank_artists(artist, artists),
-                        "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
-                    },
-                )
-            )
+        albums_by_key = {row["key"]: row for row in albums}
+        artists_by_key = {row["key"]: row for row in artists}
+        track_to_album = {
+            row["id"]: f"{row['artist'].lower()}::{row['album'].lower()}"
+            for row in tracks
+            if row.get("album")
+        }
+        track_to_artist = {row["id"]: row["artist"].lower() for row in tracks}
+
         cur.execute(
             f"SELECT result_generation, epoch, head_seq FROM {t('relationship_state')} "
             "WHERE catalog_instance_id=%s FOR UPDATE",
@@ -1360,7 +1441,29 @@ def prepare_relationships(catalog_instance_id, db=None):
         old = {(str(row[0]), str(row[1])): str(row[2]) for row in cur.fetchall()}
         current = set()
         changed = 0
-        for entity_type, entity_id, payload in result_rows:
+
+        def publish(entity_type, entity, candidates):
+            nonlocal changed, next_seq
+            entity_id = entity["key"]
+            if entity_type == "album":
+                payload = {
+                    "entity_type": "album",
+                    "entity_id": entity_id,
+                    "album": entity["album"],
+                    "artist": entity["artist"],
+                    "coverItemId": entity["cover"],
+                    "candidates": _rank_albums(entity, candidates),
+                    "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
+                }
+            else:
+                payload = {
+                    "entity_type": "artist",
+                    "entity_id": entity_id,
+                    "artist": entity["artist"],
+                    "coverItemId": entity["cover"],
+                    "candidates": _rank_artists(entity, candidates),
+                    "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
+                }
             current.add((entity_type, entity_id))
             result_fp = _fingerprint(payload)
             cur.execute(
@@ -1385,7 +1488,7 @@ def prepare_relationships(catalog_instance_id, db=None):
                 ),
             )
             if old.get((entity_type, entity_id)) == result_fp:
-                continue
+                return
             next_seq += 1
             changed += 1
             cur.execute(
@@ -1405,6 +1508,42 @@ def prepare_relationships(catalog_instance_id, db=None):
                     canonical_json(payload),
                 ),
             )
+
+        for album in albums:
+            candidates = _relationship_candidates(
+                album,
+                "album",
+                albums_by_key,
+                track_to_album,
+                candidate_lookup,
+            )
+            publish("album", album, candidates)
+        for artist in artists:
+            candidates = _relationship_candidates(
+                artist,
+                "artist",
+                artists_by_key,
+                track_to_artist,
+                candidate_lookup,
+            )
+            publish("artist", artist, candidates)
+
+        latest_sources = resolve_catalog_source(
+            db, catalog_instance_id=catalog_instance_id
+        )
+        if len(latest_sources) != 1:
+            raise CatalogScanError("Catalogue identity changed during relationship preparation")
+        latest = latest_sources[0]
+        if (
+            int(latest["catalog"]["generation"])
+            != int(source["catalog"]["generation"])
+            or int(latest["analysis"]["generation"])
+            != int(source["analysis"]["generation"])
+        ):
+            raise CatalogScanError(
+                "Catalogue or analysis generation changed during relationship preparation"
+            )
+
         for entity_type, entity_id in sorted(set(old) - current):
             next_seq += 1
             changed += 1
@@ -1462,6 +1601,25 @@ def prepare_relationships(catalog_instance_id, db=None):
             "changes": changed,
             "cursor": opaque_cursor(catalog_instance_id, epoch, next_seq),
         }
+    except RelationshipIndexUnavailable as exc:
+        db.rollback()
+        waiting_cur = db.cursor()
+        waiting_cur.execute(
+            f"""
+            UPDATE {t("relationship_state")}
+               SET status='waiting_for_index', last_error=%s,
+                   completed_at=NULL, updated_at=now()
+             WHERE catalog_instance_id=%s
+            """,
+            (str(exc)[:2000], catalog_instance_id),
+        )
+        db.commit()
+        waiting_cur.close()
+        return {
+            "catalog_instance_id": catalog_instance_id,
+            "status": "waiting_for_index",
+            "reason": str(exc),
+        }
     except Exception as exc:
         db.rollback()
         failure_cur = db.cursor()
@@ -1484,7 +1642,9 @@ def relationship_bootstrap_page(
     db, catalog_instance_id, page_token=None, limit=100
 ):
     status = relationship_status(db, catalog_instance_id)
-    if status["status"] != "complete":
+    # A stale, queued, running, paused, waiting, or failed replacement must not
+    # hide the last atomically published generation from clients.
+    if int(status.get("generation") or 0) <= 0:
         return {
             **status,
             "relationships": [],
@@ -1529,8 +1689,7 @@ def relationship_bootstrap_page(
     # let that race produce a mixed (or apparently empty) bootstrap snapshot.
     verified = relationship_status(db, catalog_instance_id)
     if (
-        verified["status"] != "complete"
-        or int(verified["generation"]) != generation
+        int(verified["generation"]) != generation
         or verified["cursor"] != status["cursor"]
     ):
         raise KeyError("bootstrap_required")
@@ -1602,8 +1761,8 @@ def read_relationship_changes(db, cursor_value, catalog_instance_id=None, limit=
     ]
     next_seq = changes[-1]["seq"] if changes else cursor["seq"]
     return {
-        "schema_version": RELATIONSHIP_SCHEMA_VERSION,
-        "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
+        "schema_version": status["schema_version"],
+        "algorithm_version": status["algorithm_version"],
         "catalog_instance_id": expected_id,
         "changes": changes,
         "cursor": opaque_cursor(expected_id, head["epoch"], next_seq),

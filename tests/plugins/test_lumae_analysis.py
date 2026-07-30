@@ -1,10 +1,12 @@
 import importlib
 import json
+import os
 import pathlib
 import struct
 import sys
 import math
 import types
+import uuid
 
 import numpy as np
 import pytest
@@ -38,6 +40,30 @@ PLUGIN_TABLE = "plugin_lumae_analysis__profiles"
 
 def load_plugin():
     return importlib.import_module("plugins.LumaeAnalysis")
+
+
+@pytest.fixture
+def lumae_postgres_db():
+    dsn = os.environ.get("LUMAE_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set LUMAE_POSTGRES_TEST_DSN to run PostgreSQL integration tests")
+    psycopg2 = pytest.importorskip("psycopg2")
+    schema = f"lumae_analysis_integration_{uuid.uuid4().hex}"
+    db = psycopg2.connect(dsn)
+    try:
+        cur = db.cursor()
+        cur.execute(f"CREATE SCHEMA {schema}")
+        cur.execute(f"SET search_path TO {schema}, public")
+        cur.close()
+        db.commit()
+        yield db
+    finally:
+        db.rollback()
+        cur = db.cursor()
+        cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        cur.close()
+        db.commit()
+        db.close()
 
 
 def plugin_client(mod):
@@ -78,7 +104,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.0.0"
+    assert manifest["versions"][0]["version"] == "1.0.1"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -168,7 +194,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.0.0",
+        "plugin_version": "1.0.1",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -299,7 +325,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.0.0"
+    assert body["plugin_version"] == "1.0.1"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -457,6 +483,286 @@ def test_server_album_and_artist_relationships_use_lumae_native_rankers():
     ]
 
 
+def test_relationship_candidate_scoring_is_bounded_by_ivf_shortlist(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    def entity(index):
+        vector = np.zeros(200, dtype=np.float32)
+        vector[index % 200] = 1.0
+        return {
+            "key": f"artist-{index}::album-{index}",
+            "album": f"Album {index}",
+            "artist": f"Artist {index}",
+            "cover": f"track-{index}",
+            "fingerprint": {
+                "mean": vector,
+                "poles": [],
+            },
+        }
+
+    entities = [entity(index) for index in range(1000)]
+    entities_by_key = {row["key"]: row for row in entities}
+    track_to_entity = {
+        f"track-{index}": row["key"] for index, row in enumerate(entities)
+    }
+    candidates = enrichment._relationship_candidates(
+        entities[0],
+        "album",
+        entities_by_key,
+        track_to_entity,
+        lambda _vectors, _limit: [f"track-{index}" for index in range(1, 1000)],
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        enrichment,
+        "_album_score",
+        lambda _source, _candidate: (calls.append(1) or 0.1, ["core"]),
+    )
+    enrichment._rank_albums(entities[0], candidates)
+
+    assert len(candidates) == enrichment.RELATIONSHIP_MAX_CANDIDATE_ENTITIES
+    assert len(calls) == enrichment.RELATIONSHIP_MAX_CANDIDATE_ENTITIES
+    assert len(calls) < len(entities) * len(entities)
+
+
+def test_relationship_builder_waits_instead_of_falling_back_without_ivf(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    fake_manager = types.SimpleNamespace(
+        ivf_index=None,
+        multi_query_ids=lambda _vectors, _limit: [],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tasks",
+        types.SimpleNamespace(ivf_manager=fake_manager),
+    )
+
+    with pytest.raises(enrichment.RelationshipIndexUnavailable, match="not ready"):
+        enrichment._ivf_candidate_track_ids(
+            [np.ones(200, dtype=np.float32)],
+            10,
+        )
+
+
+def test_relationship_builder_loads_ivf_and_caps_queries_to_small_indexes(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    calls = []
+
+    class Index:
+        def __len__(self):
+            return 7
+
+    fake_manager = types.SimpleNamespace(ivf_index=None)
+
+    def load():
+        calls.append("load")
+        fake_manager.ivf_index = Index()
+
+    def query(_vectors, limit):
+        calls.append(("query", limit))
+        return ["track-a"]
+
+    fake_manager.load_ivf_index_for_querying = load
+    fake_manager.multi_query_ids = query
+    monkeypatch.setitem(
+        sys.modules,
+        "tasks",
+        types.SimpleNamespace(ivf_manager=fake_manager),
+    )
+
+    assert enrichment._ivf_candidate_track_ids(
+        [np.ones(200, dtype=np.float32)],
+        96,
+    ) == ["track-a"]
+    assert calls == ["load", ("query", 7)]
+
+
+def test_relationship_builder_publishes_only_bounded_shortlist_candidates(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "catalog": {"status": "complete", "generation": 4},
+        "analysis": {"status": "complete", "generation": 6},
+    }
+    tracks = [
+        {"id": "track-a", "album": "Album A", "artist": "Artist A"},
+        {"id": "track-b", "album": "Album B", "artist": "Artist B"},
+    ]
+    vector = np.ones(200, dtype=np.float32)
+    albums = [
+        {
+            "key": "artist a::album a",
+            "album": "Album A",
+            "artist": "Artist A",
+            "cover": "track-a",
+            "fingerprint": {"mean": vector, "poles": []},
+        },
+        {
+            "key": "artist b::album b",
+            "album": "Album B",
+            "artist": "Artist B",
+            "cover": "track-b",
+            "fingerprint": {"mean": vector, "poles": []},
+        },
+    ]
+    artists = [
+        {
+            "key": "artist a",
+            "artist": "Artist A",
+            "cover": "track-a",
+            "fingerprint": {"core": [vector], "poles": [], "outliers": []},
+        },
+        {
+            "key": "artist b",
+            "artist": "Artist B",
+            "cover": "track-b",
+            "fingerprint": {"core": [vector], "poles": [], "outliers": []},
+        },
+    ]
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+            self.one = None
+            self.all = []
+
+        def execute(self, sql, args=None):
+            normalized = " ".join(sql.split())
+            self.executed.append((normalized, args))
+            self.one = None
+            self.all = []
+            if "SELECT result_generation, epoch, head_seq" in normalized:
+                self.one = (0, "epoch-a", 0)
+            elif "SELECT entity_type, entity_id, result_fp" in normalized:
+                self.all = []
+
+        def fetchone(self):
+            return self.one
+
+        def fetchall(self):
+            return self.all
+
+        def close(self):
+            return None
+
+    class Db:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+            self.commits = 0
+            self.rollbacks = 0
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    db = Db()
+    monkeypatch.setattr(
+        enrichment,
+        "resolve_catalog_source",
+        lambda _db, **_kwargs: [source],
+    )
+    monkeypatch.setattr(
+        enrichment,
+        "_load_relationship_inputs",
+        lambda _cur, _source: tracks,
+    )
+    monkeypatch.setattr(
+        enrichment,
+        "_build_entities",
+        lambda _tracks: (albums, artists),
+    )
+    scored = []
+    monkeypatch.setattr(
+        enrichment,
+        "_rank_albums",
+        lambda entity, candidates: scored.append(
+            ("album", entity["key"], [row["key"] for row in candidates])
+        )
+        or [],
+    )
+    monkeypatch.setattr(
+        enrichment,
+        "_rank_artists",
+        lambda entity, candidates: scored.append(
+            ("artist", entity["key"], [row["key"] for row in candidates])
+        )
+        or [],
+    )
+    lookup_calls = []
+
+    def lookup(_vectors, limit):
+        lookup_calls.append(limit)
+        return ["track-a", "track-b"]
+
+    result = enrichment.prepare_relationships(
+        "catalog-a",
+        db=db,
+        candidate_lookup=lookup,
+    )
+
+    assert result == {
+        "catalog_instance_id": "catalog-a",
+        "status": "complete",
+        "generation": 1,
+        "album_count": 2,
+        "artist_count": 2,
+        "track_count": 2,
+        "changes": 4,
+        "cursor": enrichment.opaque_cursor("catalog-a", "epoch-a", 4),
+    }
+    assert lookup_calls == [enrichment.RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR] * 4
+    assert scored == [
+        ("album", "artist a::album a", ["artist b::album b"]),
+        ("album", "artist b::album b", ["artist a::album a"]),
+        ("artist", "artist a", ["artist b"]),
+        ("artist", "artist b", ["artist a"]),
+    ]
+    assert db.commits == 2
+    assert db.rollbacks == 0
+    statements = [sql for sql, _args in db.cursor_obj.executed]
+    assert sum("INSERT INTO plugin_lumae_analysis__relationship_results" in sql for sql in statements) == 4
+    assert sum("INSERT INTO plugin_lumae_analysis__relationship_changes" in sql for sql in statements) == 4
+    assert any("status='complete'" in sql for sql in statements)
+
+
+def test_relationship_fingerprints_bound_pathological_album_pairwise_work(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    pairwise_sizes = []
+
+    def bounded_pairwise(tracks):
+        pairwise_sizes.append(len(tracks))
+        return [[0.0] * len(tracks) for _ in tracks]
+
+    monkeypatch.setattr(enrichment, "_pairwise", bounded_pairwise)
+    tracks = [
+        {
+            "id": f"track-{index:04d}",
+            "order": index,
+            "embedding": np.full(200, index / 500, dtype=np.float32),
+            "energy": 0.5,
+            "mood": None,
+        }
+        for index in range(500)
+    ]
+
+    fingerprint = enrichment._album_fingerprint("artist::album", tracks)
+
+    assert fingerprint is not None
+    assert 0 < pairwise_sizes[0] <= enrichment.RELATIONSHIP_ENTITY_SAMPLE_LIMIT
+    assert len(pairwise_sizes) == 1
+    assert pairwise_sizes[0] < len(tracks)
+
+
 def test_relationship_bootstrap_rejects_a_page_token_from_an_old_generation(
     monkeypatch,
 ):
@@ -490,6 +796,67 @@ def test_relationship_bootstrap_rejects_a_page_token_from_an_old_generation(
         catalog_enrichment.relationship_bootstrap_page(
             object(), "catalog-a", page_token=page_token
         )
+
+
+def test_relationship_bootstrap_keeps_last_published_generation_visible_while_stale(
+    monkeypatch,
+):
+    from plugins.LumaeAnalysis import catalog_enrichment
+    from plugins.LumaeAnalysis.catalog import opaque_cursor
+
+    status = {
+        "catalog_instance_id": "catalog-a",
+        "schema_version": 1,
+        "algorithm_version": 1,
+        "generation": 3,
+        "cursor": opaque_cursor("catalog-a", "epoch-a", 12),
+        "status": "waiting_for_index",
+    }
+    monkeypatch.setattr(
+        catalog_enrichment,
+        "relationship_status",
+        lambda _db, _catalog_id: dict(status),
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, args):
+            self.executed.append((" ".join(sql.split()), args))
+
+        def fetchall(self):
+            return [
+                (
+                    "album",
+                    "album-a",
+                    {"entity_type": "album", "entity_id": "album-a", "similar": []},
+                    "2026-07-30T12:00:00Z",
+                )
+            ]
+
+        def close(self):
+            return None
+
+    cursor = Cursor()
+    db = types.SimpleNamespace(cursor=lambda: cursor)
+
+    page = catalog_enrichment.relationship_bootstrap_page(
+        db, "catalog-a", limit=10
+    )
+
+    assert page["status"] == "waiting_for_index"
+    assert page["generation"] == 3
+    assert page["algorithm_version"] == 1
+    assert page["relationships"] == [
+        {
+            "entity_type": "album",
+            "entity_id": "album-a",
+            "similar": [],
+            "computed_at": "2026-07-30T12:00:00Z",
+        }
+    ]
+    assert cursor.executed[0][1][1] == 3
 
 
 def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch):
@@ -2290,7 +2657,7 @@ def test_vectorized_biquad_matches_reference_recurrence():
     np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-11)
 
 
-def test_vectorized_analysis_matches_reference_profile(monkeypatch):
+def test_streaming_analysis_matches_v1_whole_buffer_reference_profile():
     import plugins.LumaeAnalysis.loudness as loudness
 
     def reference_apply(channel, coefs):
@@ -2319,26 +2686,39 @@ def test_vectorized_analysis_matches_reference_profile(monkeypatch):
         ]
     ).astype(np.float32)
 
-    vectorized = loudness.analyze_buffer(audio, sample_rate)
-    monkeypatch.setattr(loudness, "_k_weight", reference_k_weight)
-    reference = loudness.analyze_buffer(audio, sample_rate)
+    result = loudness.analyze_buffer(audio, sample_rate)
+    weighted = np.stack([reference_k_weight(channel) for channel in audio])
+    chunk_size = int(sample_rate * loudness.CHUNK_DURATION_MS / 1000)
+    chunk_lufs = [
+        loudness._mean_square_to_lufs(
+            float(np.mean(weighted[:, start : start + chunk_size] ** 2))
+        )
+        for start in range(0, weighted.shape[1], chunk_size)
+    ]
+    reference_lufs = loudness._integrated_lufs(chunk_lufs)
+    relative = [value - reference_lufs for value in chunk_lufs]
+    reference_start = loudness._scan_forward(relative)
+    reference_end = loudness._scan_backward(relative)
 
-    assert vectorized.sample_rate == reference.sample_rate
-    assert vectorized.duration_ms == reference.duration_ms
-    assert math.isclose(vectorized.ref_lufs, reference.ref_lufs, rel_tol=0, abs_tol=1e-10)
-    assert vectorized.start_ramp == reference.start_ramp
-    assert vectorized.end_ramp == reference.end_ramp
-    assert vectorized.start_ramp_blob == reference.start_ramp_blob
-    assert vectorized.end_ramp_blob == reference.end_ramp_blob
+    assert result.sample_rate == sample_rate
+    assert result.duration_ms == 2000
+    assert math.isclose(result.ref_lufs, reference_lufs, rel_tol=0, abs_tol=1e-10)
+    assert result.start_ramp == reference_start
+    assert result.end_ramp == reference_end
+    assert result.start_ramp_blob == loudness.encode_ramp(reference_start)
+    assert result.end_ramp_blob == loudness.encode_ramp(reference_end)
 
 
 def test_analyze_buffer_uses_100ms_chunks_and_expected_ramp_encoding(monkeypatch):
     import plugins.LumaeAnalysis.loudness as loudness
 
     monkeypatch.setattr(
-        loudness,
-        "_k_weight",
-        lambda channel: channel.astype(np.float64, copy=False),
+        loudness.scipy_signal,
+        "lfilter",
+        lambda _b, _a, samples, zi=None: (
+            samples.astype(np.float64, copy=False),
+            np.asarray(zi, dtype=np.float64),
+        ),
     )
     monkeypatch.setattr(loudness, "_integrated_lufs", lambda chunk_lufs: -20.0)
 
@@ -2486,9 +2866,12 @@ def test_analyze_buffer_includes_final_partial_chunk(monkeypatch):
     import plugins.LumaeAnalysis.loudness as loudness
 
     monkeypatch.setattr(
-        loudness,
-        "_k_weight",
-        lambda channel: channel.astype(np.float64, copy=False),
+        loudness.scipy_signal,
+        "lfilter",
+        lambda _b, _a, samples, zi=None: (
+            samples.astype(np.float64, copy=False),
+            np.asarray(zi, dtype=np.float64),
+        ),
     )
     monkeypatch.setattr(loudness, "_integrated_lufs", lambda chunk_lufs: -20.0)
 
@@ -2515,29 +2898,145 @@ def test_analyze_buffer_rejects_silent_audio():
         raise AssertionError("silent audio should fail")
 
 
-def test_analyze_file_loads_audio_and_delegates_to_buffer(monkeypatch):
+def test_analyze_file_streams_pyav_frames_into_bounded_analyzer(monkeypatch):
     import plugins.LumaeAnalysis.loudness as loudness
 
     captured = {}
-    audio = np.array([0.25, -0.25], dtype=np.float32)
+    audio = np.array([[0.25, -0.25]], dtype=np.float32)
     sentinel = object()
 
-    def fake_load(path, sr=None, mono=False):
-        captured["load"] = (path, sr, mono)
-        return audio, 44100
+    class Frame:
+        def to_ndarray(self):
+            return audio
 
-    def fake_analyze_buffer(buffer, sample_rate):
-        captured["analyze"] = (buffer, sample_rate)
+    class Container:
+        streams = types.SimpleNamespace(
+            audio=[
+                types.SimpleNamespace(
+                    codec_context=types.SimpleNamespace(
+                        sample_rate=44100,
+                        layout=types.SimpleNamespace(name="mono", channels=("front",)),
+                    )
+                )
+            ]
+        )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def decode(self, _stream):
+            return [Frame()]
+
+    class Resampler:
+        def __init__(self, **kwargs):
+            captured["resampler"] = kwargs
+
+        def resample(self, frame):
+            return [] if frame is None else [frame]
+
+    def fake_open(path):
+        captured["path"] = path
+        return Container()
+
+    fake_av = types.SimpleNamespace(
+        open=fake_open,
+        audio=types.SimpleNamespace(
+            resampler=types.SimpleNamespace(AudioResampler=Resampler)
+        ),
+    )
+
+    def fake_analyze_blocks(blocks, sample_rate, **kwargs):
+        captured["analyze"] = (list(blocks), sample_rate, kwargs)
         return sentinel
 
-    monkeypatch.setattr(loudness, "librosa", types.SimpleNamespace(load=fake_load))
-    monkeypatch.setattr(loudness, "analyze_buffer", fake_analyze_buffer)
+    monkeypatch.setitem(sys.modules, "av", fake_av)
+    monkeypatch.setattr(loudness, "analyze_blocks", fake_analyze_blocks)
 
     result = loudness.analyze_file("fixture.wav")
 
     assert result is sentinel
-    assert captured["load"] == ("fixture.wav", None, False)
-    assert captured["analyze"] == (audio, 44100)
+    assert captured["path"] == "fixture.wav"
+    assert captured["resampler"] == {
+        "format": "fltp",
+        "layout": "mono",
+        "rate": 44100,
+    }
+    blocks, sample_rate, kwargs = captured["analyze"]
+    assert np.array_equal(blocks[0], audio)
+    assert sample_rate == 44100
+    assert kwargs["channel_count"] == 1
+
+
+def test_streaming_loudness_is_invariant_to_decoder_block_boundaries():
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    sample_rate = 48000
+    time_axis = np.arange(sample_rate * 3 + 117, dtype=np.float32) / sample_rate
+    audio = np.stack(
+        [
+            np.sin(2 * np.pi * 220 * time_axis) * 0.2,
+            np.sin(2 * np.pi * 440 * time_axis) * 0.1,
+        ]
+    ).astype(np.float32)
+
+    whole = loudness.analyze_blocks(
+        [audio],
+        sample_rate,
+        channel_count=2,
+    )
+    split = loudness.analyze_blocks(
+        (
+            audio[:, start : start + 7777]
+            for start in range(0, audio.shape[1], 7777)
+        ),
+        sample_rate,
+        channel_count=2,
+    )
+
+    assert split.duration_ms == whole.duration_ms
+    assert split.ref_lufs == whole.ref_lufs
+    assert split.start_ramp_blob == whole.start_ramp_blob
+    assert split.end_ramp_blob == whole.end_ramp_blob
+
+
+def test_streaming_loudness_enforces_duration_and_deadline_limits():
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    with pytest.raises(loudness.ProfileResourceLimitError, match="duration"):
+        loudness.analyze_blocks(
+            [np.ones((1, 3), dtype=np.float32)],
+            10,
+            channel_count=1,
+            max_duration_seconds=0.2,
+        )
+
+    with pytest.raises(loudness.ProfileAnalysisTimeout, match="deadline"):
+        loudness.analyze_blocks(
+            [np.ones((1, 1), dtype=np.float32)],
+            10,
+            channel_count=1,
+            deadline=0,
+        )
+
+
+def test_streaming_loudness_caps_channels_and_sample_rate():
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    with pytest.raises(loudness.ProfileResourceLimitError, match="channel count"):
+        loudness.analyze_blocks(
+            [np.ones((loudness.MAX_PROFILE_CHANNELS + 1, 10), dtype=np.float32)],
+            48000,
+            channel_count=loudness.MAX_PROFILE_CHANNELS + 1,
+        )
+    with pytest.raises(loudness.ProfileResourceLimitError, match="sample rate"):
+        loudness.analyze_blocks(
+            [np.ones((1, 10), dtype=np.float32)],
+            loudness.MAX_PROFILE_SAMPLE_RATE + 1,
+            channel_count=1,
+        )
 
 
 class FakeCursor:
@@ -2946,22 +3445,21 @@ def test_find_backfill_ids_applies_limit_after_eligibility_filtering(monkeypatch
     mod = load_plugin()
     current = tmp_path / "current.wav"
     current.write_bytes(b"new media")
-    missing = tmp_path / "not-mounted.wav"
     sig = mod.media_signature(str(current))
     rows = [
-        ("ready-current-1", str(current), sig, mod.ANALYZER_VERSION, "ready"),
-        ("failed-once", str(current), "old-sig", mod.ANALYZER_VERSION, "failed"),
-        ("skipped-once", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
         ("eligible-missing", str(current), None, None, None),
         ("eligible-stale", str(current), sig, mod.ANALYZER_VERSION, "stale"),
-        ("eligible-old", str(current), sig, 0, "ready"),
     ]
-    db = LimitAwareDb(rows=rows)
+    db = FakeDb(rows=rows)
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
     monkeypatch.setattr(mod, "media_server_download_available", lambda: False, raising=False)
 
     assert mod.find_backfill_ids(limit=2) == ["eligible-missing", "eligible-stale"]
+    sql, params = db.cursor_obj.executed[-1]
+    assert "LIMIT %s" in sql
+    assert params[-2] is True
+    assert params[-1] == 2
 
 
 def test_explicit_prepare_retry_includes_failed_profiles(monkeypatch):
@@ -3000,24 +3498,10 @@ def test_backfill_uses_configured_batch_size(monkeypatch):
     assert seen_limits == [7]
 
 
-def test_analysis_status_counts_current_pending_failed_and_needed(monkeypatch, tmp_path):
+def test_analysis_status_counts_are_aggregated_in_postgres(monkeypatch):
     mod = load_plugin()
-    current = tmp_path / "current.wav"
-    current.write_bytes(b"new media")
-    missing = tmp_path / "not-mounted.wav"
-    unchanged = tmp_path / "unchanged.wav"
-    unchanged.write_bytes(b"same media")
-    unchanged_sig = mod.media_signature(str(unchanged))
-    rows = [
-        ("ready-current", str(unchanged), unchanged_sig, mod.ANALYZER_VERSION, "ready"),
-        ("missing-profile", str(current), None, None, None),
-        ("old-analyzer", str(current), "old-sig", 0, "ready"),
-        ("changed-media", str(current), "old-sig", mod.ANALYZER_VERSION, "ready"),
-        ("pending-track", str(current), None, mod.ANALYZER_VERSION, "pending"),
-        ("failed-track", str(current), None, mod.ANALYZER_VERSION, "failed"),
-        ("skipped-track", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
-    ]
-    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    db = FakeDb(rows=[(7, 1, 1, 1, 0)])
+    monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
     monkeypatch.setattr(mod, "media_server_download_available", lambda: False, raising=False)
 
@@ -3026,18 +3510,17 @@ def test_analysis_status_counts_current_pending_failed_and_needed(monkeypatch, t
         "ready_current": 1,
         "pending": 1,
         "failed": 1,
-        "skipped": 1,
-        "needs_analysis": 3,
+        "skipped": 0,
+        "needs_analysis": 4,
     }
+    sql, params = db.cursor_obj.executed[-1]
+    assert "COUNT(*) FILTER" in sql
+    assert params == (mod.ANALYZER_VERSION, True)
 
 
-def test_analysis_status_counts_treats_retryable_skipped_rows_as_needed(monkeypatch, tmp_path):
+def test_analysis_status_counts_treats_retryable_skipped_rows_as_needed(monkeypatch):
     mod = load_plugin()
-    missing = tmp_path / "not-mounted.wav"
-    rows = [
-        ("skipped-track", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
-    ]
-    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=[(1, 0, 0, 0, 0)]))
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
     monkeypatch.setattr(mod, "media_server_download_available", lambda: True, raising=False)
 
@@ -3049,6 +3532,136 @@ def test_analysis_status_counts_treats_retryable_skipped_rows_as_needed(monkeypa
         "skipped": 0,
         "needs_analysis": 1,
     }
+
+
+def test_postgres_backfill_retries_registry_backed_skipped_profiles(
+    monkeypatch,
+    lumae_postgres_db,
+):
+    mod = load_plugin()
+    from plugins.LumaeAnalysis import catalog
+
+    catalog.migrate_catalog(lumae_postgres_db)
+    cur = lumae_postgres_db.cursor()
+    cur.execute(
+        """
+        CREATE TABLE plugin_lumae_analysis__source_profiles (
+            catalog_instance_id TEXT NOT NULL,
+            track_id TEXT NOT NULL,
+            media_signature TEXT,
+            analyzer_ver INTEGER,
+            status TEXT,
+            PRIMARY KEY (catalog_instance_id, track_id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_sources
+            (catalog_instance_id, current_core_server_id, provider_type,
+             server_name, is_default, rebind_status)
+        VALUES ('catalog-a', 'server-a', 'navidrome', 'Registry source', TRUE, 'active')
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_state
+            (catalog_instance_id, current_core_server_id, provider_type,
+             published_generation, catalog_epoch, status)
+        VALUES ('catalog-a', 'server-a', 'navidrome', 4, 'epoch-a', 'complete')
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_tracks
+            (catalog_instance_id, published_generation, track_id, title,
+             analysis_eligible, metadata_fp, media_fp, payload,
+             first_seen_at, last_seen_at)
+        VALUES
+            ('catalog-a', 4, 'retry-me', 'Retry me', TRUE, 'meta-a', 'media-a',
+             '{}'::jsonb, now(), now()),
+            ('catalog-a', 4, 'pending', 'Pending', TRUE, 'meta-b', 'media-b',
+             '{}'::jsonb, now(), now())
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__source_profiles
+            (catalog_instance_id, track_id, media_signature, analyzer_ver, status)
+        VALUES
+            ('catalog-a', 'retry-me', NULL, 1, 'skipped_no_file'),
+            ('catalog-a', 'pending', NULL, 1, 'pending')
+        """
+    )
+    cur.close()
+    lumae_postgres_db.commit()
+    monkeypatch.setattr(mod, "get_db", lambda: lumae_postgres_db)
+
+    rows = mod.fetch_backfill_rows(
+        3,
+        catalog_instance_id="catalog-a",
+        server_id="server-a",
+    )
+    counts = mod.analysis_status_counts(
+        catalog_instance_id="catalog-a",
+        server_id="server-a",
+    )
+
+    assert [row[0] for row in rows] == ["retry-me"]
+    assert counts == {
+        "total_with_files": 2,
+        "ready_current": 0,
+        "pending": 1,
+        "failed": 0,
+        "skipped": 0,
+        "needs_analysis": 1,
+    }
+
+
+def test_postgres_relationship_migration_preserves_published_generation(
+    lumae_postgres_db,
+):
+    from plugins.LumaeAnalysis import catalog, catalog_enrichment
+
+    catalog.migrate_catalog(lumae_postgres_db)
+    cur = lumae_postgres_db.cursor()
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_sources
+            (catalog_instance_id, current_core_server_id, provider_type, server_name)
+        VALUES ('catalog-a', 'server-a', 'navidrome', 'Main source')
+        """
+    )
+    cur.close()
+    catalog_enrichment.migrate_enrichment(lumae_postgres_db)
+    cur = lumae_postgres_db.cursor()
+    cur.execute(
+        """
+        UPDATE plugin_lumae_analysis__relationship_state
+           SET relationship_schema_version=1,
+               algorithm_version=0,
+               result_generation=5,
+               status='complete'
+         WHERE catalog_instance_id='catalog-a'
+        """
+    )
+    cur.close()
+    lumae_postgres_db.commit()
+
+    catalog_enrichment.migrate_enrichment(lumae_postgres_db)
+    cur = lumae_postgres_db.cursor()
+    cur.execute(
+        """
+        SELECT relationship_schema_version, algorithm_version,
+               result_generation, status
+          FROM plugin_lumae_analysis__relationship_state
+         WHERE catalog_instance_id='catalog-a'
+        """
+    )
+    state = cur.fetchone()
+    cur.close()
+
+    assert state == (1, 0, 5, "stale")
 
 
 def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch):
@@ -3454,7 +4067,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     mod.migrate(db)
 
     assert db.commits == 1
-    assert queued == [((mod.analysis_projection_task,), {"queue": "default"})]
+    assert queued == []
     assert (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
@@ -3479,6 +4092,11 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     ]
     migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
     assert "rebind_status='active' AND provider_type='navidrome'" in migration_sql
+    assert "relationship_state" in migration_sql
+    enrichment_source = pathlib.Path(
+        "plugins/LumaeAnalysis/catalog_enrichment.py"
+    ).read_text(encoding="utf-8")
+    assert "result_generation = 0" in enrichment_source
     assert "fingerprint_schema_version" in migration_sql
     assert "snapshot_estimated_bytes" in migration_sql
     assert "last_scan_change_counts" in migration_sql
@@ -3512,6 +4130,116 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "analysis_changes",
     ):
         assert f"plugin_lumae_analysis__{table_name}" in migration_sql
+
+
+def test_bounded_enqueue_uses_the_app_context_wrapper_and_finite_timeout(monkeypatch):
+    mod = load_plugin()
+    captured = {}
+
+    class Queue:
+        def enqueue(self, function, **kwargs):
+            captured.update({"function": function, **kwargs})
+            return types.SimpleNamespace(id="job-a")
+
+    monkeypatch.setattr(
+        plugin_api_module,
+        "dotted_path",
+        lambda function: f"{function.__module__}.{function.__name__}",
+        raising=False,
+    )
+    monkeypatch.setattr(plugin_api_module, "rq_queue_default", Queue(), raising=False)
+    monkeypatch.setattr(plugin_api_module, "rq_queue_high", Queue(), raising=False)
+
+    job = mod.enqueue_bounded(
+        mod.profile_backfill_task,
+        "server-a",
+        "catalog-a",
+        timeout=321,
+    )
+
+    assert job.id == "job-a"
+    assert captured["function"] == "plugin.manager.run_plugin_task"
+    assert captured["args"][1:] == ("server-a", "catalog-a")
+    assert captured["job_timeout"] == 321
+    assert captured["job_timeout"] > 0
+
+
+def test_v1_0_1_has_no_infinite_plugin_job_timeout():
+    source = pathlib.Path("plugins/LumaeAnalysis/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert "job_timeout=-1" not in source
+
+
+def test_maintenance_pause_blocks_background_work_but_preserves_control_state(
+    monkeypatch,
+):
+    mod = load_plugin()
+    monkeypatch.setattr(
+        mod,
+        "get_setting",
+        lambda key, default=None: True if key == "maintenance_paused" else default,
+    )
+    queued = []
+    released = []
+    monkeypatch.setattr(mod, "enqueue", lambda *args, **kwargs: queued.append((args, kwargs)))
+    monkeypatch.setattr(
+        mod,
+        "release_pending",
+        lambda ids, **kwargs: released.append((ids, kwargs)),
+    )
+
+    assert mod.enqueue_required_catalog_preparations(db=object()) == 0
+    assert mod.start_profile_backfill("catalog-a", "server-a") == {
+        "queued": False,
+        "coalesced": True,
+        "paused": True,
+        "batch_size": mod.DEFAULT_BACKFILL_BATCH_SIZE,
+    }
+    assert mod.start_relationship_preparation("catalog-a", "server-a") == {
+        "queued": False,
+        "coalesced": True,
+        "paused": True,
+        "reason": "maintenance_paused",
+    }
+    assert mod.analyze_one_track("track-a", catalog_instance_id="catalog-a") == {
+        "track_id": "track-a",
+        "status": "skipped_maintenance_paused",
+    }
+    assert mod.analyze_tracks_task(
+        ["track-a", "track-b"],
+        catalog_instance_id="catalog-a",
+    ) == {
+        "ready": 0,
+        "already_ready": 0,
+        "promoted": 0,
+        "failed": 0,
+        "skipped": 2,
+        "deferred": 2,
+        "paused": True,
+    }
+    assert mod.finalize_analysis_run_task("server-a", "catalog-a", "run-a") == {
+        "status": "paused",
+        "reason": "maintenance_paused",
+        "run_id": "run-a",
+    }
+    assert released == [
+        (
+            ["track-a"],
+            {
+                "catalog_instance_id": "catalog-a",
+                "reason": "Lumae background maintenance is paused",
+            },
+        ),
+        (
+            ["track-a", "track-b"],
+            {
+                "catalog_instance_id": "catalog-a",
+                "reason": "Lumae background maintenance is paused",
+            },
+        ),
+    ]
+    assert queued == []
 
 
 def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch):
@@ -4786,6 +5514,38 @@ class RefreshDb:
         self.rollbacks += 1
 
 
+def test_catalog_generation_parameters_are_materialized_one_batch_at_a_time():
+    import plugins.LumaeAnalysis.catalog as catalog
+
+    class Cursor:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def executemany(self, _sql, params):
+            self.batch_sizes.append(len(params))
+
+    rows = (
+        {
+            "track_id": f"track-{index}",
+            "title": "Track",
+            "payload": {},
+        }
+        for index in range(2501)
+    )
+    cursor = Cursor()
+
+    catalog._insert_generation_rows(
+        cursor,
+        "track",
+        "catalog-a",
+        2,
+        rows,
+        catalog.utc_now(),
+    )
+
+    assert cursor.batch_sizes == [1000, 1000, 501]
+
+
 class RefreshBridge:
     def __init__(self, payload=None, error=None):
         self.payload = payload or {"tracks": []}
@@ -5294,6 +6054,157 @@ def test_analysis_projection_reuses_one_vector_for_two_provider_occurrences(monk
     assert db.commits == 1
     assert sum("INSERT INTO plugin_lumae_analysis__analysis_items" in sql for sql, _ in db.executed) == 1
     assert sum("INSERT INTO plugin_lumae_analysis__track_analysis_links" in sql for sql, _ in db.executed) == 2
+
+
+@pytest.mark.parametrize(
+    ("analysis_status", "expect_unchanged"),
+    (("complete", True), ("failed", False)),
+)
+def test_no_change_analysis_projection_reuses_only_a_complete_generation(
+    monkeypatch,
+    analysis_status,
+    expect_unchanged,
+):
+    import plugins.LumaeAnalysis.catalog_analysis as projection
+    from plugins.LumaeAnalysis.catalog import fingerprint
+
+    item = {
+        "analysis_id": "analysis-a",
+        "scalar_payload": {"tempo": 120},
+        "scalar_fp": "scalar-fp",
+        "umap": None,
+        "umap_fp": None,
+        "musicnn_vector": struct.pack("<2f", 0.1, 0.2),
+        "musicnn_fp": "musicnn-fp",
+        "clap_vector": None,
+        "clap_fp": None,
+    }
+    link = {
+        "provider_track_id": "track-a",
+        "analysis_id": "analysis-a",
+        "status": "ready",
+        "match_tier": "direct",
+        "algorithm": "bounded-test",
+        "decision_threshold": 0.1,
+        "distance": None,
+        "evidence_complete": False,
+        "conflict_flags": [],
+        "review_state": None,
+    }
+
+    class Cursor:
+        def __init__(self):
+            self.row = None
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+            self.row = (
+                (7, "analysis-epoch", 42)
+                if "FROM plugin_lumae_analysis__analysis_state" in sql
+                else None
+            )
+
+        def fetchone(self):
+            return self.row
+
+        def close(self):
+            pass
+
+    class Db:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+            self.commits = 0
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def commit(self):
+            self.commits += 1
+
+    db = Db()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "catalog": {"status": "complete", "generation": 3},
+        "analysis": {"status": analysis_status, "generation": 7},
+    }
+    monkeypatch.setattr(projection, "resolve_catalog_source", lambda *_a, **_k: [source])
+    monkeypatch.setattr(
+        projection,
+        "_active_catalog_tracks",
+        lambda *_a: {
+            "track-a": {
+                "track_id": "track-a",
+                "title": "Track",
+                "artist": "Artist",
+                "album_id": "album-a",
+                "duration_ms": 180000,
+                "payload": {},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        projection,
+        "_analysis_mapping",
+        lambda *_a: {
+            "track-a": {
+                "analysis_id": "analysis-a",
+                "match_tier": "direct",
+            }
+        },
+    )
+    monkeypatch.setattr(projection, "_analysis_chromaprints", lambda *_a: {})
+    monkeypatch.setattr(projection, "_analysis_rows", lambda *_a: {"analysis-a": item})
+    monkeypatch.setattr(
+        projection,
+        "dedup_policy",
+        lambda: {"algorithm": "bounded-test", "configured_threshold": 0.1},
+    )
+    monkeypatch.setattr(projection, "_apply_progressive_evidence", lambda *_a: None)
+    monkeypatch.setattr(projection, "_apply_provider_conflicts", lambda *_a: None)
+    monkeypatch.setattr(projection, "_suspect_analysis_ids", lambda *_a: set())
+    monkeypatch.setattr(
+        projection,
+        "_old_items",
+        lambda *_a: {
+            "analysis-a": (
+                item["scalar_fp"],
+                item["umap_fp"],
+                item["musicnn_fp"],
+                item["clap_fp"],
+            )
+        },
+    )
+    monkeypatch.setattr(
+        projection,
+        "_old_links",
+        lambda *_a: {"track-a": fingerprint(link)},
+    )
+
+    result = projection.project_analysis(
+        "server-a",
+        db=db,
+        adapter=types.SimpleNamespace(active_server_id=lambda: "server-a"),
+    )
+
+    assert result["generation"] == (7 if expect_unchanged else 8)
+    assert result["changes"] == 0
+    assert db.commits == 1
+    writes = [
+        sql
+        for sql, _params in db.cursor_obj.executed
+        if sql.lstrip().startswith(("INSERT", "UPDATE"))
+    ]
+    if expect_unchanged:
+        assert result["unchanged"] is True
+        assert writes == []
+    else:
+        assert "unchanged" not in result
+        assert len(writes) == 3
+        assert any("analysis_items" in sql for sql in writes)
+        assert any("track_analysis_links" in sql for sql in writes)
+        assert any("status='complete'" in sql for sql in writes)
 
 
 def test_analysis_projection_marks_contradictory_dedup_group_suspect():
