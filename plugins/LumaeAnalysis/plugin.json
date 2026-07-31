@@ -92,7 +92,7 @@
       "changelog": "Bound waveform decoding and filtering memory, cap every background job, make installs idempotent, limit backfill and catalogue batches, replace all-pairs relationships with bounded IVF shortlists, preserve failed-projection and registry-source retry recovery, and add a maintenance pause that preserves published data.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.0.1.zip",
-      "checksum": "3c2fc6306d3caaff48110d675cabbd65"
+      "checksum": "d1f9d447ae525fb352da812f3cc9ae60"
     },
     {
       "version": "1.0.0",
