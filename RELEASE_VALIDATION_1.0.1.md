@@ -84,9 +84,9 @@ relationship ranking.
 - Contents: 16 deterministic code/helper files; `plugin.json`, caches, and
   bytecode are excluded.
 - MD5 (AudioMuse catalog checksum):
-  `3c2fc6306d3caaff48110d675cabbd65`
+  `d1f9d447ae525fb352da812f3cc9ae60`
 - SHA-256:
-  `cdf0dcb5ca360a2417bb14e3301ab30aa8bc52959456dbff79083fef80aa4032`
+  `0936909818a268646ef20235d26ee380611dc5c2723465e53c0e0d73d5878903`
 
 The optional PostgreSQL cases were run separately and passed in full as
 recorded above.
