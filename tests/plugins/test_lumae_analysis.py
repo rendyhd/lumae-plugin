@@ -64,7 +64,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.1.0"
+    assert manifest["versions"][0]["version"] == "1.2.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -89,7 +89,7 @@ def test_plugin_manifest_has_lumae_identity():
     }
     assert manifest["capabilities"]["catalog_mirror"] == {
         "contract_revision": 1,
-        "catalog_schema_version": 2,
+        "catalog_schema_version": 3,
         "analysis_schema_version": 2,
         "supported_core_range": ">=2.6.0,<4.0.0",
         "supported_provider_types": ["navidrome"],
@@ -119,6 +119,7 @@ def test_plugin_manifest_has_lumae_identity():
             "catalog_prepare_api",
             "analysis_run_finalization",
             "provider_identity_transition_shield_v1",
+            "provider_identity_rekey_v1",
         ],
     }
 
@@ -132,7 +133,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.1.0",
+        "plugin_version": "1.2.0",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -255,7 +256,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.1.0"
+    assert body["plugin_version"] == "1.2.0"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -2908,6 +2909,11 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
             "17 */6 * * *",
         ),
         (
+            mod.PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
+            mod.PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
+            "2,32 * * * *",
+        ),
+        (
             mod.ANALYSIS_PROJECTION_TASK_TYPE,
             mod.ANALYSIS_PROJECTION_TASK_TYPE,
             "47 */6 * * *",
@@ -2946,6 +2952,8 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "analysis_runs",
         "analysis_changes",
         "provider_identity_transitions",
+        "provider_identity_manifests",
+        "catalog_generation_pins",
     ):
         assert f"plugin_lumae_analysis__{table_name}" in migration_sql
 
@@ -4516,9 +4524,11 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.tasks == [
         ("prepare", mod.prepare_lumae_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
+        ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
     ]
     assert ctx.cron_tasks == [
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
+        ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
     ]
     assert ctx.menu_items == []
@@ -4879,9 +4889,9 @@ def test_refresh_shield_stops_before_provider_diff_publication(monkeypatch):
         lambda *_args, **_kwargs: {"state": "transition_pending"},
     )
 
-    with pytest.raises(catalog.CatalogScanError, match="provider IDs changed"):
-        catalog.refresh_catalog("server-a", db=db, bridge=bridge)
+    result = catalog.refresh_catalog("server-a", db=db, bridge=bridge)
 
+    assert result["change_reason"] == "provider_identity_wait"
     assert not any("INSERT INTO plugin_lumae_analysis__catalog_changes" in sql for sql, _ in db.executed)
     assert not any("SET published_generation=" in sql for sql, _ in db.executed)
 
@@ -4912,3 +4922,561 @@ def test_analysis_shield_runs_before_reading_current_audiomuse_mapping(monkeypat
         )
 
     assert not any("FROM fake_mapping" in sql for sql, _ in db.executed)
+
+
+def _identity_fixture_catalog(track_id, album_id, artist_id):
+    return {
+        "libraries": [{"id": "library-1", "name": "Music"}],
+        "albums": [
+            {
+                "id": album_id,
+                "name": "Record",
+                "artistItems": [{"id": artist_id, "name": "Artist"}],
+            }
+        ],
+        "tracks": [
+            {
+                "id": track_id,
+                "title": "Song",
+                "albumId": album_id,
+                "album": "Record",
+                "artist": "Artist",
+                "artistId": artist_id,
+                "musicFolderId": "library-1",
+                "duration": 180,
+            }
+        ],
+    }
+
+
+def _fingerprints_by_entity(normalized):
+    from plugins.LumaeAnalysis.catalog import ENTITY_COLLECTIONS, ENTITY_ORDER, ENTITY_TABLES
+
+    result = {}
+    for entity_type in ENTITY_ORDER:
+        id_column = ENTITY_TABLES[entity_type][1]
+        rows = {}
+        for row in normalized[ENTITY_COLLECTIONS[entity_type]]:
+            values = [row["metadata_fp"]]
+            if entity_type == "album":
+                values.append(row["artwork_fp"])
+            elif entity_type == "track":
+                values.extend((row["media_fp"], row["artwork_fp"]))
+            rows[row[id_column]] = tuple(values)
+        result[entity_type] = rows
+    return result
+
+
+def test_rekey_plan_uses_exact_codec_for_all_provider_entities():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+    from plugins.LumaeAnalysis.provider_identity import canonicalize_navidrome_id
+    from plugins.LumaeAnalysis.provider_identity_rekey import (
+        build_provider_identity_rekey_plan,
+    )
+
+    old_ids = {
+        "track": "e3b7fc2ae9447bbec37a13bf916e3cf6",
+        "album": "0123456789abcdef0123456789abcdef",
+        "artist": "11111111111111111111111111111111",
+    }
+    new_ids = {
+        kind: canonicalize_navidrome_id(value).value for kind, value in old_ids.items()
+    }
+    old = normalize_provider_catalog(
+        _identity_fixture_catalog(old_ids["track"], old_ids["album"], old_ids["artist"]),
+        "navidrome",
+    )
+    target = normalize_provider_catalog(
+        _identity_fixture_catalog(new_ids["track"], new_ids["album"], new_ids["artist"]),
+        "navidrome",
+    )
+
+    plan = build_provider_identity_rekey_plan(_fingerprints_by_entity(old), target)
+
+    assert plan.counts == {
+        "rekey": 3,
+        "unchanged": 1,
+        "addition": 0,
+        "confirmed_removal": 0,
+        "conflict": 0,
+    }
+    assert [(row["entity_type"], row["old_id"], row["new_id"]) for row in plan.mappings] == [
+        ("artist", old_ids["artist"], new_ids["artist"]),
+        ("album", old_ids["album"], new_ids["album"]),
+        ("track", old_ids["track"], new_ids["track"]),
+    ]
+    assert all(event.payload[event.entity_type + "_id"] == event.entity_id for event in plan.events)
+
+
+def test_rekey_plan_rejects_old_and_new_identity_collision():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+    from plugins.LumaeAnalysis.provider_identity import canonicalize_navidrome_id
+    from plugins.LumaeAnalysis.provider_identity_rekey import (
+        build_provider_identity_rekey_plan,
+    )
+
+    old_id = "e3b7fc2ae9447bbec37a13bf916e3cf6"
+    new_id = canonicalize_navidrome_id(old_id).value
+    target = normalize_provider_catalog(
+        {"tracks": [{"id": new_id, "title": "Song"}]}, "navidrome"
+    )
+    previous = _fingerprints_by_entity(target)
+    previous["track"][old_id] = previous["track"][new_id]
+
+    with pytest.raises(ValueError, match="not one-to-one"):
+        build_provider_identity_rekey_plan(previous, target)
+
+
+def test_exact_json_rewrite_never_changes_substrings_and_blocks_key_collisions():
+    from plugins.LumaeAnalysis.provider_identity_rekey import _replace_exact
+
+    assert _replace_exact(
+        {
+            "old": "old",
+            "nested": ["old", "prefix-old", {"id": "old"}],
+        },
+        {"old": "new"},
+    ) == {
+        "new": "new",
+        "nested": ["new", "prefix-old", {"id": "new"}],
+    }
+    with pytest.raises(ValueError, match="collides"):
+        _replace_exact({"old": 1, "new": 2}, {"old": "new"})
+
+
+class IdentityInspectionCursor(FakeCursor):
+    def __init__(self, db):
+        super().__init__([])
+        self.db = db
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        if "SELECT COALESCE(c.published_generation" in sql:
+            self.rows = [
+                (
+                    7,
+                    5,
+                    self.db.transition_id,
+                    "transition_pending",
+                    "0.64.0",
+                    self.db.target_fingerprint,
+                    self.db.target_scan_count,
+                )
+            ]
+        elif "SELECT track_id FROM" in sql:
+            self.rows = [(self.db.old_id,)]
+        elif "target_scan_count=%s" in sql:
+            self.db.transition_id = params[0]
+            self.db.target_fingerprint = params[6]
+            self.db.target_scan_count = params[7]
+            self.rows = []
+        else:
+            self.rows = []
+
+
+class IdentityInspectionDb:
+    def __init__(self, old_id):
+        self.old_id = old_id
+        self.transition_id = "transition-a"
+        self.target_fingerprint = None
+        self.target_scan_count = 0
+
+    def cursor(self):
+        return IdentityInspectionCursor(self)
+
+
+def test_identity_publication_requires_two_identical_full_target_scans():
+    from plugins.LumaeAnalysis.provider_identity import canonicalize_navidrome_id
+    from plugins.LumaeAnalysis.provider_identity_guard import inspect_catalog_identity
+
+    old_id = "e3b7fc2ae9447bbec37a13bf916e3cf6"
+    new_id = canonicalize_navidrome_id(old_id).value
+    db = IdentityInspectionDb(old_id)
+
+    first = inspect_catalog_identity(db, "catalog-a", [new_id], "0.64.0", "full-fp")
+    second = inspect_catalog_identity(db, "catalog-a", [new_id], "0.64.0", "full-fp")
+
+    assert first["state"] == second["state"] == "transition_pending"
+    assert first["target_scan_count"] == 1
+    assert second["target_scan_count"] == 2
+
+
+def test_transient_probe_failure_does_not_discard_an_applied_transition(monkeypatch):
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "catalog_generation": 8,
+        "analysis_generation": 6,
+        "transition_id": "transition-a",
+        "state": "applied",
+        "current_provider_version": "0.64.0",
+    }
+    captured = {}
+    monkeypatch.setattr(guard, "_source_state", lambda *_args, **_kwargs: source)
+    monkeypatch.setattr(guard, "_ensure_transition_row", lambda *_args: None)
+    monkeypatch.setattr(
+        guard,
+        "_update_observation",
+        lambda *_args, **kwargs: captured.update(kwargs),
+    )
+
+    class FailingBridge:
+        @staticmethod
+        def probe_server_identity(_server_id):
+            raise RuntimeError("provider offline")
+
+    db = types.SimpleNamespace(commit=lambda: None)
+    result = guard.observe_provider_version(db, FailingBridge(), "server-a")
+
+    assert result["state"] == "applied"
+    assert captured["state"] == "applied"
+    assert captured["required_action"] == "retry_provider_identity_check"
+
+
+def test_identity_recheck_schedule_scans_only_pending_sources(monkeypatch):
+    mod = load_plugin()
+
+    class Bridge:
+        @staticmethod
+        def list_servers():
+            return [{"server_id": "server-a", "supported": True}]
+
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
+    monkeypatch.setattr(
+        mod,
+        "resolve_catalog_source",
+        lambda *_args, **_kwargs: [{"catalog_instance_id": "catalog-a"}],
+    )
+    monkeypatch.setattr(
+        mod,
+        "provider_transition_health",
+        lambda *_args: {"state": "normal"},
+    )
+    refresh = pytest.MonkeyPatch()
+    try:
+        refresh.setattr(
+            mod,
+            "refresh_catalog",
+            lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not scan")),
+        )
+        assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
+    finally:
+        refresh.undo()
+
+
+class PublisherCursor(FakeCursor):
+    def __init__(self, db):
+        super().__init__([])
+        self.db = db
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        self.db.executed.append((sql, params))
+        normalized = " ".join(sql.split())
+        if "SELECT published_generation, catalog_epoch" in normalized:
+            self.rows = [(7, "catalog-epoch", 100, 2)]
+        elif "SELECT projection_generation, analysis_epoch" in normalized:
+            self.rows = [(5, "analysis-epoch", 200, 1, 1, "complete")]
+        elif "SELECT transition_id, state, previous_provider_version" in normalized:
+            self.rows = [
+                (
+                    "transition-a",
+                    "transition_pending",
+                    "0.63.2",
+                    "0.64.0",
+                    7,
+                    5,
+                    self.db.target_fingerprint,
+                    2,
+                )
+            ]
+        elif "SELECT (SELECT COUNT(*)" in normalized:
+            self.rows = [(1, 1, 0, 0)]
+        elif "available=TRUE" in normalized and normalized.startswith("SELECT"):
+            self.rows = next(
+                (
+                    rows
+                    for table_name, rows in self.db.fingerprint_rows.items()
+                    if table_name in normalized
+                ),
+                [],
+            )
+        elif "FROM fake_mapping" in normalized:
+            self.rows = [(self.db.new_track_id, "analysis-1", "fingerprint")]
+        elif "SELECT provider_track_id, analysis_id" in normalized:
+            self.rows = [
+                (
+                    self.db.old_track_id,
+                    "analysis-1",
+                    "ready",
+                    "fingerprint",
+                    "audiomuse_catalogue_fp_4",
+                    0.02,
+                    None,
+                    True,
+                    [],
+                    None,
+                )
+            ]
+        elif normalized.startswith("SELECT seq, payload FROM"):
+            self.rows = []
+        elif normalized.startswith("SELECT principal, idempotency_key"):
+            self.rows = []
+        elif "SELECT COUNT(*) FROM task_status" in normalized:
+            self.rows = [(0,)]
+        else:
+            self.rows = []
+
+    def executemany(self, sql, params):
+        materialized = list(params)
+        self.db.executed.append((sql, materialized))
+
+
+class PublisherDb:
+    def __init__(self, old_normalized, target_fingerprint, old_track_id, new_track_id):
+        self.target_fingerprint = target_fingerprint
+        self.old_track_id = old_track_id
+        self.new_track_id = new_track_id
+        self.executed = []
+        self.commits = 0
+        self.rollbacks = 0
+        fingerprints = _fingerprints_by_entity(old_normalized)
+        self.fingerprint_rows = {}
+        for entity_type, table_name in {
+            "library": "catalog_libraries",
+            "artist": "catalog_artists",
+            "album": "catalog_albums",
+            "track": "catalog_tracks",
+        }.items():
+            self.fingerprint_rows[table_name] = [
+                (entity_id, *values)
+                for entity_id, values in fingerprints[entity_type].items()
+            ]
+
+    def cursor(self):
+        return PublisherCursor(self)
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+class PublisherAdapter:
+    @staticmethod
+    def analysis_mapping_sql():
+        return "SELECT provider_track_id, analysis_id, match_tier FROM fake_mapping WHERE server_id=%s"
+
+
+def test_atomic_publisher_carries_analysis_and_retains_recovery_evidence():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+    from plugins.LumaeAnalysis.provider_identity import canonicalize_navidrome_id
+    from plugins.LumaeAnalysis.provider_identity_rekey import (
+        publish_provider_identity_rekey,
+        target_scan_fingerprint,
+    )
+
+    old_ids = {
+        "track": "e3b7fc2ae9447bbec37a13bf916e3cf6",
+        "album": "0123456789abcdef0123456789abcdef",
+        "artist": "11111111111111111111111111111111",
+    }
+    new_ids = {
+        kind: canonicalize_navidrome_id(value).value for kind, value in old_ids.items()
+    }
+    old = normalize_provider_catalog(
+        _identity_fixture_catalog(old_ids["track"], old_ids["album"], old_ids["artist"]),
+        "navidrome",
+    )
+    target = normalize_provider_catalog(
+        _identity_fixture_catalog(new_ids["track"], new_ids["album"], new_ids["artist"]),
+        "navidrome",
+    )
+    target_fp = target_scan_fingerprint(target)
+    db = PublisherDb(old, target_fp, old_ids["track"], new_ids["track"])
+
+    result = publish_provider_identity_rekey(
+        db,
+        catalog_instance_id="catalog-a",
+        server_id="server-a",
+        normalized=target,
+        target_fingerprint=target_fp,
+        current_provider_version="0.64.0",
+        adapter=PublisherAdapter(),
+        scan_id="scan-a",
+        scan_duration_ms=123,
+    )
+
+    assert result["provider_identity_transition"] == {
+        "state": "applied",
+        "transition_id": "transition-a",
+        "first_seq": 101,
+        "last_seq": 103,
+        "counts": {
+            "rekey": 3,
+            "unchanged": 1,
+            "addition": 0,
+            "confirmed_removal": 0,
+            "conflict": 0,
+        },
+        "manifest_sha256": result["provider_identity_transition"]["manifest_sha256"],
+        "audiomuse_health": "ready",
+    }
+    assert db.commits == 1
+    assert db.rollbacks == 0
+    sql = "\n".join(statement for statement, _params in db.executed)
+    assert "INSERT INTO plugin_lumae_analysis__analysis_items" in sql
+    assert "SELECT catalog_instance_id, %s, analysis_id" in sql
+    assert "INSERT INTO plugin_lumae_analysis__catalog_generation_pins" in sql
+    assert "INSERT INTO plugin_lumae_analysis__provider_identity_manifests" in sql
+    assert "SET state='applied'" in sql
+    change_params = [
+        params
+        for statement, params in db.executed
+        if "INSERT INTO plugin_lumae_analysis__catalog_changes" in statement
+    ]
+    assert [params[6] for params in change_params] == ["rekey", "rekey", "rekey"]
+    assert all(json.loads(params[10])["analysis_identity_preserved"] for params in change_params)
+
+
+def test_atomic_publisher_rolls_back_before_writes_when_target_proof_changes():
+    from plugins.LumaeAnalysis.provider_identity_rekey import publish_provider_identity_rekey
+
+    db = PublisherDb(
+        {"libraries": [], "artists": [], "albums": [], "tracks": []},
+        "persisted-fingerprint",
+        "old",
+        "new",
+    )
+    with pytest.raises(ValueError, match="stable-scan fingerprint"):
+        publish_provider_identity_rekey(
+            db,
+            catalog_instance_id="catalog-a",
+            server_id="server-a",
+            normalized={
+                "libraries": [],
+                "artists": [],
+                "albums": [],
+                "tracks": [],
+                "track_artists": [],
+                "album_artists": [],
+                "entity_libraries": [],
+            },
+            target_fingerprint="wrong",
+            current_provider_version="0.64.0",
+            adapter=PublisherAdapter(),
+        )
+    assert db.rollbacks == 1
+    assert db.commits == 0
+
+
+def test_atomic_publisher_rolls_back_generation_rows_after_mid_publish_failure(monkeypatch):
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+    from plugins.LumaeAnalysis.provider_identity import canonicalize_navidrome_id
+    from plugins.LumaeAnalysis import provider_identity_rekey as rekey
+
+    old_id = "e3b7fc2ae9447bbec37a13bf916e3cf6"
+    new_id = canonicalize_navidrome_id(old_id).value
+    old = normalize_provider_catalog(
+        {"tracks": [{"id": old_id, "title": "Song"}]}, "navidrome"
+    )
+    target = normalize_provider_catalog(
+        {"tracks": [{"id": new_id, "title": "Song"}]}, "navidrome"
+    )
+    target_fp = rekey.target_scan_fingerprint(target)
+    db = PublisherDb(old, target_fp, old_id, new_id)
+    monkeypatch.setattr(
+        rekey,
+        "_rekey_plugin_owned_state",
+        lambda *_args: (_ for _ in ()).throw(RuntimeError("state rewrite interrupted")),
+    )
+
+    with pytest.raises(RuntimeError, match="state rewrite interrupted"):
+        rekey.publish_provider_identity_rekey(
+            db,
+            catalog_instance_id="catalog-a",
+            server_id="server-a",
+            normalized=target,
+            target_fingerprint=target_fp,
+            current_provider_version="0.64.0",
+            adapter=PublisherAdapter(),
+        )
+
+    assert db.rollbacks == 1
+    assert db.commits == 0
+    assert any(
+        statement.lstrip().startswith("INSERT INTO") and "catalog_tracks" in statement
+        for statement, _params in db.executed
+    )
+    assert not any("SET catalog_schema_version=" in statement for statement, _ in db.executed)
+
+
+class AudioMuseHealthCursor(FakeCursor):
+    def __init__(self, active_tasks, mappings):
+        super().__init__([])
+        self.active_tasks = active_tasks
+        self.mappings = mappings
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        if "FROM task_status" in sql:
+            self.rows = [(self.active_tasks,)]
+        elif "FROM fake_mapping" in sql:
+            self.rows = [(track_id, analysis_id, "fingerprint") for track_id, analysis_id in self.mappings]
+        else:
+            self.rows = []
+
+
+@pytest.mark.parametrize(
+    ("active_tasks", "mappings", "expected"),
+    [
+        (1, [], "busy"),
+        (0, [], "migration_required"),
+        (0, [("track-new", "different-analysis")], "repair_required"),
+        (0, [("track-new", "analysis-1")], "ready"),
+    ],
+)
+def test_audiomuse_health_is_independent_and_exact(active_tasks, mappings, expected):
+    from plugins.LumaeAnalysis.provider_identity_rekey import inspect_audiomuse_health
+
+    links = {"track-new": {"analysis_id": "analysis-1"}}
+
+    assert (
+        inspect_audiomuse_health(
+            AudioMuseHealthCursor(active_tasks, mappings),
+            PublisherAdapter(),
+            "server-a",
+            links,
+        )
+        == expected
+    )
+
+
+def test_transition_manifest_route_downloads_recovery_evidence(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(
+        mod,
+        "read_transition_manifest",
+        lambda *_args, **_kwargs: {
+            "contract": "provider_identity_rekey_v1",
+            "transition_id": "transition-a",
+            "mappings": [{"entity_type": "track", "old_id": "old", "new_id": "new"}],
+        },
+    )
+
+    response = plugin_client(mod).get(
+        "/api/catalog/provider-identity/manifest?transition_id=transition-a"
+    )
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert "lumae-provider-rekey-transition-a.json" in response.headers["Content-Disposition"]
+    assert response.get_json()["mappings"][0] == {
+        "entity_type": "track",
+        "old_id": "old",
+        "new_id": "new",
+    }

@@ -17,7 +17,7 @@ from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .provider_identity_guard import inspect_catalog_identity, observe_provider_version
 
 
-CATALOG_SCHEMA_VERSION = 2
+CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FINGERPRINT_SCHEMA_VERSION = 2
 CHANGE_EVENT_OVERHEAD_BYTES = 192
@@ -974,6 +974,23 @@ def migrate_catalog(db):
         ADD COLUMN IF NOT EXISTS change_reason TEXT NOT NULL DEFAULT 'provider_diff'
         """,
         f"""
+        ALTER TABLE {t("catalog_changes")}
+        ADD COLUMN IF NOT EXISTS old_entity_id TEXT
+        """,
+        f"""
+        ALTER TABLE {t("catalog_changes")}
+        ADD COLUMN IF NOT EXISTS evidence JSONB
+        """,
+        f"""
+        ALTER TABLE {t("catalog_state")}
+        ALTER COLUMN catalog_schema_version SET DEFAULT {CATALOG_SCHEMA_VERSION}
+        """,
+        f"""
+        UPDATE {t("catalog_state")}
+           SET catalog_schema_version={CATALOG_SCHEMA_VERSION}
+         WHERE catalog_schema_version < {CATALOG_SCHEMA_VERSION}
+        """,
+        f"""
         CREATE TABLE IF NOT EXISTS {t("stream_bootstrap_sessions")} (
             token_hash TEXT PRIMARY KEY,
             stream TEXT NOT NULL,
@@ -1421,16 +1438,87 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             raise CatalogScanError("Refusing to replace a non-empty catalogue with an empty scan")
 
         if identity_observation and identity_observation.get("observation") != "bridge_unavailable":
+            from .provider_identity_rekey import (
+                publish_provider_identity_rekey,
+                target_scan_fingerprint,
+            )
+
+            identity_target_fingerprint = target_scan_fingerprint(normalized)
             identity_inspection = inspect_catalog_identity(
                 db,
                 catalog_instance_id,
                 [row["track_id"] for row in normalized["tracks"]],
                 identity_observation.get("current_provider_version"),
+                identity_target_fingerprint,
             )
             if identity_inspection.get("state") in ("transition_pending", "blocked"):
+                if (
+                    identity_inspection.get("state") == "transition_pending"
+                    and int(identity_inspection.get("target_scan_count") or 0) >= 2
+                ):
+                    return publish_provider_identity_rekey(
+                        db,
+                        catalog_instance_id=catalog_instance_id,
+                        server_id=server_id,
+                        normalized=normalized,
+                        target_fingerprint=identity_target_fingerprint,
+                        current_provider_version=identity_observation.get(
+                            "current_provider_version"
+                        ),
+                        adapter=provider_bridge.core,
+                        scan_id=scan_id,
+                        scan_duration_ms=max(
+                            0, round((time.monotonic() - scan_started) * 1000)
+                        ),
+                    )
+                if identity_inspection.get("state") == "transition_pending":
+                    duration_ms = max(
+                        0, round((time.monotonic() - scan_started) * 1000)
+                    )
+                    cur = db.cursor()
+                    progress = {
+                        "input_counts": counts,
+                        "change_counts": identity_inspection.get("counts") or {},
+                        "change_reason": "provider_identity_wait",
+                        "duration_ms": duration_ms,
+                        "generation": previous_generation,
+                        "head_seq": head_seq,
+                        "target_scan_count": int(
+                            identity_inspection.get("target_scan_count") or 0
+                        ),
+                    }
+                    cur.execute(
+                        f"UPDATE {t('catalog_scans')} SET status='complete', "
+                        "completed_at=now(), progress=%s::jsonb WHERE scan_id=%s",
+                        (_json_param(progress), scan_id),
+                    )
+                    cur.execute(
+                        f"""
+                        UPDATE {t('catalog_state')}
+                           SET status='complete', last_scan_change_reason='provider_identity_wait',
+                               last_scan_duration_ms=%s, last_error=NULL, updated_at=now()
+                         WHERE catalog_instance_id=%s
+                        """,
+                        (duration_ms, catalog_instance_id),
+                    )
+                    cur.close()
+                    db.commit()
+                    return {
+                        "catalog_instance_id": catalog_instance_id,
+                        "server_id": server_id,
+                        "generation": previous_generation,
+                        "cursor": {"epoch": str(epoch), "seq": head_seq},
+                        "counts": _state_counts(previous_counts),
+                        "change_counts": identity_inspection.get("counts") or {},
+                        "change_reason": "provider_identity_wait",
+                        "duration_ms": duration_ms,
+                        "changes": 0,
+                        "provider_identity_transition": identity_inspection,
+                    }
                 db.commit()
                 raise CatalogScanError(
-                    "Navidrome provider IDs changed; Lumae preserved the previous complete generation"
+                    "Navidrome provider ID evidence is incomplete or conflicting; "
+                    "Lumae preserved the previous complete generation"
                 )
 
         cur = db.cursor()
