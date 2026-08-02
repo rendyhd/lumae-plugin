@@ -91,6 +91,40 @@ class ProviderCatalogBridge:
             }[server["provider_type"]]
             return fetcher(module, self.core, server_id)
 
+    def probe_server_identity(self, server_id, timeout_seconds=5):
+        """Return credential-free provider identity from a bounded ping."""
+
+        server = self.require_server(server_id)
+        if server["provider_type"] != "navidrome":
+            return {
+                "provider_type": server["provider_type"],
+                "server_type": server["provider_type"],
+                "server_version": None,
+            }
+        bind = getattr(self.core, "bind", None)
+        context = bind(server_id) if callable(bind) else nullcontext()
+        with context:
+            module = self.core.provider_module(server["provider_type"])
+            request = getattr(module, "_navidrome_request", None)
+            if not callable(request):
+                raise CatalogProviderError("Navidrome provider does not expose a bounded ping")
+            try:
+                response = request("ping", timeout=timeout_seconds)
+            except TypeError:
+                # AudioMuse 2.6's compatibility function may not yet accept a
+                # timeout keyword. Its own request timeout remains bounded.
+                response = request("ping")
+            if not isinstance(response, dict):
+                raise CatalogProviderError("Navidrome ping did not return a response envelope")
+            server_version = response.get("serverVersion")
+            if not server_version:
+                raise CatalogProviderError("Navidrome ping did not expose serverVersion")
+            return {
+                "provider_type": "navidrome",
+                "server_type": str(response.get("type") or "navidrome").lower(),
+                "server_version": str(server_version),
+            }
+
     def download_track(self, server_id, temp_dir, item):
         self.require_server(server_id)
         with self.core.bind(server_id):

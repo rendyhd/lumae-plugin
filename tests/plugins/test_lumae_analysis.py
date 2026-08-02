@@ -64,7 +64,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.0.0"
+    assert manifest["versions"][0]["version"] == "1.1.0"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -118,6 +118,7 @@ def test_plugin_manifest_has_lumae_identity():
             "prepare_lumae",
             "catalog_prepare_api",
             "analysis_run_finalization",
+            "provider_identity_transition_shield_v1",
         ],
     }
 
@@ -131,7 +132,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.0.0",
+        "plugin_version": "1.1.0",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -254,12 +255,80 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.0.0"
+    assert body["plugin_version"] == "1.1.0"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
     assert captured["source"] == {**source, "supported": True}
     assert captured["policy"]["catalogue_id_scheme_version"] is None
+
+
+def test_catalog_health_denies_both_streams_while_provider_identity_is_pending(monkeypatch):
+    mod = load_plugin()
+    source = readiness_source()
+    db = object()
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", "v3.1.1")
+    monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
+    monkeypatch.setattr(plugin_api_module, "use_server", lambda _server_id: None, raising=False)
+    monkeypatch.setattr(
+        plugin_api_module,
+        "list_servers",
+        lambda: [{"server_id": "server-a", "server_type": "navidrome"}],
+        raising=False,
+    )
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "observe_provider_version", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "provider_transition_health",
+        lambda *_args, **_kwargs: {
+            "state": "transition_pending",
+            "catalog_sync_allowed": False,
+            "analysis_sync_allowed": False,
+            "audiomuse_projection_ingest_allowed": False,
+            "provider_mutations_allowed": False,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "v3_release_readiness",
+        lambda *_args, **_kwargs: {
+            "qualified_core_version": "v3.1.1",
+            "detected_core_version": "v3.1.1",
+            "applicable": True,
+            "status": "ready",
+            "ready": True,
+            "analysis_sync_allowed": True,
+            "verification_mode": "upgraded",
+            "administrator_acknowledged": True,
+            "acknowledged_at": "2026-08-02T12:00:00Z",
+            "blockers": [],
+            "admission": {
+                "catalog": {"admitted": True, "status": "admitted", "blockers": []},
+                "analysis": {"admitted": True, "status": "admitted", "blockers": []},
+            },
+        },
+    )
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 200
+    server = response.get_json()["servers"][0]
+    assert server["provider_identity_transition"]["state"] == "transition_pending"
+    assert server["catalog_sync_allowed"] is False
+    assert server["analysis_sync_allowed"] is False
+    assert server["v3_readiness"]["ready"] is False
+    assert server["v3_readiness"]["admission"]["catalog"] == {
+        "admitted": False,
+        "status": "denied",
+        "blockers": ["provider_identity_transition"],
+    }
+    assert server["v3_readiness"]["admission"]["analysis"] == {
+        "admitted": False,
+        "status": "denied",
+        "blockers": ["provider_identity_transition"],
+    }
 
 
 def test_v2_catalog_health_never_executes_v3_readiness_queries(monkeypatch):
@@ -2210,6 +2279,7 @@ class FakeCtx:
         self.blueprints = []
         self.settings_endpoint = None
         self.install_hooks = []
+        self.flask_hooks = []
         self.song_hooks = []
         self.cron_tasks = []
         self.tasks = []
@@ -2226,6 +2296,9 @@ class FakeCtx:
 
     def on_install(self, func):
         self.install_hooks.append(func)
+
+    def on_flask_start(self, func):
+        self.flask_hooks.append(func)
 
     def on_song_analyzed(self, func):
         self.song_hooks.append(func)
@@ -2872,6 +2945,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "preparation_state",
         "analysis_runs",
         "analysis_changes",
+        "provider_identity_transitions",
     ):
         assert f"plugin_lumae_analysis__{table_name}" in migration_sql
 
@@ -4437,6 +4511,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.blueprints == [mod.bp]
     assert ctx.settings_endpoint == "lumae_analysis.settings"
     assert ctx.install_hooks == [mod.migrate]
+    assert ctx.flask_hooks == [mod.observe_provider_identities_on_start]
     assert ctx.song_hooks == [mod.analyze_song_hook]
     assert ctx.tasks == [
         ("prepare", mod.prepare_lumae_task, "default"),
@@ -4696,3 +4771,144 @@ def test_settings_prepare_action_claims_and_enqueues_exact_source_once(monkeypat
         ("prepare_lumae_task", ("server-a", "catalog-a"), "default"),
     ]
     assert "Preparing Main Navidrome" in response.get_data(as_text=True)
+
+
+def test_provider_bridge_probe_returns_only_sanitized_navidrome_identity():
+    from contextlib import nullcontext
+
+    from plugins.LumaeAnalysis.catalog_providers import ProviderCatalogBridge
+
+    class Module:
+        @staticmethod
+        def _navidrome_request(endpoint, timeout=None):
+            assert endpoint == "ping"
+            assert timeout == 5
+            return {
+                "status": "ok",
+                "type": "navidrome",
+                "serverVersion": "0.64.0 (abcdef0)",
+                "ignoredSecret": "must-not-leak",
+            }
+
+    class Core:
+        @staticmethod
+        def list_servers():
+            return [
+                {
+                    "server_id": "server-a",
+                    "name": "Main",
+                    "provider_type": "navidrome",
+                    "is_default": True,
+                }
+            ]
+
+        @staticmethod
+        def bind(_server_id):
+            return nullcontext()
+
+        @staticmethod
+        def provider_module(_provider_type):
+            return Module()
+
+    assert ProviderCatalogBridge(core_adapter=Core()).probe_server_identity("server-a") == {
+        "provider_type": "navidrome",
+        "server_type": "navidrome",
+        "server_version": "0.64.0 (abcdef0)",
+    }
+
+
+def test_identity_inspection_distinguishes_rekey_incomplete_and_conflict():
+    from plugins.LumaeAnalysis.provider_identity_guard import inspect_track_id_sets
+
+    old = [
+        "e3b7fc2ae9447bbec37a13bf916e3cf6",
+        "zzzzzzzzzzzzzzzzzzzzzz",
+        "5cLJPkLA5DK2BADhoeotPk",
+    ]
+    transformed = [
+        "6VHl3uR4kss6sUPKA8Cwnk",
+        "3LyqmwQBm5IRqlVjNYASwb",
+        "5cLJPkLA5DK2BADhoeotPk",
+    ]
+
+    detected = inspect_track_id_sets(old, transformed)
+    assert detected.status == "transition_detected"
+    assert detected.matched_rekeys == 2
+    assert detected.blocked is True
+
+    unchanged = inspect_track_id_sets(old, old)
+    assert unchanged.status == "unchanged"
+    assert unchanged.blocked is False
+
+    conflict = inspect_track_id_sets(old, [*old, *transformed])
+    assert conflict.status == "conflict"
+    assert conflict.duplicate_targets == 2
+
+    many_old = [f"{value:032x}" for value in range(30)]
+    incomplete = inspect_track_id_sets(many_old, [])
+    assert incomplete.status == "incomplete"
+
+
+def test_refresh_shield_stops_before_provider_diff_publication(monkeypatch):
+    from plugins.LumaeAnalysis import catalog
+
+    db = RefreshDb(
+        previous_counts={"track": 1},
+        previous_generation=1,
+        published_fingerprints={
+            "catalog_tracks": [("old-id", "metadata", "media", None)],
+        },
+    )
+    bridge = RefreshBridge(
+        {
+            "libraries": [{"id": "library-1", "name": "Music"}],
+            "tracks": [{"id": "new-id", "title": "Song"}],
+        }
+    )
+    monkeypatch.setattr(
+        catalog,
+        "observe_provider_version",
+        lambda *_args, **_kwargs: {
+            "observation": "verified",
+            "current_provider_version": "0.64.0",
+        },
+    )
+    monkeypatch.setattr(
+        catalog,
+        "inspect_catalog_identity",
+        lambda *_args, **_kwargs: {"state": "transition_pending"},
+    )
+
+    with pytest.raises(catalog.CatalogScanError, match="provider IDs changed"):
+        catalog.refresh_catalog("server-a", db=db, bridge=bridge)
+
+    assert not any("INSERT INTO plugin_lumae_analysis__catalog_changes" in sql for sql, _ in db.executed)
+    assert not any("SET published_generation=" in sql for sql, _ in db.executed)
+
+
+def test_analysis_shield_runs_before_reading_current_audiomuse_mapping(monkeypatch):
+    from plugins.LumaeAnalysis import catalog_analysis
+    from plugins.LumaeAnalysis.provider_identity_guard import ProviderIdentityTransitionPending
+
+    class GuardedProjectionAdapter(ProjectionAdapter):
+        @staticmethod
+        def provider_module(_provider_type):
+            return object()
+
+    db = ProjectionDb()
+    monkeypatch.setattr(
+        catalog_analysis,
+        "assert_analysis_projection_allowed",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ProviderIdentityTransitionPending("identity pending")
+        ),
+    )
+
+    with pytest.raises(catalog_analysis.CatalogScanError, match="identity pending"):
+        catalog_analysis.project_analysis(
+            "server-a",
+            db=db,
+            adapter=GuardedProjectionAdapter(),
+        )
+
+    assert not any("FROM fake_mapping" in sql for sql, _ in db.executed)

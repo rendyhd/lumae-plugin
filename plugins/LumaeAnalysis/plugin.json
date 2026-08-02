@@ -63,11 +63,20 @@
         "source_scoped_profiles",
         "prepare_lumae",
         "catalog_prepare_api",
-        "analysis_run_finalization"
+        "analysis_run_finalization",
+        "provider_identity_transition_shield_v1"
       ]
     }
   },
   "versions": [
+    {
+      "version": "1.1.0",
+      "min_core_version": "2.6.0",
+      "changelog": "Detect and shield Navidrome canonical-ID transitions before catalogue diffs or analysis projection ingestion, while preserving the last complete Lumae generations.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
     {
       "version": "1.0.0",
       "min_core_version": "2.6.0",
