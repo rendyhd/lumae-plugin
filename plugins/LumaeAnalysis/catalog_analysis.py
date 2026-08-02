@@ -20,6 +20,11 @@ from .catalog import (
     resolve_catalog_source,
 )
 from .core_compat import get_core_adapter
+from .catalog_providers import ProviderCatalogBridge
+from .provider_identity_guard import (
+    ProviderIdentityTransitionPending,
+    assert_analysis_projection_allowed,
+)
 
 
 def t(name):
@@ -430,6 +435,15 @@ def project_analysis(server_id=None, db=None, adapter=None):
         raise CatalogScanError("Provider catalogue must be complete before analysis projection")
     catalog_instance_id = source["catalog_instance_id"]
     catalog_generation = source["catalog"]["generation"]
+    if callable(getattr(adapter, "provider_module", None)):
+        try:
+            assert_analysis_projection_allowed(
+                db,
+                ProviderCatalogBridge(core_adapter=adapter),
+                server_id,
+            )
+        except ProviderIdentityTransitionPending as exc:
+            raise CatalogScanError(str(exc)) from exc
     cur = db.cursor()
     tracks = _active_catalog_tracks(cur, catalog_instance_id, catalog_generation)
     mapped = _analysis_mapping(cur, adapter, server_id)

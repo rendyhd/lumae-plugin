@@ -15,6 +15,7 @@ import uuid
 from plugin.api import table
 
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
+from .provider_identity_guard import inspect_catalog_identity, observe_provider_version
 
 
 CATALOG_SCHEMA_VERSION = 2
@@ -1430,6 +1431,12 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         cur.close()
         raise CatalogScanError("Catalogue source is not initialized or is awaiting continuity review")
     catalog_instance_id = str(source[0])
+    identity_observation = observe_provider_version(
+        db,
+        provider_bridge,
+        server_id,
+        commit=True,
+    )
     scan_id = str(uuid.uuid4())
     cur.execute(
         f"SELECT published_generation, catalog_epoch, catalog_head_seq, entity_counts, "
@@ -1504,6 +1511,19 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                     "The corrupt refresh was not published and the previous catalogue remains "
                     "available. Lumae Analysis will retry automatically; check AudioMuse Music "
                     "Libraries if the repair keeps failing."
+                )
+
+        if identity_observation and identity_observation.get("observation") != "bridge_unavailable":
+            identity_inspection = inspect_catalog_identity(
+                db,
+                catalog_instance_id,
+                [row["track_id"] for row in normalized["tracks"]],
+                identity_observation.get("current_provider_version"),
+            )
+            if identity_inspection.get("state") in ("transition_pending", "blocked"):
+                db.commit()
+                raise CatalogScanError(
+                    "Navidrome provider IDs changed; Lumae preserved the previous complete generation"
                 )
 
         cur = db.cursor()

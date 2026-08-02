@@ -60,6 +60,12 @@ from .catalog_enrichment import (
 from .catalog_readiness import CONTRACT_REVISION, v3_release_readiness
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .database_state import collect_database_state, render_database_state
+from .provider_identity_guard import (
+    TRANSITION_BLOCKER,
+    migrate_provider_identity,
+    observe_provider_version,
+    provider_transition_health,
+)
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -72,7 +78,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.0.1"
+PLUGIN_VERSION = "1.1.0"
 CATALOG_SCHEMA_VERSION = 2
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -114,6 +120,7 @@ CATALOG_FEATURES = (
     "server_album_artist_relationships",
     "relationship_cursor_stream",
     "nonblocking_enrichment",
+    "provider_identity_transition_shield_v1",
 )
 CATALOG_FEATURE_ROUTES = {
     "bootstrap_leases": (
@@ -507,6 +514,25 @@ def enqueue_required_catalog_preparations(db=None):
     return queued
 
 
+def observe_provider_identities_on_start():
+    """Bounded, best-effort observation that never delays Flask startup indefinitely."""
+
+    db = get_db()
+    if db is None:
+        return
+    bridge = ProviderCatalogBridge()
+    for server in bridge.list_servers():
+        if not server.get("supported"):
+            continue
+        try:
+            observe_provider_version(db, bridge, server["server_id"], commit=True)
+        except Exception:
+            logger.exception(
+                "lumae_analysis could not observe provider identity for %s",
+                server["server_id"],
+            )
+
+
 def migrate(db):
     cur = db.cursor()
     cur.execute(
@@ -530,6 +556,7 @@ def migrate(db):
     cur.close()
     migrate_catalog(db)
     ensure_catalog_sources(db)
+    migrate_provider_identity(db)
     cur = db.cursor()
     cur.execute(
         f"""
@@ -1195,6 +1222,23 @@ def catalog_health():
     if compatibility.supported:
         try:
             db = get_db()
+        except Exception:
+            db = None
+            logger.exception("lumae_analysis could not open catalogue health database")
+        if db is not None:
+            try:
+                bridge = ProviderCatalogBridge()
+                for candidate in bridge.list_servers():
+                    if candidate.get("supported"):
+                        observe_provider_version(
+                            db,
+                            bridge,
+                            candidate["server_id"],
+                            commit=True,
+                        )
+            except Exception:
+                logger.exception("lumae_analysis could not observe provider identity")
+        try:
             if db is not None:
                 persisted = resolve_catalog_source(db)
         except Exception:
@@ -1249,6 +1293,52 @@ def catalog_health():
             }
             for server in servers
         ]
+    if db is not None:
+        guarded_servers = []
+        for server in servers:
+            transition = None
+            catalog_instance_id = server.get("catalog_instance_id")
+            if catalog_instance_id:
+                try:
+                    transition = provider_transition_health(db, catalog_instance_id)
+                except Exception:
+                    logger.exception(
+                        "lumae_analysis could not read provider transition health for %s",
+                        catalog_instance_id,
+                    )
+            if transition:
+                server = {
+                    **server,
+                    "provider_identity_transition": transition,
+                    "catalog_sync_allowed": transition["catalog_sync_allowed"],
+                    "analysis_sync_allowed": transition["analysis_sync_allowed"],
+                    "audiomuse_projection_ingest_allowed": transition[
+                        "audiomuse_projection_ingest_allowed"
+                    ],
+                    "provider_mutations_allowed": transition["provider_mutations_allowed"],
+                }
+                if not transition["catalog_sync_allowed"] and server.get("v3_readiness"):
+                    readiness = dict(server["v3_readiness"])
+                    readiness["ready"] = False
+                    readiness["analysis_sync_allowed"] = False
+                    readiness["blockers"] = list(
+                        dict.fromkeys([*(readiness.get("blockers") or []), TRANSITION_BLOCKER])
+                    )
+                    admission = dict(readiness.get("admission") or {})
+                    for stream in ("catalog", "analysis"):
+                        stream_admission = dict(admission.get(stream) or {})
+                        stream_admission["admitted"] = False
+                        stream_admission["status"] = "denied"
+                        stream_admission["blockers"] = list(
+                            dict.fromkeys(
+                                [*(stream_admission.get("blockers") or []), TRANSITION_BLOCKER]
+                            )
+                        )
+                        admission[stream] = stream_admission
+                    readiness["admission"] = admission
+                    server["v3_readiness"] = readiness
+            guarded_servers.append(server)
+        servers = guarded_servers
     payload = compatibility.as_dict()
     payload.update(
         {
@@ -4065,6 +4155,51 @@ def render_source_preparation_panel(batch_size):
     return f"{catalogue_html}{waveform_html}"
 
 
+def render_provider_identity_panel():
+    try:
+        db = get_db()
+        sources = resolve_catalog_source(db) if db is not None else []
+        rows = []
+        for source in sources:
+            transition = provider_transition_health(db, source["catalog_instance_id"])
+            if transition:
+                rows.append((source, transition))
+    except Exception:
+        logger.exception("lumae_analysis could not render provider identity status")
+        return ""
+    if not rows:
+        return ""
+
+    cards = []
+    for source, transition in rows:
+        state = escape(str(transition.get("state") or "normal"))
+        version = escape(str(transition.get("current_provider_version") or "unverified"))
+        action = escape(str(transition.get("required_action") or "No action required"))
+        cards.append(
+            f"""
+            <article class="lumae-status-card">
+              <span>{escape(source['name'])}</span>
+              <strong>{state}</strong>
+              <small>Navidrome {version}</small>
+              <small>{action}</small>
+            </article>
+            """
+        )
+    return f"""
+      <section class="lumae-panel" aria-label="Provider identity transition">
+        <h3>Provider identity safety</h3>
+        <p class="lumae-help">Lumae freezes catalogue and analysis publication before a
+          Navidrome ID transition can appear as mass deletion and addition.</p>
+        <div class="lumae-status-grid">{''.join(cards)}</div>
+        <div class="lumae-actions">
+          <a class="lumae-button lumae-button-secondary" href="/backup">Open AudioMuse Backup</a>
+          <a class="lumae-button lumae-button-secondary" href="/provider-migration">Open Provider Migration</a>
+          <a class="lumae-button lumae-button-secondary" href="">Check again</a>
+        </div>
+      </section>
+    """
+
+
 def render_settings(message=None, error=None):
     batch_size = configured_backfill_limit()
     paused = maintenance_paused()
@@ -4103,6 +4238,7 @@ def render_settings(message=None, error=None):
         </form>
       </section>
     """
+    identity_html = render_provider_identity_panel()
     return render_page(
         f"""
         <style>
@@ -4503,6 +4639,7 @@ def render_settings(message=None, error=None):
 
           {maintenance_html}
           {catalogue_html}
+          {identity_html}
           {readiness_html}
           {waveform_html}
           {relationships_html}
@@ -4648,6 +4785,7 @@ def register(ctx):
     if collections_enabled():
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
     ctx.on_install(migrate)
+    ctx.on_flask_start(observe_provider_identities_on_start)
     ctx.on_song_analyzed(analyze_song_hook)
     ctx.add_task("prepare", prepare_lumae_task, queue="default")
     ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
