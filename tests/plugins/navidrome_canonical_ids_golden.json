@@ -1,0 +1,98 @@
+{
+  "source": {
+    "pull_request": "https://github.com/navidrome/navidrome/pull/5824",
+    "head_branch": "uniform-canonical-ids",
+    "captured_at": "2026-08-02",
+    "alphabet": "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+  },
+  "vectors": [
+    {
+      "name": "zero 128-bit value",
+      "input": "00000000000000000000000000000000",
+      "expected": "0000000000000000000000",
+      "recognized": true,
+      "changed": true,
+      "shape": "hex32"
+    },
+    {
+      "name": "all-ff 128-bit value",
+      "input": "ffffffffffffffffffffffffffffffff",
+      "expected": "7N42dgm5tFLK9N8MT7fHC7",
+      "recognized": true,
+      "changed": true,
+      "shape": "hex32"
+    },
+    {
+      "name": "legacy 32-hex track id",
+      "input": "e3b7fc2ae9447bbec37a13bf916e3cf6",
+      "expected": "6VHl3uR4kss6sUPKA8Cwnk",
+      "recognized": true,
+      "changed": true,
+      "shape": "hex32"
+    },
+    {
+      "name": "playlist UUID",
+      "input": "f47ac10b-58cc-4372-a567-0e02b2c3d479",
+      "expected": "7rke2SAWaicSeSYzkhww6R",
+      "recognized": true,
+      "changed": true,
+      "shape": "uuid"
+    },
+    {
+      "name": "canonical hash-family id",
+      "input": "5cLJPkLA5DK2BADhoeotPk",
+      "expected": "5cLJPkLA5DK2BADhoeotPk",
+      "recognized": true,
+      "changed": false,
+      "shape": "base62_128"
+    },
+    {
+      "name": "overflowing random id",
+      "input": "zzzzzzzzzzzzzzzzzzzzzz",
+      "expected": "3LyqmwQBm5IRqlVjNYASwb",
+      "recognized": true,
+      "changed": true,
+      "shape": "base62_overflow"
+    },
+    {
+      "name": "empty value",
+      "input": "",
+      "expected": "",
+      "recognized": false,
+      "changed": false,
+      "shape": "unrecognized"
+    },
+    {
+      "name": "share id",
+      "input": "aB3xY9kQz1",
+      "expected": "aB3xY9kQz1",
+      "recognized": false,
+      "changed": false,
+      "shape": "unrecognized"
+    },
+    {
+      "name": "invalid 22-character value",
+      "input": "!!!!!!!!!!!!!!!!!!!!!!",
+      "expected": "!!!!!!!!!!!!!!!!!!!!!!",
+      "recognized": false,
+      "changed": false,
+      "shape": "unrecognized"
+    },
+    {
+      "name": "invalid 32-character value",
+      "input": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "expected": "zzzzzzzzzzzzzzzzzzzzzzzzzzzzzzzz",
+      "recognized": false,
+      "changed": false,
+      "shape": "unrecognized"
+    },
+    {
+      "name": "invalid UUID shape",
+      "input": "000000000000000000000000000000000000",
+      "expected": "000000000000000000000000000000000000",
+      "recognized": false,
+      "changed": false,
+      "shape": "unrecognized"
+    }
+  ]
+}
