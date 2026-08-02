@@ -1,5 +1,6 @@
 import base64
 import hashlib
+import json
 import os
 from datetime import datetime, timezone
 from html import escape
@@ -66,6 +67,7 @@ from .provider_identity_guard import (
     observe_provider_version,
     provider_transition_health,
 )
+from .provider_identity_rekey import read_transition_manifest
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -78,8 +80,8 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.1.0"
-CATALOG_SCHEMA_VERSION = 2
+PLUGIN_VERSION = "1.2.0"
+CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
     "dual_core_compat",
@@ -121,6 +123,7 @@ CATALOG_FEATURES = (
     "relationship_cursor_stream",
     "nonblocking_enrichment",
     "provider_identity_transition_shield_v1",
+    "provider_identity_rekey_v1",
 )
 CATALOG_FEATURE_ROUTES = {
     "bootstrap_leases": (
@@ -141,10 +144,14 @@ CATALOG_FEATURE_ROUTES = {
         ("/api/catalog/prepare", "POST"),
         ("/api/catalog/prepare/<operation_id>", "GET"),
     ),
+    "provider_identity_rekey_v1": (
+        ("/api/catalog/provider-identity/manifest", "GET"),
+    ),
 }
 BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
+PROVIDER_IDENTITY_RECHECK_TASK_TYPE = "plugin.lumae_analysis.provider_identity_recheck"
 ANALYSIS_PROJECTION_TASK_TYPE = "plugin.lumae_analysis.analysis_projection"
 DEFAULT_BACKFILL_BATCH_SIZE = 3
 MAX_BACKFILL_BATCH_SIZE = 10
@@ -366,6 +373,21 @@ def ensure_catalog_reconcile_schedule(db):
     cur.close()
 
 
+def ensure_provider_identity_recheck_schedule(db):
+    cur = db.cursor()
+    cur.execute(
+        "INSERT INTO cron (name, task_type, cron_expr, enabled) "
+        "VALUES (%s, %s, %s, TRUE) ON CONFLICT (task_type) DO UPDATE SET "
+        "cron_expr=EXCLUDED.cron_expr, enabled=TRUE",
+        (
+            PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
+            PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
+            "2,32 * * * *",
+        ),
+    )
+    cur.close()
+
+
 def ensure_analysis_projection_schedule(db):
     cur = db.cursor()
     cur.execute(
@@ -512,6 +534,30 @@ def enqueue_required_catalog_preparations(db=None):
                     "lumae_analysis could not record the failed preparation queue attempt"
                 )
     return queued
+
+
+def provider_identity_recheck_task(server_id=None):
+    """Run target scans only while a source is waiting at the identity barrier."""
+
+    db = get_db()
+    bridge = ProviderCatalogBridge()
+    candidates = [
+        server
+        for server in bridge.list_servers()
+        if server.get("supported") and (not server_id or server["server_id"] == server_id)
+    ]
+    results = []
+    for server in candidates:
+        sources = resolve_catalog_source(db, server_id=server["server_id"])
+        transition = (
+            provider_transition_health(db, sources[0]["catalog_instance_id"])
+            if len(sources) == 1
+            else None
+        )
+        if not transition or transition.get("state") != "transition_pending":
+            continue
+        results.append(refresh_catalog(server_id=server["server_id"], db=db, bridge=bridge))
+    return {"checked": len(results), "results": results}
 
 
 def observe_provider_identities_on_start():
@@ -702,6 +748,7 @@ def migrate(db):
     migrate_collections(db)
     ensure_catalog_refresh_schedule(db)
     ensure_catalog_reconcile_schedule(db)
+    ensure_provider_identity_recheck_schedule(db)
     ensure_analysis_projection_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
@@ -1316,6 +1363,7 @@ def catalog_health():
                         "audiomuse_projection_ingest_allowed"
                     ],
                     "provider_mutations_allowed": transition["provider_mutations_allowed"],
+                    "audiomuse_health": transition.get("audiomuse_health"),
                 }
                 if not transition["catalog_sync_allowed"] and server.get("v3_readiness"):
                     readiness = dict(server["v3_readiness"])
@@ -1747,6 +1795,32 @@ def catalog_changes_api():
         )
     except ValueError as exc:
         return _catalog_error("invalid_cursor", str(exc), 400)
+
+
+@bp.get("/api/catalog/provider-identity/manifest")
+def provider_identity_manifest_api():
+    try:
+        manifest = read_transition_manifest(
+            get_db(),
+            transition_id=request.args.get("transition_id"),
+            catalog_instance_id=request.args.get("catalog_instance_id"),
+        )
+    except KeyError:
+        return _catalog_error(
+            "transition_manifest_not_found",
+            "No retained provider identity manifest was found.",
+            404,
+        )
+    except ValueError as exc:
+        return _catalog_error("identity_required", str(exc), 400)
+    payload = json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2)
+    response = Response(payload, mimetype="application/json")
+    response.headers["Content-Disposition"] = (
+        f'attachment; filename="lumae-provider-rekey-{manifest["transition_id"]}.json"'
+    )
+    response.headers["Cache-Control"] = "private, no-store"
+    response.headers["Vary"] = "Authorization, Cookie"
+    return response
 
 
 @bp.get("/api/catalog/analysis/changes")
@@ -4175,21 +4249,47 @@ def render_provider_identity_panel():
         state = escape(str(transition.get("state") or "normal"))
         version = escape(str(transition.get("current_provider_version") or "unverified"))
         action = escape(str(transition.get("required_action") or "No action required"))
+        counts = transition.get("counts") or {}
+        baseline = (
+            "passed"
+            if transition.get("baseline_integrity") is True
+            else ("pending" if transition.get("baseline_integrity") is None else "failed")
+        )
+        audiomuse_health = escape(
+            str(transition.get("audiomuse_health") or "not checked")
+        )
+        scan_count = int(transition.get("target_scan_count") or 0)
+        manifest_link = ""
+        if transition.get("state") == "applied" and transition.get("transition_id"):
+            manifest_link = (
+                '<a class="lumae-button lumae-button-secondary" '
+                'href="/api/catalog/provider-identity/manifest?transition_id='
+                f'{escape(str(transition["transition_id"]))}">Download transition manifest</a>'
+            )
         cards.append(
             f"""
             <article class="lumae-status-card">
               <span>{escape(source['name'])}</span>
               <strong>{state}</strong>
               <small>Navidrome {version}</small>
+              <small>Stable target scans: {scan_count}/2</small>
+              <small>Exact changes: {int(counts.get('rekey', 0) or 0):,} rekeys,
+                {int(counts.get('addition', 0) or 0):,} additions,
+                {int(counts.get('confirmed_removal', 0) or 0):,} removals,
+                {int(counts.get('conflict', 0) or 0):,} conflicts</small>
+              <small>Stored analysis baseline: {baseline}; AudioMuse: {audiomuse_health}</small>
               <small>{action}</small>
+              <div class="lumae-actions">{manifest_link}</div>
             </article>
             """
         )
     return f"""
       <section class="lumae-panel" aria-label="Provider identity transition">
         <h3>Provider identity safety</h3>
-        <p class="lumae-help">Lumae freezes catalogue and analysis publication before a
-          Navidrome ID transition can appear as mass deletion and addition.</p>
+        <p class="lumae-help">Lumae freezes publication at the old complete generation,
+          requires two identical provider scans, and then applies only the exact Navidrome
+          canonical-ID transform in one database transaction. AudioMuse health is checked
+          separately and never authorizes the Lumae rekey.</p>
         <div class="lumae-status-grid">{''.join(cards)}</div>
         <div class="lumae-actions">
           <a class="lumae-button lumae-button-secondary" href="/backup">Open AudioMuse Backup</a>
@@ -4794,5 +4894,9 @@ def register(ctx):
         "relationship_preparation", relationship_preparation_task, queue="default"
     )
     ctx.add_cron_task("catalog_reconcile", catalog_reconcile_task, queue="default")
+    ctx.add_task("provider_identity_recheck", provider_identity_recheck_task, queue="default")
     ctx.add_cron_task("catalog_refresh", catalog_refresh_task, queue="default")
+    ctx.add_cron_task(
+        "provider_identity_recheck", provider_identity_recheck_task, queue="default"
+    )
     ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")
