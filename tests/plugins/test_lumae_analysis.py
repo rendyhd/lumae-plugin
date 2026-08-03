@@ -104,7 +104,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.1.0"
+    assert manifest["versions"][0]["version"] == "1.1.1"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -197,7 +197,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.1.0",
+        "plugin_version": "1.1.1",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -328,7 +328,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.1.0"
+    assert body["plugin_version"] == "1.1.1"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -8208,6 +8208,7 @@ class IdentityInspectionCursor(FakeCursor):
 
     def execute(self, sql, params=None):
         super().execute(sql, params)
+        self.db.executed.append((sql, params))
         if "SELECT COALESCE(c.published_generation" in sql:
             self.rows = [
                 (
@@ -8237,6 +8238,7 @@ class IdentityInspectionDb:
         self.transition_id = "transition-a"
         self.target_fingerprint = None
         self.target_scan_count = 0
+        self.executed = []
 
     def cursor(self):
         return IdentityInspectionCursor(self)
@@ -8256,6 +8258,59 @@ def test_identity_publication_requires_two_identical_full_target_scans():
     assert first["state"] == second["state"] == "transition_pending"
     assert first["target_scan_count"] == 1
     assert second["target_scan_count"] == 2
+
+
+def test_provider_identity_queries_lock_only_non_nullable_join_rows():
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    source_db = FakeDb(
+        [
+            (
+                "catalog-a",
+                7,
+                5,
+                "transition-a",
+                "normal",
+                None,
+                "0.63.2",
+                "0.63.2",
+                "pre_transition_version",
+                None,
+                {},
+                None,
+                None,
+                0,
+                None,
+                None,
+                {},
+                None,
+                None,
+                None,
+            )
+        ]
+    )
+    source = guard._source_state(source_db, "server-a", for_update=True)
+    source_query = " ".join(source_db.cursor_obj.executed[0][0].split())
+
+    inspection_db = IdentityInspectionDb("e3b7fc2ae9447bbec37a13bf916e3cf6")
+    guard.inspect_catalog_identity(
+        inspection_db,
+        "catalog-a",
+        ["e3b7fc2ae9447bbec37a13bf916e3cf6"],
+        "0.63.2",
+        "full-fp",
+    )
+    inspection_query = next(
+        " ".join(sql.split())
+        for sql, _params in inspection_db.executed
+        if "SELECT COALESCE(c.published_generation" in sql
+    )
+
+    assert source["catalog_instance_id"] == "catalog-a"
+    assert "LEFT JOIN" in source_query
+    assert "FOR UPDATE OF s" in source_query
+    assert "LEFT JOIN" in inspection_query
+    assert "FOR UPDATE OF c, p" in inspection_query
 
 
 def test_transient_probe_failure_does_not_discard_an_applied_transition(monkeypatch):

@@ -41,6 +41,13 @@ page. Pausing stops new catalogue, projection, waveform, and relationship work;
 it does not delete or hide already published catalogue, profile, collection, or
 relationship data.
 
+### Catalogue refresh fix in 1.1.1
+
+Provider-identity inspection now locks only mandatory catalogue and transition
+rows. PostgreSQL no longer receives a row-lock request for the nullable side of
+the optional analysis-state join, so refresh retries can publish normally while
+the previous complete generation remains available.
+
 ## Layout
 
 * `manifest.json` - the AudioMuse plugin catalog.

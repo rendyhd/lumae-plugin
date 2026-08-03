@@ -1,8 +1,12 @@
 # Catalogue sync operations
 
-Lumae Analysis 1.1.0 publishes catalogue schema 3. Schema 3 is additive to the
+Lumae Analysis 1.1.1 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
+
+Version 1.1.1 also narrows provider-identity row locks to mandatory catalogue
+and transition rows. Optional analysis state remains readable through its outer
+join without asking PostgreSQL to lock the nullable side of that join.
 
 Lumae Analysis 1.0.1 is a resource-safety release. Audio decoding and BS.1770
 filtering are streaming, waveform backfill queries and batches are bounded,

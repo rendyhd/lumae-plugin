@@ -225,7 +225,7 @@ def _source_state(db, server_id, for_update=False):
           LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
           LEFT JOIN {t('provider_identity_transitions')} p USING (catalog_instance_id)
          WHERE s.current_core_server_id=%s AND s.rebind_status='active'
-         {'FOR UPDATE' if for_update else ''}
+         {'FOR UPDATE OF s' if for_update else ''}
         """,
         (server_id,),
     )
@@ -478,7 +478,7 @@ def inspect_catalog_identity(
           LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
           JOIN {t('provider_identity_transitions')} p USING (catalog_instance_id)
          WHERE c.catalog_instance_id=%s
-         FOR UPDATE
+         FOR UPDATE OF c, p
         """,
         (catalog_instance_id,),
     )

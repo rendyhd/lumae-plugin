@@ -90,6 +90,14 @@
   },
   "versions": [
     {
+      "version": "1.1.1",
+      "min_core_version": "2.6.0",
+      "changelog": "Fix PostgreSQL catalogue refresh locking so provider-identity inspection locks only mandatory rows and safely preserves the last complete catalogue while optional analysis state is joined.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.1.zip",
+      "checksum": "105b3385dca41596a77e8187db0fe657"
+    },
+    {
       "version": "1.1.0",
       "min_core_version": "2.6.0",
       "changelog": "Detect, shield, and publish exact Navidrome canonical-ID transitions after two stable scans; preserve Lumae analysis and user state atomically; retain recovery evidence; gate fresh AudioMuse projection ingestion until its provider migration is healthy; and prune superseded snapshots plus bounded cursor journals without invalidating active bootstrap leases.",
