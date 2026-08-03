@@ -183,6 +183,7 @@ def test_plugin_manifest_has_lumae_identity():
             "nonblocking_enrichment",
             "provider_identity_transition_shield_v1",
             "provider_identity_rekey_v1",
+            "bounded_storage_retention",
         ],
     }
 
@@ -8022,7 +8023,13 @@ def test_refresh_shield_stops_before_provider_diff_publication(monkeypatch):
     bridge = RefreshBridge(
         {
             "libraries": [{"id": "library-1", "name": "Music"}],
-            "tracks": [{"id": "new-id", "title": "Song"}],
+            "tracks": [
+                {
+                    "id": "new-id",
+                    "title": "Song",
+                    "_lumae_library_ids": ["library-1"],
+                }
+            ],
         }
     )
     monkeypatch.setattr(
@@ -8630,3 +8637,165 @@ def test_transition_manifest_route_downloads_recovery_evidence(monkeypatch):
         "old_id": "old",
         "new_id": "new",
     }
+
+
+def test_snapshot_pruning_preserves_generations_pinned_by_active_leases():
+    from plugins.LumaeAnalysis import catalog
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+
+    cur = Cursor()
+    catalog.prune_snapshot_generations(cur, "catalog-a", "catalog", 27)
+
+    deletes = [
+        (sql, params)
+        for sql, params in cur.executed
+        if " AS stale" in sql and sql.lstrip().startswith("DELETE FROM")
+    ]
+    assert len(deletes) == len(catalog.CATALOG_GENERATION_TABLES)
+    assert all(params == ("catalog-a", 27, "catalog") for _sql, params in deletes)
+    assert all("lease.pinned_generation=stale.published_generation" in sql for sql, _ in deletes)
+    assert all("lease.expires_at>now()" in sql for sql, _ in deletes)
+    assert all("lease.completed_at IS NULL" in sql for sql, _ in deletes)
+
+
+def test_change_journal_compaction_advances_floor_and_deletes_expired_events():
+    from plugins.LumaeAnalysis import catalog
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+
+    cur = Cursor()
+    floor = catalog.compact_change_journal(
+        cur,
+        catalog_instance_id="catalog-a",
+        state_table="analysis_state",
+        changes_table="analysis_changes",
+        epoch_column="analysis_epoch",
+        floor_column="analysis_floor_seq",
+        epoch="epoch-a",
+        head_seq=212_002,
+        retention_limit=84_398,
+    )
+
+    assert floor == 127_604
+    assert cur.executed[0][1] == ("catalog-a", "epoch-a", "epoch-a", 127_604)
+    assert "seq<=%s" in cur.executed[0][0]
+    assert cur.executed[1][1] == (127_604, "catalog-a", "epoch-a")
+    assert "GREATEST(analysis_floor_seq, %s)" in cur.executed[1][0]
+
+
+def test_install_cleanup_prunes_backup_generations_and_bounds_core_journals():
+    from plugins.LumaeAnalysis import catalog
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+            self.rows = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+            if "SELECT c.catalog_instance_id" in sql:
+                self.rows = [
+                    (
+                        "catalog-a",
+                        27,
+                        "catalog-epoch",
+                        0,
+                        {"library": 2, "artist": 3478, "album": 1328, "track": 21569},
+                        10,
+                        "analysis-epoch",
+                        212_002,
+                        20_630,
+                        21_569,
+                    )
+                ]
+            else:
+                self.rows = []
+
+        def fetchall(self):
+            return list(self.rows)
+
+        def close(self):
+            pass
+
+    class Db:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+    db = Db()
+    catalog.prune_catalog_storage(db)
+
+    stale_deletes = [
+        params
+        for sql, params in db.cursor_obj.executed
+        if " AS stale" in sql and sql.lstrip().startswith("DELETE FROM")
+    ]
+    assert ("catalog-a", 27, "catalog") in stale_deletes
+    assert ("catalog-a", 10, "analysis") in stale_deletes
+    assert any(
+        params == (127_604, "catalog-a", "analysis-epoch")
+        and "analysis_floor_seq" in sql
+        for sql, params in db.cursor_obj.executed
+    )
+
+
+def test_enrichment_cleanup_bounds_relationship_history_to_two_snapshots():
+    from plugins.LumaeAnalysis import catalog_enrichment
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+            self.rows = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+            if "SELECT p.catalog_instance_id" in sql:
+                self.rows = [
+                    (
+                        "catalog-a",
+                        "profile-epoch",
+                        0,
+                        21_709,
+                        "relationship-epoch",
+                        7_620,
+                        1_324,
+                        581,
+                    )
+                ]
+            else:
+                self.rows = []
+
+        def fetchall(self):
+            return list(self.rows)
+
+        def close(self):
+            pass
+
+    class Db:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+    db = Db()
+    catalog_enrichment.compact_enrichment_storage(db)
+
+    assert any(
+        params == (3_810, "catalog-a", "relationship-epoch")
+        and "relationship_state" in sql
+        for sql, params in db.cursor_obj.executed
+    )

@@ -28,6 +28,8 @@ from plugin.api import get_db, table
 from .catalog import (
     CatalogScanError,
     canonical_json,
+    change_journal_retention_limit,
+    compact_change_journal,
     opaque_cursor,
     parse_opaque_cursor,
     resolve_catalog_source,
@@ -41,6 +43,7 @@ RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR = 96
 RELATIONSHIP_MAX_CANDIDATE_ENTITIES = 384
 RELATIONSHIP_ENTITY_SAMPLE_LIMIT = 160
 ENRICHMENT_STALE_HOURS = 2
+PROFILE_CHANGE_RETENTION_EVENTS = 50_000
 MOOD_FEATURE_NAMES = ("danceable", "aggressive", "happy", "party", "relaxed", "sad")
 
 _ALBUM_WEIGHTS = {
@@ -117,6 +120,53 @@ def _stream_state(cur, table_name, catalog_instance_id):
         (catalog_instance_id, epoch),
     )
     return epoch, 0, 0
+
+
+def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
+    """Bound profile and relationship journals during upgrades and maintenance."""
+    cur = cursor or db.cursor()
+    cur.execute(
+        f"""
+        SELECT p.catalog_instance_id, p.epoch, p.head_seq,
+               (SELECT COUNT(*) FROM {t('source_profiles')} AS profile
+                 WHERE profile.catalog_instance_id=p.catalog_instance_id),
+               r.epoch, r.head_seq, r.album_count, r.artist_count
+          FROM {t('profile_stream_state')} AS p
+          LEFT JOIN {t('relationship_state')} AS r USING (catalog_instance_id)
+         WHERE %s IS NULL OR p.catalog_instance_id=%s
+        """,
+        (catalog_instance_id, catalog_instance_id),
+    )
+    rows = cur.fetchall()
+    for row in rows:
+        source_id = str(row[0])
+        compact_change_journal(
+            cur,
+            catalog_instance_id=source_id,
+            state_table="profile_stream_state",
+            changes_table="profile_changes",
+            epoch_column="epoch",
+            floor_column="floor_seq",
+            epoch=row[1],
+            head_seq=row[2],
+            retention_limit=change_journal_retention_limit(row[3]),
+        )
+        if row[4] is not None:
+            compact_change_journal(
+                cur,
+                catalog_instance_id=source_id,
+                state_table="relationship_state",
+                changes_table="relationship_changes",
+                epoch_column="epoch",
+                floor_column="floor_seq",
+                epoch=row[4],
+                head_seq=row[5],
+                retention_limit=change_journal_retention_limit(
+                    int(row[6] or 0) + int(row[7] or 0)
+                ),
+            )
+    if cursor is None:
+        cur.close()
 
 
 def migrate_enrichment(db):
@@ -308,6 +358,17 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
         f"UPDATE {t('profile_stream_state')} "
         "SET head_seq=%s, updated_at=now() WHERE catalog_instance_id=%s",
         (seq, catalog_instance_id),
+    )
+    compact_change_journal(
+        cur,
+        catalog_instance_id=catalog_instance_id,
+        state_table="profile_stream_state",
+        changes_table="profile_changes",
+        epoch_column="epoch",
+        floor_column="floor_seq",
+        epoch=epoch,
+        head_seq=seq,
+        retention_limit=PROFILE_CHANGE_RETENTION_EVENTS,
     )
     return seq
 
@@ -1588,6 +1649,19 @@ def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None):
                 len(albums),
                 len(artists),
                 catalog_instance_id,
+            ),
+        )
+        compact_change_journal(
+            cur,
+            catalog_instance_id=catalog_instance_id,
+            state_table="relationship_state",
+            changes_table="relationship_changes",
+            epoch_column="epoch",
+            floor_column="floor_seq",
+            epoch=epoch,
+            head_seq=next_seq,
+            retention_limit=change_journal_retention_limit(
+                len(albums) + len(artists)
             ),
         )
         db.commit()

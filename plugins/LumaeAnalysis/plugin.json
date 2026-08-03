@@ -83,7 +83,8 @@
         "relationship_cursor_stream",
         "nonblocking_enrichment",
         "provider_identity_transition_shield_v1",
-        "provider_identity_rekey_v1"
+        "provider_identity_rekey_v1",
+        "bounded_storage_retention"
       ]
     }
   },
@@ -91,7 +92,7 @@
     {
       "version": "1.2.0",
       "min_core_version": "2.6.0",
-      "changelog": "Publish exact Navidrome canonical-ID transitions after two stable scans, preserve Lumae analysis and user state atomically, retain recovery evidence, and gate only fresh AudioMuse projection ingestion until its provider migration is healthy.",
+      "changelog": "Publish exact Navidrome canonical-ID transitions after two stable scans, preserve Lumae analysis and user state atomically, retain recovery evidence, gate fresh AudioMuse projection ingestion until its provider migration is healthy, and prune superseded snapshots plus bounded cursor journals without invalidating active bootstrap leases.",
       "imageUrl": "",
       "sourceUrl": "",
       "checksum": ""

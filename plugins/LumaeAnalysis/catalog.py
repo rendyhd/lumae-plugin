@@ -24,10 +24,168 @@ CATALOG_BUILDER_VERSION = 5
 CATALOG_FINGERPRINT_SCHEMA_VERSION = 2
 CHANGE_EVENT_OVERHEAD_BYTES = 192
 SNAPSHOT_ENTITY_OVERHEAD_BYTES = 96
+MIN_RETAINED_CHANGE_EVENTS = 1_000
+CHANGE_EVENT_SNAPSHOT_MULTIPLIER = 2
+
+CATALOG_GENERATION_TABLES = (
+    "catalog_libraries",
+    "catalog_artists",
+    "catalog_albums",
+    "catalog_tracks",
+    "catalog_track_artists",
+    "catalog_album_artists",
+    "catalog_entity_libraries",
+    "catalog_disc_titles",
+)
+ANALYSIS_GENERATION_TABLES = (
+    "analysis_items",
+    "track_analysis_links",
+)
 
 
 def t(name):
     return table(name)
+
+
+def change_journal_retention_limit(entity_count):
+    """Keep enough events for two complete logical snapshots, with a small floor."""
+    return max(
+        MIN_RETAINED_CHANGE_EVENTS,
+        max(0, int(entity_count or 0)) * CHANGE_EVENT_SNAPSHOT_MULTIPLIER,
+    )
+
+
+def compact_change_journal(
+    cur,
+    *,
+    catalog_instance_id,
+    state_table,
+    changes_table,
+    epoch_column,
+    floor_column,
+    epoch,
+    head_seq,
+    retention_limit,
+):
+    """Bound one cursor journal and advance its bootstrap floor atomically."""
+    retained = max(MIN_RETAINED_CHANGE_EVENTS, int(retention_limit or 0))
+    target_floor = max(0, int(head_seq or 0) - retained)
+    if target_floor > 0:
+        cur.execute(
+            f"""
+            DELETE FROM {t(changes_table)}
+             WHERE catalog_instance_id=%s
+               AND (epoch<>%s OR (epoch=%s AND seq<=%s))
+            """,
+            (catalog_instance_id, str(epoch), str(epoch), target_floor),
+        )
+        cur.execute(
+            f"""
+            UPDATE {t(state_table)}
+               SET {floor_column}=GREATEST({floor_column}, %s), updated_at=now()
+             WHERE catalog_instance_id=%s AND {epoch_column}=%s
+            """,
+            (target_floor, catalog_instance_id, str(epoch)),
+        )
+    else:
+        cur.execute(
+            f"DELETE FROM {t(changes_table)} "
+            "WHERE catalog_instance_id=%s AND epoch<>%s",
+            (catalog_instance_id, str(epoch)),
+        )
+    return target_floor
+
+
+def prune_snapshot_generations(cur, catalog_instance_id, stream, active_generation):
+    """Delete superseded snapshots unless an unexpired bootstrap lease pins them."""
+    if stream == "catalog":
+        generation_column = "published_generation"
+        table_names = CATALOG_GENERATION_TABLES
+    elif stream == "analysis":
+        generation_column = "projection_generation"
+        table_names = ANALYSIS_GENERATION_TABLES
+    else:
+        raise ValueError("Unknown snapshot stream")
+    active_generation = int(active_generation or 0)
+    if active_generation <= 0:
+        return
+    cur.execute(
+        f"DELETE FROM {t('stream_bootstrap_sessions')} "
+        "WHERE expires_at<=now() OR completed_at IS NOT NULL"
+    )
+    for table_name in table_names:
+        cur.execute(
+            f"""
+            DELETE FROM {t(table_name)} AS stale
+             WHERE stale.catalog_instance_id=%s
+               AND stale.{generation_column}<%s
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM {t('stream_bootstrap_sessions')} AS lease
+                    WHERE lease.catalog_instance_id=stale.catalog_instance_id
+                      AND lease.stream=%s
+                      AND lease.pinned_generation=stale.{generation_column}
+                      AND lease.expires_at>now()
+                      AND lease.completed_at IS NULL
+               )
+            """,
+            (catalog_instance_id, active_generation, stream),
+        )
+
+
+def prune_catalog_storage(db, catalog_instance_id=None, cursor=None):
+    """Run idempotent install-time cleanup for snapshots and core change journals."""
+    cur = cursor or db.cursor()
+    cur.execute(
+        f"""
+        SELECT c.catalog_instance_id, c.published_generation, c.catalog_epoch,
+               c.catalog_head_seq, c.entity_counts,
+               COALESCE(a.projection_generation, 0), COALESCE(a.analysis_epoch, ''),
+               COALESCE(a.analysis_head_seq, 0), COALESCE(a.item_count, 0),
+               COALESCE(a.mapped_track_count, 0)
+          FROM {t('catalog_state')} AS c
+          LEFT JOIN {t('analysis_state')} AS a USING (catalog_instance_id)
+         WHERE %s IS NULL OR c.catalog_instance_id=%s
+        """,
+        (catalog_instance_id, catalog_instance_id),
+    )
+    rows = cur.fetchall()
+    for row in rows:
+        source_id = str(row[0])
+        catalog_generation = int(row[1] or 0)
+        catalog_counts = _state_counts(row[4])
+        analysis_generation = int(row[5] or 0)
+        prune_snapshot_generations(cur, source_id, "catalog", catalog_generation)
+        prune_snapshot_generations(cur, source_id, "analysis", analysis_generation)
+        compact_change_journal(
+            cur,
+            catalog_instance_id=source_id,
+            state_table="catalog_state",
+            changes_table="catalog_changes",
+            epoch_column="catalog_epoch",
+            floor_column="catalog_floor_seq",
+            epoch=row[2],
+            head_seq=row[3],
+            retention_limit=change_journal_retention_limit(
+                sum(int(value or 0) for value in catalog_counts.values())
+            ),
+        )
+        if analysis_generation > 0:
+            compact_change_journal(
+                cur,
+                catalog_instance_id=source_id,
+                state_table="analysis_state",
+                changes_table="analysis_changes",
+                epoch_column="analysis_epoch",
+                floor_column="analysis_floor_seq",
+                epoch=row[6],
+                head_seq=row[7],
+                retention_limit=change_journal_retention_limit(
+                    int(row[8] or 0) + int(row[9] or 0)
+                ),
+            )
+    if cursor is None:
+        cur.close()
 
 
 def utc_now():
@@ -1850,6 +2008,18 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             f"UPDATE {t('catalog_scans')} SET status='complete', completed_at=now(), "
             "progress=%s::jsonb WHERE scan_id=%s",
             (_json_param(progress), scan_id),
+        )
+        prune_snapshot_generations(cur, catalog_instance_id, "catalog", generation)
+        compact_change_journal(
+            cur,
+            catalog_instance_id=catalog_instance_id,
+            state_table="catalog_state",
+            changes_table="catalog_changes",
+            epoch_column="catalog_epoch",
+            floor_column="catalog_floor_seq",
+            epoch=publication_epoch,
+            head_seq=next_seq,
+            retention_limit=change_journal_retention_limit(sum(counts.values())),
         )
         cur.close()
         db.commit()

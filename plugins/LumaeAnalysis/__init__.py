@@ -30,6 +30,7 @@ from .catalog import (
     create_bootstrap_session,
     ensure_catalog_sources,
     migrate_catalog,
+    prune_catalog_storage,
     read_catalog_changes,
     refresh_catalog,
     release_bootstrap_session,
@@ -48,6 +49,7 @@ from .catalog_enrichment import (
     RELATIONSHIP_ALGORITHM_VERSION,
     RELATIONSHIP_SCHEMA_VERSION,
     claim_relationship_preparation,
+    compact_enrichment_storage,
     migrate_enrichment,
     prepare_relationships,
     profile_bootstrap_page,
@@ -124,6 +126,7 @@ CATALOG_FEATURES = (
     "nonblocking_enrichment",
     "provider_identity_transition_shield_v1",
     "provider_identity_rekey_v1",
+    "bounded_storage_retention",
 )
 CATALOG_FEATURE_ROUTES = {
     "bootstrap_leases": (
@@ -745,6 +748,8 @@ def migrate(db):
     )
     cur.close()
     migrate_enrichment(db)
+    prune_catalog_storage(db)
+    compact_enrichment_storage(db)
     migrate_collections(db)
     ensure_catalog_refresh_schedule(db)
     ensure_catalog_reconcile_schedule(db)

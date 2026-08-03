@@ -14,9 +14,12 @@ from plugin.api import config, get_db, table
 from .catalog import (
     CatalogScanError,
     canonical_json,
+    change_journal_retention_limit,
+    compact_change_journal,
     fingerprint,
     opaque_cursor,
     parse_opaque_cursor,
+    prune_snapshot_generations,
     resolve_catalog_source,
 )
 from .core_compat import get_core_adapter
@@ -633,6 +636,18 @@ def project_analysis(server_id=None, db=None, adapter=None):
          WHERE catalog_instance_id=%s
         """,
         (generation, next_seq, len(analysis), len(links), catalog_instance_id),
+    )
+    prune_snapshot_generations(cur, catalog_instance_id, "analysis", generation)
+    compact_change_journal(
+        cur,
+        catalog_instance_id=catalog_instance_id,
+        state_table="analysis_state",
+        changes_table="analysis_changes",
+        epoch_column="analysis_epoch",
+        floor_column="analysis_floor_seq",
+        epoch=epoch,
+        head_seq=next_seq,
+        retention_limit=change_journal_retention_limit(len(analysis) + len(links)),
     )
     cur.close()
     db.commit()

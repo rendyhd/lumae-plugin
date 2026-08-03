@@ -28,6 +28,20 @@ The settings page includes a maintenance pause. It prevents new catalogue,
 projection, waveform, and relationship work while preserving all published
 data. Resume it from the same page after diagnosing server pressure.
 
+## Storage retention
+
+Catalogue and analysis publications keep the active generation plus any older
+generation pinned by an unexpired bootstrap lease. Superseded, unpinned rows
+are deleted in the same transaction that publishes their replacement. Plugin
+migration runs the same idempotent cleanup so installations created before
+1.2.0 shed accumulated historical generations on upgrade.
+
+Catalogue, analysis, profile, and relationship change journals retain at least
+1,000 events and normally enough events for two complete logical snapshots.
+Compaction advances each stream's floor atomically. A client whose cursor falls
+below that floor receives `bootstrap_required` through the existing cursor
+contract and cannot silently miss changes.
+
 Lumae Analysis 0.9.1 normalized structured provider artist identities before
 publishing catalogue display fields and relationship keys. Its catalogue
 builder version bump forces existing malformed rows to be rebuilt. The 0.9.0
