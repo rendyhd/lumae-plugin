@@ -95,7 +95,7 @@
       "changelog": "Close the plugin-upgrade ordering race by forcing one idempotent analysis-projection check after install, even when Flask startup already marked the completed AudioMuse migration ready; recurring rechecks remain no-op once reconciled.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.4.zip",
-      "checksum": ""
+      "checksum": "7ce6de7e9f99e8c19580c6c11d1eee8a"
     },
     {
       "version": "1.1.3",
