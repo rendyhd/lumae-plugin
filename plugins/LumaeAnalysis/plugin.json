@@ -90,6 +90,14 @@
   },
   "versions": [
     {
+      "version": "1.1.2",
+      "min_core_version": "2.6.0",
+      "changelog": "Treat Navidrome prerelease, snapshot, branch, and unknown builds as uncertain transition builds so canonical-ID inspection runs even when a develop build retains the last safe numeric version.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.2.zip",
+      "checksum": "9c32e068b4e9d15d66dbb4591bba50fc"
+    },
+    {
       "version": "1.1.1",
       "min_core_version": "2.6.0",
       "changelog": "Fix PostgreSQL catalogue refresh locking so provider-identity inspection locks only mandatory rows and safely preserves the last complete catalogue while optional analysis state is joined.",

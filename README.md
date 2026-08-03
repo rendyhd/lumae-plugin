@@ -41,6 +41,13 @@ page. Pausing stops new catalogue, projection, waveform, and relationship work;
 it does not delete or hide already published catalogue, profile, collection, or
 relationship data.
 
+### Develop-build transition guard in 1.1.2
+
+Navidrome prerelease, snapshot, branch, and unknown builds are always treated
+as uncertain identity builds. This catches develop builds that contain the
+canonical-ID migration while still reporting the last safe numeric release,
+and forces two exact provider scans before Lumae publishes any ID changes.
+
 ### Catalogue refresh fix in 1.1.1
 
 Provider-identity inspection now locks only mandatory catalogue and transition
