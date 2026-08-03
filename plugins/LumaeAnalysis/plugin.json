@@ -95,7 +95,7 @@
       "changelog": "Make projection release durable across mixed old/new worker startup: plugin migration records a database reconciliation request, argument-compatible startup and scheduled rechecks retry it, and only a successful atomic projection clears it.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.5.zip",
-      "checksum": ""
+      "checksum": "d34ed3ad1f60894bf264ae8cafb8d70e"
     },
     {
       "version": "1.1.4",
