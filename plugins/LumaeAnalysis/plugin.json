@@ -95,7 +95,7 @@
       "changelog": "Fix PostgreSQL catalogue refresh locking so provider-identity inspection locks only mandatory rows and safely preserves the last complete catalogue while optional analysis state is joined.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.1.zip",
-      "checksum": "105b3385dca41596a77e8187db0fe657"
+      "checksum": "3b3131102e51d290064bb82451ea62f5"
     },
     {
       "version": "1.1.0",
