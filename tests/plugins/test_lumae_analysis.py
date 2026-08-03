@@ -8260,6 +8260,42 @@ def test_identity_publication_requires_two_identical_full_target_scans():
     assert second["target_scan_count"] == 2
 
 
+def test_target_scan_fingerprint_treats_contributor_order_as_unordered():
+    from copy import deepcopy
+
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+    from plugins.LumaeAnalysis.provider_identity_rekey import target_scan_fingerprint
+
+    first = normalize_provider_catalog(
+        {
+            "tracks": [
+                {
+                    "id": "track-a",
+                    "title": "Song",
+                    "contributors": [
+                        {"role": "composer", "artist": {"id": "a", "name": "A"}},
+                        {"role": "producer", "artist": {"id": "b", "name": "B"}},
+                    ],
+                    "genres": ["Rock", "Alternative"],
+                }
+            ]
+        },
+        "navidrome",
+    )
+    reordered = deepcopy(first)
+    reordered["tracks"][0]["payload"]["contributors"].reverse()
+
+    assert target_scan_fingerprint(first) == target_scan_fingerprint(reordered)
+
+    changed = deepcopy(reordered)
+    changed["tracks"][0]["payload"]["contributors"][0]["role"] = "lyricist"
+    assert target_scan_fingerprint(first) != target_scan_fingerprint(changed)
+
+    reordered_genres = deepcopy(first)
+    reordered_genres["tracks"][0]["payload"]["genres"].reverse()
+    assert target_scan_fingerprint(first) != target_scan_fingerprint(reordered_genres)
+
+
 def test_provider_identity_queries_lock_only_non_nullable_join_rows():
     from plugins.LumaeAnalysis import provider_identity_guard as guard
 

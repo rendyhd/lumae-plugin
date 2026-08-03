@@ -92,10 +92,10 @@
     {
       "version": "1.1.2",
       "min_core_version": "2.6.0",
-      "changelog": "Treat Navidrome prerelease, snapshot, branch, and unknown builds as uncertain transition builds so canonical-ID inspection runs even when a develop build retains the last safe numeric version.",
+      "changelog": "Treat Navidrome prerelease, snapshot, branch, and unknown builds as uncertain transition builds so canonical-ID inspection runs even when a develop build retains the last safe numeric version, and canonicalize unordered contributor records so the required two stable scans cannot be reset by equivalent provider row ordering.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.2.zip",
-      "checksum": "9c32e068b4e9d15d66dbb4591bba50fc"
+      "checksum": "34c90a56b69ca0a38faa9f7e4e12b347"
     },
     {
       "version": "1.1.1",

@@ -152,6 +152,24 @@ def build_provider_identity_rekey_plan(previous, normalized):
 def target_scan_fingerprint(normalized):
     from .catalog import canonical_json
 
+    def stable_value(value, parent_key=None):
+        if isinstance(value, dict):
+            return {
+                key: stable_value(item, str(key))
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            items = [stable_value(item) for item in value]
+            # Navidrome's contributor query does not promise a row order. The
+            # contributor objects have roles and identities but no position,
+            # so permutations represent the same provider snapshot. Keep all
+            # other arrays order-sensitive.
+            if str(parent_key or "").casefold() == "contributors":
+                items.sort(key=canonical_json)
+            return items
+        return value
+
+    normalized = stable_value(normalized)
     stable = {
         key: sorted(list(rows), key=canonical_json)
         for key, rows in normalized.items()
