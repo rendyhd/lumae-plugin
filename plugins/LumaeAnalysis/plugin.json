@@ -90,17 +90,9 @@
   },
   "versions": [
     {
-      "version": "1.2.0",
-      "min_core_version": "2.6.0",
-      "changelog": "Publish exact Navidrome canonical-ID transitions after two stable scans, preserve Lumae analysis and user state atomically, retain recovery evidence, gate fresh AudioMuse projection ingestion until its provider migration is healthy, and prune superseded snapshots plus bounded cursor journals without invalidating active bootstrap leases.",
-      "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
-    },
-    {
       "version": "1.1.0",
       "min_core_version": "2.6.0",
-      "changelog": "Detect and shield Navidrome canonical-ID transitions before catalogue diffs or analysis projection ingestion, while preserving the last complete Lumae generations.",
+      "changelog": "Detect, shield, and publish exact Navidrome canonical-ID transitions after two stable scans; preserve Lumae analysis and user state atomically; retain recovery evidence; gate fresh AudioMuse projection ingestion until its provider migration is healthy; and prune superseded snapshots plus bounded cursor journals without invalidating active bootstrap leases.",
       "imageUrl": "",
       "sourceUrl": "",
       "checksum": ""

@@ -1,6 +1,6 @@
 # Catalogue sync operations
 
-Lumae Analysis 1.2.0 publishes catalogue schema 3. Schema 3 is additive to the
+Lumae Analysis 1.1.0 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
 
@@ -34,7 +34,7 @@ Catalogue and analysis publications keep the active generation plus any older
 generation pinned by an unexpired bootstrap lease. Superseded, unpinned rows
 are deleted in the same transaction that publishes their replacement. Plugin
 migration runs the same idempotent cleanup so installations created before
-1.2.0 shed accumulated historical generations on upgrade.
+1.1.0 shed accumulated historical generations on upgrade.
 
 Catalogue, analysis, profile, and relationship change journals retain at least
 1,000 events and normally enough events for two complete logical snapshots.
