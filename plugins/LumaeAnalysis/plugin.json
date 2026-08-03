@@ -90,6 +90,14 @@
   },
   "versions": [
     {
+      "version": "1.1.3",
+      "min_core_version": "2.6.0",
+      "changelog": "Allow a completed AudioMuse provider migration to hand off legitimate post-analysis fingerprint relinks to the normal atomic analysis projection while retaining the protected pre-transition generation; contradictory duplicate mappings still fail closed.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.3.zip",
+      "checksum": ""
+    },
+    {
       "version": "1.1.2",
       "min_core_version": "2.6.0",
       "changelog": "Treat Navidrome prerelease, snapshot, branch, and unknown builds as uncertain transition builds so canonical-ID inspection runs even when a develop build retains the last safe numeric version, and canonicalize unordered contributor records so the required two stable scans cannot be reset by equivalent provider row ordering.",

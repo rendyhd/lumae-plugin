@@ -1,8 +1,13 @@
 # Catalogue sync operations
 
-Lumae Analysis 1.1.2 publishes catalogue schema 3. Schema 3 is additive to the
+Lumae Analysis 1.1.3 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
+
+Version 1.1.3 treats the migrated provider track ID as the identity invariant
+and leaves analysis grouping to AudioMuse. A complete, non-contradictory
+AudioMuse mapping may therefore replace carried analysis IDs after fingerprint
+cleanup or re-analysis; the plugin publishes that projection atomically.
 
 Version 1.1.2 treats every Navidrome prerelease, snapshot, branch, or unknown
 build as uncertain, even when it retains the numeric version of the last safe
@@ -140,10 +145,14 @@ Any error rolls back the transaction. There is no fuzzy matcher, manual rekey
 button, AudioMuse-derived authorization, or plugin-local backup engine.
 
 After publication, catalogue and carried analysis sync are safe. Fresh
-AudioMuse projection ingestion remains paused until its new provider IDs map to
-the same analysis IDs. Health reports `ready`, `migration_required`, `busy`, or
-`repair_required`; the ordinary AudioMuse Provider Migration is sufficient when
-it produces those exact mappings.
+AudioMuse projection ingestion remains paused until every provider ID that had
+carried analysis has a current AudioMuse mapping. AudioMuse may legitimately
+reassign canonical analysis IDs during its later analysis/cleaning pass; once
+the provider-ID mapping is complete, the plugin publishes that current grouping
+as a normal atomic analysis generation. Health reports `ready`,
+`migration_required`, `busy`, or `repair_required`; the ordinary AudioMuse
+Provider Migration is sufficient. `repair_required` is reserved for internally
+contradictory mappings, not a valid change in canonical analysis grouping.
 
 Download retained evidence from:
 

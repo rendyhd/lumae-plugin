@@ -104,7 +104,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.1.2"
+    assert manifest["versions"][0]["version"] == "1.1.3"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -197,7 +197,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.1.2",
+        "plugin_version": "1.1.3",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -328,7 +328,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.1.2"
+    assert body["plugin_version"] == "1.1.3"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -4142,7 +4142,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     mod.migrate(db)
 
     assert db.commits == 1
-    assert queued == []
+    assert queued == [((mod.provider_identity_recheck_task,), {"queue": "default"})]
     assert (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
@@ -8382,7 +8382,7 @@ def test_transient_probe_failure_does_not_discard_an_applied_transition(monkeypa
     assert captured["required_action"] == "retry_provider_identity_check"
 
 
-def test_identity_recheck_schedule_scans_only_pending_sources(monkeypatch):
+def test_identity_recheck_schedule_skips_normal_sources(monkeypatch):
     mod = load_plugin()
 
     class Bridge:
@@ -8412,6 +8412,71 @@ def test_identity_recheck_schedule_scans_only_pending_sources(monkeypatch):
         assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
     finally:
         refresh.undo()
+
+
+def test_identity_recheck_releases_completed_migration_and_queues_projection(monkeypatch):
+    mod = load_plugin()
+
+    class Bridge:
+        @staticmethod
+        def list_servers():
+            return [{"server_id": "server-a", "supported": True}]
+
+    class Db:
+        commits = 0
+        rollbacks = 0
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    db = Db()
+    queued = []
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: "adapter-a")
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
+    monkeypatch.setattr(
+        mod,
+        "resolve_catalog_source",
+        lambda *_args, **_kwargs: [{"catalog_instance_id": "catalog-a"}],
+    )
+    monkeypatch.setattr(
+        mod,
+        "provider_transition_health",
+        lambda *_args: {"state": "applied", "audiomuse_health": "repair_required"},
+    )
+    monkeypatch.setattr(mod, "refresh_audiomuse_health", lambda *_args, **_kwargs: "ready")
+    monkeypatch.setattr(
+        mod,
+        "enqueue_bounded",
+        lambda func, *args, **kwargs: queued.append((func, args, kwargs)),
+    )
+
+    result = mod.provider_identity_recheck_task()
+
+    assert result == {
+        "checked": 1,
+        "results": [
+            {
+                "catalog_instance_id": "catalog-a",
+                "server_id": "server-a",
+                "previous_health": "repair_required",
+                "audiomuse_health": "ready",
+                "projection_queued": True,
+            }
+        ],
+    }
+    assert queued == [
+        (
+            mod.analysis_projection_task,
+            ("server-a",),
+            {"queue": "default", "timeout": mod.PROJECTION_JOB_TIMEOUT_SECONDS},
+        )
+    ]
+    assert db.commits == 1
+    assert db.rollbacks == 0
 
 
 class PublisherCursor(FakeCursor):
@@ -8683,11 +8748,18 @@ class AudioMuseHealthCursor(FakeCursor):
     [
         (1, [], "busy"),
         (0, [], "migration_required"),
-        (0, [("track-new", "different-analysis")], "repair_required"),
+        (0, [("track-new", "different-analysis")], "ready"),
+        (
+            0,
+            [("track-new", "analysis-1"), ("track-new", "different-analysis")],
+            "repair_required",
+        ),
         (0, [("track-new", "analysis-1")], "ready"),
     ],
 )
-def test_audiomuse_health_is_independent_and_exact(active_tasks, mappings, expected):
+def test_audiomuse_health_requires_new_provider_ids_but_allows_analysis_relinking(
+    active_tasks, mappings, expected
+):
     from plugins.LumaeAnalysis.provider_identity_rekey import inspect_audiomuse_health
 
     links = {"track-new": {"analysis_id": "analysis-1"}}

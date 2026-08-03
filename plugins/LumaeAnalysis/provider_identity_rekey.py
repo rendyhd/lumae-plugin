@@ -486,7 +486,16 @@ def _copy_analysis_generation(
 
 
 def inspect_audiomuse_health(cur, adapter, server_id, expected_links):
-    """Classify AudioMuse independently from Lumae's publication decision."""
+    """Classify whether AudioMuse has moved its mappings to the new provider IDs.
+
+    The provider migration owns provider IDs, while AudioMuse owns canonical
+    analysis IDs. A later analysis/cleaning pass may legitimately regroup a
+    provider track under a different fingerprint ID, so equality with the
+    carried pre-migration analysis ID is not migration evidence. Lumae keeps
+    serving that carried generation until every previously mapped provider ID
+    exists, then lets the normal atomic projection publish AudioMuse's current
+    grouping.
+    """
 
     cur.execute(
         """
@@ -509,11 +518,15 @@ def inspect_audiomuse_health(cur, adapter, server_id, expected_links):
         return "ready"
     sql = adapter.analysis_mapping_sql()
     cur.execute(sql, (server_id,) if "%s" in sql else None)
-    actual = {
-        str(row[0]): str(row[1]) if row[1] is not None else None
-        for row in cur.fetchall()
-    }
-    if any(actual.get(track_id) not in (None, analysis_id) for track_id, analysis_id in expected.items()):
+    actual = {}
+    conflicting = False
+    for row in cur.fetchall():
+        track_id = str(row[0])
+        analysis_id = str(row[1]) if row[1] is not None else None
+        if track_id in actual and actual[track_id] != analysis_id:
+            conflicting = True
+        actual[track_id] = analysis_id
+    if conflicting:
         return "repair_required"
     if any(actual.get(track_id) is None for track_id in expected):
         return "migration_required"

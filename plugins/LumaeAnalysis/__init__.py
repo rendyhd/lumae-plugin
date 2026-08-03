@@ -69,7 +69,7 @@ from .provider_identity_guard import (
     observe_provider_version,
     provider_transition_health,
 )
-from .provider_identity_rekey import read_transition_manifest
+from .provider_identity_rekey import read_transition_manifest, refresh_audiomuse_health
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -82,7 +82,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.1.2"
+PLUGIN_VERSION = "1.1.3"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -540,10 +540,11 @@ def enqueue_required_catalog_preparations(db=None):
 
 
 def provider_identity_recheck_task(server_id=None):
-    """Run target scans only while a source is waiting at the identity barrier."""
+    """Advance pending ID proofs and hand completed AudioMuse migrations off."""
 
     db = get_db()
     bridge = ProviderCatalogBridge()
+    adapter = get_core_adapter()
     candidates = [
         server
         for server in bridge.list_servers()
@@ -557,9 +558,47 @@ def provider_identity_recheck_task(server_id=None):
             if len(sources) == 1
             else None
         )
-        if not transition or transition.get("state") != "transition_pending":
+        if not transition:
             continue
-        results.append(refresh_catalog(server_id=server["server_id"], db=db, bridge=bridge))
+        if transition.get("state") == "transition_pending":
+            results.append(refresh_catalog(server_id=server["server_id"], db=db, bridge=bridge))
+            continue
+        if transition.get("state") != "applied" or transition.get("audiomuse_health") == "ready":
+            continue
+        result = {
+            "catalog_instance_id": sources[0]["catalog_instance_id"],
+            "server_id": server["server_id"],
+            "previous_health": transition.get("audiomuse_health"),
+            "projection_queued": False,
+        }
+        try:
+            health = refresh_audiomuse_health(
+                db,
+                sources[0]["catalog_instance_id"],
+                server["server_id"],
+                adapter,
+                commit=False,
+            )
+            result["audiomuse_health"] = health
+            if health == "ready":
+                enqueue_bounded(
+                    analysis_projection_task,
+                    server["server_id"],
+                    queue="default",
+                    timeout=PROJECTION_JOB_TIMEOUT_SECONDS,
+                )
+                result["projection_queued"] = True
+            db.commit()
+        except Exception as exc:
+            rollback = getattr(db, "rollback", None)
+            if callable(rollback):
+                rollback()
+            logger.exception(
+                "lumae_analysis could not reconcile AudioMuse provider migration for %s",
+                server["server_id"],
+            )
+            result["error"] = str(exc)
+        results.append(result)
     return {"checked": len(results), "results": results}
 
 
@@ -762,6 +801,15 @@ def migrate(db):
     # is admitted here; ordinary analysis hooks and explicit prepare requests
     # own later enrichment.
     enqueue_required_catalog_preparations(db=db)
+    # A plugin update may itself fix transition-health classification. Queue a
+    # small reconciliation pass so an already-completed provider migration can
+    # release and republish the current AudioMuse projection without waiting for
+    # the next cron tick or requiring another analysis run.
+    enqueue_bounded(
+        provider_identity_recheck_task,
+        queue="default",
+        timeout=PROJECTION_JOB_TIMEOUT_SECONDS,
+    )
 
 
 def parse_ids(value):
