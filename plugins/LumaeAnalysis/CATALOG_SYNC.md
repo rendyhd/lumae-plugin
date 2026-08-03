@@ -1,8 +1,13 @@
 # Catalogue sync operations
 
-Lumae Analysis 1.1.3 publishes catalogue schema 3. Schema 3 is additive to the
+Lumae Analysis 1.1.4 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
+
+Version 1.1.4 forces one idempotent projection check after a plugin upgrade.
+This closes the startup race where the Flask process could mark a completed
+AudioMuse migration ready just before the background recheck ran. Recurring
+checks still skip work after the projection has been reconciled.
 
 Version 1.1.3 treats the migrated provider track ID as the identity invariant
 and leaves analysis grouping to AudioMuse. A complete, non-contradictory

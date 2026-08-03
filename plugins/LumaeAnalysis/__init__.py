@@ -82,7 +82,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.1.3"
+PLUGIN_VERSION = "1.1.4"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -539,7 +539,7 @@ def enqueue_required_catalog_preparations(db=None):
     return queued
 
 
-def provider_identity_recheck_task(server_id=None):
+def provider_identity_recheck_task(server_id=None, force_projection_check=False):
     """Advance pending ID proofs and hand completed AudioMuse migrations off."""
 
     db = get_db()
@@ -563,22 +563,27 @@ def provider_identity_recheck_task(server_id=None):
         if transition.get("state") == "transition_pending":
             results.append(refresh_catalog(server_id=server["server_id"], db=db, bridge=bridge))
             continue
-        if transition.get("state") != "applied" or transition.get("audiomuse_health") == "ready":
+        if transition.get("state") != "applied":
+            continue
+        previous_health = transition.get("audiomuse_health")
+        if previous_health == "ready" and not force_projection_check:
             continue
         result = {
             "catalog_instance_id": sources[0]["catalog_instance_id"],
             "server_id": server["server_id"],
-            "previous_health": transition.get("audiomuse_health"),
+            "previous_health": previous_health,
             "projection_queued": False,
         }
         try:
-            health = refresh_audiomuse_health(
-                db,
-                sources[0]["catalog_instance_id"],
-                server["server_id"],
-                adapter,
-                commit=False,
-            )
+            health = previous_health
+            if health != "ready":
+                health = refresh_audiomuse_health(
+                    db,
+                    sources[0]["catalog_instance_id"],
+                    server["server_id"],
+                    adapter,
+                    commit=False,
+                )
             result["audiomuse_health"] = health
             if health == "ready":
                 enqueue_bounded(
@@ -807,6 +812,8 @@ def migrate(db):
     # the next cron tick or requiring another analysis run.
     enqueue_bounded(
         provider_identity_recheck_task,
+        None,
+        True,
         queue="default",
         timeout=PROJECTION_JOB_TIMEOUT_SECONDS,
     )
