@@ -104,7 +104,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.1.4"
+    assert manifest["versions"][0]["version"] == "1.1.5"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -197,7 +197,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.1.4",
+        "plugin_version": "1.1.5",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -328,7 +328,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.1.4"
+    assert body["plugin_version"] == "1.1.5"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -4142,9 +4142,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     mod.migrate(db)
 
     assert db.commits == 1
-    assert queued == [
-        ((mod.provider_identity_recheck_task, None, True), {"queue": "default"})
-    ]
+    assert queued == [((mod.provider_identity_recheck_task,), {"queue": "default"})]
     assert (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
@@ -5150,6 +5148,72 @@ def test_stale_v2_worker_task_uses_only_the_proven_rebound_server(monkeypatch):
         "reason": "source_rebind_required",
     }
     assert len(calls) == 2
+
+
+def test_analysis_projection_clears_durable_reconcile_only_after_success(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    adapter = types.SimpleNamespace(
+        mode="v2_single_server",
+        active_server_id=lambda: "server-a",
+    )
+    completed = []
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: adapter)
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "project_analysis",
+        lambda **_kwargs: {
+            "catalog_instance_id": "catalog-a",
+            "server_id": "server-a",
+            "generation": 12,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "complete_projection_reconcile",
+        lambda selected_db, catalog_instance_id: completed.append(
+            (selected_db, catalog_instance_id)
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "start_relationship_preparation",
+        lambda **_kwargs: {"queued": False, "coalesced": False},
+    )
+
+    result = mod.analysis_projection_task("server-a")
+
+    assert result["generation"] == 12
+    assert completed == [(db, "catalog-a")]
+
+
+def test_flask_start_requeues_argument_compatible_identity_recheck(monkeypatch):
+    mod = load_plugin()
+    queued = []
+
+    class Bridge:
+        @staticmethod
+        def list_servers():
+            return []
+
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
+    monkeypatch.setattr(
+        mod,
+        "enqueue_bounded",
+        lambda func, *args, **kwargs: queued.append((func, args, kwargs)),
+    )
+
+    mod.observe_provider_identities_on_start()
+
+    assert queued == [
+        (
+            mod.provider_identity_recheck_task,
+            (),
+            {"queue": "default", "timeout": mod.PROJECTION_JOB_TIMEOUT_SECONDS},
+        )
+    ]
 
 
 @pytest.mark.parametrize(
@@ -8449,6 +8513,7 @@ def test_identity_recheck_releases_completed_migration_and_queues_projection(mon
         "provider_transition_health",
         lambda *_args: {"state": "applied", "audiomuse_health": "repair_required"},
     )
+    monkeypatch.setattr(mod, "projection_reconcile_required", lambda *_args: False)
     monkeypatch.setattr(mod, "refresh_audiomuse_health", lambda *_args, **_kwargs: "ready")
     monkeypatch.setattr(
         mod,
@@ -8465,6 +8530,7 @@ def test_identity_recheck_releases_completed_migration_and_queues_projection(mon
                 "catalog_instance_id": "catalog-a",
                 "server_id": "server-a",
                 "previous_health": "repair_required",
+                "reconcile_required": False,
                 "audiomuse_health": "ready",
                 "projection_queued": True,
             }
@@ -8481,7 +8547,7 @@ def test_identity_recheck_releases_completed_migration_and_queues_projection(mon
     assert db.rollbacks == 0
 
 
-def test_identity_recheck_install_check_queues_projection_when_startup_was_already_ready(
+def test_identity_recheck_durable_request_queues_projection_when_startup_was_already_ready(
     monkeypatch,
 ):
     mod = load_plugin()
@@ -8512,6 +8578,12 @@ def test_identity_recheck_install_check_queues_projection_when_startup_was_alrea
         "provider_transition_health",
         lambda *_args: {"state": "applied", "audiomuse_health": "ready"},
     )
+    reconcile = {"required": False}
+    monkeypatch.setattr(
+        mod,
+        "projection_reconcile_required",
+        lambda *_args: reconcile["required"],
+    )
     monkeypatch.setattr(
         mod,
         "refresh_audiomuse_health",
@@ -8526,13 +8598,15 @@ def test_identity_recheck_install_check_queues_projection_when_startup_was_alrea
     )
 
     assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
-    result = mod.provider_identity_recheck_task(force_projection_check=True)
+    reconcile["required"] = True
+    result = mod.provider_identity_recheck_task()
 
     assert result["results"] == [
         {
             "catalog_instance_id": "catalog-a",
             "server_id": "server-a",
             "previous_health": "ready",
+            "reconcile_required": True,
             "audiomuse_health": "ready",
             "projection_queued": True,
         }

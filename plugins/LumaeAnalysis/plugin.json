@@ -90,6 +90,14 @@
   },
   "versions": [
     {
+      "version": "1.1.5",
+      "min_core_version": "2.6.0",
+      "changelog": "Make projection release durable across mixed old/new worker startup: plugin migration records a database reconciliation request, argument-compatible startup and scheduled rechecks retry it, and only a successful atomic projection clears it.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.5.zip",
+      "checksum": ""
+    },
+    {
       "version": "1.1.4",
       "min_core_version": "2.6.0",
       "changelog": "Close the plugin-upgrade ordering race by forcing one idempotent analysis-projection check after install, even when Flask startup already marked the completed AudioMuse migration ready; recurring rechecks remain no-op once reconciled.",

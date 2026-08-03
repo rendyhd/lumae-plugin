@@ -125,6 +125,7 @@ def migrate_provider_identity(db):
             analysis_baseline JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             baseline_integrity BOOLEAN,
             audiomuse_health TEXT,
+            projection_reconcile_required BOOLEAN NOT NULL DEFAULT FALSE,
             manifest_sha256 TEXT,
             detected_at TIMESTAMPTZ,
             applied_at TIMESTAMPTZ,
@@ -148,6 +149,9 @@ def migrate_provider_identity(db):
         "ADD COLUMN IF NOT EXISTS baseline_integrity BOOLEAN",
         f"ALTER TABLE {t('provider_identity_transitions')} "
         "ADD COLUMN IF NOT EXISTS audiomuse_health TEXT",
+        f"ALTER TABLE {t('provider_identity_transitions')} "
+        "ADD COLUMN IF NOT EXISTS projection_reconcile_required "
+        "BOOLEAN NOT NULL DEFAULT FALSE",
         f"ALTER TABLE {t('provider_identity_transitions')} "
         "ADD COLUMN IF NOT EXISTS manifest_sha256 TEXT",
         f"ALTER TABLE {t('provider_identity_transitions')} "
@@ -205,6 +209,54 @@ def migrate_provider_identity(db):
         """
     )
     cur.close()
+
+
+def require_projection_reconcile(db):
+    """Persist an upgrade-safe request to compare carried and current projections."""
+
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        UPDATE {t('provider_identity_transitions')}
+           SET projection_reconcile_required=TRUE, updated_at=now()
+         WHERE state='applied'
+        """
+    )
+    changed = max(int(getattr(cur, "rowcount", 0) or 0), 0)
+    cur.close()
+    return changed
+
+
+def projection_reconcile_required(db, catalog_instance_id):
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT COALESCE(projection_reconcile_required, FALSE)
+          FROM {t('provider_identity_transitions')}
+         WHERE catalog_instance_id=%s
+        """,
+        (catalog_instance_id,),
+    )
+    row = cur.fetchone()
+    cur.close()
+    return bool(row and row[0])
+
+
+def complete_projection_reconcile(db, catalog_instance_id, commit=True):
+    """Clear the durable request only after projection publication succeeds."""
+
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        UPDATE {t('provider_identity_transitions')}
+           SET projection_reconcile_required=FALSE, updated_at=now()
+         WHERE catalog_instance_id=%s
+        """,
+        (catalog_instance_id,),
+    )
+    cur.close()
+    if commit:
+        db.commit()
 
 
 def _source_state(db, server_id, for_update=False):

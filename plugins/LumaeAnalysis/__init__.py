@@ -65,9 +65,12 @@ from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .database_state import collect_database_state, render_database_state
 from .provider_identity_guard import (
     TRANSITION_BLOCKER,
+    complete_projection_reconcile,
     migrate_provider_identity,
     observe_provider_version,
+    projection_reconcile_required,
     provider_transition_health,
+    require_projection_reconcile,
 )
 from .provider_identity_rekey import read_transition_manifest, refresh_audiomuse_health
 from .collection_manager import (
@@ -82,7 +85,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.1.4"
+PLUGIN_VERSION = "1.1.5"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -465,6 +468,7 @@ def analysis_projection_task(server_id=None):
     result = project_analysis(server_id=resolved_server_id, adapter=adapter)
     if not result.get("catalog_instance_id"):
         return result
+    complete_projection_reconcile(get_db(), result["catalog_instance_id"])
     try:
         result["relationships"] = start_relationship_preparation(
             catalog_instance_id=result["catalog_instance_id"],
@@ -539,7 +543,7 @@ def enqueue_required_catalog_preparations(db=None):
     return queued
 
 
-def provider_identity_recheck_task(server_id=None, force_projection_check=False):
+def provider_identity_recheck_task(server_id=None):
     """Advance pending ID proofs and hand completed AudioMuse migrations off."""
 
     db = get_db()
@@ -566,12 +570,16 @@ def provider_identity_recheck_task(server_id=None, force_projection_check=False)
         if transition.get("state") != "applied":
             continue
         previous_health = transition.get("audiomuse_health")
-        if previous_health == "ready" and not force_projection_check:
+        reconcile_required = projection_reconcile_required(
+            db, sources[0]["catalog_instance_id"]
+        )
+        if previous_health == "ready" and not reconcile_required:
             continue
         result = {
             "catalog_instance_id": sources[0]["catalog_instance_id"],
             "server_id": server["server_id"],
             "previous_health": previous_health,
+            "reconcile_required": reconcile_required,
             "projection_queued": False,
         }
         try:
@@ -624,6 +632,15 @@ def observe_provider_identities_on_start():
                 "lumae_analysis could not observe provider identity for %s",
                 server["server_id"],
             )
+    # Installation can dispatch its first task while a worker still has the
+    # previous plugin module imported. This argument-compatible second recheck
+    # lets the reloaded worker consume the durable reconciliation request; the
+    # scheduled task remains the final fallback for unusual restart ordering.
+    enqueue_bounded(
+        provider_identity_recheck_task,
+        queue="default",
+        timeout=PROJECTION_JOB_TIMEOUT_SECONDS,
+    )
 
 
 def migrate(db):
@@ -650,6 +667,7 @@ def migrate(db):
     migrate_catalog(db)
     ensure_catalog_sources(db)
     migrate_provider_identity(db)
+    require_projection_reconcile(db)
     cur = db.cursor()
     cur.execute(
         f"""
@@ -812,8 +830,6 @@ def migrate(db):
     # the next cron tick or requiring another analysis run.
     enqueue_bounded(
         provider_identity_recheck_task,
-        None,
-        True,
         queue="default",
         timeout=PROJECTION_JOB_TIMEOUT_SECONDS,
     )

@@ -1,8 +1,13 @@
 # Catalogue sync operations
 
-Lumae Analysis 1.1.4 publishes catalogue schema 3. Schema 3 is additive to the
+Lumae Analysis 1.1.5 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
+
+Version 1.1.5 persists the post-upgrade projection check in the plugin database.
+An old worker may safely ignore the first argument-compatible recheck while it
+is restarting; the new startup hook or scheduled recheck consumes the same
+durable request. Only successful atomic projection publication clears it.
 
 Version 1.1.4 forces one idempotent projection check after a plugin upgrade.
 This closes the startup race where the Flask process could mark a completed
