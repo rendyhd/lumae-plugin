@@ -85,7 +85,7 @@ from .collection_manager import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.1.5"
+PLUGIN_VERSION = "1.1.6"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -621,6 +621,21 @@ def observe_provider_identities_on_start():
     db = get_db()
     if db is None:
         return
+    try:
+        # AudioMuse records a plugin update even when an install hook fails. In
+        # that case PostgreSQL rolls the hook transaction back while the new
+        # plugin code remains active. Re-running this additive migration here
+        # repairs the provider-identity tables before any startup read needs
+        # them, including upgrades from releases that predate the transition
+        # shield.
+        migrate_provider_identity(db)
+        db.commit()
+    except Exception:
+        rollback = getattr(db, "rollback", None)
+        if callable(rollback):
+            rollback()
+        logger.exception("lumae_analysis could not ensure provider identity schema")
+        return
     bridge = ProviderCatalogBridge()
     for server in bridge.list_servers():
         if not server.get("supported"):
@@ -628,6 +643,9 @@ def observe_provider_identities_on_start():
         try:
             observe_provider_version(db, bridge, server["server_id"], commit=True)
         except Exception:
+            rollback = getattr(db, "rollback", None)
+            if callable(rollback):
+                rollback()
             logger.exception(
                 "lumae_analysis could not observe provider identity for %s",
                 server["server_id"],
@@ -4306,6 +4324,7 @@ def render_source_preparation_panel(batch_size):
 
 
 def render_provider_identity_panel():
+    db = None
     try:
         db = get_db()
         sources = resolve_catalog_source(db) if db is not None else []
@@ -4315,6 +4334,12 @@ def render_provider_identity_panel():
             if transition:
                 rows.append((source, transition))
     except Exception:
+        # psycopg2 leaves the entire request transaction aborted after an SQL
+        # error. The status panel is optional, so restore the connection before
+        # later settings panels call the plugin settings API.
+        rollback = getattr(db, "rollback", None)
+        if callable(rollback):
+            rollback()
         logger.exception("lumae_analysis could not render provider identity status")
         return ""
     if not rows:

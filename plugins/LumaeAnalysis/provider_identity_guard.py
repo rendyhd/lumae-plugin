@@ -684,20 +684,22 @@ def assert_analysis_projection_allowed(db, bridge, server_id):
 
 def provider_transition_health(db, catalog_instance_id):
     cur = db.cursor()
-    cur.execute(
-        f"""
-        SELECT transition_id, state, previous_provider_version,
-               current_provider_version, detection_reason, required_action,
-               counts, target_fingerprint, checked_at, last_error,
-               first_seq, last_seq, target_scan_count, analysis_baseline,
-               baseline_integrity, audiomuse_health, manifest_sha256
-          FROM {t('provider_identity_transitions')}
-         WHERE catalog_instance_id=%s
-        """,
-        (catalog_instance_id,),
-    )
-    row = cur.fetchone()
-    cur.close()
+    try:
+        cur.execute(
+            f"""
+            SELECT transition_id, state, previous_provider_version,
+                   current_provider_version, detection_reason, required_action,
+                   counts, target_fingerprint, checked_at, last_error,
+                   first_seq, last_seq, target_scan_count, analysis_baseline,
+                   baseline_integrity, audiomuse_health, manifest_sha256
+              FROM {t('provider_identity_transitions')}
+             WHERE catalog_instance_id=%s
+            """,
+            (catalog_instance_id,),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
     if row is None:
         return None
     state = str(row[1] or "normal")

@@ -104,7 +104,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.1.5"
+    assert manifest["versions"][0]["version"] == "1.1.6"
     assert manifest["versions"][0]["min_core_version"] == "2.6.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -197,7 +197,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.1.5",
+        "plugin_version": "1.1.6",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -328,7 +328,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.1.5"
+    assert body["plugin_version"] == "1.1.6"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -5191,13 +5191,28 @@ def test_analysis_projection_clears_durable_reconcile_only_after_success(monkeyp
 def test_flask_start_requeues_argument_compatible_identity_recheck(monkeypatch):
     mod = load_plugin()
     queued = []
+    migrations = []
+
+    class Db:
+        def __init__(self):
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    db = Db()
 
     class Bridge:
         @staticmethod
         def list_servers():
             return []
 
-    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "migrate_provider_identity",
+        lambda selected_db: migrations.append(selected_db),
+    )
     monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
     monkeypatch.setattr(
         mod,
@@ -5207,6 +5222,8 @@ def test_flask_start_requeues_argument_compatible_identity_recheck(monkeypatch):
 
     mod.observe_provider_identities_on_start()
 
+    assert migrations == [db]
+    assert db.commits == 1
     assert queued == [
         (
             mod.provider_identity_recheck_task,
@@ -5214,6 +5231,41 @@ def test_flask_start_requeues_argument_compatible_identity_recheck(monkeypatch):
             {"queue": "default", "timeout": mod.PROJECTION_JOB_TIMEOUT_SECONDS},
         )
     ]
+
+
+def test_flask_start_rolls_back_a_failed_identity_schema_repair(monkeypatch):
+    mod = load_plugin()
+
+    class Db:
+        def __init__(self):
+            self.rollbacks = 0
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    db = Db()
+    queued = []
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "migrate_provider_identity",
+        lambda _db: (_ for _ in ()).throw(RuntimeError("schema migration failed")),
+    )
+    monkeypatch.setattr(
+        mod,
+        "ProviderCatalogBridge",
+        lambda: (_ for _ in ()).throw(AssertionError("must not probe an invalid schema")),
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue_bounded",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
+    )
+
+    mod.observe_provider_identities_on_start()
+
+    assert db.rollbacks == 1
+    assert queued == []
 
 
 @pytest.mark.parametrize(
@@ -7896,6 +7948,48 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
         < body.index("3. Volume &amp; ramp status")
         < body.index("4. Similar albums &amp; artists")
     )
+
+
+def test_settings_page_recovers_transaction_after_identity_status_query_fails(monkeypatch):
+    mod = load_plugin()
+
+    class Db:
+        def __init__(self):
+            self.aborted = False
+            self.rollbacks = 0
+
+        def rollback(self):
+            self.aborted = False
+            self.rollbacks += 1
+
+    db = Db()
+    source = settings_catalog_source()
+
+    def fail_identity_status(*_args):
+        db.aborted = True
+        raise RuntimeError(
+            'relation "plugin_lumae_analysis__provider_identity_transitions" does not exist'
+        )
+
+    def render_collections():
+        assert db.aborted is False
+        return '<section id="collections-recovered"></section>'
+
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(mod, "provider_transition_health", fail_identity_status)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 25)
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "render_v3_readiness_panel", lambda: "")
+    monkeypatch.setattr(mod, "render_relationship_status_panel", lambda: "")
+    monkeypatch.setattr(mod, "render_source_preparation_sections", lambda _size: ("", ""))
+    monkeypatch.setattr(mod, "render_collections_settings_panel", render_collections)
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+
+    body = mod.render_settings()
+
+    assert db.rollbacks == 1
+    assert 'id="collections-recovered"' in body
 
 
 def test_settings_page_never_labels_a_completed_empty_catalogue_ready(monkeypatch):

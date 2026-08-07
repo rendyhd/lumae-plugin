@@ -90,6 +90,14 @@
   },
   "versions": [
     {
+      "version": "1.1.6",
+      "min_core_version": "2.6.0",
+      "changelog": "Recover automatically when AudioMuse rolls back a failed plugin install-hook transaction: retry the additive provider-identity schema on Flask startup and restore PostgreSQL transaction health when the optional status panel cannot be read.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "1.1.5",
       "min_core_version": "2.6.0",
       "changelog": "Make projection release durable across mixed old/new worker startup: plugin migration records a database reconciliation request, argument-compatible startup and scheduled rechecks retry it, and only a successful atomic projection clears it.",

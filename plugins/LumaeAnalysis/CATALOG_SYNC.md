@@ -1,8 +1,13 @@
 # Catalogue sync operations
 
-Lumae Analysis 1.1.5 publishes catalogue schema 3. Schema 3 is additive to the
+Lumae Analysis 1.1.6 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
+
+Version 1.1.6 retries the additive provider-identity schema migration during
+Flask startup. This repairs an update whose install-hook transaction was rolled
+back, and a failed optional status query now rolls back before the rest of the
+Settings page reads plugin configuration.
 
 Version 1.1.5 persists the post-upgrade projection check in the plugin database.
 An old worker may safely ignore the first argument-compatible recheck while it
