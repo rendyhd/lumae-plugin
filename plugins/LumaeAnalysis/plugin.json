@@ -94,8 +94,8 @@
       "min_core_version": "2.6.0",
       "changelog": "Recover automatically when AudioMuse rolls back a failed plugin install-hook transaction: retry the additive provider-identity schema on Flask startup and restore PostgreSQL transaction health when the optional status panel cannot be read.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.6.zip",
+      "checksum": "ab438ab21aa0f97be2a36c53f2f7e22f"
     },
     {
       "version": "1.1.5",
