@@ -90,6 +90,14 @@
   },
   "versions": [
     {
+      "version": "1.1.7",
+      "min_core_version": "3.2.0",
+      "changelog": "Restore AudioMuse 3.4 compatibility by removing private RQ imports and replacing task-within-task queueing with a database-driven one-action reconciliation watchdog; recover stranded analysis runs and make profile, relationship, catalogue, and provider follow-ups restart-safe.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "1.1.6",
       "min_core_version": "2.6.0",
       "changelog": "Recover automatically when AudioMuse rolls back a failed plugin install-hook transaction: retry the additive provider-identity schema on Flask startup and restore PostgreSQL transaction health when the optional status panel cannot be read.",

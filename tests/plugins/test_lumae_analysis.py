@@ -104,8 +104,8 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.1.6"
-    assert manifest["versions"][0]["min_core_version"] == "2.6.0"
+    assert manifest["versions"][0]["version"] == "1.1.7"
+    assert manifest["versions"][0]["min_core_version"] == "3.2.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
         "analyzer_version": 1,
@@ -197,7 +197,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.1.6",
+        "plugin_version": "1.1.7",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -328,7 +328,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.1.6"
+    assert body["plugin_version"] == "1.1.7"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -2394,76 +2394,51 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
     assert params[11] == "ready"
 
 
-def test_analysis_run_events_coalesce_to_one_source_finalizer(monkeypatch):
+def test_analysis_run_events_coalesce_to_one_durable_source_request(monkeypatch):
     mod = load_plugin()
     db = AnalysisRunDb()
-    queued = []
-
-    def enqueue_finalizer(server_id, catalog_instance_id, run_id):
-        queued.append((server_id, catalog_instance_id, run_id))
-        return types.SimpleNamespace(id="finalizer-a")
-
-    monkeypatch.setattr(mod, "enqueue_analysis_run_finalizer", enqueue_finalizer)
 
     first = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
     second = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
 
-    assert first == {"queued": True, "coalesced": False, "job_id": "finalizer-a"}
-    assert second == {"queued": False, "coalesced": True}
-    assert queued == [("server-a", "catalog-a", "run-a")]
+    assert first == {"queued": False, "coalesced": False, "status": "pending"}
+    assert second == {"queued": False, "coalesced": True, "status": "pending"}
     assert db.runs[("catalog-a", "run-a")]["songs_seen"] == 2
-    assert db.runs[("catalog-a", "run-a")]["status"] == "queued"
+    assert db.runs[("catalog-a", "run-a")]["status"] == "pending"
 
 
-def test_one_multiserver_analysis_run_gets_one_finalizer_per_source(monkeypatch):
+def test_one_multiserver_analysis_run_gets_one_durable_request_per_source(monkeypatch):
     mod = load_plugin()
     db = AnalysisRunDb()
-    queued = []
-    monkeypatch.setattr(
-        mod,
-        "enqueue_analysis_run_finalizer",
-        lambda server_id, catalog_id, run_id: queued.append(
-            (server_id, catalog_id, run_id)
-        )
-        or types.SimpleNamespace(id=f"finalizer-{catalog_id}"),
-    )
 
     mod.record_analysis_run("server-a", "catalog-a", "shared-run", db=db)
     mod.record_analysis_run("server-b", "catalog-b", "shared-run", db=db)
     mod.record_analysis_run("server-a", "catalog-a", "shared-run", db=db)
     mod.record_analysis_run("server-b", "catalog-b", "shared-run", db=db)
 
-    assert queued == [
-        ("server-a", "catalog-a", "shared-run"),
-        ("server-b", "catalog-b", "shared-run"),
-    ]
     assert db.runs[("catalog-a", "shared-run")]["songs_seen"] == 2
     assert db.runs[("catalog-b", "shared-run")]["songs_seen"] == 2
+    assert db.runs[("catalog-a", "shared-run")]["status"] == "pending"
+    assert db.runs[("catalog-b", "shared-run")]["status"] == "pending"
 
 
-def test_analysis_run_enqueue_failure_is_retryable_by_the_next_song(monkeypatch):
+def test_analysis_run_hook_never_touches_the_queue(monkeypatch):
     mod = load_plugin()
     db = AnalysisRunDb()
-    attempts = []
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("analysis hooks must not enqueue")
+        ),
+    )
 
-    def enqueue_finalizer(*args):
-        attempts.append(args)
-        if len(attempts) == 1:
-            raise RuntimeError("redis unavailable")
-        return types.SimpleNamespace(id="finalizer-retry")
+    first = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
+    second = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
 
-    monkeypatch.setattr(mod, "enqueue_analysis_run_finalizer", enqueue_finalizer)
-
-    with pytest.raises(RuntimeError, match="redis unavailable"):
-        mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
-    assert db.runs[("catalog-a", "run-a")]["status"] == "enqueue_failed"
-
-    result = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
-
-    assert result["job_id"] == "finalizer-retry"
-    assert len(attempts) == 2
+    assert first["status"] == second["status"] == "pending"
     assert db.runs[("catalog-a", "run-a")]["songs_seen"] == 2
-    assert db.runs[("catalog-a", "run-a")]["status"] == "queued"
+    assert db.runs[("catalog-a", "run-a")]["status"] == "pending"
 
 
 def test_analysis_run_finalizer_refreshes_projects_then_queues_only_needed_profiles(monkeypatch):
@@ -2583,7 +2558,7 @@ def test_analysis_run_finalizer_failure_is_recorded_and_can_be_retried(monkeypat
     assert len(attempts) == 2
 
 
-def test_running_analysis_finalizer_can_only_be_reclaimed_by_the_same_rq_job():
+def test_running_analysis_finalizer_can_only_be_reclaimed_after_it_is_stale():
     mod = load_plugin()
     db = AnalysisRunDb()
     db.runs[("catalog-a", "run-a")] = {
@@ -2596,75 +2571,31 @@ def test_running_analysis_finalizer_can_only_be_reclaimed_by_the_same_rq_job():
         "last_error": None,
     }
 
-    assert (
-        mod.claim_analysis_run(
-            "catalog-a",
-            "run-a",
-            finalizer_job_id="different-job",
-            db=db,
-        )
-        is None
-    )
-    assert (
-        mod.claim_analysis_run(
-            "catalog-a",
-            "run-a",
-            finalizer_job_id="finalizer-a",
-            db=db,
-        )
-        == 9
-    )
+    assert mod.claim_analysis_run("catalog-a", "run-a", db=db) is None
+    db.runs[("catalog-a", "run-a")]["stale"] = True
+    assert mod.claim_analysis_run("catalog-a", "run-a", db=db) == 9
 
 
-def test_analysis_run_finalizer_identity_is_scoped_by_catalogue():
+def test_settled_analysis_run_selector_is_scoped_and_terminal_aware():
     mod = load_plugin()
+    db = FakeDb([("server-a", "catalog-a", "shared-run")])
 
-    first = mod.analysis_run_finalizer_job_id("catalog-a", "shared-run")
-    same = mod.analysis_run_finalizer_job_id("catalog-a", "shared-run")
-    other_source = mod.analysis_run_finalizer_job_id("catalog-b", "shared-run")
+    assert mod.next_settled_analysis_run(db=db) == {
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "run_id": "shared-run",
+    }
+    sql = db.cursor_obj.executed[-1][0]
+    assert "parent.task_id=r.run_id" in sql
+    assert "'SUCCESS', 'FAILURE', 'FAIL', 'REVOKED'" in sql
+    assert "NOT EXISTS" in sql
 
-    assert first == same
-    assert first != other_source
+def test_plugin_runtime_has_no_private_rq_imports():
+    source = pathlib.Path("plugins/LumaeAnalysis/__init__.py").read_text(encoding="utf-8")
 
-
-def test_analysis_run_finalizer_waits_for_parent_even_when_parent_fails(monkeypatch):
-    from rq.exceptions import NoSuchJobError
-    from rq.job import Job
-
-    mod = load_plugin()
-    captured = {}
-
-    class Queue:
-        connection = object()
-
-        def enqueue(self, func, **kwargs):
-            captured["func"] = func
-            captured.update(kwargs)
-            return types.SimpleNamespace(id=kwargs["job_id"])
-
-    monkeypatch.setattr(plugin_api_module, "rq_queue_default", Queue(), raising=False)
-    monkeypatch.setattr(
-        plugin_api_module,
-        "dotted_path",
-        lambda func: f"{func.__module__}.{func.__name__}",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        Job,
-        "fetch",
-        classmethod(
-            lambda _cls, _job_id, connection=None: (_ for _ in ()).throw(NoSuchJobError())
-        ),
-    )
-
-    job = mod.enqueue_analysis_run_finalizer("server-a", "catalog-a", "run-a")
-
-    assert job.id == mod.analysis_run_finalizer_job_id("catalog-a", "run-a")
-    assert captured["func"] == "plugin.manager.run_plugin_task"
-    assert captured["args"][1:] == ("server-a", "catalog-a", "run-a")
-    assert captured["depends_on"].dependencies == ["run-a"]
-    assert captured["depends_on"].allow_failure is True
-    assert captured["retry"].max == 2
+    assert "rq_queue_" not in source
+    assert "from rq" not in source
+    assert "get_current_job" not in source
 
 
 def test_encode_ramp_matches_lumae_byte_layout():
@@ -3157,33 +3088,36 @@ class AnalysisRunCursor:
             if key not in self.db.runs:
                 self.db.runs[key] = {
                     "server_id": server_id,
-                    "status": "registering",
+                    "status": "pending",
                     "songs_seen": 1,
                     "job_id": None,
                     "queued_profiles": 0,
                     "profile_jobs": 0,
                     "last_error": None,
                 }
-                self.current_row = (run_id,)
-        elif "SET songs_seen=songs_seen + 1" in normalized:
-            row = self.db.runs[(params[0], params[1])]
-            row["songs_seen"] += 1
-        elif "SET status='registering'" in normalized:
-            row = self.db.runs[(params[0], params[1])]
-            if row["status"] == "enqueue_failed":
-                row["status"] = "registering"
-                row["last_error"] = None
-                self.current_row = (params[1],)
+            else:
+                row = self.db.runs[key]
+                row["server_id"] = server_id
+                row["songs_seen"] += 1
+                if row["status"] not in {"running", "complete"}:
+                    row["status"] = "pending"
+                    row["job_id"] = None
+                    row["last_error"] = None
+            row = self.db.runs[key]
+            self.current_row = (row["status"], row["songs_seen"])
         elif "SET status='running'" in normalized:
             row = self.db.runs[(params[0], params[1])]
-            same_retry = (
-                row["status"] == "running"
-                and params[2] is not None
-                and row["job_id"] == params[2]
-            )
-            if row["status"] in {"registering", "queued", "enqueue_failed", "failed"} or same_retry:
+            stale_retry = row["status"] == "running" and row.get("stale") is True
+            if row["status"] in {
+                "pending",
+                "registering",
+                "queued",
+                "enqueue_failed",
+                "failed",
+            } or stale_retry:
                 row["status"] = "running"
                 row["last_error"] = None
+                row["stale"] = False
                 self.current_row = (row["songs_seen"],)
         elif normalized.startswith("UPDATE plugin_lumae_analysis__analysis_runs"):
             status, job_id, queued_profiles, profile_jobs, error = params[:5]
@@ -3808,9 +3742,65 @@ def test_start_profile_backfill_coalesces_while_chain_is_active(monkeypatch):
     assert calls == []
 
 
+def test_start_profile_backfill_can_only_record_durable_work(monkeypatch):
+    mod = load_plugin()
+    source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(mod, "claim_profile_backfill", lambda selected: selected == source)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 7)
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("deferred work must not enqueue")
+        ),
+    )
+
+    assert mod.start_profile_backfill(
+        "catalog-a", "server-a", enqueue_job=False
+    ) == {
+        "queued": True,
+        "coalesced": False,
+        "deferred": True,
+        "batch_size": 7,
+    }
+
+
+def test_start_relationship_preparation_can_only_record_durable_work(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    source = settings_catalog_source()
+    source["catalog"]["generation"] = 4
+    source["analysis"]["generation"] = 5
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda *_args: {"status": "stale"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "claim_relationship_preparation",
+        lambda selected_db, catalog_id: selected_db is db and catalog_id == "catalog-a",
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("deferred work must not enqueue")
+        ),
+    )
+
+    assert mod.start_relationship_preparation(
+        "catalog-a", "server-a", enqueue_job=False
+    ) == {"queued": True, "coalesced": False, "deferred": True}
+
+
 def test_profile_backfill_task_processes_one_batch_then_yields_worker(monkeypatch):
     mod = load_plugin()
     calls = []
+    monkeypatch.setattr(mod, "claim_profile_backfill_batch", lambda _catalog_id: True)
     monkeypatch.setattr(
         mod,
         "resolve_profile_source",
@@ -3842,24 +3832,19 @@ def test_profile_backfill_task_processes_one_batch_then_yields_worker(monkeypatc
         lambda *args, **kwargs: calls.append(("analyze", args, kwargs))
         or {"ready": 2, "already_ready": 0, "promoted": 0, "failed": 0, "skipped": 0},
     )
-    monkeypatch.setattr(
-        mod,
-        "enqueue_next_profile_backfill",
-        lambda *args: calls.append(("next", args)),
-    )
-
     result = mod.profile_backfill_task("server-b", "catalog-b")
 
     assert result["status"] == "queued"
     assert result["processed"] == 2
-    assert result["queued_next"] is True
+    assert result["queued_next"] is False
+    assert result["deferred"] is True
     assert ("pending", ["a", "b"], "catalog-b", "background") in calls
-    assert ("next", ("server-b", "catalog-b")) in calls
 
 
 def test_profile_backfill_task_releases_claimed_rows_when_batch_crashes(monkeypatch):
     mod = load_plugin()
     calls = []
+    monkeypatch.setattr(mod, "claim_profile_backfill_batch", lambda _catalog_id: True)
     monkeypatch.setattr(
         mod,
         "resolve_profile_source",
@@ -3919,7 +3904,11 @@ def test_legacy_oversized_background_job_is_drained_into_bounded_chain(monkeypat
     assert "bounded 0.8.1" in calls[0][3]
     assert calls[1] == (
         "start",
-        {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+        {
+            "catalog_instance_id": "catalog-a",
+            "server_id": "server-a",
+            "enqueue_job": False,
+        },
     )
 
 
@@ -4000,6 +3989,7 @@ def test_prepare_lumae_marks_catalog_ready_before_background_profiles(monkeypatc
     calls = []
     source = settings_catalog_source()
     monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(mod, "claim_preparation_run", lambda _catalog_id: True)
     monkeypatch.setattr(
         mod,
         "update_preparation_state",
@@ -4033,6 +4023,12 @@ def test_prepare_lumae_marks_catalog_ready_before_background_profiles(monkeypatc
         "preparation_state",
         lambda catalog_id: {"catalog_instance_id": catalog_id, "status": "ready"},
     )
+    monkeypatch.setattr(
+        mod,
+        "start_relationship_preparation",
+        lambda **kwargs: calls.append(("relationships", kwargs))
+        or {"queued": True, "coalesced": False, "deferred": True},
+    )
 
     result = mod.prepare_lumae_task("server-a", "catalog-a")
 
@@ -4049,6 +4045,15 @@ def test_prepare_lumae_marks_catalog_ready_before_background_profiles(monkeypatc
             {
                 "catalog_instance_id": "catalog-a",
                 "server_id": "server-a",
+                "enqueue_job": False,
+            },
+        ),
+        (
+            "relationships",
+            {
+                "catalog_instance_id": "catalog-a",
+                "server_id": "server-a",
+                "enqueue_job": False,
             },
         ),
     ]
@@ -4058,6 +4063,7 @@ def test_prepare_lumae_records_failure_and_does_not_queue_profiles(monkeypatch):
     mod = load_plugin()
     calls = []
     monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: settings_catalog_source())
+    monkeypatch.setattr(mod, "claim_preparation_run", lambda _catalog_id: True)
     monkeypatch.setattr(
         mod,
         "update_preparation_state",
@@ -4142,7 +4148,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     mod.migrate(db)
 
     assert db.commits == 1
-    assert queued == [((mod.provider_identity_recheck_task,), {"queue": "default"})]
+    assert queued == []
     assert (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
@@ -4157,7 +4163,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         (
             mod.CATALOG_RECONCILE_TASK_TYPE,
             mod.CATALOG_RECONCILE_TASK_TYPE,
-            "*/15 * * * *",
+            "* * * * *",
         ),
         (
             mod.PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
@@ -4187,6 +4193,8 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     assert "plugin_lumae_analysis__profile_backfill_state" in migration_sql
     assert "plugin_lumae_analysis__collection_items" in migration_sql
     assert "plugin_lumae_analysis__collection_changes" in migration_sql
+    assert "SET status='pending', finalizer_job_id=NULL" in migration_sql
+    assert "status IN ('registering', 'queued', 'enqueue_failed', 'failed')" in migration_sql
     for table_name in (
         "catalog_sources",
         "catalog_state",
@@ -4215,23 +4223,17 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         assert f"plugin_lumae_analysis__{table_name}" in migration_sql
 
 
-def test_bounded_enqueue_uses_the_app_context_wrapper_and_finite_timeout(monkeypatch):
+def test_bounded_enqueue_delegates_only_to_the_public_plugin_api(monkeypatch):
     mod = load_plugin()
     captured = {}
-
-    class Queue:
-        def enqueue(self, function, **kwargs):
-            captured.update({"function": function, **kwargs})
-            return types.SimpleNamespace(id="job-a")
-
     monkeypatch.setattr(
-        plugin_api_module,
-        "dotted_path",
-        lambda function: f"{function.__module__}.{function.__name__}",
-        raising=False,
+        mod,
+        "enqueue",
+        lambda function, *args, **kwargs: captured.update(
+            {"function": function, "args": args, "kwargs": kwargs}
+        )
+        or types.SimpleNamespace(id="job-a"),
     )
-    monkeypatch.setattr(plugin_api_module, "rq_queue_default", Queue(), raising=False)
-    monkeypatch.setattr(plugin_api_module, "rq_queue_high", Queue(), raising=False)
 
     job = mod.enqueue_bounded(
         mod.profile_backfill_task,
@@ -4241,10 +4243,11 @@ def test_bounded_enqueue_uses_the_app_context_wrapper_and_finite_timeout(monkeyp
     )
 
     assert job.id == "job-a"
-    assert captured["function"] == "plugin.manager.run_plugin_task"
-    assert captured["args"][1:] == ("server-a", "catalog-a")
-    assert captured["job_timeout"] == 321
-    assert captured["job_timeout"] > 0
+    assert captured == {
+        "function": mod.profile_backfill_task,
+        "args": ("server-a", "catalog-a"),
+        "kwargs": {"queue": "default"},
+    }
 
 
 def test_v1_0_1_has_no_infinite_plugin_job_timeout():
@@ -4341,7 +4344,7 @@ def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch)
     )
 
 
-def test_builder_upgrade_queues_one_coalesced_catalogue_preparation(monkeypatch):
+def test_builder_upgrade_records_one_coalesced_catalogue_preparation(monkeypatch):
     mod = load_plugin()
     source = {
         "catalog_instance_id": "catalog-a",
@@ -4354,7 +4357,6 @@ def test_builder_upgrade_queues_one_coalesced_catalogue_preparation(monkeypatch)
         },
     }
     claimed = []
-    queued = []
     monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
     monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
@@ -4362,19 +4364,10 @@ def test_builder_upgrade_queues_one_coalesced_catalogue_preparation(monkeypatch)
         "claim_preparation",
         lambda selected, db=None: claimed.append((selected, db)) or True,
     )
-    monkeypatch.setattr(
-        mod,
-        "enqueue",
-        lambda func, server_id, catalog_id, queue="default": queued.append(
-            (func, server_id, catalog_id, queue)
-        ),
-    )
-
     result = mod.enqueue_required_catalog_preparations(db=object())
 
     assert result == 1
     assert claimed[0][0] is source
-    assert queued == [(mod.prepare_lumae_task, "server-a", "catalog-a", "default")]
 
 
 def test_reconcile_retries_an_unattested_catalogue_even_when_generation_is_current(
@@ -4391,7 +4384,6 @@ def test_reconcile_retries_an_unattested_catalogue_even_when_generation_is_curre
             "refresh_required": False,
         },
     }
-    queued = []
     monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
     monkeypatch.setattr(
         mod,
@@ -4405,28 +4397,62 @@ def test_reconcile_retries_an_unattested_catalogue_even_when_generation_is_curre
         },
     )
     monkeypatch.setattr(mod, "claim_preparation", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(
-        mod,
-        "enqueue",
-        lambda func, server_id, catalog_id, queue="default": queued.append(
-            (func, server_id, catalog_id, queue)
-        ),
-    )
-
     assert mod.enqueue_required_catalog_preparations(db=object()) == 1
-    assert queued == [(mod.prepare_lumae_task, "server-a", "catalog-a", "default")]
 
 
 def test_reconcile_watchdog_is_a_noop_for_current_attested_catalogues(monkeypatch):
     mod = load_plugin()
-    monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda: 0)
+    db = object()
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "next_settled_analysis_run", lambda db=None: None)
+    monkeypatch.setattr(
+        mod, "enqueue_required_catalog_preparations", lambda db=None: 0
+    )
+    monkeypatch.setattr(mod, "next_preparation_run", lambda db=None: None)
+    monkeypatch.setattr(mod, "next_relationship_run", lambda db=None: None)
+    monkeypatch.setattr(mod, "next_profile_backfill_run", lambda db=None: None)
 
     assert mod.catalog_reconcile_task() == {
         "status": "current",
-        "queued": 0,
+        "requested": 0,
         "plugin_version": mod.PLUGIN_VERSION,
         "catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
     }
+
+
+def test_reconcile_watchdog_processes_only_the_highest_priority_action(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    calls = []
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "next_settled_analysis_run",
+        lambda db=None: {
+            "server_id": "server-a",
+            "catalog_instance_id": "catalog-a",
+            "run_id": "run-a",
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "finalize_analysis_run_task",
+        lambda *args: calls.append(("analysis", args)) or {"status": "complete"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue_required_catalog_preparations",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a watchdog tick must stop after one action")
+        ),
+    )
+
+    assert mod.catalog_reconcile_task() == {
+        "status": "processed",
+        "action": "analysis_run",
+        "result": {"status": "complete"},
+    }
+    assert calls == [("analysis", ("server-a", "catalog-a", "run-a"))]
 
 
 def test_worker_attestation_rejects_a_stale_audio_muse_worker(monkeypatch):
@@ -5176,19 +5202,36 @@ def test_analysis_projection_clears_durable_reconcile_only_after_success(monkeyp
             (selected_db, catalog_instance_id)
         ),
     )
+    relationships = []
     monkeypatch.setattr(
         mod,
         "start_relationship_preparation",
-        lambda **_kwargs: {"queued": False, "coalesced": False},
+        lambda **kwargs: relationships.append(kwargs)
+        or {"queued": True, "coalesced": False, "deferred": True},
     )
 
     result = mod.analysis_projection_task("server-a")
 
     assert result["generation"] == 12
     assert completed == [(db, "catalog-a")]
+    assert relationships == [
+        {
+            "catalog_instance_id": "catalog-a",
+            "server_id": "server-a",
+            "enqueue_job": False,
+        }
+    ]
 
 
-def test_flask_start_requeues_argument_compatible_identity_recheck(monkeypatch):
+def test_audiomuse_fail_status_is_terminal_for_provider_rekey_checks():
+    source = pathlib.Path(
+        "plugins/LumaeAnalysis/provider_identity_rekey.py"
+    ).read_text(encoding="utf-8")
+
+    assert "'SUCCESS', 'FAILURE', 'FAIL', 'REVOKED'" in source
+
+
+def test_flask_start_repairs_identity_schema_without_queueing(monkeypatch):
     mod = load_plugin()
     queued = []
     migrations = []
@@ -5224,13 +5267,7 @@ def test_flask_start_requeues_argument_compatible_identity_recheck(monkeypatch):
 
     assert migrations == [db]
     assert db.commits == 1
-    assert queued == [
-        (
-            mod.provider_identity_recheck_task,
-            (),
-            {"queue": "default", "timeout": mod.PROJECTION_JOB_TIMEOUT_SECONDS},
-        )
-    ]
+    assert queued == []
 
 
 def test_flask_start_rolls_back_a_failed_identity_schema_repair(monkeypatch):
@@ -8574,7 +8611,7 @@ def test_identity_recheck_schedule_skips_normal_sources(monkeypatch):
         refresh.undo()
 
 
-def test_identity_recheck_releases_completed_migration_and_queues_projection(monkeypatch):
+def test_identity_recheck_releases_completed_migration_and_projects_inline(monkeypatch):
     mod = load_plugin()
 
     class Bridge:
@@ -8593,9 +8630,9 @@ def test_identity_recheck_releases_completed_migration_and_queues_projection(mon
             self.rollbacks += 1
 
     db = Db()
-    queued = []
+    projected = []
     monkeypatch.setattr(mod, "get_db", lambda: db)
-    monkeypatch.setattr(mod, "get_core_adapter", lambda: "adapter-a")
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
     monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
     monkeypatch.setattr(
         mod,
@@ -8611,8 +8648,9 @@ def test_identity_recheck_releases_completed_migration_and_queues_projection(mon
     monkeypatch.setattr(mod, "refresh_audiomuse_health", lambda *_args, **_kwargs: "ready")
     monkeypatch.setattr(
         mod,
-        "enqueue_bounded",
-        lambda func, *args, **kwargs: queued.append((func, args, kwargs)),
+        "analysis_projection_task",
+        lambda server_id=None: projected.append(server_id)
+        or {"status": "complete", "catalog_instance_id": "catalog-a"},
     )
 
     result = mod.provider_identity_recheck_task()
@@ -8626,22 +8664,21 @@ def test_identity_recheck_releases_completed_migration_and_queues_projection(mon
                 "previous_health": "repair_required",
                 "reconcile_required": False,
                 "audiomuse_health": "ready",
-                "projection_queued": True,
+                "projection_queued": False,
+                "projection_processed": True,
+                "projection": {
+                    "status": "complete",
+                    "catalog_instance_id": "catalog-a",
+                },
             }
         ],
     }
-    assert queued == [
-        (
-            mod.analysis_projection_task,
-            ("server-a",),
-            {"queue": "default", "timeout": mod.PROJECTION_JOB_TIMEOUT_SECONDS},
-        )
-    ]
+    assert projected == ["server-a"]
     assert db.commits == 1
     assert db.rollbacks == 0
 
 
-def test_identity_recheck_durable_request_queues_projection_when_startup_was_already_ready(
+def test_identity_recheck_durable_request_projects_when_startup_was_already_ready(
     monkeypatch,
 ):
     mod = load_plugin()
@@ -8658,9 +8695,9 @@ def test_identity_recheck_durable_request_queues_projection_when_startup_was_alr
             self.commits += 1
 
     db = Db()
-    queued = []
+    projected = []
     monkeypatch.setattr(mod, "get_db", lambda: db)
-    monkeypatch.setattr(mod, "get_core_adapter", lambda: "adapter-a")
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
     monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
     monkeypatch.setattr(
         mod,
@@ -8687,8 +8724,9 @@ def test_identity_recheck_durable_request_queues_projection_when_startup_was_alr
     )
     monkeypatch.setattr(
         mod,
-        "enqueue_bounded",
-        lambda func, *args, **kwargs: queued.append((func, args, kwargs)),
+        "analysis_projection_task",
+        lambda server_id=None: projected.append(server_id)
+        or {"status": "complete", "catalog_instance_id": "catalog-a"},
     )
 
     assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
@@ -8702,16 +8740,15 @@ def test_identity_recheck_durable_request_queues_projection_when_startup_was_alr
             "previous_health": "ready",
             "reconcile_required": True,
             "audiomuse_health": "ready",
-            "projection_queued": True,
+            "projection_queued": False,
+            "projection_processed": True,
+            "projection": {
+                "status": "complete",
+                "catalog_instance_id": "catalog-a",
+            },
         }
     ]
-    assert queued == [
-        (
-            mod.analysis_projection_task,
-            ("server-a",),
-            {"queue": "default", "timeout": mod.PROJECTION_JOB_TIMEOUT_SECONDS},
-        )
-    ]
+    assert projected == ["server-a"]
     assert db.commits == 1
 
 

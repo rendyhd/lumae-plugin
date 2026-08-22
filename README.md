@@ -16,7 +16,7 @@ The plugin provides:
 * a source-scoped preparation page that marks the provider catalogue and AudioMuse projection ready before waveform enrichment finishes;
 * a read-only database-state dashboard for published catalogue generations, sonic-link evidence, embeddings, Chromaprint, journals, and waveform coverage;
 * progressive sonic admission that keeps repair-flagged AudioMuse 3 mappings usable while preserving their uncertainty evidence for later replacement;
-* one bounded background-enrichment chain per source, using small worker jobs instead of flooding the queue;
+* one durable background-enrichment workflow per source, using small batches and a one-action watchdog instead of flooding the queue;
 * high-priority, idempotent promotion for the current playback window, so a requested track is not trapped behind a library backfill.
 * cursor-based playback-profile delivery, so phones install only newly ready or removed profiles after the first bootstrap;
 * server-owned album and artist relationship generations using Lumae's native scoring model, published as resumable snapshots and deltas;
@@ -40,6 +40,21 @@ Administrators can pause Lumae background maintenance from the plugin settings
 page. Pausing stops new catalogue, projection, waveform, and relationship work;
 it does not delete or hide already published catalogue, profile, collection, or
 relationship data.
+
+### AudioMuse 3.4 queue compatibility in 1.1.7
+
+Lumae no longer imports RQ queues, jobs, dependencies, or retry objects from
+AudioMuse. Song-analysis hooks only record a pending source run in PostgreSQL.
+The catalogue watchdog runs every minute and advances at most one settled
+analysis finalizer, catalogue preparation, relationship build, or waveform
+batch. Each step is claimed atomically, so worker restarts and a manual job
+racing the watchdog are safe.
+
+The ONNX Runtime message `No registered plugin EP device found for
+'CUDAExecutionProvider'` is not emitted by Lumae. When AudioMuse continues with
+album progress immediately afterward, it is a non-fatal execution-provider
+discovery warning; CUDA availability and CPU fallback belong to the AudioMuse
+container and ONNX Runtime configuration.
 
 ### Develop-build transition guard in 1.1.2
 
@@ -70,6 +85,16 @@ The latest AudioMuse plugin documentation is here:
 https://github.com/NeptuneHub/AudioMuse-AI/blob/main/docs/PLUGIN.md
 
 The release zip must contain code only: `__init__.py` and helper files, with no `plugin.json` inside the zip. The GitHub workflow rebuilds the zip, fills the release `sourceUrl` and `checksum`, and regenerates `manifest.json`.
+
+Run the local regression suite with:
+
+```sh
+python -m pip install -r requirements-dev.txt
+python -m pytest tests/plugins -q
+```
+
+Pull requests run the same tests. The release builder rejects source changes
+that would alter an already checksummed version; add a new version entry instead.
 
 ## License
 

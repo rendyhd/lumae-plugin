@@ -1,8 +1,15 @@
 # Catalogue sync operations
 
-Lumae Analysis 1.1.6 publishes catalogue schema 3. Schema 3 is additive to the
+Lumae Analysis 1.1.7 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
+
+Version 1.1.7 uses only AudioMuse's public plugin API for initial root tasks.
+Follow-up work is stored in plugin-owned PostgreSQL state and a one-minute
+catalogue watchdog executes at most one action per tick. Analysis hooks never
+queue work; settled parent runs, catalogue preparation, relationships, and
+waveform batches use atomic claims and survive worker or application restarts.
+The migration re-admits finalizers stranded by the former private-RQ path.
 
 Version 1.1.6 retries the additive provider-identity schema migration during
 Flask startup. This repairs an update whose install-hook transaction was rolled
@@ -40,7 +47,9 @@ snapshot, and no-change analysis projections retain their current generation.
 An install only schedules preparation for a missing, stale, or unattested
 catalogue; it does not automatically rebuild an otherwise current projection.
 
-Every heavy RQ job now has a finite timeout. One waveform analysis has a
+In 1.0.1, every heavy RQ job received a finite timeout. In current releases,
+AudioMuse owns queue implementation and execution limits through its public
+plugin API. One waveform analysis still has a
 15-minute deadline and accepts at most eight channels, 384 kHz, and the roughly
 109-minute duration representable by the v1 100 ms/uint16 ramp contract.
 Out-of-contract media remains playable but does not receive a waveform profile.

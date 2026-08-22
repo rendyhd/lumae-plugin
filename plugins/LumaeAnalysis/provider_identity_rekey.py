@@ -500,7 +500,7 @@ def inspect_audiomuse_health(cur, adapter, server_id, expected_links):
     cur.execute(
         """
         SELECT COUNT(*) FROM task_status
-         WHERE status NOT IN ('SUCCESS', 'FAILURE', 'REVOKED')
+         WHERE status NOT IN ('SUCCESS', 'FAILURE', 'FAIL', 'REVOKED')
            AND (task_type ILIKE '%migration%'
                 OR task_type IN ('main_analysis', 'cleaning'))
         """

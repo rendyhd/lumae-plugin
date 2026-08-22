@@ -5,19 +5,57 @@ on:
     branches: [ main ]
     paths:
       - 'plugins/**'
+      - 'tests/**'
+      - 'requirements-dev.txt'
+      - '.github/workflows/build.yml'
+  pull_request:
+    paths:
+      - 'plugins/**'
+      - 'tests/**'
+      - 'requirements-dev.txt'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 concurrency:
   group: build-plugins
   cancel-in-progress: false
 
 jobs:
-  build:
+  test:
     runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+
+      - name: Install test dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Compile plugin sources
+        run: python -m compileall -q plugins/LumaeAnalysis
+
+      - name: Run plugin regression tests
+        run: >-
+          python -m pytest
+          tests/plugins/test_lumae_analysis.py
+          tests/plugins/test_lumae_analysis_provider_identity.py
+          tests/plugins/test_collection_library_postgres_integration.py
+          -q
+
+  build:
+    needs: test
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -93,8 +131,30 @@ jobs:
               version = str(latest["version"])
               zip_name = f"{pid}_{version}.zip"
               out = os.path.join(dist_dir, pid, zip_name)
-              build_zip(os.path.join(plugins_dir, folder), out)
-              checksum = hashlib.md5(open(out, "rb").read()).hexdigest()
+              candidate = out + ".candidate"
+              build_zip(os.path.join(plugins_dir, folder), candidate)
+              checksum = hashlib.md5(open(candidate, "rb").read()).hexdigest()
+
+              # A published version is immutable. Source changes must add a new
+              # versions[] entry instead of silently replacing an existing zip.
+              declared_checksum = str(latest.get("checksum") or "").strip()
+              if declared_checksum:
+                  if not os.path.isfile(out):
+                      raise RuntimeError(
+                          f"{pid} {version} declares a checksum but {out} is missing"
+                      )
+                  existing_checksum = hashlib.md5(open(out, "rb").read()).hexdigest()
+                  if existing_checksum != declared_checksum:
+                      raise RuntimeError(
+                          f"{pid} {version} stored artifact does not match plugin.json"
+                      )
+                  if checksum != declared_checksum:
+                      raise RuntimeError(
+                          f"{pid} {version} is already published; bump the version"
+                      )
+                  os.remove(candidate)
+              else:
+                  os.replace(candidate, out)
 
               # Fill this release's download link and checksum back into the plugin's
               # own plugin.json (in place). Older releases keep their existing values.
