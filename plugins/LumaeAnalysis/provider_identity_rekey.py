@@ -25,6 +25,23 @@ def t(name):
     return table(name)
 
 
+_AUDIOMUSE_REQUIRED_ACTION_BY_HEALTH = {
+    "ready": None,
+    "migration_required": "run_audiomuse_provider_migration",
+    "busy": "wait_for_audiomuse_work",
+    "repair_required": "investigate_audiomuse_mapping",
+}
+
+
+def audiomuse_required_action(health):
+    """Return the one operator action that matches AudioMuse's live health."""
+
+    try:
+        return _AUDIOMUSE_REQUIRED_ACTION_BY_HEALTH[health]
+    except KeyError as exc:
+        raise ValueError(f"Unsupported AudioMuse health: {health!r}") from exc
+
+
 @dataclass(frozen=True)
 class RekeyEvent:
     entity_type: str
@@ -806,7 +823,7 @@ def _publish_provider_identity_rekey(
             manifest_sha256,
         ),
     )
-    required_action = None if audiomuse_health == "ready" else "run_audiomuse_provider_migration"
+    required_action = audiomuse_required_action(audiomuse_health)
     cur.execute(
         f"""
         UPDATE {t('provider_identity_transitions')}
@@ -915,16 +932,16 @@ def refresh_audiomuse_health(db, catalog_instance_id, server_id, adapter, commit
         return None
     links = _load_analysis_links(cur, catalog_instance_id, int(state[1] or 0))
     health = inspect_audiomuse_health(cur, adapter, server_id, links)
+    required_action = audiomuse_required_action(health)
     cur.execute(
         f"""
         UPDATE {t('provider_identity_transitions')}
            SET audiomuse_health=%s,
-               required_action=CASE WHEN %s='ready' THEN NULL
-                                    ELSE 'run_audiomuse_provider_migration' END,
+               required_action=%s,
                checked_at=now(), updated_at=now()
          WHERE catalog_instance_id=%s AND state='applied'
         """,
-        (health, health, catalog_instance_id),
+        (health, required_action, catalog_instance_id),
     )
     cur.close()
     if commit:

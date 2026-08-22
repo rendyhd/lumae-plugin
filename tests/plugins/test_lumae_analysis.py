@@ -5455,6 +5455,83 @@ def test_audiomuse_health_is_independent_and_exact(active_tasks, mappings, expec
     )
 
 
+@pytest.mark.parametrize(
+    ("health", "expected"),
+    [
+        ("ready", None),
+        ("migration_required", "run_audiomuse_provider_migration"),
+        ("busy", "wait_for_audiomuse_work"),
+        ("repair_required", "investigate_audiomuse_mapping"),
+    ],
+)
+def test_audiomuse_required_action_matches_live_health(health, expected):
+    from plugins.LumaeAnalysis.provider_identity_rekey import audiomuse_required_action
+
+    assert audiomuse_required_action(health) == expected
+
+
+class RefreshHealthCursor:
+    def __init__(self):
+        self.executed = []
+        self.row = None
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        self.row = ("applied", 12) if "SELECT p.state" in sql else None
+
+    def fetchone(self):
+        return self.row
+
+    def close(self):
+        return None
+
+
+class RefreshHealthDb:
+    def __init__(self):
+        self.cur = RefreshHealthCursor()
+        self.commits = 0
+
+    def cursor(self):
+        return self.cur
+
+    def commit(self):
+        self.commits += 1
+
+
+@pytest.mark.parametrize(
+    ("health", "expected_action"),
+    [
+        ("ready", None),
+        ("migration_required", "run_audiomuse_provider_migration"),
+        ("busy", "wait_for_audiomuse_work"),
+        ("repair_required", "investigate_audiomuse_mapping"),
+    ],
+)
+def test_refresh_audiomuse_health_persists_state_specific_action(
+    monkeypatch, health, expected_action
+):
+    from plugins.LumaeAnalysis import provider_identity_rekey as rekey
+
+    db = RefreshHealthDb()
+    monkeypatch.setattr(rekey, "_load_analysis_links", lambda *_args: {})
+    monkeypatch.setattr(rekey, "inspect_audiomuse_health", lambda *_args: health)
+
+    assert (
+        rekey.refresh_audiomuse_health(
+            db, "catalog-a", "server-a", PublisherAdapter()
+        )
+        == health
+    )
+
+    update_params = next(
+        params
+        for sql, params in db.cur.executed
+        if "UPDATE plugin_lumae_analysis__provider_identity_transitions" in sql
+    )
+    assert update_params == (health, expected_action, "catalog-a")
+    assert db.commits == 1
+
+
 def test_transition_manifest_route_downloads_recovery_evidence(monkeypatch):
     mod = load_plugin()
     monkeypatch.setattr(mod, "get_db", lambda: object())

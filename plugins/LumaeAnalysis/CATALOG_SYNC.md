@@ -93,6 +93,11 @@ the same analysis IDs. Health reports `ready`, `migration_required`, `busy`, or
 `repair_required`; the ordinary AudioMuse Provider Migration is sufficient when
 it produces those exact mappings.
 
+The transition's `required_action` mirrors that health without collapsing the
+operator workflow: `ready` has no action, `migration_required` requests
+`run_audiomuse_provider_migration`, `busy` requests `wait_for_audiomuse_work`,
+and `repair_required` requests `investigate_audiomuse_mapping`.
+
 Download retained evidence from:
 
 ```text
