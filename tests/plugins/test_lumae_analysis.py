@@ -1,10 +1,12 @@
 import importlib
 import json
+import os
 import pathlib
 import struct
 import sys
 import math
 import types
+import uuid
 
 import numpy as np
 import pytest
@@ -40,6 +42,30 @@ def load_plugin():
     return importlib.import_module("plugins.LumaeAnalysis")
 
 
+@pytest.fixture
+def lumae_postgres_db():
+    dsn = os.environ.get("LUMAE_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set LUMAE_POSTGRES_TEST_DSN to run PostgreSQL integration tests")
+    psycopg2 = pytest.importorskip("psycopg2")
+    schema = f"lumae_analysis_integration_{uuid.uuid4().hex}"
+    db = psycopg2.connect(dsn)
+    try:
+        cur = db.cursor()
+        cur.execute(f"CREATE SCHEMA {schema}")
+        cur.execute(f"SET search_path TO {schema}, public")
+        cur.close()
+        db.commit()
+        yield db
+    finally:
+        db.rollback()
+        cur = db.cursor()
+        cur.execute(f"DROP SCHEMA IF EXISTS {schema} CASCADE")
+        cur.close()
+        db.commit()
+        db.close()
+
+
 def plugin_client(mod):
     app = Flask(__name__)
     app.register_blueprint(mod.bp)
@@ -52,8 +78,22 @@ def settings_catalog_source():
         "server_id": "server-a",
         "provider_type": "navidrome",
         "name": "Main Navidrome",
-        "catalog": {"status": "complete"},
+        "catalog": {"status": "complete", "entity_counts": {"track": 100}},
         "analysis": {"status": "complete"},
+    }
+
+
+def expect_v3_readiness(core_version):
+    return {
+        "qualified_core_version": core_version,
+        "detected_core_version": core_version,
+        "applicable": True,
+        "status": "catalog_not_initialized",
+        "ready": False,
+        "verification_mode": None,
+        "administrator_acknowledged": False,
+        "acknowledged_at": None,
+        "blockers": ["catalog_not_initialized"],
     }
 
 
@@ -64,13 +104,21 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.2.0"
-    assert manifest["versions"][0]["min_core_version"] == "2.6.0"
+    assert manifest["versions"][0]["version"] == "1.1.7"
+    assert manifest["versions"][0]["min_core_version"] == "3.2.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
         "analyzer_version": 1,
         "profile_source": "waveform",
-        "features": ["loudness", "mix_ramp", "source_scoped_profiles", "prepare_lumae"],
+        "features": [
+            "loudness",
+            "mix_ramp",
+            "source_scoped_profiles",
+            "prepare_lumae",
+            "interactive_profile_priority",
+            "bounded_profile_backfill",
+            "profile_cursor_stream",
+        ],
     }
     assert manifest["capabilities"]["living_collections"] == {
         "schema_version": 1,
@@ -91,6 +139,7 @@ def test_plugin_manifest_has_lumae_identity():
         "contract_revision": 1,
         "catalog_schema_version": 3,
         "analysis_schema_version": 2,
+        "catalog_builder_version": 5,
         "supported_core_range": ">=2.6.0,<4.0.0",
         "supported_provider_types": ["navidrome"],
         "features": [
@@ -113,13 +162,28 @@ def test_plugin_manifest_has_lumae_identity():
             "independent_stream_admission",
             "automatic_sonic_verification",
             "semantic_contracts_v1",
+            "progressive_analysis_admission",
+            "repair_flagged_analysis_admission",
+            "database_state_dashboard",
             "provider_track_scope_verification",
             "source_scoped_profiles",
             "prepare_lumae",
             "catalog_prepare_api",
             "analysis_run_finalization",
+            "catalog_ready_before_profile_backfill",
+            "interactive_profile_priority",
+            "bounded_profile_backfill",
+            "automatic_catalog_preparation",
+            "catalog_builder_versioning",
+            "durable_catalog_reconciliation",
+            "preparation_worker_attestation",
+            "profile_cursor_stream",
+            "server_album_artist_relationships",
+            "relationship_cursor_stream",
+            "nonblocking_enrichment",
             "provider_identity_transition_shield_v1",
             "provider_identity_rekey_v1",
+            "bounded_storage_retention",
         ],
     }
 
@@ -133,7 +197,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.2.0",
+        "plugin_version": "1.1.7",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -160,6 +224,14 @@ def test_catalog_health_uses_v2_single_server_adapter():
     assert response.status_code == 200
     body = response.get_json()
     assert body["core_adapter"] == "v2_single_server"
+    assert body["core_api_contract"] == "audiomuse_v2_single_server_v1"
+    assert body["sync_contract"]["revision"] == 1
+    assert body["sync_contract"]["core_api_contract"] == body["core_api_contract"]
+    assert body["sync_contract"]["streams"]["catalog"]["semantic_contracts"] == [
+        "provider_track_ids_v1",
+        "complete_catalog_generation_v1",
+        "contiguous_change_journal_v1",
+    ]
     assert body["supported"] is True
     assert body["servers"] == [
         {
@@ -244,9 +316,9 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
             "applicable": True,
             "status": "ready",
             "ready": True,
-            "verification_mode": "upgraded",
-            "administrator_acknowledged": True,
-            "acknowledged_at": "2026-07-20T12:00:00Z",
+            "verification_mode": "automatic",
+            "administrator_acknowledged": False,
+            "acknowledged_at": None,
             "blockers": [],
         }
 
@@ -256,7 +328,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.2.0"
+    assert body["plugin_version"] == "1.1.7"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -361,6 +433,621 @@ def test_catalog_cursor_is_opaque_round_trippable_and_source_bound():
         parse_opaque_cursor("not-a-cursor")
 
 
+def test_profile_stream_serializes_waveform_payload_without_device_analysis():
+    from plugins.LumaeAnalysis.catalog_enrichment import serialize_profile
+
+    payload = serialize_profile(
+        "track-a",
+        44100,
+        123000,
+        -14.25,
+        b"\x01\x02",
+        b"\x03\x04",
+        1,
+        "2026-07-27T12:00:00Z",
+        "catalog-media:abc",
+    )
+
+    assert payload == {
+        "track_id": "track-a",
+        "source": "waveform",
+        "sample_rate": 44100,
+        "duration_ms": 123000,
+        "ref_lufs": -14.25,
+        "start_ramp": "AQI=",
+        "end_ramp": "AwQ=",
+        "analyzer_ver": 1,
+        "analyzed_at": "2026-07-27T12:00:00Z",
+        "media_signature": "catalog-media:abc",
+    }
+
+
+def test_server_album_and_artist_relationships_use_lumae_native_rankers():
+    from plugins.LumaeAnalysis.catalog_enrichment import (
+        _album_fingerprint,
+        _artist_fingerprint,
+        _rank_albums,
+        _rank_artists,
+    )
+
+    def track(track_id, embedding, order, album, year):
+        return {
+            "id": track_id,
+            "embedding": embedding,
+            "energy": 0.5,
+            "mood": [0.5] * 6,
+            "order": order,
+            "album": album,
+            "year": year,
+        }
+
+    album_rows = [
+        {
+            "key": "artist-a::source",
+            "album": "Source",
+            "artist": "Artist A",
+            "cover": "a1",
+            "fingerprint": _album_fingerprint(
+                "artist-a::source",
+                [track("a1", [1.0, 0.0], 0, "Source", 2020)],
+            ),
+        },
+        {
+            "key": "artist-b::near",
+            "album": "Near",
+            "artist": "Artist B",
+            "cover": "b1",
+            "fingerprint": _album_fingerprint(
+                "artist-b::near",
+                [track("b1", [0.99, 0.1], 0, "Near", 2021)],
+            ),
+        },
+        {
+            "key": "artist-c::far",
+            "album": "Far",
+            "artist": "Artist C",
+            "cover": "c1",
+            "fingerprint": _album_fingerprint(
+                "artist-c::far",
+                [track("c1", [0.0, 1.0], 0, "Far", 2022)],
+            ),
+        },
+    ]
+    assert [row["albumKey"] for row in _rank_albums(album_rows[0], album_rows)] == [
+        "artist-b::near",
+        "artist-c::far",
+    ]
+    assert _rank_albums(album_rows[0], album_rows)[0]["reasons"][0] == "core"
+
+    artist_rows = [
+        {
+            "key": "artist-a",
+            "artist": "Artist A",
+            "cover": "a1",
+            "fingerprint": _artist_fingerprint(
+                "artist-a",
+                [track("a1", [1.0, 0.0], 0, "Source", 2020)],
+            ),
+        },
+        {
+            "key": "artist-b",
+            "artist": "Artist B",
+            "cover": "b1",
+            "fingerprint": _artist_fingerprint(
+                "artist-b",
+                [track("b1", [0.99, 0.1], 0, "Near", 2021)],
+            ),
+        },
+        {
+            "key": "artist-c",
+            "artist": "Artist C",
+            "cover": "c1",
+            "fingerprint": _artist_fingerprint(
+                "artist-c",
+                [track("c1", [0.0, 1.0], 0, "Far", 2022)],
+            ),
+        },
+    ]
+    assert [row["artistKey"] for row in _rank_artists(artist_rows[0], artist_rows)] == [
+        "artist-b",
+        "artist-c",
+    ]
+
+
+def test_relationship_candidate_scoring_is_bounded_by_ivf_shortlist(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    def entity(index):
+        vector = np.zeros(200, dtype=np.float32)
+        vector[index % 200] = 1.0
+        return {
+            "key": f"artist-{index}::album-{index}",
+            "album": f"Album {index}",
+            "artist": f"Artist {index}",
+            "cover": f"track-{index}",
+            "fingerprint": {
+                "mean": vector,
+                "poles": [],
+            },
+        }
+
+    entities = [entity(index) for index in range(1000)]
+    entities_by_key = {row["key"]: row for row in entities}
+    track_to_entity = {
+        f"track-{index}": row["key"] for index, row in enumerate(entities)
+    }
+    candidates = enrichment._relationship_candidates(
+        entities[0],
+        "album",
+        entities_by_key,
+        track_to_entity,
+        lambda _vectors, _limit: [f"track-{index}" for index in range(1, 1000)],
+    )
+
+    calls = []
+    monkeypatch.setattr(
+        enrichment,
+        "_album_score",
+        lambda _source, _candidate: (calls.append(1) or 0.1, ["core"]),
+    )
+    enrichment._rank_albums(entities[0], candidates)
+
+    assert len(candidates) == enrichment.RELATIONSHIP_MAX_CANDIDATE_ENTITIES
+    assert len(calls) == enrichment.RELATIONSHIP_MAX_CANDIDATE_ENTITIES
+    assert len(calls) < len(entities) * len(entities)
+
+
+def test_relationship_builder_waits_instead_of_falling_back_without_ivf(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    fake_manager = types.SimpleNamespace(
+        ivf_index=None,
+        multi_query_ids=lambda _vectors, _limit: [],
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "tasks",
+        types.SimpleNamespace(ivf_manager=fake_manager),
+    )
+
+    with pytest.raises(enrichment.RelationshipIndexUnavailable, match="not ready"):
+        enrichment._ivf_candidate_track_ids(
+            [np.ones(200, dtype=np.float32)],
+            10,
+        )
+
+
+def test_relationship_builder_loads_ivf_and_caps_queries_to_small_indexes(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    calls = []
+
+    class Index:
+        def __len__(self):
+            return 7
+
+    fake_manager = types.SimpleNamespace(ivf_index=None)
+
+    def load():
+        calls.append("load")
+        fake_manager.ivf_index = Index()
+
+    def query(_vectors, limit):
+        calls.append(("query", limit))
+        return ["track-a"]
+
+    fake_manager.load_ivf_index_for_querying = load
+    fake_manager.multi_query_ids = query
+    monkeypatch.setitem(
+        sys.modules,
+        "tasks",
+        types.SimpleNamespace(ivf_manager=fake_manager),
+    )
+
+    assert enrichment._ivf_candidate_track_ids(
+        [np.ones(200, dtype=np.float32)],
+        96,
+    ) == ["track-a"]
+    assert calls == ["load", ("query", 7)]
+
+
+def test_relationship_builder_publishes_only_bounded_shortlist_candidates(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "catalog": {"status": "complete", "generation": 4},
+        "analysis": {"status": "complete", "generation": 6},
+    }
+    tracks = [
+        {"id": "track-a", "album": "Album A", "artist": "Artist A"},
+        {"id": "track-b", "album": "Album B", "artist": "Artist B"},
+    ]
+    vector = np.ones(200, dtype=np.float32)
+    albums = [
+        {
+            "key": "artist a::album a",
+            "album": "Album A",
+            "artist": "Artist A",
+            "cover": "track-a",
+            "fingerprint": {"mean": vector, "poles": []},
+        },
+        {
+            "key": "artist b::album b",
+            "album": "Album B",
+            "artist": "Artist B",
+            "cover": "track-b",
+            "fingerprint": {"mean": vector, "poles": []},
+        },
+    ]
+    artists = [
+        {
+            "key": "artist a",
+            "artist": "Artist A",
+            "cover": "track-a",
+            "fingerprint": {"core": [vector], "poles": [], "outliers": []},
+        },
+        {
+            "key": "artist b",
+            "artist": "Artist B",
+            "cover": "track-b",
+            "fingerprint": {"core": [vector], "poles": [], "outliers": []},
+        },
+    ]
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+            self.one = None
+            self.all = []
+
+        def execute(self, sql, args=None):
+            normalized = " ".join(sql.split())
+            self.executed.append((normalized, args))
+            self.one = None
+            self.all = []
+            if "SELECT result_generation, epoch, head_seq" in normalized:
+                self.one = (0, "epoch-a", 0)
+            elif "SELECT entity_type, entity_id, result_fp" in normalized:
+                self.all = []
+
+        def fetchone(self):
+            return self.one
+
+        def fetchall(self):
+            return self.all
+
+        def close(self):
+            return None
+
+    class Db:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+            self.commits = 0
+            self.rollbacks = 0
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    db = Db()
+    monkeypatch.setattr(
+        enrichment,
+        "resolve_catalog_source",
+        lambda _db, **_kwargs: [source],
+    )
+    monkeypatch.setattr(
+        enrichment,
+        "_load_relationship_inputs",
+        lambda _cur, _source: tracks,
+    )
+    monkeypatch.setattr(
+        enrichment,
+        "_build_entities",
+        lambda _tracks: (albums, artists),
+    )
+    scored = []
+    monkeypatch.setattr(
+        enrichment,
+        "_rank_albums",
+        lambda entity, candidates: scored.append(
+            ("album", entity["key"], [row["key"] for row in candidates])
+        )
+        or [],
+    )
+    monkeypatch.setattr(
+        enrichment,
+        "_rank_artists",
+        lambda entity, candidates: scored.append(
+            ("artist", entity["key"], [row["key"] for row in candidates])
+        )
+        or [],
+    )
+    lookup_calls = []
+
+    def lookup(_vectors, limit):
+        lookup_calls.append(limit)
+        return ["track-a", "track-b"]
+
+    result = enrichment.prepare_relationships(
+        "catalog-a",
+        db=db,
+        candidate_lookup=lookup,
+    )
+
+    assert result == {
+        "catalog_instance_id": "catalog-a",
+        "status": "complete",
+        "generation": 1,
+        "album_count": 2,
+        "artist_count": 2,
+        "track_count": 2,
+        "changes": 4,
+        "cursor": enrichment.opaque_cursor("catalog-a", "epoch-a", 4),
+    }
+    assert lookup_calls == [enrichment.RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR] * 4
+    assert scored == [
+        ("album", "artist a::album a", ["artist b::album b"]),
+        ("album", "artist b::album b", ["artist a::album a"]),
+        ("artist", "artist a", ["artist b"]),
+        ("artist", "artist b", ["artist a"]),
+    ]
+    assert db.commits == 2
+    assert db.rollbacks == 0
+    statements = [sql for sql, _args in db.cursor_obj.executed]
+    assert sum("INSERT INTO plugin_lumae_analysis__relationship_results" in sql for sql in statements) == 4
+    assert sum("INSERT INTO plugin_lumae_analysis__relationship_changes" in sql for sql in statements) == 4
+    assert any("status='complete'" in sql for sql in statements)
+
+
+def test_relationship_fingerprints_bound_pathological_album_pairwise_work(monkeypatch):
+    import plugins.LumaeAnalysis.catalog_enrichment as enrichment
+
+    pairwise_sizes = []
+
+    def bounded_pairwise(tracks):
+        pairwise_sizes.append(len(tracks))
+        return [[0.0] * len(tracks) for _ in tracks]
+
+    monkeypatch.setattr(enrichment, "_pairwise", bounded_pairwise)
+    tracks = [
+        {
+            "id": f"track-{index:04d}",
+            "order": index,
+            "embedding": np.full(200, index / 500, dtype=np.float32),
+            "energy": 0.5,
+            "mood": None,
+        }
+        for index in range(500)
+    ]
+
+    fingerprint = enrichment._album_fingerprint("artist::album", tracks)
+
+    assert fingerprint is not None
+    assert 0 < pairwise_sizes[0] <= enrichment.RELATIONSHIP_ENTITY_SAMPLE_LIMIT
+    assert len(pairwise_sizes) == 1
+    assert pairwise_sizes[0] < len(tracks)
+
+
+def test_relationship_bootstrap_rejects_a_page_token_from_an_old_generation(
+    monkeypatch,
+):
+    from plugins.LumaeAnalysis import catalog_enrichment
+    from plugins.LumaeAnalysis.catalog import opaque_cursor
+
+    cursor = opaque_cursor("catalog-a", "epoch-a", 12)
+    monkeypatch.setattr(
+        catalog_enrichment,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "catalog_instance_id": "catalog-a",
+            "schema_version": 1,
+            "algorithm_version": 1,
+            "generation": 3,
+            "cursor": cursor,
+            "status": "complete",
+        },
+    )
+    page_token = catalog_enrichment._encode_page_token(
+        {
+            "catalog_instance_id": "catalog-a",
+            "epoch": "epoch-a",
+            "generation": 2,
+            "entity_type": "album",
+            "entity_id": "artist::album",
+        }
+    )
+
+    with pytest.raises(KeyError, match="bootstrap_required"):
+        catalog_enrichment.relationship_bootstrap_page(
+            object(), "catalog-a", page_token=page_token
+        )
+
+
+def test_relationship_bootstrap_keeps_last_published_generation_visible_while_stale(
+    monkeypatch,
+):
+    from plugins.LumaeAnalysis import catalog_enrichment
+    from plugins.LumaeAnalysis.catalog import opaque_cursor
+
+    status = {
+        "catalog_instance_id": "catalog-a",
+        "schema_version": 1,
+        "algorithm_version": 1,
+        "generation": 3,
+        "cursor": opaque_cursor("catalog-a", "epoch-a", 12),
+        "status": "waiting_for_index",
+    }
+    monkeypatch.setattr(
+        catalog_enrichment,
+        "relationship_status",
+        lambda _db, _catalog_id: dict(status),
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, args):
+            self.executed.append((" ".join(sql.split()), args))
+
+        def fetchall(self):
+            return [
+                (
+                    "album",
+                    "album-a",
+                    {"entity_type": "album", "entity_id": "album-a", "similar": []},
+                    "2026-07-30T12:00:00Z",
+                )
+            ]
+
+        def close(self):
+            return None
+
+    cursor = Cursor()
+    db = types.SimpleNamespace(cursor=lambda: cursor)
+
+    page = catalog_enrichment.relationship_bootstrap_page(
+        db, "catalog-a", limit=10
+    )
+
+    assert page["status"] == "waiting_for_index"
+    assert page["generation"] == 3
+    assert page["algorithm_version"] == 1
+    assert page["relationships"] == [
+        {
+            "entity_type": "album",
+            "entity_id": "album-a",
+            "similar": [],
+            "computed_at": "2026-07-30T12:00:00Z",
+        }
+    ]
+    assert cursor.executed[0][1][1] == 3
+
+
+def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch):
+    from plugins.LumaeAnalysis import catalog_enrichment
+    from plugins.LumaeAnalysis.catalog import opaque_cursor
+
+    class Cursor:
+        def __init__(self, state_row=None):
+            self.state_row = state_row
+            self.calls = []
+
+        def execute(self, sql, args):
+            self.calls.append((" ".join(sql.split()), args))
+
+        def fetchone(self):
+            return self.state_row
+
+        def fetchall(self):
+            return []
+
+        def close(self):
+            return None
+
+    profile_cursor = Cursor(("profile-epoch", 10, 0))
+    profile_db = type("Db", (), {"cursor": lambda _self: profile_cursor})()
+    monkeypatch.setattr(
+        catalog_enrichment,
+        "resolve_catalog_source",
+        lambda _db, **_kwargs: [{"catalog_instance_id": "catalog-a"}],
+    )
+
+    profile_page = catalog_enrichment.read_profile_changes(
+        profile_db,
+        opaque_cursor("catalog-a", "profile-epoch", 2),
+        catalog_instance_id="catalog-a",
+    )
+
+    assert profile_page["has_more"] is True
+    assert "seq>%s AND seq<=%s" in profile_cursor.calls[-1][0]
+    assert profile_cursor.calls[-1][1][2:4] == (2, 10)
+
+    relationship_cursor = Cursor()
+    relationship_db = type(
+        "Db", (), {"cursor": lambda _self: relationship_cursor}
+    )()
+    monkeypatch.setattr(
+        catalog_enrichment,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "catalog_instance_id": "catalog-a",
+            "schema_version": 1,
+            "algorithm_version": 1,
+            "generation": 4,
+            "cursor": opaque_cursor("catalog-a", "relationship-epoch", 20),
+            "floor_seq": 0,
+            "status": "complete",
+        },
+    )
+
+    relationship_page = catalog_enrichment.read_relationship_changes(
+        relationship_db,
+        opaque_cursor("catalog-a", "relationship-epoch", 3),
+        catalog_instance_id="catalog-a",
+    )
+
+    assert relationship_page["has_more"] is True
+    assert "seq>%s AND seq<=%s" in relationship_cursor.calls[-1][0]
+    assert relationship_cursor.calls[-1][1][2:4] == (3, 20)
+
+
+def test_enrichment_stream_endpoints_are_source_scoped_and_nonblocking(monkeypatch):
+    mod = load_plugin()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(
+        mod,
+        "start_relationship_preparation",
+        lambda **_kwargs: {"queued": True, "coalesced": False, "job_id": "job-a"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda _db, catalog_instance_id: {
+            "catalog_instance_id": catalog_instance_id,
+            "status": "queued",
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "profile_bootstrap_page",
+        lambda _db, catalog_instance_id, **_kwargs: {
+            "catalog_instance_id": catalog_instance_id,
+            "profiles": [{"track_id": "track-a"}],
+            "cursor": "profile-cursor",
+            "has_more": False,
+            "next_page_token": None,
+        },
+    )
+    client = plugin_client(mod)
+
+    queued = client.post(
+        "/api/catalog/relationships/prepare",
+        json={"catalog_instance_id": "catalog-a"},
+    )
+    profiles = client.get(
+        "/api/profiles/bootstrap?catalog_instance_id=catalog-a"
+    )
+
+    assert queued.status_code == 200
+    assert queued.get_json()["job_id"] == "job-a"
+    assert queued.get_json()["relationships"]["status"] == "queued"
+    assert profiles.status_code == 200
+    assert profiles.get_json()["profiles"] == [{"track_id": "track-a"}]
+    assert profiles.headers["Cache-Control"] == "private, no-cache"
+
+
 def test_bootstrap_session_api_keeps_token_out_of_url_and_private_cache(monkeypatch):
     mod = load_plugin()
     captured = {}
@@ -385,6 +1072,42 @@ def test_bootstrap_session_api_keeps_token_out_of_url_and_private_cache(monkeypa
     assert response.headers["Cache-Control"] == "private, no-store"
     assert captured["server_id"] == "server-a"
     assert captured["principal"].startswith("client:")
+
+
+def test_bootstrap_session_uses_published_generation_during_refresh(monkeypatch):
+    import plugins.LumaeAnalysis.catalog as catalog
+
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "catalog": {
+            "generation": 7,
+            "epoch": "epoch-a",
+            "head_seq": 42,
+            "status": "scanning",
+            "entity_counts": {"track": 100},
+        },
+        "analysis": {
+            "generation": 0,
+            "epoch": "analysis-a",
+            "head_seq": 0,
+            "status": "not_initialized",
+        },
+    }
+    monkeypatch.setattr(catalog, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    db = FakeDb([(0,)])
+
+    result = catalog.create_bootstrap_session(
+        db,
+        "user:alice",
+        stream="catalog",
+        server_id="server-a",
+        catalog_instance_id="catalog-a",
+    )
+
+    assert result["generation"] == 7
+    assert result["snapshot_seq"] == 42
+    assert result["totals"] == {"track": 100}
 
 
 def test_bootstrap_page_requires_token_header_and_returns_410_after_expiry(monkeypatch):
@@ -472,6 +1195,7 @@ def test_catalog_refresh_coalesces_to_selected_source(monkeypatch):
             {
                 "server_id": "server-a",
                 "catalog_instance_id": "catalog-a",
+                "rebind_status": "active",
                 "catalog": {
                     "generation": 3,
                     "status": "complete",
@@ -498,31 +1222,76 @@ def test_catalog_refresh_coalesces_to_selected_source(monkeypatch):
     assert "internal.invalid" not in response.get_data(as_text=True)
 
 
-def test_catalog_prepare_api_claims_one_exact_source_and_returns_mobile_contract(monkeypatch):
+def test_catalog_refresh_blocks_pending_v2_to_v3_rebind(monkeypatch):
     mod = load_plugin()
-    source = {
-        **settings_catalog_source(),
-        "catalog": {
-            "generation": 3,
-            "status": "complete",
-            "entity_counts": {"track": 21_377},
-        },
-        "analysis": {"status": "complete"},
-    }
-    queued = []
+    calls = []
     monkeypatch.setattr(mod, "get_db", lambda: object())
     monkeypatch.setattr(
         mod,
         "resolve_catalog_source",
-        lambda *_args, **_kwargs: [source],
+        lambda *_args, **_kwargs: [
+            {
+                "server_id": "legacy-default",
+                "candidate_server_id": "server-a",
+                "catalog_instance_id": "catalog-a",
+                "rebind_status": "rebind_required",
+                "catalog": {
+                    "generation": 3,
+                    "status": "complete",
+                    "completed_at": None,
+                },
+            }
+        ],
     )
-    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(mod, "claim_preparation", lambda *_args, **_kwargs: True)
+    monkeypatch.setattr(mod, "enqueue", lambda *args, **kwargs: calls.append((args, kwargs)))
+
+    response = plugin_client(mod).post(
+        "/api/catalog/refresh",
+        json={"server_id": "legacy-default", "catalog_instance_id": "catalog-a"},
+    )
+
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "rebind_required"
+    assert calls == []
+
+
+def test_catalog_prepare_api_queues_first_publication_and_returns_poll_location(monkeypatch):
+    mod = load_plugin()
+    source = {
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 0,
+            "status": "not_initialized",
+            "entity_counts": {},
+            "builder_version": 0,
+            "refresh_required": True,
+            "refresh_reason": "catalog_builder_upgrade",
+        },
+        "analysis": {"generation": 0, "status": "not_initialized"},
+    }
+    state = {"value": None}
+    queued = []
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: state["value"])
+
+    def claim(_source, db=None):
+        state["value"] = {
+            "status": "queued",
+            "phase": "queued",
+            "last_error": None,
+            "updated_at": "2099-07-27T12:00:00Z",
+        }
+        return True
+
+    monkeypatch.setattr(mod, "claim_preparation", claim)
     monkeypatch.setattr(
         mod,
         "enqueue",
-        lambda func, server_id, catalog_instance_id, queue="default": queued.append(
-            (func, server_id, catalog_instance_id, queue)
+        lambda func, server_id, catalog_id, queue="default": queued.append(
+            (func, server_id, catalog_id, queue)
         ),
     )
 
@@ -532,120 +1301,46 @@ def test_catalog_prepare_api_claims_one_exact_source_and_returns_mobile_contract
     )
 
     assert response.status_code == 202
-    assert response.headers["Cache-Control"] == "private, no-store"
-    assert response.get_json() == {
-        "operation_id": "catalog-a",
-        "catalog_instance_id": "catalog-a",
-        "server_id": "server-a",
-        "status": "queued",
-        "phase": "queued",
-        "catalog_ready": True,
-        "publication_current": True,
-        "refresh_required": False,
-        "generation": 3,
-        "counts": {"track": 21_377},
-        "published_builder_version": 1,
-        "current_builder_version": 1,
-        "fingerprint_schema_version": 2,
-        "analysis_ready": True,
-        "worker_attested": True,
-        "queued_profiles": 0,
-        "profile_jobs": 0,
-        "last_error": None,
-        "started_at": None,
-        "completed_at": None,
-        "updated_at": None,
-    }
+    assert response.headers["Retry-After"] == "2"
+    assert response.headers["Location"].endswith("/api/catalog/prepare/catalog-a")
+    assert response.get_json()["status"] == "queued"
+    assert response.get_json()["catalog_ready"] is False
     assert queued == [(mod.prepare_lumae_task, "server-a", "catalog-a", "default")]
 
 
-def test_catalog_prepare_api_coalesces_active_operation_and_status_is_pollable(monkeypatch):
+def test_catalog_prepare_api_coalesces_active_operation(monkeypatch):
     mod = load_plugin()
     source = {
-        **settings_catalog_source(),
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "rebind_status": "active",
         "catalog": {
             "generation": 0,
-            "status": "not_initialized",
+            "status": "scanning",
             "entity_counts": {},
+            "builder_version": 0,
+            "refresh_required": True,
         },
-        "analysis": {"status": "not_initialized"},
+        "analysis": {"generation": 0, "status": "not_initialized"},
     }
     state = {
-        "catalog_instance_id": "catalog-a",
-        "server_id": "server-a",
         "status": "running",
         "phase": "catalog_refresh",
-        "queued_profiles": 0,
-        "profile_jobs": 0,
         "last_error": None,
-        "started_at": "2026-07-29T12:00:00Z",
-        "completed_at": None,
-        "updated_at": "2026-07-29T12:00:01Z",
+        "updated_at": "2099-07-27T12:00:00Z",
     }
     monkeypatch.setattr(mod, "get_db", lambda: object())
-    monkeypatch.setattr(
-        mod,
-        "resolve_catalog_source",
-        lambda *_args, **_kwargs: [source],
-    )
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
     monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: state)
-    monkeypatch.setattr(mod, "preparation_is_active", lambda selected: selected is state)
     monkeypatch.setattr(
         mod,
         "claim_preparation",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("active operation must not be reclaimed")
-        ),
+        lambda *_args, **_kwargs: pytest.fail("active preparation must coalesce"),
     )
     monkeypatch.setattr(
         mod,
         "enqueue",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("active operation must not enqueue twice")
-        ),
-    )
-    client = plugin_client(mod)
-
-    started = client.post(
-        "/api/catalog/prepare",
-        json={"server_id": "server-a", "catalog_instance_id": "catalog-a"},
-    )
-    polled = client.get("/api/catalog/prepare/catalog-a")
-
-    assert started.status_code == 202
-    assert started.get_json()["status"] == "running"
-    assert polled.status_code == 200
-    assert polled.get_json()["operation_id"] == "catalog-a"
-    assert polled.get_json()["catalog_ready"] is False
-    assert polled.get_json()["refresh_required"] is True
-    assert polled.get_json()["phase"] == "catalog_refresh"
-
-
-def test_catalog_prepare_api_records_queue_failure_without_leaving_stuck_work(monkeypatch):
-    mod = load_plugin()
-    source = {
-        **settings_catalog_source(),
-        "catalog": {
-            "generation": 0,
-            "status": "not_initialized",
-            "entity_counts": {},
-        },
-        "analysis": {"status": "not_initialized"},
-    }
-    states = []
-    monkeypatch.setattr(mod, "get_db", lambda: object())
-    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
-    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(mod, "claim_preparation", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(
-        mod,
-        "enqueue",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("queue unavailable")),
-    )
-    monkeypatch.setattr(
-        mod,
-        "update_preparation_state",
-        lambda *args, **kwargs: states.append((args, kwargs)),
+        lambda *_args, **_kwargs: pytest.fail("active preparation must not enqueue twice"),
     )
 
     response = plugin_client(mod).post(
@@ -653,30 +1348,140 @@ def test_catalog_prepare_api_records_queue_failure_without_leaving_stuck_work(mo
         json={"server_id": "server-a", "catalog_instance_id": "catalog-a"},
     )
 
-    assert response.status_code == 503
-    assert response.get_json()["error"] == "preparation_enqueue_failed"
-    assert "queue unavailable" not in response.get_data(as_text=True)
-    assert states[0][0][2:4] == ("failed", "failed")
-    assert states[0][1]["completed"] is True
+    assert response.status_code == 202
+    assert response.get_json()["status"] == "running"
 
 
-def test_catalog_capabilities_have_routes_and_optional_streams_stay_unadvertised():
+def test_catalog_prepare_status_exposes_catalogue_before_analysis_finishes(monkeypatch):
     mod = load_plugin()
-    app = Flask(__name__)
-    app.register_blueprint(mod.bp)
-    routes = {
-        (rule.rule, ",".join(sorted(rule.methods - {"HEAD", "OPTIONS"})))
-        for rule in app.url_map.iter_rules()
+    source = {
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 4,
+            "status": "complete",
+            "entity_counts": {"track": 21_397},
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "fingerprint_schema_version": mod.CATALOG_FINGERPRINT_SCHEMA_VERSION,
+            "refresh_required": False,
+        },
+        "analysis": {"generation": 0, "status": "projecting"},
+    }
+    state = {
+        "status": "running",
+        "phase": "analysis_projection",
+        "last_error": None,
+        "updated_at": "2099-07-27T12:00:00Z",
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: state)
+
+    response = plugin_client(mod).get("/api/catalog/prepare/catalog-a")
+
+    assert response.status_code == 200
+    assert response.get_json()["catalog_ready"] is True
+    assert response.get_json()["analysis_ready"] is False
+    assert response.get_json()["phase"] == "analysis_projection"
+    assert response.get_json()["counts"]["track"] == 21_397
+
+
+def test_catalog_prepare_is_idempotent_when_catalogue_is_current_but_analysis_is_pending(
+    monkeypatch,
+):
+    mod = load_plugin()
+    source = {
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 4,
+            "status": "complete",
+            "entity_counts": {"track": 21_397},
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "fingerprint_schema_version": mod.CATALOG_FINGERPRINT_SCHEMA_VERSION,
+            "refresh_required": False,
+        },
+        "analysis": {"generation": 0, "status": "projecting"},
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *_args, **_kwargs: pytest.fail("a current catalogue must not rebuild"),
+    )
+
+    response = plugin_client(mod).post(
+        "/api/catalog/prepare",
+        json={"server_id": "server-a", "catalog_instance_id": "catalog-a"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "operation_id": "catalog-a",
+        "status": "ready",
+        "phase": "ready",
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "catalog_ready": True,
+        "publication_current": True,
+        "generation": 4,
+        "counts": {"track": 21_397},
+        "published_builder_version": mod.CATALOG_BUILDER_VERSION,
+        "current_builder_version": mod.CATALOG_BUILDER_VERSION,
+        "fingerprint_schema_version": mod.CATALOG_FINGERPRINT_SCHEMA_VERSION,
+        "current_fingerprint_schema_version": mod.CATALOG_FINGERPRINT_SCHEMA_VERSION,
+        "snapshot_estimated_bytes": 0,
+        "last_scan_change_counts": {},
+        "last_scan_change_reason": None,
+        "last_scan_duration_ms": None,
+        "refresh_required": False,
+        "refresh_reason": None,
+        "analysis_ready": False,
+        "target_plugin_version": None,
+        "target_catalog_builder_version": None,
+        "worker_plugin_version": None,
+        "worker_catalog_builder_version": None,
+        "worker_attested": True,
+        "last_error": None,
+        "updated_at": None,
     }
 
-    for feature, contract_routes in mod.CATALOG_FEATURE_ROUTES.items():
-        assert feature in mod.CATALOG_FEATURES
-        assert set(contract_routes).issubset(routes)
 
-    assert "profile_cursor_stream" not in mod.CATALOG_FEATURES
-    assert "server_album_artist_relationships" not in mod.CATALOG_FEATURES
-    assert not any(path.startswith("/api/catalog/profiles/") for path, _methods in routes)
-    assert not any(path.startswith("/api/catalog/relationships/") for path, _methods in routes)
+def test_catalog_health_marks_unattested_worker_publication_for_repair(monkeypatch):
+    mod = load_plugin()
+    source = settings_catalog_source()
+    source["catalog"].update(
+        {
+            "generation": 4,
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        }
+    )
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(
+        mod,
+        "preparation_state",
+        lambda *_args, **_kwargs: {
+            "status": "ready",
+            "phase": "catalog_ready",
+            "target_plugin_version": mod.PLUGIN_VERSION,
+            "target_catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+            "worker_plugin_version": "0.8.9",
+            "worker_catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+        },
+    )
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 200
+    catalog = response.get_json()["servers"][0]["catalog"]
+    assert catalog["refresh_required"] is True
+    assert catalog["refresh_reason"] == "worker_version_mismatch"
 
 
 @pytest.mark.parametrize(
@@ -695,9 +1500,7 @@ def test_catalog_health_rejects_unsupported_core_before_server_work(monkeypatch,
 
 
 @pytest.mark.parametrize("version", ["v3.0.6", "v4.0.0", "development-build"])
-def test_catalog_health_admits_future_or_unparseable_core_when_v3_contract_passes(
-    monkeypatch, version
-):
+def test_catalog_health_admits_future_core_when_live_v3_contract_passes(monkeypatch, version):
     mod = load_plugin()
     monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", version)
     monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
@@ -712,8 +1515,29 @@ def test_catalog_health_admits_future_or_unparseable_core_when_v3_contract_passe
     response = plugin_client(mod).get("/api/catalog/health")
 
     assert response.status_code == 200
-    assert response.get_json()["supported"] is True
-    assert response.get_json()["core_api_contract"] == "audiomuse_v3_registry_v1"
+    body = response.get_json()
+    assert body["supported"] is True
+    assert body["core_api_contract"] == "audiomuse_v3_registry_v1"
+    assert body["sync_contract"]["core_api_contract"] == body["core_api_contract"]
+    assert body["capability"]["contract_revision"] == 1
+
+
+def test_catalog_health_rejects_malformed_live_v3_registry(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", "v3.99.0")
+    monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
+    monkeypatch.setattr(plugin_api_module, "use_server", lambda _server_id: None, raising=False)
+    monkeypatch.setattr(
+        plugin_api_module,
+        "list_servers",
+        lambda: {"server-a": {"server_type": "navidrome"}},
+        raising=False,
+    )
+
+    response = plugin_client(mod).get("/api/catalog/health")
+
+    assert response.status_code == 409
+    assert response.get_json()["status"] == "core_api_incomplete"
 
 
 def test_collections_api_is_hidden_until_enabled():
@@ -1432,7 +2256,7 @@ def test_scoped_profile_writes_use_catalogue_and_track_composite_key(monkeypatch
     assert params[:2] == ("catalog-b", ["same-track-id"])
 
 
-def test_analyze_endpoint_enqueues_only_missing_or_stale_ids(monkeypatch):
+def test_analyze_endpoint_promotes_pending_and_enqueues_small_high_priority_chunks(monkeypatch):
     mod = load_plugin()
     calls = []
     rows = [
@@ -1450,8 +2274,8 @@ def test_analyze_endpoint_enqueues_only_missing_or_stale_ids(monkeypatch):
     monkeypatch.setattr(
         mod,
         "mark_pending",
-        lambda ids, catalog_instance_id=None: calls.append(
-            ("mark_pending", ids, catalog_instance_id)
+        lambda ids, catalog_instance_id=None, priority="background": calls.append(
+            ("mark_pending", ids, catalog_instance_id, priority)
         ),
     )
     monkeypatch.setattr(
@@ -1476,11 +2300,21 @@ def test_analyze_endpoint_enqueues_only_missing_or_stale_ids(monkeypatch):
         "already_pending": ["pending-1"],
     }
     assert calls == [
-        ("mark_pending", ["stale-1", "missing-1"], "catalog-a"),
+        (
+            "mark_pending",
+            ["stale-1", "missing-1", "pending-1"],
+            "catalog-a",
+            "interactive",
+        ),
         (
             "analyze_tracks_task",
-            (["stale-1", "missing-1"], "catalog-a", "server-a"),
-            "default",
+            (
+                ["stale-1", "missing-1", "pending-1"],
+                "catalog-a",
+                "server-a",
+                "interactive",
+            ),
+            "high",
         ),
     ]
 
@@ -1548,7 +2382,11 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
     assert seen["path"] == str(audio)
     assert seen["run"] == ("legacy-default", "catalog-a", "analysis-run-a")
     assert audio.exists()
-    params = db.cursor_obj.executed[-1][1]
+    params = next(
+        params
+        for sql, params in db.cursor_obj.executed
+        if "INSERT INTO plugin_lumae_analysis__source_profiles" in sql
+    )
     assert params[0] == "catalog-a"
     assert params[1] == "track-a"
     assert params[2] == 44100
@@ -1556,76 +2394,51 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
     assert params[11] == "ready"
 
 
-def test_analysis_run_events_coalesce_to_one_source_finalizer(monkeypatch):
+def test_analysis_run_events_coalesce_to_one_durable_source_request(monkeypatch):
     mod = load_plugin()
     db = AnalysisRunDb()
-    queued = []
-
-    def enqueue_finalizer(server_id, catalog_instance_id, run_id):
-        queued.append((server_id, catalog_instance_id, run_id))
-        return types.SimpleNamespace(id="finalizer-a")
-
-    monkeypatch.setattr(mod, "enqueue_analysis_run_finalizer", enqueue_finalizer)
 
     first = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
     second = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
 
-    assert first == {"queued": True, "coalesced": False, "job_id": "finalizer-a"}
-    assert second == {"queued": False, "coalesced": True}
-    assert queued == [("server-a", "catalog-a", "run-a")]
+    assert first == {"queued": False, "coalesced": False, "status": "pending"}
+    assert second == {"queued": False, "coalesced": True, "status": "pending"}
     assert db.runs[("catalog-a", "run-a")]["songs_seen"] == 2
-    assert db.runs[("catalog-a", "run-a")]["status"] == "queued"
+    assert db.runs[("catalog-a", "run-a")]["status"] == "pending"
 
 
-def test_one_multiserver_analysis_run_gets_one_finalizer_per_source(monkeypatch):
+def test_one_multiserver_analysis_run_gets_one_durable_request_per_source(monkeypatch):
     mod = load_plugin()
     db = AnalysisRunDb()
-    queued = []
-    monkeypatch.setattr(
-        mod,
-        "enqueue_analysis_run_finalizer",
-        lambda server_id, catalog_id, run_id: queued.append(
-            (server_id, catalog_id, run_id)
-        )
-        or types.SimpleNamespace(id=f"finalizer-{catalog_id}"),
-    )
 
     mod.record_analysis_run("server-a", "catalog-a", "shared-run", db=db)
     mod.record_analysis_run("server-b", "catalog-b", "shared-run", db=db)
     mod.record_analysis_run("server-a", "catalog-a", "shared-run", db=db)
     mod.record_analysis_run("server-b", "catalog-b", "shared-run", db=db)
 
-    assert queued == [
-        ("server-a", "catalog-a", "shared-run"),
-        ("server-b", "catalog-b", "shared-run"),
-    ]
     assert db.runs[("catalog-a", "shared-run")]["songs_seen"] == 2
     assert db.runs[("catalog-b", "shared-run")]["songs_seen"] == 2
+    assert db.runs[("catalog-a", "shared-run")]["status"] == "pending"
+    assert db.runs[("catalog-b", "shared-run")]["status"] == "pending"
 
 
-def test_analysis_run_enqueue_failure_is_retryable_by_the_next_song(monkeypatch):
+def test_analysis_run_hook_never_touches_the_queue(monkeypatch):
     mod = load_plugin()
     db = AnalysisRunDb()
-    attempts = []
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("analysis hooks must not enqueue")
+        ),
+    )
 
-    def enqueue_finalizer(*args):
-        attempts.append(args)
-        if len(attempts) == 1:
-            raise RuntimeError("redis unavailable")
-        return types.SimpleNamespace(id="finalizer-retry")
+    first = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
+    second = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
 
-    monkeypatch.setattr(mod, "enqueue_analysis_run_finalizer", enqueue_finalizer)
-
-    with pytest.raises(RuntimeError, match="redis unavailable"):
-        mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
-    assert db.runs[("catalog-a", "run-a")]["status"] == "enqueue_failed"
-
-    result = mod.record_analysis_run("server-a", "catalog-a", "run-a", db=db)
-
-    assert result["job_id"] == "finalizer-retry"
-    assert len(attempts) == 2
+    assert first["status"] == second["status"] == "pending"
     assert db.runs[("catalog-a", "run-a")]["songs_seen"] == 2
-    assert db.runs[("catalog-a", "run-a")]["status"] == "queued"
+    assert db.runs[("catalog-a", "run-a")]["status"] == "pending"
 
 
 def test_analysis_run_finalizer_refreshes_projects_then_queues_only_needed_profiles(monkeypatch):
@@ -1664,14 +2477,15 @@ def test_analysis_run_finalizer_refreshes_projects_then_queues_only_needed_profi
     )
     monkeypatch.setattr(
         mod,
-        "recover_stale_pending_profiles",
-        lambda catalog_id: calls.append(("recover", catalog_id)) or 0,
+        "start_profile_backfill",
+        lambda **kwargs: calls.append(("profiles", kwargs))
+        or {"queued": True, "coalesced": False, "batch_size": 4},
     )
     monkeypatch.setattr(
         mod,
-        "queue_whole_library",
-        lambda **kwargs: calls.append(("profiles", kwargs))
-        or {"queued": 4, "jobs": 1, "chunk_size": 250},
+        "start_relationship_preparation",
+        lambda **kwargs: calls.append(("relationships", kwargs))
+        or {"queued": True, "coalesced": False},
     )
 
     result = mod.finalize_analysis_run_task("server-a", "catalog-a", "run-a")
@@ -1680,10 +2494,9 @@ def test_analysis_run_finalizer_refreshes_projects_then_queues_only_needed_profi
         "resolve",
         "refresh",
         "project",
-        "recover",
         "profiles",
+        "relationships",
     ]
-    assert calls[-1][1]["include_failed"] is False
     assert result["songs_seen"] == 37
     assert result["status"] == "complete"
     assert db.runs[("catalog-a", "run-a")]["status"] == "complete"
@@ -1723,11 +2536,15 @@ def test_analysis_run_finalizer_failure_is_recorded_and_can_be_retried(monkeypat
         "project_analysis",
         lambda **_kwargs: {"catalog_instance_id": "catalog-a"},
     )
-    monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda _catalog_id: 0)
     monkeypatch.setattr(
         mod,
-        "queue_whole_library",
-        lambda **_kwargs: {"queued": 0, "jobs": 0, "chunk_size": 250},
+        "start_profile_backfill",
+        lambda **_kwargs: {"queued": False, "coalesced": True, "batch_size": 10},
+    )
+    monkeypatch.setattr(
+        mod,
+        "start_relationship_preparation",
+        lambda **_kwargs: {"queued": False, "coalesced": True},
     )
 
     with pytest.raises(RuntimeError, match="temporarily unavailable"):
@@ -1741,7 +2558,7 @@ def test_analysis_run_finalizer_failure_is_recorded_and_can_be_retried(monkeypat
     assert len(attempts) == 2
 
 
-def test_running_analysis_finalizer_can_only_be_reclaimed_by_the_same_rq_job():
+def test_running_analysis_finalizer_can_only_be_reclaimed_after_it_is_stale():
     mod = load_plugin()
     db = AnalysisRunDb()
     db.runs[("catalog-a", "run-a")] = {
@@ -1754,75 +2571,31 @@ def test_running_analysis_finalizer_can_only_be_reclaimed_by_the_same_rq_job():
         "last_error": None,
     }
 
-    assert (
-        mod.claim_analysis_run(
-            "catalog-a",
-            "run-a",
-            finalizer_job_id="different-job",
-            db=db,
-        )
-        is None
-    )
-    assert (
-        mod.claim_analysis_run(
-            "catalog-a",
-            "run-a",
-            finalizer_job_id="finalizer-a",
-            db=db,
-        )
-        == 9
-    )
+    assert mod.claim_analysis_run("catalog-a", "run-a", db=db) is None
+    db.runs[("catalog-a", "run-a")]["stale"] = True
+    assert mod.claim_analysis_run("catalog-a", "run-a", db=db) == 9
 
 
-def test_analysis_run_finalizer_identity_is_scoped_by_catalogue():
+def test_settled_analysis_run_selector_is_scoped_and_terminal_aware():
     mod = load_plugin()
+    db = FakeDb([("server-a", "catalog-a", "shared-run")])
 
-    first = mod.analysis_run_finalizer_job_id("catalog-a", "shared-run")
-    same = mod.analysis_run_finalizer_job_id("catalog-a", "shared-run")
-    other_source = mod.analysis_run_finalizer_job_id("catalog-b", "shared-run")
+    assert mod.next_settled_analysis_run(db=db) == {
+        "server_id": "server-a",
+        "catalog_instance_id": "catalog-a",
+        "run_id": "shared-run",
+    }
+    sql = db.cursor_obj.executed[-1][0]
+    assert "parent.task_id=r.run_id" in sql
+    assert "'SUCCESS', 'FAILURE', 'FAIL', 'REVOKED'" in sql
+    assert "NOT EXISTS" in sql
 
-    assert first == same
-    assert first != other_source
+def test_plugin_runtime_has_no_private_rq_imports():
+    source = pathlib.Path("plugins/LumaeAnalysis/__init__.py").read_text(encoding="utf-8")
 
-
-def test_analysis_run_finalizer_waits_for_parent_even_when_parent_fails(monkeypatch):
-    from rq.exceptions import NoSuchJobError
-    from rq.job import Job
-
-    mod = load_plugin()
-    captured = {}
-
-    class Queue:
-        connection = object()
-
-        def enqueue(self, func, **kwargs):
-            captured["func"] = func
-            captured.update(kwargs)
-            return types.SimpleNamespace(id=kwargs["job_id"])
-
-    monkeypatch.setattr(plugin_api_module, "rq_queue_default", Queue(), raising=False)
-    monkeypatch.setattr(
-        plugin_api_module,
-        "dotted_path",
-        lambda func: f"{func.__module__}.{func.__name__}",
-        raising=False,
-    )
-    monkeypatch.setattr(
-        Job,
-        "fetch",
-        classmethod(
-            lambda _cls, _job_id, connection=None: (_ for _ in ()).throw(NoSuchJobError())
-        ),
-    )
-
-    job = mod.enqueue_analysis_run_finalizer("server-a", "catalog-a", "run-a")
-
-    assert job.id == mod.analysis_run_finalizer_job_id("catalog-a", "run-a")
-    assert captured["func"] == "plugin.manager.run_plugin_task"
-    assert captured["args"][1:] == ("server-a", "catalog-a", "run-a")
-    assert captured["depends_on"].dependencies == ["run-a"]
-    assert captured["depends_on"].allow_failure is True
-    assert captured["retry"].max == 2
+    assert "rq_queue_" not in source
+    assert "from rq" not in source
+    assert "get_current_job" not in source
 
 
 def test_encode_ramp_matches_lumae_byte_layout():
@@ -1886,7 +2659,7 @@ def test_vectorized_biquad_matches_reference_recurrence():
     np.testing.assert_allclose(actual, expected, rtol=1e-11, atol=1e-11)
 
 
-def test_vectorized_analysis_matches_reference_profile(monkeypatch):
+def test_streaming_analysis_matches_v1_whole_buffer_reference_profile():
     import plugins.LumaeAnalysis.loudness as loudness
 
     def reference_apply(channel, coefs):
@@ -1915,26 +2688,39 @@ def test_vectorized_analysis_matches_reference_profile(monkeypatch):
         ]
     ).astype(np.float32)
 
-    vectorized = loudness.analyze_buffer(audio, sample_rate)
-    monkeypatch.setattr(loudness, "_k_weight", reference_k_weight)
-    reference = loudness.analyze_buffer(audio, sample_rate)
+    result = loudness.analyze_buffer(audio, sample_rate)
+    weighted = np.stack([reference_k_weight(channel) for channel in audio])
+    chunk_size = int(sample_rate * loudness.CHUNK_DURATION_MS / 1000)
+    chunk_lufs = [
+        loudness._mean_square_to_lufs(
+            float(np.mean(weighted[:, start : start + chunk_size] ** 2))
+        )
+        for start in range(0, weighted.shape[1], chunk_size)
+    ]
+    reference_lufs = loudness._integrated_lufs(chunk_lufs)
+    relative = [value - reference_lufs for value in chunk_lufs]
+    reference_start = loudness._scan_forward(relative)
+    reference_end = loudness._scan_backward(relative)
 
-    assert vectorized.sample_rate == reference.sample_rate
-    assert vectorized.duration_ms == reference.duration_ms
-    assert math.isclose(vectorized.ref_lufs, reference.ref_lufs, rel_tol=0, abs_tol=1e-10)
-    assert vectorized.start_ramp == reference.start_ramp
-    assert vectorized.end_ramp == reference.end_ramp
-    assert vectorized.start_ramp_blob == reference.start_ramp_blob
-    assert vectorized.end_ramp_blob == reference.end_ramp_blob
+    assert result.sample_rate == sample_rate
+    assert result.duration_ms == 2000
+    assert math.isclose(result.ref_lufs, reference_lufs, rel_tol=0, abs_tol=1e-10)
+    assert result.start_ramp == reference_start
+    assert result.end_ramp == reference_end
+    assert result.start_ramp_blob == loudness.encode_ramp(reference_start)
+    assert result.end_ramp_blob == loudness.encode_ramp(reference_end)
 
 
 def test_analyze_buffer_uses_100ms_chunks_and_expected_ramp_encoding(monkeypatch):
     import plugins.LumaeAnalysis.loudness as loudness
 
     monkeypatch.setattr(
-        loudness,
-        "_k_weight",
-        lambda channel: channel.astype(np.float64, copy=False),
+        loudness.scipy_signal,
+        "lfilter",
+        lambda _b, _a, samples, zi=None: (
+            samples.astype(np.float64, copy=False),
+            np.asarray(zi, dtype=np.float64),
+        ),
     )
     monkeypatch.setattr(loudness, "_integrated_lufs", lambda chunk_lufs: -20.0)
 
@@ -2082,9 +2868,12 @@ def test_analyze_buffer_includes_final_partial_chunk(monkeypatch):
     import plugins.LumaeAnalysis.loudness as loudness
 
     monkeypatch.setattr(
-        loudness,
-        "_k_weight",
-        lambda channel: channel.astype(np.float64, copy=False),
+        loudness.scipy_signal,
+        "lfilter",
+        lambda _b, _a, samples, zi=None: (
+            samples.astype(np.float64, copy=False),
+            np.asarray(zi, dtype=np.float64),
+        ),
     )
     monkeypatch.setattr(loudness, "_integrated_lufs", lambda chunk_lufs: -20.0)
 
@@ -2111,29 +2900,145 @@ def test_analyze_buffer_rejects_silent_audio():
         raise AssertionError("silent audio should fail")
 
 
-def test_analyze_file_loads_audio_and_delegates_to_buffer(monkeypatch):
+def test_analyze_file_streams_pyav_frames_into_bounded_analyzer(monkeypatch):
     import plugins.LumaeAnalysis.loudness as loudness
 
     captured = {}
-    audio = np.array([0.25, -0.25], dtype=np.float32)
+    audio = np.array([[0.25, -0.25]], dtype=np.float32)
     sentinel = object()
 
-    def fake_load(path, sr=None, mono=False):
-        captured["load"] = (path, sr, mono)
-        return audio, 44100
+    class Frame:
+        def to_ndarray(self):
+            return audio
 
-    def fake_analyze_buffer(buffer, sample_rate):
-        captured["analyze"] = (buffer, sample_rate)
+    class Container:
+        streams = types.SimpleNamespace(
+            audio=[
+                types.SimpleNamespace(
+                    codec_context=types.SimpleNamespace(
+                        sample_rate=44100,
+                        layout=types.SimpleNamespace(name="mono", channels=("front",)),
+                    )
+                )
+            ]
+        )
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return None
+
+        def decode(self, _stream):
+            return [Frame()]
+
+    class Resampler:
+        def __init__(self, **kwargs):
+            captured["resampler"] = kwargs
+
+        def resample(self, frame):
+            return [] if frame is None else [frame]
+
+    def fake_open(path):
+        captured["path"] = path
+        return Container()
+
+    fake_av = types.SimpleNamespace(
+        open=fake_open,
+        audio=types.SimpleNamespace(
+            resampler=types.SimpleNamespace(AudioResampler=Resampler)
+        ),
+    )
+
+    def fake_analyze_blocks(blocks, sample_rate, **kwargs):
+        captured["analyze"] = (list(blocks), sample_rate, kwargs)
         return sentinel
 
-    monkeypatch.setattr(loudness, "librosa", types.SimpleNamespace(load=fake_load))
-    monkeypatch.setattr(loudness, "analyze_buffer", fake_analyze_buffer)
+    monkeypatch.setitem(sys.modules, "av", fake_av)
+    monkeypatch.setattr(loudness, "analyze_blocks", fake_analyze_blocks)
 
     result = loudness.analyze_file("fixture.wav")
 
     assert result is sentinel
-    assert captured["load"] == ("fixture.wav", None, False)
-    assert captured["analyze"] == (audio, 44100)
+    assert captured["path"] == "fixture.wav"
+    assert captured["resampler"] == {
+        "format": "fltp",
+        "layout": "mono",
+        "rate": 44100,
+    }
+    blocks, sample_rate, kwargs = captured["analyze"]
+    assert np.array_equal(blocks[0], audio)
+    assert sample_rate == 44100
+    assert kwargs["channel_count"] == 1
+
+
+def test_streaming_loudness_is_invariant_to_decoder_block_boundaries():
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    sample_rate = 48000
+    time_axis = np.arange(sample_rate * 3 + 117, dtype=np.float32) / sample_rate
+    audio = np.stack(
+        [
+            np.sin(2 * np.pi * 220 * time_axis) * 0.2,
+            np.sin(2 * np.pi * 440 * time_axis) * 0.1,
+        ]
+    ).astype(np.float32)
+
+    whole = loudness.analyze_blocks(
+        [audio],
+        sample_rate,
+        channel_count=2,
+    )
+    split = loudness.analyze_blocks(
+        (
+            audio[:, start : start + 7777]
+            for start in range(0, audio.shape[1], 7777)
+        ),
+        sample_rate,
+        channel_count=2,
+    )
+
+    assert split.duration_ms == whole.duration_ms
+    assert split.ref_lufs == whole.ref_lufs
+    assert split.start_ramp_blob == whole.start_ramp_blob
+    assert split.end_ramp_blob == whole.end_ramp_blob
+
+
+def test_streaming_loudness_enforces_duration_and_deadline_limits():
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    with pytest.raises(loudness.ProfileResourceLimitError, match="duration"):
+        loudness.analyze_blocks(
+            [np.ones((1, 3), dtype=np.float32)],
+            10,
+            channel_count=1,
+            max_duration_seconds=0.2,
+        )
+
+    with pytest.raises(loudness.ProfileAnalysisTimeout, match="deadline"):
+        loudness.analyze_blocks(
+            [np.ones((1, 1), dtype=np.float32)],
+            10,
+            channel_count=1,
+            deadline=0,
+        )
+
+
+def test_streaming_loudness_caps_channels_and_sample_rate():
+    import plugins.LumaeAnalysis.loudness as loudness
+
+    with pytest.raises(loudness.ProfileResourceLimitError, match="channel count"):
+        loudness.analyze_blocks(
+            [np.ones((loudness.MAX_PROFILE_CHANNELS + 1, 10), dtype=np.float32)],
+            48000,
+            channel_count=loudness.MAX_PROFILE_CHANNELS + 1,
+        )
+    with pytest.raises(loudness.ProfileResourceLimitError, match="sample rate"):
+        loudness.analyze_blocks(
+            [np.ones((1, 10), dtype=np.float32)],
+            loudness.MAX_PROFILE_SAMPLE_RATE + 1,
+            channel_count=1,
+        )
 
 
 class FakeCursor:
@@ -2183,33 +3088,36 @@ class AnalysisRunCursor:
             if key not in self.db.runs:
                 self.db.runs[key] = {
                     "server_id": server_id,
-                    "status": "registering",
+                    "status": "pending",
                     "songs_seen": 1,
                     "job_id": None,
                     "queued_profiles": 0,
                     "profile_jobs": 0,
                     "last_error": None,
                 }
-                self.current_row = (run_id,)
-        elif "SET songs_seen=songs_seen + 1" in normalized:
-            row = self.db.runs[(params[0], params[1])]
-            row["songs_seen"] += 1
-        elif "SET status='registering'" in normalized:
-            row = self.db.runs[(params[0], params[1])]
-            if row["status"] == "enqueue_failed":
-                row["status"] = "registering"
-                row["last_error"] = None
-                self.current_row = (params[1],)
+            else:
+                row = self.db.runs[key]
+                row["server_id"] = server_id
+                row["songs_seen"] += 1
+                if row["status"] not in {"running", "complete"}:
+                    row["status"] = "pending"
+                    row["job_id"] = None
+                    row["last_error"] = None
+            row = self.db.runs[key]
+            self.current_row = (row["status"], row["songs_seen"])
         elif "SET status='running'" in normalized:
             row = self.db.runs[(params[0], params[1])]
-            same_retry = (
-                row["status"] == "running"
-                and params[2] is not None
-                and row["job_id"] == params[2]
-            )
-            if row["status"] in {"registering", "queued", "enqueue_failed", "failed"} or same_retry:
+            stale_retry = row["status"] == "running" and row.get("stale") is True
+            if row["status"] in {
+                "pending",
+                "registering",
+                "queued",
+                "enqueue_failed",
+                "failed",
+            } or stale_retry:
                 row["status"] = "running"
                 row["last_error"] = None
+                row["stale"] = False
                 self.current_row = (row["songs_seen"],)
         elif normalized.startswith("UPDATE plugin_lumae_analysis__analysis_runs"):
             status, job_id, queued_profiles, profile_jobs, error = params[:5]
@@ -2546,22 +3454,21 @@ def test_find_backfill_ids_applies_limit_after_eligibility_filtering(monkeypatch
     mod = load_plugin()
     current = tmp_path / "current.wav"
     current.write_bytes(b"new media")
-    missing = tmp_path / "not-mounted.wav"
     sig = mod.media_signature(str(current))
     rows = [
-        ("ready-current-1", str(current), sig, mod.ANALYZER_VERSION, "ready"),
-        ("failed-once", str(current), "old-sig", mod.ANALYZER_VERSION, "failed"),
-        ("skipped-once", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
         ("eligible-missing", str(current), None, None, None),
         ("eligible-stale", str(current), sig, mod.ANALYZER_VERSION, "stale"),
-        ("eligible-old", str(current), sig, 0, "ready"),
     ]
-    db = LimitAwareDb(rows=rows)
+    db = FakeDb(rows=rows)
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
     monkeypatch.setattr(mod, "media_server_download_available", lambda: False, raising=False)
 
     assert mod.find_backfill_ids(limit=2) == ["eligible-missing", "eligible-stale"]
+    sql, params = db.cursor_obj.executed[-1]
+    assert "LIMIT %s" in sql
+    assert params[-2] is True
+    assert params[-1] == 2
 
 
 def test_explicit_prepare_retry_includes_failed_profiles(monkeypatch):
@@ -2589,28 +3496,21 @@ def test_backfill_uses_configured_batch_size(monkeypatch):
     )
     monkeypatch.setattr(mod, "find_backfill_ids", lambda limit: seen_limits.append(limit) or [])
 
-    assert mod.backfill_missing_profiles() == {"ready": 0, "failed": 0, "skipped": 0}
+    assert mod.backfill_missing_profiles() == {
+        "ready": 0,
+        "already_ready": 0,
+        "promoted": 0,
+        "failed": 0,
+        "skipped": 0,
+        "deferred": 0,
+    }
     assert seen_limits == [7]
 
 
-def test_analysis_status_counts_current_pending_failed_and_needed(monkeypatch, tmp_path):
+def test_analysis_status_counts_are_aggregated_in_postgres(monkeypatch):
     mod = load_plugin()
-    current = tmp_path / "current.wav"
-    current.write_bytes(b"new media")
-    missing = tmp_path / "not-mounted.wav"
-    unchanged = tmp_path / "unchanged.wav"
-    unchanged.write_bytes(b"same media")
-    unchanged_sig = mod.media_signature(str(unchanged))
-    rows = [
-        ("ready-current", str(unchanged), unchanged_sig, mod.ANALYZER_VERSION, "ready"),
-        ("missing-profile", str(current), None, None, None),
-        ("old-analyzer", str(current), "old-sig", 0, "ready"),
-        ("changed-media", str(current), "old-sig", mod.ANALYZER_VERSION, "ready"),
-        ("pending-track", str(current), None, mod.ANALYZER_VERSION, "pending"),
-        ("failed-track", str(current), None, mod.ANALYZER_VERSION, "failed"),
-        ("skipped-track", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
-    ]
-    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    db = FakeDb(rows=[(7, 1, 1, 1, 0)])
+    monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
     monkeypatch.setattr(mod, "media_server_download_available", lambda: False, raising=False)
 
@@ -2619,18 +3519,17 @@ def test_analysis_status_counts_current_pending_failed_and_needed(monkeypatch, t
         "ready_current": 1,
         "pending": 1,
         "failed": 1,
-        "skipped": 1,
-        "needs_analysis": 3,
+        "skipped": 0,
+        "needs_analysis": 4,
     }
+    sql, params = db.cursor_obj.executed[-1]
+    assert "COUNT(*) FILTER" in sql
+    assert params == (mod.ANALYZER_VERSION, True)
 
 
-def test_analysis_status_counts_treats_retryable_skipped_rows_as_needed(monkeypatch, tmp_path):
+def test_analysis_status_counts_treats_retryable_skipped_rows_as_needed(monkeypatch):
     mod = load_plugin()
-    missing = tmp_path / "not-mounted.wav"
-    rows = [
-        ("skipped-track", str(missing), None, mod.ANALYZER_VERSION, "skipped_no_file"),
-    ]
-    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=[(1, 0, 0, 0, 0)]))
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
     monkeypatch.setattr(mod, "media_server_download_available", lambda: True, raising=False)
 
@@ -2644,6 +3543,136 @@ def test_analysis_status_counts_treats_retryable_skipped_rows_as_needed(monkeypa
     }
 
 
+def test_postgres_backfill_retries_registry_backed_skipped_profiles(
+    monkeypatch,
+    lumae_postgres_db,
+):
+    mod = load_plugin()
+    from plugins.LumaeAnalysis import catalog
+
+    catalog.migrate_catalog(lumae_postgres_db)
+    cur = lumae_postgres_db.cursor()
+    cur.execute(
+        """
+        CREATE TABLE plugin_lumae_analysis__source_profiles (
+            catalog_instance_id TEXT NOT NULL,
+            track_id TEXT NOT NULL,
+            media_signature TEXT,
+            analyzer_ver INTEGER,
+            status TEXT,
+            PRIMARY KEY (catalog_instance_id, track_id)
+        )
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_sources
+            (catalog_instance_id, current_core_server_id, provider_type,
+             server_name, is_default, rebind_status)
+        VALUES ('catalog-a', 'server-a', 'navidrome', 'Registry source', TRUE, 'active')
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_state
+            (catalog_instance_id, current_core_server_id, provider_type,
+             published_generation, catalog_epoch, status)
+        VALUES ('catalog-a', 'server-a', 'navidrome', 4, 'epoch-a', 'complete')
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_tracks
+            (catalog_instance_id, published_generation, track_id, title,
+             analysis_eligible, metadata_fp, media_fp, payload,
+             first_seen_at, last_seen_at)
+        VALUES
+            ('catalog-a', 4, 'retry-me', 'Retry me', TRUE, 'meta-a', 'media-a',
+             '{}'::jsonb, now(), now()),
+            ('catalog-a', 4, 'pending', 'Pending', TRUE, 'meta-b', 'media-b',
+             '{}'::jsonb, now(), now())
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__source_profiles
+            (catalog_instance_id, track_id, media_signature, analyzer_ver, status)
+        VALUES
+            ('catalog-a', 'retry-me', NULL, 1, 'skipped_no_file'),
+            ('catalog-a', 'pending', NULL, 1, 'pending')
+        """
+    )
+    cur.close()
+    lumae_postgres_db.commit()
+    monkeypatch.setattr(mod, "get_db", lambda: lumae_postgres_db)
+
+    rows = mod.fetch_backfill_rows(
+        3,
+        catalog_instance_id="catalog-a",
+        server_id="server-a",
+    )
+    counts = mod.analysis_status_counts(
+        catalog_instance_id="catalog-a",
+        server_id="server-a",
+    )
+
+    assert [row[0] for row in rows] == ["retry-me"]
+    assert counts == {
+        "total_with_files": 2,
+        "ready_current": 0,
+        "pending": 1,
+        "failed": 0,
+        "skipped": 0,
+        "needs_analysis": 1,
+    }
+
+
+def test_postgres_relationship_migration_preserves_published_generation(
+    lumae_postgres_db,
+):
+    from plugins.LumaeAnalysis import catalog, catalog_enrichment
+
+    catalog.migrate_catalog(lumae_postgres_db)
+    cur = lumae_postgres_db.cursor()
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_sources
+            (catalog_instance_id, current_core_server_id, provider_type, server_name)
+        VALUES ('catalog-a', 'server-a', 'navidrome', 'Main source')
+        """
+    )
+    cur.close()
+    catalog_enrichment.migrate_enrichment(lumae_postgres_db)
+    cur = lumae_postgres_db.cursor()
+    cur.execute(
+        """
+        UPDATE plugin_lumae_analysis__relationship_state
+           SET relationship_schema_version=1,
+               algorithm_version=0,
+               result_generation=5,
+               status='complete'
+         WHERE catalog_instance_id='catalog-a'
+        """
+    )
+    cur.close()
+    lumae_postgres_db.commit()
+
+    catalog_enrichment.migrate_enrichment(lumae_postgres_db)
+    cur = lumae_postgres_db.cursor()
+    cur.execute(
+        """
+        SELECT relationship_schema_version, algorithm_version,
+               result_generation, status
+          FROM plugin_lumae_analysis__relationship_state
+         WHERE catalog_instance_id='catalog-a'
+        """
+    )
+    state = cur.fetchone()
+    cur.close()
+
+    assert state == (1, 0, 5, "stale")
+
+
 def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch):
     mod = load_plugin()
     calls = []
@@ -2654,103 +3683,274 @@ def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch)
         "find_backfill_ids",
         lambda limit: calls.append(("find", limit)) or ["a", "b"],
     )
-    monkeypatch.setattr(mod, "mark_pending", lambda ids: calls.append(("mark_pending", ids)))
+    monkeypatch.setattr(
+        mod,
+        "mark_pending",
+        lambda ids, priority="background": calls.append(("mark_pending", ids, priority)),
+    )
     monkeypatch.setattr(
         mod,
         "enqueue",
-        lambda func, ids, queue="default": calls.append((func.__name__, ids, queue)),
+        lambda func, *args, queue="default": calls.append((func.__name__, args, queue)),
     )
 
     assert mod.queue_backfill_batch() == {"queued": 2, "limit": 3}
     assert calls == [
         ("find", 3),
-        ("mark_pending", ["a", "b"]),
-        ("analyze_tracks_task", ["a", "b"], "default"),
+        ("mark_pending", ["a", "b"], "background"),
+        ("analyze_tracks_task", (["a", "b"], None, None, "background"), "default"),
     ]
 
 
-def test_queue_whole_library_splits_every_candidate_into_250_track_jobs(monkeypatch):
+def test_start_profile_backfill_claims_one_bounded_default_queue_chain(monkeypatch):
     mod = load_plugin()
     calls = []
-    ids = [f"track-{i}" for i in range(601)]
-
-    monkeypatch.setattr(mod, "find_all_backfill_ids", lambda: ids)
-    monkeypatch.setattr(mod, "mark_pending", lambda chunk: calls.append(("mark_pending", chunk)))
+    source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(mod, "claim_profile_backfill", lambda selected: selected == source)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 10)
     monkeypatch.setattr(
         mod,
         "enqueue",
-        lambda func, chunk, queue="default": calls.append((func.__name__, chunk, queue)),
+        lambda func, *args, queue="default": calls.append((func.__name__, args, queue))
+        or types.SimpleNamespace(id="backfill-a"),
     )
 
-    assert mod.queue_whole_library() == {"queued": 601, "jobs": 3, "chunk_size": 250}
-    assert calls == [
-        ("mark_pending", ids[:250]),
-        ("analyze_tracks_task", ids[:250], "default"),
-        ("mark_pending", ids[250:500]),
-        ("analyze_tracks_task", ids[250:500], "default"),
-        ("mark_pending", ids[500:]),
-        ("analyze_tracks_task", ids[500:], "default"),
-    ]
+    assert mod.start_profile_backfill("catalog-a", "server-a") == {
+        "queued": True,
+        "coalesced": False,
+        "batch_size": 10,
+        "job_id": "backfill-a",
+    }
+    assert calls == [("profile_backfill_task", ("server-a", "catalog-a"), "default")]
 
 
-def test_queue_whole_library_does_not_enqueue_when_no_candidates(monkeypatch):
+def test_start_profile_backfill_coalesces_while_chain_is_active(monkeypatch):
     mod = load_plugin()
     calls = []
+    source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(mod, "claim_profile_backfill", lambda _source: False)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 10)
+    monkeypatch.setattr(mod, "enqueue", lambda *args, **kwargs: calls.append((args, kwargs)))
 
-    monkeypatch.setattr(mod, "find_all_backfill_ids", lambda: [])
-    monkeypatch.setattr(mod, "mark_pending", lambda chunk: calls.append(("mark_pending", chunk)))
-    monkeypatch.setattr(
-        mod,
-        "enqueue",
-        lambda func, chunk, queue="default": calls.append((func.__name__, chunk, queue)),
-    )
-
-    assert mod.queue_whole_library() == {"queued": 0, "jobs": 0, "chunk_size": 250}
+    assert mod.start_profile_backfill("catalog-a", "server-a") == {
+        "queued": False,
+        "coalesced": True,
+        "batch_size": 10,
+    }
     assert calls == []
 
 
-def test_queue_whole_library_keeps_child_jobs_on_exact_source(monkeypatch):
+def test_start_profile_backfill_can_only_record_durable_work(monkeypatch):
     mod = load_plugin()
-    calls = []
+    source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(mod, "claim_profile_backfill", lambda selected: selected == source)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 7)
     monkeypatch.setattr(
         mod,
-        "find_all_backfill_ids",
-        lambda **kwargs: calls.append(("find", kwargs)) or ["same-track-id"],
+        "enqueue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("deferred work must not enqueue")
+        ),
+    )
+
+    assert mod.start_profile_backfill(
+        "catalog-a", "server-a", enqueue_job=False
+    ) == {
+        "queued": True,
+        "coalesced": False,
+        "deferred": True,
+        "batch_size": 7,
+    }
+
+
+def test_start_relationship_preparation_can_only_record_durable_work(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    source = settings_catalog_source()
+    source["catalog"]["generation"] = 4
+    source["analysis"]["generation"] = 5
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda *_args: {"status": "stale"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "claim_relationship_preparation",
+        lambda selected_db, catalog_id: selected_db is db and catalog_id == "catalog-a",
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("deferred work must not enqueue")
+        ),
+    )
+
+    assert mod.start_relationship_preparation(
+        "catalog-a", "server-a", enqueue_job=False
+    ) == {"queued": True, "coalesced": False, "deferred": True}
+
+
+def test_profile_backfill_task_processes_one_batch_then_yields_worker(monkeypatch):
+    mod = load_plugin()
+    calls = []
+    monkeypatch.setattr(mod, "claim_profile_backfill_batch", lambda _catalog_id: True)
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **kwargs: calls.append(("resolve", kwargs))
+        or {"catalog_instance_id": "catalog-b", "server_id": "server-b"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "update_profile_backfill_state",
+        lambda *args, **kwargs: calls.append(("state", args, kwargs)),
+    )
+    monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda catalog_id: 0)
+    batches = iter([["a", "b"], ["c"]])
+    monkeypatch.setattr(
+        mod,
+        "find_backfill_ids",
+        lambda *args, **kwargs: next(batches),
     )
     monkeypatch.setattr(
         mod,
         "mark_pending",
-        lambda ids, catalog_instance_id=None: calls.append(
-            ("pending", ids, catalog_instance_id)
+        lambda ids, catalog_instance_id=None, priority="background": calls.append(
+            ("pending", ids, catalog_instance_id, priority)
         ),
     )
     monkeypatch.setattr(
         mod,
-        "enqueue",
-        lambda func, *args, queue="default": calls.append(
-            (func.__name__, args, queue)
+        "analyze_tracks_task",
+        lambda *args, **kwargs: calls.append(("analyze", args, kwargs))
+        or {"ready": 2, "already_ready": 0, "promoted": 0, "failed": 0, "skipped": 0},
+    )
+    result = mod.profile_backfill_task("server-b", "catalog-b")
+
+    assert result["status"] == "queued"
+    assert result["processed"] == 2
+    assert result["queued_next"] is False
+    assert result["deferred"] is True
+    assert ("pending", ["a", "b"], "catalog-b", "background") in calls
+
+
+def test_profile_backfill_task_releases_claimed_rows_when_batch_crashes(monkeypatch):
+    mod = load_plugin()
+    calls = []
+    monkeypatch.setattr(mod, "claim_profile_backfill_batch", lambda _catalog_id: True)
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "update_profile_backfill_state",
+        lambda *args, **kwargs: calls.append(("state", args, kwargs)),
+    )
+    monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda _catalog_id: 0)
+    monkeypatch.setattr(mod, "find_backfill_ids", lambda *_args, **_kwargs: ["track-a"])
+    monkeypatch.setattr(mod, "mark_pending", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "analyze_tracks_task",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("decoder crashed")),
+    )
+    monkeypatch.setattr(
+        mod,
+        "release_pending",
+        lambda ids, catalog_instance_id=None, reason=None: calls.append(
+            ("release", ids, catalog_instance_id, reason)
         ),
     )
 
-    result = mod.queue_whole_library("catalog-b", "server-b")
+    with pytest.raises(RuntimeError, match="decoder crashed"):
+        mod.profile_backfill_task("server-a", "catalog-a")
 
-    assert result == {"queued": 1, "jobs": 1, "chunk_size": 250}
-    assert calls == [
-        (
-            "find",
-            {
-                "catalog_instance_id": "catalog-b",
-                "server_id": "server-b",
-                "include_failed": False,
-            },
+    assert calls[-2][0:3] == ("release", ["track-a"], "catalog-a")
+    assert "decoder crashed" in calls[-2][3]
+    assert calls[-1][0] == "state"
+    assert calls[-1][1][2] == "failed"
+
+
+def test_legacy_oversized_background_job_is_drained_into_bounded_chain(monkeypatch):
+    mod = load_plugin()
+    ids = [f"track-{index}" for index in range(mod.MAX_BACKFILL_BATCH_SIZE + 1)]
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "release_pending",
+        lambda selected, catalog_instance_id=None, reason=None: calls.append(
+            ("release", selected, catalog_instance_id, reason)
         ),
-        ("pending", ["same-track-id"], "catalog-b"),
-        (
-            "analyze_tracks_task",
-            (["same-track-id"], "catalog-b", "server-b"),
-            "default",
-        ),
-    ]
+    )
+    monkeypatch.setattr(
+        mod,
+        "start_profile_backfill",
+        lambda **kwargs: calls.append(("start", kwargs)) or {"queued": True},
+    )
+
+    result = mod.analyze_tracks_task(ids, "catalog-a", "server-a")
+
+    assert result["deferred"] == len(ids)
+    assert calls[0][0:3] == ("release", ids, "catalog-a")
+    assert "bounded 0.8.1" in calls[0][3]
+    assert calls[1] == (
+        "start",
+        {
+            "catalog_instance_id": "catalog-a",
+            "server_id": "server-a",
+            "enqueue_job": False,
+        },
+    )
+
+
+def test_background_task_skips_ready_and_interactively_promoted_tracks(monkeypatch):
+    mod = load_plugin()
+    rows = {
+        "ready": {
+            "track_id": "ready",
+            "status": "ready",
+            "analyzer_ver": mod.ANALYZER_VERSION,
+            "media_signature": "catalog-media:same",
+        },
+        "promoted": {
+            "track_id": "promoted",
+            "status": "pending_interactive",
+            "analyzer_ver": mod.ANALYZER_VERSION,
+            "media_signature": None,
+        },
+    }
+    monkeypatch.setattr(
+        mod,
+        "fetch_profile_rows",
+        lambda ids, catalog_instance_id=None: [rows[ids[0]]],
+    )
+    monkeypatch.setattr(mod, "catalog_media_signature", lambda *_args: "catalog-media:same")
+    monkeypatch.setattr(
+        mod,
+        "analyze_one_track",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not analyze")),
+    )
+    monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
+
+    result = mod.analyze_tracks_task(["ready", "promoted"], "catalog-a", "server-a")
+
+    assert result == {
+        "ready": 0,
+        "already_ready": 1,
+        "promoted": 1,
+        "failed": 0,
+        "skipped": 0,
+        "deferred": 0,
+    }
 
 
 def test_profile_enqueue_failure_releases_pending_rows_for_retry(monkeypatch):
@@ -2759,8 +3959,8 @@ def test_profile_enqueue_failure_releases_pending_rows_for_retry(monkeypatch):
     monkeypatch.setattr(
         mod,
         "mark_pending",
-        lambda ids, catalog_instance_id=None: calls.append(
-            ("pending", ids, catalog_instance_id)
+        lambda ids, catalog_instance_id=None, priority="background": calls.append(
+            ("pending", ids, catalog_instance_id, priority)
         ),
     )
     monkeypatch.setattr(
@@ -2779,16 +3979,17 @@ def test_profile_enqueue_failure_releases_pending_rows_for_retry(monkeypatch):
     with pytest.raises(RuntimeError, match="redis down"):
         mod.enqueue_profile_analysis(["track-a"], "catalog-a", "server-a")
 
-    assert calls[0] == ("pending", ["track-a"], "catalog-a")
+    assert calls[0] == ("pending", ["track-a"], "catalog-a", "background")
     assert calls[1][:3] == ("released", ["track-a"], "catalog-a")
     assert "redis down" in calls[1][3]
 
 
-def test_prepare_lumae_runs_catalog_projection_then_source_profiles(monkeypatch):
+def test_prepare_lumae_marks_catalog_ready_before_background_profiles(monkeypatch):
     mod = load_plugin()
     calls = []
     source = settings_catalog_source()
     monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
+    monkeypatch.setattr(mod, "claim_preparation_run", lambda _catalog_id: True)
     monkeypatch.setattr(
         mod,
         "update_preparation_state",
@@ -2798,7 +3999,11 @@ def test_prepare_lumae_runs_catalog_projection_then_source_profiles(monkeypatch)
         mod,
         "refresh_catalog",
         lambda server_id=None: calls.append(("catalog", server_id))
-        or {"catalog_instance_id": "catalog-a"},
+        or {
+            "catalog_instance_id": "catalog-a",
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        },
     )
     monkeypatch.setattr(
         mod,
@@ -2809,41 +4014,48 @@ def test_prepare_lumae_runs_catalog_projection_then_source_profiles(monkeypatch)
     monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
     monkeypatch.setattr(
         mod,
-        "queue_whole_library",
+        "start_profile_backfill",
         lambda **kwargs: calls.append(("profiles", kwargs))
-        or {"queued": 25, "jobs": 1, "chunk_size": 250},
+        or {"queued": True, "coalesced": False, "batch_size": 10},
     )
     monkeypatch.setattr(
         mod,
-        "recover_stale_pending_profiles",
-        lambda catalog_id: calls.append(("recover", catalog_id)) or 0,
+        "preparation_state",
+        lambda catalog_id: {"catalog_instance_id": catalog_id, "status": "ready"},
     )
     monkeypatch.setattr(
         mod,
-        "finalize_preparation_if_settled",
-        lambda catalog_id: calls.append(("finalize", catalog_id)) or {"status": "profiles_queued"},
+        "start_relationship_preparation",
+        lambda **kwargs: calls.append(("relationships", kwargs))
+        or {"queued": True, "coalesced": False, "deferred": True},
     )
 
     result = mod.prepare_lumae_task("server-a", "catalog-a")
 
-    assert result["profiles"]["queued"] == 25
+    assert result["profiles"]["queued"] is True
+    assert result["preparation"]["status"] == "ready"
     assert calls == [
         ("state", "running", "catalog_refresh"),
         ("catalog", "server-a"),
         ("state", "running", "analysis_projection"),
         ("projection", "server-a"),
-        ("state", "profiles_queued", "profile_backfill"),
-        ("recover", "catalog-a"),
+        ("state", "ready", "catalog_ready"),
         (
             "profiles",
             {
                 "catalog_instance_id": "catalog-a",
                 "server_id": "server-a",
-                "include_failed": True,
+                "enqueue_job": False,
             },
         ),
-        ("state", "profiles_queued", "profile_backfill"),
-        ("finalize", "catalog-a"),
+        (
+            "relationships",
+            {
+                "catalog_instance_id": "catalog-a",
+                "server_id": "server-a",
+                "enqueue_job": False,
+            },
+        ),
     ]
 
 
@@ -2851,6 +4063,7 @@ def test_prepare_lumae_records_failure_and_does_not_queue_profiles(monkeypatch):
     mod = load_plugin()
     calls = []
     monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: settings_catalog_source())
+    monkeypatch.setattr(mod, "claim_preparation_run", lambda _catalog_id: True)
     monkeypatch.setattr(
         mod,
         "update_preparation_state",
@@ -2859,8 +4072,13 @@ def test_prepare_lumae_records_failure_and_does_not_queue_profiles(monkeypatch):
     monkeypatch.setattr(
         mod,
         "refresh_catalog",
-        lambda server_id=None: {"catalog_instance_id": "catalog-a"},
+        lambda server_id=None: {
+            "catalog_instance_id": "catalog-a",
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        },
     )
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(
         mod,
         "project_analysis",
@@ -2869,7 +4087,7 @@ def test_prepare_lumae_records_failure_and_does_not_queue_profiles(monkeypatch):
     monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
     monkeypatch.setattr(
         mod,
-        "queue_whole_library",
+        "start_profile_backfill",
         lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not queue")),
     )
 
@@ -2879,34 +4097,73 @@ def test_prepare_lumae_records_failure_and_does_not_queue_profiles(monkeypatch):
     assert calls[-1] == ("failed", "failed")
 
 
-def test_preparation_active_guard_expires_interrupted_jobs_after_24_hours():
+def test_preparation_active_guard_only_blocks_short_catalog_publication():
     mod = load_plugin()
     now = mod.datetime(2026, 7, 21, 12, 0, tzinfo=mod.timezone.utc)
-    state = {"status": "profiles_queued", "updated_at": "2026-07-21T11:00:00+00:00"}
+    state = {"status": "running", "updated_at": "2026-07-21T11:30:01+00:00"}
 
     assert mod.preparation_is_active(state, now=now) is True
-    state["updated_at"] = "2026-07-20T11:59:59+00:00"
+    state["updated_at"] = "2026-07-21T10:59:59+00:00"
     assert mod.preparation_is_active(state, now=now) is False
+    state["status"] = "ready"
+    state["updated_at"] = "2026-07-21T11:59:59+00:00"
+    assert mod.preparation_is_active(state, now=now) is False
+
+
+def test_profile_backfill_active_guard_makes_stalled_queue_retryable():
+    mod = load_plugin()
+    now = mod.datetime(2026, 7, 21, 12, 0, tzinfo=mod.timezone.utc)
+    state = {"status": "queued", "updated_at": "2026-07-21T11:30:01+00:00"}
+
+    assert mod.profile_backfill_is_active(state, now=now) is True
+    state["updated_at"] = "2026-07-21T11:29:59+00:00"
+    assert mod.profile_backfill_is_active(state, now=now) is False
+    state["status"] = "complete"
+    state["updated_at"] = "2026-07-21T11:59:59+00:00"
+    assert mod.profile_backfill_is_active(state, now=now) is False
+
+
+def test_catalog_preparation_claim_does_not_inherit_legacy_profile_queue_lock():
+    mod = load_plugin()
+    db = FakeDb([("catalog-a",)])
+    source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
+
+    assert mod.claim_preparation(source, db=db) is True
+    sql, _params = db.cursor_obj.executed[-1]
+    assert "status NOT IN ('queued', 'running')" in sql
+    assert "profiles_queued" not in sql
 
 
 def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     mod = load_plugin()
     db = CronDb(existing=None)
+    queued = []
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
+    )
 
     mod.migrate(db)
 
     assert db.commits == 1
-    assert db.cursor_obj.executed[-1] == (
+    assert queued == []
+    assert (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
-    )
+    ) in db.cursor_obj.executed
     cron_inserts = [params for sql, params in db.cursor_obj.executed if "INSERT INTO cron" in sql]
     assert cron_inserts == [
         (
             mod.CATALOG_REFRESH_TASK_TYPE,
             mod.CATALOG_REFRESH_TASK_TYPE,
             "17 */6 * * *",
+        ),
+        (
+            mod.CATALOG_RECONCILE_TASK_TYPE,
+            mod.CATALOG_RECONCILE_TASK_TYPE,
+            "* * * * *",
         ),
         (
             mod.PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
@@ -2921,6 +4178,11 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     ]
     migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
     assert "rebind_status='active' AND provider_type='navidrome'" in migration_sql
+    assert "relationship_state" in migration_sql
+    enrichment_source = pathlib.Path(
+        "plugins/LumaeAnalysis/catalog_enrichment.py"
+    ).read_text(encoding="utf-8")
+    assert "result_generation = 0" in enrichment_source
     assert "fingerprint_schema_version" in migration_sql
     assert "snapshot_estimated_bytes" in migration_sql
     assert "last_scan_change_counts" in migration_sql
@@ -2928,8 +4190,11 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     assert "last_scan_duration_ms" in migration_sql
     assert "change_reason" in migration_sql
     assert "plugin_lumae_analysis__collections" in migration_sql
+    assert "plugin_lumae_analysis__profile_backfill_state" in migration_sql
     assert "plugin_lumae_analysis__collection_items" in migration_sql
     assert "plugin_lumae_analysis__collection_changes" in migration_sql
+    assert "SET status='pending', finalizer_job_id=NULL" in migration_sql
+    assert "status IN ('registering', 'queued', 'enqueue_failed', 'failed')" in migration_sql
     for table_name in (
         "catalog_sources",
         "catalog_state",
@@ -2958,6 +4223,111 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         assert f"plugin_lumae_analysis__{table_name}" in migration_sql
 
 
+def test_bounded_enqueue_delegates_only_to_the_public_plugin_api(monkeypatch):
+    mod = load_plugin()
+    captured = {}
+    monkeypatch.setattr(
+        mod,
+        "enqueue",
+        lambda function, *args, **kwargs: captured.update(
+            {"function": function, "args": args, "kwargs": kwargs}
+        )
+        or types.SimpleNamespace(id="job-a"),
+    )
+
+    job = mod.enqueue_bounded(
+        mod.profile_backfill_task,
+        "server-a",
+        "catalog-a",
+        timeout=321,
+    )
+
+    assert job.id == "job-a"
+    assert captured == {
+        "function": mod.profile_backfill_task,
+        "args": ("server-a", "catalog-a"),
+        "kwargs": {"queue": "default"},
+    }
+
+
+def test_v1_0_1_has_no_infinite_plugin_job_timeout():
+    source = pathlib.Path("plugins/LumaeAnalysis/__init__.py").read_text(
+        encoding="utf-8"
+    )
+    assert "job_timeout=-1" not in source
+
+
+def test_maintenance_pause_blocks_background_work_but_preserves_control_state(
+    monkeypatch,
+):
+    mod = load_plugin()
+    monkeypatch.setattr(
+        mod,
+        "get_setting",
+        lambda key, default=None: True if key == "maintenance_paused" else default,
+    )
+    queued = []
+    released = []
+    monkeypatch.setattr(mod, "enqueue", lambda *args, **kwargs: queued.append((args, kwargs)))
+    monkeypatch.setattr(
+        mod,
+        "release_pending",
+        lambda ids, **kwargs: released.append((ids, kwargs)),
+    )
+
+    assert mod.enqueue_required_catalog_preparations(db=object()) == 0
+    assert mod.start_profile_backfill("catalog-a", "server-a") == {
+        "queued": False,
+        "coalesced": True,
+        "paused": True,
+        "batch_size": mod.DEFAULT_BACKFILL_BATCH_SIZE,
+    }
+    assert mod.start_relationship_preparation("catalog-a", "server-a") == {
+        "queued": False,
+        "coalesced": True,
+        "paused": True,
+        "reason": "maintenance_paused",
+    }
+    assert mod.analyze_one_track("track-a", catalog_instance_id="catalog-a") == {
+        "track_id": "track-a",
+        "status": "skipped_maintenance_paused",
+    }
+    assert mod.analyze_tracks_task(
+        ["track-a", "track-b"],
+        catalog_instance_id="catalog-a",
+    ) == {
+        "ready": 0,
+        "already_ready": 0,
+        "promoted": 0,
+        "failed": 0,
+        "skipped": 2,
+        "deferred": 2,
+        "paused": True,
+    }
+    assert mod.finalize_analysis_run_task("server-a", "catalog-a", "run-a") == {
+        "status": "paused",
+        "reason": "maintenance_paused",
+        "run_id": "run-a",
+    }
+    assert released == [
+        (
+            ["track-a"],
+            {
+                "catalog_instance_id": "catalog-a",
+                "reason": "Lumae background maintenance is paused",
+            },
+        ),
+        (
+            ["track-a", "track-b"],
+            {
+                "catalog_instance_id": "catalog-a",
+                "reason": "Lumae background maintenance is paused",
+            },
+        ),
+    ]
+    assert queued == []
+
+
 def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch):
     mod = load_plugin()
     db = CronDb(existing=None)
@@ -2972,6 +4342,134 @@ def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch)
     assert sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql, _ in db.cursor_obj.executed) == (
         2 * sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql in first_sql)
     )
+
+
+def test_builder_upgrade_records_one_coalesced_catalogue_preparation(monkeypatch):
+    mod = load_plugin()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 3,
+            "builder_version": mod.CATALOG_BUILDER_VERSION - 1,
+            "refresh_required": True,
+        },
+    }
+    claimed = []
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(mod, "preparation_state", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "claim_preparation",
+        lambda selected, db=None: claimed.append((selected, db)) or True,
+    )
+    result = mod.enqueue_required_catalog_preparations(db=object())
+
+    assert result == 1
+    assert claimed[0][0] is source
+
+
+def test_reconcile_retries_an_unattested_catalogue_even_when_generation_is_current(
+    monkeypatch,
+):
+    mod = load_plugin()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 4,
+            "builder_version": mod.CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
+        },
+    }
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(
+        mod,
+        "preparation_state",
+        lambda *_args, **_kwargs: {
+            "status": "ready",
+            "target_plugin_version": mod.PLUGIN_VERSION,
+            "target_catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+            "worker_plugin_version": "0.8.9",
+            "worker_catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+        },
+    )
+    monkeypatch.setattr(mod, "claim_preparation", lambda *_args, **_kwargs: True)
+    assert mod.enqueue_required_catalog_preparations(db=object()) == 1
+
+
+def test_reconcile_watchdog_is_a_noop_for_current_attested_catalogues(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "next_settled_analysis_run", lambda db=None: None)
+    monkeypatch.setattr(
+        mod, "enqueue_required_catalog_preparations", lambda db=None: 0
+    )
+    monkeypatch.setattr(mod, "next_preparation_run", lambda db=None: None)
+    monkeypatch.setattr(mod, "next_relationship_run", lambda db=None: None)
+    monkeypatch.setattr(mod, "next_profile_backfill_run", lambda db=None: None)
+
+    assert mod.catalog_reconcile_task() == {
+        "status": "current",
+        "requested": 0,
+        "plugin_version": mod.PLUGIN_VERSION,
+        "catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
+    }
+
+
+def test_reconcile_watchdog_processes_only_the_highest_priority_action(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    calls = []
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "next_settled_analysis_run",
+        lambda db=None: {
+            "server_id": "server-a",
+            "catalog_instance_id": "catalog-a",
+            "run_id": "run-a",
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "finalize_analysis_run_task",
+        lambda *args: calls.append(("analysis", args)) or {"status": "complete"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue_required_catalog_preparations",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AssertionError("a watchdog tick must stop after one action")
+        ),
+    )
+
+    assert mod.catalog_reconcile_task() == {
+        "status": "processed",
+        "action": "analysis_run",
+        "result": {"status": "complete"},
+    }
+    assert calls == [("analysis", ("server-a", "catalog-a", "run-a"))]
+
+
+def test_worker_attestation_rejects_a_stale_audio_muse_worker(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(
+        mod,
+        "preparation_state",
+        lambda *_args, **_kwargs: {
+            "target_plugin_version": "0.8.11",
+            "target_catalog_builder_version": mod.CATALOG_BUILDER_VERSION + 1,
+            "worker_plugin_version": None,
+            "worker_catalog_builder_version": None,
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="worker is still running"):
+        mod.assert_preparation_worker_current("catalog-a")
 
 
 def test_core_adapters_normalize_equivalent_v2_and_v3_analysis_events(monkeypatch):
@@ -3049,6 +4547,182 @@ def test_provider_bridge_admits_only_navidrome_sources():
         bridge.require_server("jelly")
 
 
+def test_navidrome_catalog_uses_folder_album_queries_when_song_rows_lack_folder_ids():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+    from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
+
+    calls = []
+
+    class Module:
+        @staticmethod
+        def list_libraries():
+            return [
+                {"id": "folder-a", "name": "Included"},
+                {"id": "folder-b", "name": "Excluded"},
+            ]
+
+        @staticmethod
+        def _get_target_music_folder_ids():
+            return {"folder-a"}
+
+        @staticmethod
+        def _navidrome_request(endpoint, params=None):
+            calls.append((endpoint, params))
+            if endpoint == "getAlbumList2":
+                assert params["musicFolderId"] == "folder-a"
+                return {
+                    "albumList2": {
+                        "album": [{"id": "album-a", "name": "Included album"}]
+                    }
+                }
+            if endpoint == "getAlbum":
+                return {
+                    "album": {
+                        "id": "album-a",
+                        "name": "Included album",
+                        "song": [
+                            {
+                                "id": "track-a",
+                                "title": "Included song",
+                                "albumId": "album-a",
+                                "album": "Included album",
+                            }
+                        ],
+                    }
+                }
+            raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
+
+    result = _fetch_navidrome(Module(), object(), "server-a")
+
+    assert [row["id"] for row in result["tracks"]] == ["track-a"]
+    assert [row["id"] for row in result["albums"]] == ["album-a"]
+    assert result["tracks"][0]["_lumae_library_ids"] == ["folder-a"]
+    assert result["albums"][0]["_lumae_library_ids"] == ["folder-a"]
+    assert all(endpoint != "search3" for endpoint, _params in calls)
+    normalized = normalize_provider_catalog(result, "navidrome")
+    assert normalized["tracks"][0]["payload"]["_lumae"]["library_ids"] == ["folder-a"]
+    assert normalized["albums"][0]["payload"]["_lumae"]["library_ids"] == ["folder-a"]
+    assert [
+        (row["entity_type"], row["entity_id"], row["library_id"])
+        for row in normalized["entity_libraries"]
+    ] == [
+        ("album", "album-a", "folder-a"),
+        ("track", "track-a", "folder-a"),
+    ]
+
+
+def test_navidrome_catalog_maps_unfiltered_music_folders_when_song_rows_omit_folder_ids():
+    from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
+
+    class Module:
+        @staticmethod
+        def list_libraries():
+            return [{"id": "folder-a", "name": "Music"}]
+
+        @staticmethod
+        def _get_target_music_folder_ids():
+            return None
+
+        @staticmethod
+        def _navidrome_request(endpoint, params=None):
+            if endpoint == "getAlbumList2":
+                assert params["musicFolderId"] == "folder-a"
+                return {
+                    "albumList2": {
+                        "album": [{"id": "album-a", "name": "Album", "songCount": 1}]
+                    }
+                }
+            if endpoint == "getAlbum":
+                return {
+                    "album": {
+                        "id": "album-a",
+                        "name": "Album",
+                        "song": [
+                            {
+                                "id": "track-a",
+                                "title": "Hydrated title",
+                                "albumId": "album-a",
+                            }
+                        ],
+                    }
+                }
+            raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
+
+    result = _fetch_navidrome(Module(), object(), "server-a")
+
+    assert result["tracks"] == [
+        {
+            "id": "track-a",
+            "title": "Hydrated title",
+            "albumId": "album-a",
+            "_lumae_library_ids": ["folder-a"],
+        }
+    ]
+    assert result["albums"][0]["_lumae_library_ids"] == ["folder-a"]
+
+
+def test_navidrome_catalog_joins_large_folder_scope_onto_search_rows_without_n_plus_one():
+    from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
+
+    album_rows = [
+        {"id": f"album-{index}", "name": f"Album {index}", "songCount": 1}
+        for index in range(33)
+    ]
+    calls = []
+
+    class Module:
+        @staticmethod
+        def list_libraries():
+            return [{"id": "folder-a", "name": "Music"}]
+
+        @staticmethod
+        def _get_target_music_folder_ids():
+            return None
+
+        @staticmethod
+        def _navidrome_request(endpoint, params=None):
+            calls.append((endpoint, params))
+            if endpoint == "getAlbumList2":
+                return {"albumList2": {"album": album_rows}}
+            if endpoint == "search3":
+                return {
+                    "searchResult3": {
+                        "song": [
+                            {
+                                "id": f"track-{index}",
+                                "title": f"Track {index}",
+                                "albumId": f"album-{index}",
+                            }
+                            for index in range(33)
+                        ]
+                    }
+                }
+            raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
+
+    result = _fetch_navidrome(Module(), object(), "server-a")
+
+    assert len(result["tracks"]) == 33
+    assert all(row["_lumae_library_ids"] == ["folder-a"] for row in result["tracks"])
+    assert [endpoint for endpoint, _params in calls].count("getAlbumList2") == 1
+    assert [endpoint for endpoint, _params in calls].count("search3") == 1
+    assert all(endpoint != "getAlbum" for endpoint, _params in calls)
+
+
+def test_navidrome_catalog_rejects_an_unmatched_music_folder_filter():
+    from plugins.LumaeAnalysis.catalog_providers import CatalogProviderError, _fetch_navidrome
+
+    module = types.SimpleNamespace(
+        list_libraries=lambda: [{"id": "folder-a", "name": "Available"}],
+        _get_target_music_folder_ids=lambda: set(),
+        _navidrome_request=lambda *_args, **_kwargs: pytest.fail(
+            "No catalogue request should run for an invalid folder selection"
+        ),
+    )
+
+    with pytest.raises(CatalogProviderError, match="did not match any music folder"):
+        _fetch_navidrome(module, object(), "server-a")
+
+
 class RebindCursor(FakeCursor):
     def __init__(self, source_rows, selected_source=None):
         super().__init__(source_rows)
@@ -3076,6 +4750,77 @@ def test_catalogue_source_resolution_hides_persisted_non_navidrome_sources():
 
     with pytest.raises(KeyError, match="Unknown catalogue source"):
         resolve_catalog_source(db, server_id="server-jelly")
+
+
+def _catalog_source_row(
+    server_id="server-a",
+    rebind_status="active",
+    continuity_from=None,
+    candidate_server_id=None,
+):
+    return (
+        "catalog-a",
+        server_id,
+        "navidrome",
+        "Main Navidrome",
+        True,
+        rebind_status,
+        17,
+        "catalog-epoch",
+        100,
+        0,
+        "complete",
+        {"track": 10},
+        {},
+        {},
+        None,
+        None,
+        None,
+        3,
+        "analysis-epoch",
+        50,
+        0,
+        "complete",
+        10,
+        10,
+        None,
+        None,
+        continuity_from,
+        candidate_server_id,
+        "provider-fp",
+        "scope-fp",
+        {"track_count": 10},
+    )
+
+
+def test_catalogue_source_accepts_only_a_proven_legacy_server_alias():
+    from plugins.LumaeAnalysis.catalog import resolve_catalog_source
+
+    db = FakeDb(
+        rows=[
+            _catalog_source_row(
+                server_id="server-a",
+                rebind_status="active",
+                continuity_from="legacy-default",
+            )
+        ]
+    )
+
+    source = resolve_catalog_source(
+        db,
+        server_id="legacy-default",
+        catalog_instance_id="catalog-a",
+    )[0]
+
+    assert source["server_id"] == "server-a"
+    assert source["catalog_instance_id"] == "catalog-a"
+    assert "catalog_instance_id=%s" in db.cursor_obj.executed[0][0]
+    with pytest.raises(KeyError, match="Unknown catalogue source"):
+        resolve_catalog_source(
+            db,
+            server_id="another-server",
+            catalog_instance_id="catalog-a",
+        )
 
 
 def test_catalogue_source_migration_does_not_create_non_navidrome_sources():
@@ -3350,6 +5095,216 @@ def test_automatic_rebind_accepts_only_an_exact_provider_projection(monkeypatch)
     assert accepted == []
 
 
+def test_profile_source_accepts_proven_legacy_alias_but_rejects_other_servers(
+    monkeypatch,
+):
+    mod = load_plugin()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "rebind_status": "active",
+        "continuity_from": "legacy-default",
+    }
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+
+    assert (
+        mod.resolve_profile_source(
+            catalog_instance_id="catalog-a",
+            server_id="legacy-default",
+            db=object(),
+        )
+        == source
+    )
+    with pytest.raises(ValueError, match="music-server identity changed"):
+        mod.resolve_profile_source(
+            catalog_instance_id="catalog-a",
+            server_id="another-server",
+            db=object(),
+        )
+
+
+def test_stale_v2_worker_task_uses_only_the_proven_rebound_server(monkeypatch):
+    mod = load_plugin()
+    adapter = types.SimpleNamespace(
+        mode="v3_registry",
+        active_server_id=lambda: "server-a",
+        list_servers=lambda: [{"server_id": "server-a"}],
+    )
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "rebind_status": "active",
+        "continuity_from": "legacy-default",
+    }
+    calls = []
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: adapter)
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [source])
+    monkeypatch.setattr(
+        mod,
+        "refresh_catalog",
+        lambda server_id=None: calls.append(("catalog", server_id))
+        or {"status": "complete"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "project_analysis",
+        lambda server_id=None, adapter=None: calls.append(
+            ("analysis", server_id, adapter)
+        )
+        or {"status": "complete"},
+    )
+
+    assert mod.catalog_refresh_task("legacy-default") == {"status": "complete"}
+    assert mod.analysis_projection_task("legacy-default") == {"status": "complete"}
+    assert calls == [
+        ("catalog", "server-a"),
+        ("analysis", "server-a", adapter),
+    ]
+
+    pending = {
+        **source,
+        "server_id": "legacy-default",
+        "rebind_status": "rebind_required",
+        "continuity_from": None,
+    }
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda *_args, **_kwargs: [pending])
+    assert mod.catalog_refresh_task("legacy-default") == {
+        "status": "skipped",
+        "reason": "source_rebind_required",
+    }
+    assert len(calls) == 2
+
+
+def test_analysis_projection_clears_durable_reconcile_only_after_success(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    adapter = types.SimpleNamespace(
+        mode="v2_single_server",
+        active_server_id=lambda: "server-a",
+    )
+    completed = []
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: adapter)
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "project_analysis",
+        lambda **_kwargs: {
+            "catalog_instance_id": "catalog-a",
+            "server_id": "server-a",
+            "generation": 12,
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "complete_projection_reconcile",
+        lambda selected_db, catalog_instance_id: completed.append(
+            (selected_db, catalog_instance_id)
+        ),
+    )
+    relationships = []
+    monkeypatch.setattr(
+        mod,
+        "start_relationship_preparation",
+        lambda **kwargs: relationships.append(kwargs)
+        or {"queued": True, "coalesced": False, "deferred": True},
+    )
+
+    result = mod.analysis_projection_task("server-a")
+
+    assert result["generation"] == 12
+    assert completed == [(db, "catalog-a")]
+    assert relationships == [
+        {
+            "catalog_instance_id": "catalog-a",
+            "server_id": "server-a",
+            "enqueue_job": False,
+        }
+    ]
+
+
+def test_audiomuse_fail_status_is_terminal_for_provider_rekey_checks():
+    source = pathlib.Path(
+        "plugins/LumaeAnalysis/provider_identity_rekey.py"
+    ).read_text(encoding="utf-8")
+
+    assert "'SUCCESS', 'FAILURE', 'FAIL', 'REVOKED'" in source
+
+
+def test_flask_start_repairs_identity_schema_without_queueing(monkeypatch):
+    mod = load_plugin()
+    queued = []
+    migrations = []
+
+    class Db:
+        def __init__(self):
+            self.commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    db = Db()
+
+    class Bridge:
+        @staticmethod
+        def list_servers():
+            return []
+
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "migrate_provider_identity",
+        lambda selected_db: migrations.append(selected_db),
+    )
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
+    monkeypatch.setattr(
+        mod,
+        "enqueue_bounded",
+        lambda func, *args, **kwargs: queued.append((func, args, kwargs)),
+    )
+
+    mod.observe_provider_identities_on_start()
+
+    assert migrations == [db]
+    assert db.commits == 1
+    assert queued == []
+
+
+def test_flask_start_rolls_back_a_failed_identity_schema_repair(monkeypatch):
+    mod = load_plugin()
+
+    class Db:
+        def __init__(self):
+            self.rollbacks = 0
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    db = Db()
+    queued = []
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "migrate_provider_identity",
+        lambda _db: (_ for _ in ()).throw(RuntimeError("schema migration failed")),
+    )
+    monkeypatch.setattr(
+        mod,
+        "ProviderCatalogBridge",
+        lambda: (_ for _ in ()).throw(AssertionError("must not probe an invalid schema")),
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue_bounded",
+        lambda *args, **kwargs: queued.append((args, kwargs)),
+    )
+
+    mod.observe_provider_identities_on_start()
+
+    assert db.rollbacks == 1
+    assert queued == []
+
+
 @pytest.mark.parametrize(
     ("provider_type", "track"),
     [
@@ -3458,6 +5413,53 @@ def test_provider_catalog_accepts_v3_duration_seconds_field():
     )
 
     assert normalized["tracks"][0]["duration_ms"] == 201250
+
+
+def test_provider_catalog_normalizes_structured_navidrome_artist_identities():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    normalized = normalize_provider_catalog(
+        {
+            "albums": [
+                {
+                    "id": "album-1",
+                    "name": "Lux",
+                    "AlbumArtist": {
+                        "id": "7na6296tJwTG4kzEPL94VM",
+                        "name": "ROSALÍA",
+                    },
+                }
+            ],
+            "tracks": [
+                {
+                    "id": "track-1",
+                    "title": "Berghain",
+                    "albumId": "album-1",
+                    "album": "Lux",
+                    "artist": {
+                        "id": "7na6296tJwTG4kzEPL94VM",
+                        "name": "Rosalía",
+                    },
+                    "albumArtist": [
+                        {
+                            "id": "7na6296tJwTG4kzEPL94VM",
+                            "name": "ROSALÍA",
+                        }
+                    ],
+                }
+            ],
+        },
+        "navidrome",
+    )
+
+    assert normalized["albums"][0]["album_artist_display"] == "ROSALÍA"
+    assert normalized["tracks"][0]["artist_display"] == "Rosalía"
+    assert normalized["tracks"][0]["album_artist_display"] == "ROSALÍA"
+    assert len(normalized["artists"]) == 1
+    assert normalized["artists"][0]["artist_id"] == "7na6296tJwTG4kzEPL94VM"
+    assert normalized["artists"][0]["name"] == "ROSALÍA"
+    assert normalized["artists"][0]["identity_provenance"] == "provider_id"
+    assert "{'id':" not in json.dumps(normalized, ensure_ascii=False)
 
 
 def test_provider_catalog_publishes_relationships_and_rich_enrichment_in_stream_payloads():
@@ -3750,6 +5752,38 @@ class RefreshDb:
         self.rollbacks += 1
 
 
+def test_catalog_generation_parameters_are_materialized_one_batch_at_a_time():
+    import plugins.LumaeAnalysis.catalog as catalog
+
+    class Cursor:
+        def __init__(self):
+            self.batch_sizes = []
+
+        def executemany(self, _sql, params):
+            self.batch_sizes.append(len(params))
+
+    rows = (
+        {
+            "track_id": f"track-{index}",
+            "title": "Track",
+            "payload": {},
+        }
+        for index in range(2501)
+    )
+    cursor = Cursor()
+
+    catalog._insert_generation_rows(
+        cursor,
+        "track",
+        "catalog-a",
+        2,
+        rows,
+        catalog.utc_now(),
+    )
+
+    assert cursor.batch_sizes == [1000, 1000, 501]
+
+
 class RefreshBridge:
     def __init__(self, payload=None, error=None):
         self.payload = payload or {"tracks": []}
@@ -3819,7 +5853,8 @@ def test_refresh_catalog_failure_keeps_prior_generation_and_records_error():
     assert db.commits == 2
     assert not any("SET published_generation" in sql for sql, _params in db.executed)
     assert any(
-        "status='complete'" in sql and params[0] == "provider unavailable"
+        "CASE WHEN published_generation=0 THEN 'failed' ELSE status END" in sql
+        and params[0] == "provider unavailable"
         for sql, params in db.executed
         if params
     )
@@ -4039,10 +6074,96 @@ def test_interrupted_fingerprint_rebase_keeps_previous_generation_and_epoch(monk
     assert not any("SET published_generation=" in sql for sql, _params in db.executed)
     assert not any("SET catalog_epoch=" in sql for sql, _params in db.executed)
     assert any(
-        "status='complete'" in sql and params[0] == "publication interrupted"
+        "CASE WHEN published_generation=0 THEN 'failed' ELSE status END" in sql
+        and params[0] == "publication interrupted"
         for sql, params in db.executed
         if params
     )
+
+
+def test_refresh_catalog_rejects_an_empty_first_generation():
+    from plugins.LumaeAnalysis.catalog import CatalogScanError, refresh_catalog
+
+    db = RefreshDb()
+
+    with pytest.raises(CatalogScanError, match="empty catalogue was not published"):
+        refresh_catalog("server-a", db=db, bridge=RefreshBridge({"tracks": []}))
+
+    assert db.rollbacks == 1
+    assert not any("SET published_generation" in sql for sql, _params in db.executed)
+    assert any(
+        "status='failed'" in sql
+        and "Navidrome returned no usable tracks" in params[0]
+        for sql, params in db.executed
+        if params
+    )
+
+
+def test_refresh_catalog_rejects_tracks_without_library_membership():
+    from plugins.LumaeAnalysis.catalog import CatalogScanError, refresh_catalog
+
+    db = RefreshDb()
+    payload = {
+        "libraries": [{"id": "library-1", "name": "Music"}],
+        "tracks": [{"id": "track-1", "title": "Song"}],
+    }
+
+    with pytest.raises(CatalogScanError, match="0 of 1 tracks had valid"):
+        refresh_catalog("server-a", db=db, bridge=RefreshBridge(payload))
+
+    assert db.rollbacks == 1
+    assert not any("SET published_generation" in sql for sql, _params in db.executed)
+
+
+def test_refresh_catalog_rejects_partial_or_unknown_library_memberships():
+    from plugins.LumaeAnalysis.catalog import CatalogScanError, refresh_catalog
+
+    db = RefreshDb()
+    payload = {
+        "libraries": [{"id": "library-1", "name": "Music"}],
+        "tracks": [
+            {
+                "id": "track-1",
+                "title": "Mapped",
+                "_lumae_library_ids": ["library-1"],
+            },
+            {
+                "id": "track-2",
+                "title": "Wrong library",
+                "_lumae_library_ids": ["library-2"],
+            },
+            {"id": "track-3", "title": "Unmapped"},
+        ],
+    }
+
+    with pytest.raises(
+        CatalogScanError,
+        match="1 of 3 tracks had valid.*1 unknown library IDs",
+    ):
+        refresh_catalog("server-a", db=db, bridge=RefreshBridge(payload))
+
+    assert db.rollbacks == 1
+    assert not any("SET published_generation" in sql for sql, _params in db.executed)
+
+
+def test_refresh_failure_preserves_published_readiness():
+    from plugins.LumaeAnalysis.catalog import refresh_catalog
+
+    db = RefreshDb(previous_counts={"track": 3})
+
+    with pytest.raises(RuntimeError, match="provider unavailable"):
+        refresh_catalog(
+            "server-a",
+            db=db,
+            bridge=RefreshBridge(error=RuntimeError("provider unavailable")),
+        )
+
+    failure_sql = next(
+        sql
+        for sql, params in db.executed
+        if params and params[0] == "provider unavailable" and "catalog_state" in sql
+    )
+    assert "CASE WHEN published_generation=0 THEN 'failed' ELSE status END" in failure_sql
 
 
 class ProjectionCursor(FakeCursor):
@@ -4094,6 +6215,11 @@ class ProjectionCursor(FakeCursor):
                 ("copy-a", "canonical-1", "fingerprint"),
                 ("copy-b", "canonical-1", "fingerprint"),
             ]
+        elif "FROM chromaprint" in sql:
+            self.rows = [
+                ("copy-a", b"same-fingerprint"),
+                ("copy-b", b"same-fingerprint"),
+            ]
         elif "FROM score s" in sql:
             self.rows = [
                 (
@@ -4133,6 +6259,8 @@ class ProjectionDb:
 
 
 class ProjectionAdapter:
+    mode = "v3_registry"
+
     def active_server_id(self):
         return "server-a"
 
@@ -4140,19 +6268,181 @@ class ProjectionAdapter:
         return "SELECT provider_track_id, analysis_id, match_tier FROM fake_mapping WHERE server_id=%s"
 
 
-def test_analysis_projection_reuses_one_vector_for_two_provider_occurrences():
+def test_analysis_projection_reuses_one_vector_for_two_provider_occurrences(monkeypatch):
     from plugins.LumaeAnalysis.catalog_analysis import project_analysis
 
+    monkeypatch.setattr(
+        plugin_api_module.config, "CATALOGUE_ID_SCHEME_VERSION", 4, raising=False
+    )
+    monkeypatch.setattr(
+        plugin_api_module.config, "CHROMAPRINT_COLLECTION_ENABLED", True, raising=False
+    )
+    monkeypatch.setattr(
+        plugin_api_module.config, "CHROMAPRINT_GATE_ENABLED", True, raising=False
+    )
     db = ProjectionDb()
 
     result = project_analysis("server-a", db=db, adapter=ProjectionAdapter())
 
     assert result["item_count"] == 1
     assert result["link_count"] == 2
+    assert result["ready_count"] == 2
+    assert result["evidence_complete_count"] == 2
     assert result["suspect_count"] == 0
     assert db.commits == 1
     assert sum("INSERT INTO plugin_lumae_analysis__analysis_items" in sql for sql, _ in db.executed) == 1
     assert sum("INSERT INTO plugin_lumae_analysis__track_analysis_links" in sql for sql, _ in db.executed) == 2
+
+
+@pytest.mark.parametrize(
+    ("analysis_status", "expect_unchanged"),
+    (("complete", True), ("failed", False)),
+)
+def test_no_change_analysis_projection_reuses_only_a_complete_generation(
+    monkeypatch,
+    analysis_status,
+    expect_unchanged,
+):
+    import plugins.LumaeAnalysis.catalog_analysis as projection
+    from plugins.LumaeAnalysis.catalog import fingerprint
+
+    item = {
+        "analysis_id": "analysis-a",
+        "scalar_payload": {"tempo": 120},
+        "scalar_fp": "scalar-fp",
+        "umap": None,
+        "umap_fp": None,
+        "musicnn_vector": struct.pack("<2f", 0.1, 0.2),
+        "musicnn_fp": "musicnn-fp",
+        "clap_vector": None,
+        "clap_fp": None,
+    }
+    link = {
+        "provider_track_id": "track-a",
+        "analysis_id": "analysis-a",
+        "status": "ready",
+        "match_tier": "direct",
+        "algorithm": "bounded-test",
+        "decision_threshold": 0.1,
+        "distance": None,
+        "evidence_complete": False,
+        "conflict_flags": [],
+        "review_state": None,
+    }
+
+    class Cursor:
+        def __init__(self):
+            self.row = None
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+            self.row = (
+                (7, "analysis-epoch", 42)
+                if "FROM plugin_lumae_analysis__analysis_state" in sql
+                else None
+            )
+
+        def fetchone(self):
+            return self.row
+
+        def close(self):
+            pass
+
+    class Db:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+            self.commits = 0
+
+        def cursor(self):
+            return self.cursor_obj
+
+        def commit(self):
+            self.commits += 1
+
+    db = Db()
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "catalog": {"status": "complete", "generation": 3},
+        "analysis": {"status": analysis_status, "generation": 7},
+    }
+    monkeypatch.setattr(projection, "resolve_catalog_source", lambda *_a, **_k: [source])
+    monkeypatch.setattr(
+        projection,
+        "_active_catalog_tracks",
+        lambda *_a: {
+            "track-a": {
+                "track_id": "track-a",
+                "title": "Track",
+                "artist": "Artist",
+                "album_id": "album-a",
+                "duration_ms": 180000,
+                "payload": {},
+            }
+        },
+    )
+    monkeypatch.setattr(
+        projection,
+        "_analysis_mapping",
+        lambda *_a: {
+            "track-a": {
+                "analysis_id": "analysis-a",
+                "match_tier": "direct",
+            }
+        },
+    )
+    monkeypatch.setattr(projection, "_analysis_chromaprints", lambda *_a: {})
+    monkeypatch.setattr(projection, "_analysis_rows", lambda *_a: {"analysis-a": item})
+    monkeypatch.setattr(
+        projection,
+        "dedup_policy",
+        lambda: {"algorithm": "bounded-test", "configured_threshold": 0.1},
+    )
+    monkeypatch.setattr(projection, "_apply_progressive_evidence", lambda *_a: None)
+    monkeypatch.setattr(projection, "_apply_provider_conflicts", lambda *_a: None)
+    monkeypatch.setattr(projection, "_suspect_analysis_ids", lambda *_a: set())
+    monkeypatch.setattr(
+        projection,
+        "_old_items",
+        lambda *_a: {
+            "analysis-a": (
+                item["scalar_fp"],
+                item["umap_fp"],
+                item["musicnn_fp"],
+                item["clap_fp"],
+            )
+        },
+    )
+    monkeypatch.setattr(
+        projection,
+        "_old_links",
+        lambda *_a: {"track-a": fingerprint(link)},
+    )
+
+    result = projection.project_analysis(
+        "server-a",
+        db=db,
+        adapter=types.SimpleNamespace(active_server_id=lambda: "server-a"),
+    )
+
+    assert result["generation"] == (7 if expect_unchanged else 8)
+    assert result["changes"] == 0
+    assert db.commits == 1
+    writes = [
+        sql
+        for sql, _params in db.cursor_obj.executed
+        if sql.lstrip().startswith(("INSERT", "UPDATE"))
+    ]
+    if expect_unchanged:
+        assert result["unchanged"] is True
+        assert writes == []
+    else:
+        assert "unchanged" not in result
+        assert len(writes) == 3
+        assert any("analysis_items" in sql for sql in writes)
+        assert any("track_analysis_links" in sql for sql in writes)
+        assert any("status='complete'" in sql for sql in writes)
 
 
 def test_analysis_projection_marks_contradictory_dedup_group_suspect():
@@ -4178,6 +6468,185 @@ def test_analysis_projection_marks_contradictory_dedup_group_suspect():
     }
 
     assert _suspect_analysis_ids(tracks, links) == {"canonical-1"}
+
+
+def test_progressive_evidence_keeps_disagreements_usable_and_flagged_for_repair():
+    from plugins.LumaeAnalysis.catalog_analysis import _apply_progressive_evidence
+
+    policy = {"per_link_chromaprint_evidence_available": True}
+    links = {
+        "single": {
+            "analysis_id": "single-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+        "pending-a": {
+            "analysis_id": "pending-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+        "pending-b": {
+            "analysis_id": "pending-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+        "suspect-a": {
+            "analysis_id": "suspect-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+        "suspect-b": {
+            "analysis_id": "suspect-analysis",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+    }
+    fingerprints = {
+        "pending-a": b"pending-a",
+        "suspect-a": b"suspect-a",
+        "suspect-b": b"suspect-b",
+    }
+
+    _apply_progressive_evidence(
+        links,
+        fingerprints,
+        policy,
+        compare=lambda left, right: False,
+    )
+
+    assert links["single"]["status"] == "ready"
+    assert links["single"]["evidence_complete"] is True
+    assert links["pending-a"]["status"] == "ready"
+    assert links["pending-b"]["status"] == "ready"
+    assert links["pending-a"]["evidence_complete"] is False
+    assert links["pending-a"]["conflict_flags"] == ["chromaprint_evidence_pending"]
+    assert links["pending-a"]["review_state"] == "provisional"
+    assert links["suspect-a"]["status"] == "ready"
+    assert links["suspect-b"]["status"] == "ready"
+    assert links["suspect-a"]["evidence_complete"] is False
+    assert links["suspect-a"]["conflict_flags"] == ["chromaprint_disagreement"]
+    assert links["suspect-a"]["review_state"] == "needs_repair"
+
+
+def test_provider_conflicts_keep_sonic_data_usable_and_preserve_stronger_repair_flag():
+    from plugins.LumaeAnalysis.catalog_analysis import _apply_provider_conflicts
+
+    links = {
+        "chromaprint-conflict": {
+            "analysis_id": "analysis-a",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": ["chromaprint_disagreement"],
+            "review_state": "needs_repair",
+        },
+        "provider-conflict": {
+            "analysis_id": "analysis-b",
+            "status": "ready",
+            "evidence_complete": True,
+            "conflict_flags": [],
+            "review_state": None,
+        },
+    }
+
+    _apply_provider_conflicts(links, {"analysis-a", "analysis-b"})
+
+    assert {link["status"] for link in links.values()} == {"ready"}
+    assert links["chromaprint-conflict"]["conflict_flags"] == [
+        "chromaprint_disagreement",
+        "provider_evidence_conflict",
+    ]
+    assert links["chromaprint-conflict"]["review_state"] == "needs_repair"
+    assert links["provider-conflict"]["evidence_complete"] is False
+    assert links["provider-conflict"]["conflict_flags"] == [
+        "provider_evidence_conflict"
+    ]
+    assert links["provider-conflict"]["review_state"] == "needs_review"
+
+
+def test_old_link_fingerprint_uses_the_same_fields_as_new_projection_payload():
+    from plugins.LumaeAnalysis.catalog import fingerprint
+    from plugins.LumaeAnalysis.catalog_analysis import _old_links
+
+    link = {
+        "provider_track_id": "track-a",
+        "analysis_id": "analysis-a",
+        "status": "ready",
+        "match_tier": "provider_occurrence",
+        "algorithm": "audiomuse_catalogue_fp_4",
+        "decision_threshold": 0.01,
+        "distance": None,
+        "evidence_complete": False,
+        "conflict_flags": ["provider_evidence_conflict"],
+        "review_state": "needs_review",
+    }
+
+    class Cursor:
+        def __init__(self):
+            self.sql = ""
+
+        def execute(self, sql, params):
+            self.sql = " ".join(sql.split())
+            assert params == ("catalog-a", 4)
+
+        def fetchall(self):
+            return [
+                (
+                    link["provider_track_id"],
+                    link["analysis_id"],
+                    link["status"],
+                    link["match_tier"],
+                    link["algorithm"],
+                    link["decision_threshold"],
+                    link["distance"],
+                    link["evidence_complete"],
+                    link["conflict_flags"],
+                    link["review_state"],
+                )
+            ]
+
+    cur = Cursor()
+    old = _old_links(cur, "catalog-a", 4)
+
+    assert "review_state" in cur.sql
+    assert old == {"track-a": fingerprint(link)}
+
+
+def test_progressive_evidence_uses_inconclusive_fingerprints_provisionally():
+    from plugins.LumaeAnalysis.catalog_analysis import _apply_progressive_evidence
+
+    links = {
+        track_id: {
+            "analysis_id": "analysis-a",
+            "status": "ready",
+            "evidence_complete": False,
+            "conflict_flags": [],
+            "review_state": None,
+        }
+        for track_id in ("track-a", "track-b")
+    }
+
+    _apply_progressive_evidence(
+        links,
+        {"track-a": b"a", "track-b": b"b"},
+        {"per_link_chromaprint_evidence_available": True},
+        compare=lambda _left, _right: None,
+    )
+
+    assert {link["status"] for link in links.values()} == {"ready"}
+    assert {
+        tuple(link["conflict_flags"]) for link in links.values()
+    } == {("chromaprint_evidence_inconclusive",)}
+    assert {link["review_state"] for link in links.values()} == {"provisional"}
 
 
 def test_v3_0_3_dedup_policy_and_duration_backstop(monkeypatch):
@@ -4208,8 +6677,8 @@ def test_v3_0_3_dedup_policy_and_duration_backstop(monkeypatch):
         "chromaprint_match_threshold": 0.95,
         "chromaprint_min_overlap": 40,
         "per_link_distance_available": False,
-        "per_link_chromaprint_evidence_available": False,
-        "evidence_status": "configured_policy_only",
+        "per_link_chromaprint_evidence_available": True,
+        "evidence_status": "per_link_progressive",
     }
     tracks = {
         "a": {"title": "Song", "artist": "Artist", "duration_ms": 180000, "payload": {}},
@@ -4231,6 +6700,8 @@ class ReadinessCursor:
         self.db.executed.append((sql, params))
         if "FROM plugin_lumae_analysis__catalog_tracks" in sql:
             self.rows = [self.db.coverage]
+        elif "FROM plugin_lumae_analysis__track_analysis_links" in sql:
+            self.rows = [self.db.link_counts]
         elif "FROM task_status" in sql:
             self.rows = list(self.db.tasks)
         else:
@@ -4247,9 +6718,15 @@ class ReadinessCursor:
 
 
 class ReadinessDb:
-    def __init__(self, coverage=(10, 9, 9, 150.0), tasks=None):
+    def __init__(
+        self,
+        coverage=(10, 9, 9, 150.0),
+        tasks=None,
+        link_counts=(8, 1, 0, 1, 7, 1),
+    ):
         self.coverage = coverage
         self.tasks = tasks or []
+        self.link_counts = link_counts
         self.executed = []
 
     def cursor(self):
@@ -4274,6 +6751,7 @@ def readiness_policy():
         "folder_aware": True,
         "chromaprint_collection_enabled": True,
         "chromaprint_gate_enabled": True,
+        "per_link_chromaprint_evidence_available": True,
     }
 
 
@@ -4285,33 +6763,65 @@ def readiness_tasks():
     ]
 
 
-def test_v3_readiness_admits_catalogue_independently_and_analysis_automatically():
+def test_v3_readiness_blocks_pending_source_rebind_before_database_queries():
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
-        core_version="v3.0.6",
+        core_version="v3.0.5",
         adapter="v3_registry",
     )
-    db = ReadinessDb(tasks=readiness_tasks())
+    source = {
+        **readiness_source(),
+        "server_id": "legacy-default",
+        "candidate_server_id": "server-a",
+        "rebind_status": "rebind_required",
+    }
 
     result = readiness.v3_release_readiness(
-        db,
+        None,
+        compatibility,
+        source,
+        readiness_policy(),
+    )
+
+    assert result["status"] == "source_rebind_required"
+    assert result["ready"] is False
+    assert result["blockers"] == ["source_rebind_required"]
+    assert result["admission"]["catalog"]["admitted"] is False
+    assert result["admission"]["analysis"]["admitted"] is False
+    assert result["admission"]["analysis"]["semantic_contracts"]
+
+
+def test_v3_readiness_is_derived_automatically_from_complete_evidence():
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.3",
+        adapter="v3_registry",
+    )
+    result = readiness.v3_release_readiness(
+        ReadinessDb(
+            coverage=(10, 10, 10, 150.0),
+            tasks=[],
+            link_counts=(10, 0, 0, 0, 10, 0),
+        ),
         compatibility,
         readiness_source(),
         readiness_policy(),
     )
 
-    assert result["qualified_core_version"] == "v3.0.6"
+    assert result["status"] == "ready"
     assert result["ready"] is True
+    assert result["fully_verified"] is True
+    assert result["analysis_sync_allowed"] is True
+    assert result["progressive_analysis"] is False
     assert result["verification_mode"] == "automatic"
     assert result["administrator_acknowledged"] is False
-    assert result["missing_mapping_count"] == 1
-    assert result["chromaprint_coverage"] == 1.0
-    assert result["task_evidence"]["verification_sequence_complete"] is True
+    assert result["acknowledged_at"] is None
+    assert result["blockers"] == []
     assert result["admission"]["catalog"]["admitted"] is True
     assert result["admission"]["analysis"]["admitted"] is True
 
 
-def test_v3_readiness_withholds_only_analysis_for_incomplete_backfill():
+def test_v3_readiness_keeps_incomplete_evidence_progressively_usable():
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
         core_version="v3.0.3",
@@ -4326,19 +6836,77 @@ def test_v3_readiness_withholds_only_analysis_for_incomplete_backfill():
         readiness_policy(),
     )
 
+    assert result["status"] == "progressive"
+    assert result["ready"] is False
+    assert result["fully_verified"] is False
+    assert result["analysis_sync_allowed"] is True
+    assert result["progressive_analysis"] is True
+    assert result["verification_mode"] == "automatic"
     assert result["admission"]["catalog"]["admitted"] is True
-    assert result["admission"]["analysis"]["admitted"] is False
-    assert "chromaprint_backfill_incomplete" in result["blockers"]
-    assert "analysis_verification_sequence_incomplete" in result["blockers"]
+    assert result["admission"]["analysis"]["admitted"] is True
+    assert result["admission"]["analysis"]["status"] == "progressive"
+    assert result["admission"]["analysis"]["blockers"] == []
+    assert result["ready_link_count"] == 8
+    assert result["pending_link_count"] == 1
+    assert result["missing_link_count"] == 1
+    assert result["verified_link_count"] == 7
+    assert result["provisional_link_count"] == 1
+    assert result["usable_analysis_coverage"] == 0.8
+    assert result["blockers"] == [
+        "analysis_mapping_incomplete",
+        "chromaprint_backfill_incomplete",
+        "analysis_links_pending",
+        "analysis_links_missing",
+        "provisional_links_remaining",
+    ]
+    link_query = next(
+        sql
+        for sql, _params in db.executed
+        if "track_analysis_links" in sql
+    )
+    assert "review_state IN ('needs_repair', 'needs_review')" in link_query
 
 
-def test_v3_readiness_requires_cleaning_after_chromaprint_completion():
+def test_v3_historical_upgrade_sequence_is_diagnostic_only():
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
         core_version="v3.0.3",
         adapter="v3_registry",
     )
-    db = ReadinessDb(coverage=(10, 10, 10, 250.0), tasks=readiness_tasks())
+    result = readiness.v3_release_readiness(
+        ReadinessDb(
+            coverage=(10, 10, 10, 250.0),
+            tasks=readiness_tasks(),
+            link_counts=(10, 0, 0, 0, 10, 0),
+        ),
+        compatibility,
+        readiness_source(),
+        readiness_policy(),
+    )
+
+    assert result["ready"] is True
+    assert result["task_evidence"]["chromaprint_complete_before_cleaning"] is False
+    assert result["task_evidence"]["upgrade_sequence_complete"] is False
+
+
+def test_v3_readiness_does_not_depend_on_historical_task_diagnostics():
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.5",
+        adapter="v3_registry",
+    )
+    db = ReadinessDb(
+        coverage=(10, 10, 10, 150.0),
+        link_counts=(10, 0, 0, 0, 10, 0),
+    )
+
+    class MissingTaskHistoryCursor(ReadinessCursor):
+        def execute(self, sql, params=None):
+            if "FROM task_status" in sql:
+                raise RuntimeError("task history unavailable")
+            super().execute(sql, params)
+
+    db.cursor = lambda: MissingTaskHistoryCursor(db)
 
     result = readiness.v3_release_readiness(
         db,
@@ -4347,22 +6915,27 @@ def test_v3_readiness_requires_cleaning_after_chromaprint_completion():
         readiness_policy(),
     )
 
-    assert result["ready"] is False
-    assert result["admission"]["catalog"]["admitted"] is True
-    assert result["admission"]["analysis"]["admitted"] is False
-    assert result["blockers"] == ["analysis_verification_sequence_incomplete"]
+    assert result["ready"] is True
+    assert result["verification_mode"] == "automatic"
+    assert result["task_evidence"]["diagnostics_available"] is False
 
 
-@pytest.mark.parametrize("core_version", ["v3.0.3", "v3.0.5", "v3.0.6", "v4.0.0"])
-def test_v3_admission_result_does_not_depend_on_core_patch(core_version):
+@pytest.mark.parametrize(
+    "core_version",
+    ["v3.0.3", "v3.0.5", "v3.0.6", "v4.0.0"],
+)
+def test_v3_complete_evidence_is_automatic_across_core_releases(core_version):
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
         core_version=core_version,
         adapter="v3_registry",
     )
-
     result = readiness.v3_release_readiness(
-        ReadinessDb(coverage=(10, 10, 10, 150.0), tasks=readiness_tasks()),
+        ReadinessDb(
+            coverage=(10, 10, 10, 150.0),
+            tasks=[],
+            link_counts=(10, 0, 0, 0, 10, 0),
+        ),
         compatibility,
         readiness_source(),
         readiness_policy(),
@@ -4371,11 +6944,41 @@ def test_v3_admission_result_does_not_depend_on_core_patch(core_version):
     assert result["ready"] is True
     assert result["verification_mode"] == "automatic"
     assert result["qualified_core_version"] == core_version
-    assert result["admission"]["catalog"]["admitted"] is True
     assert result["admission"]["analysis"]["admitted"] is True
 
 
-def test_v3_readiness_never_reuses_administrator_acknowledgement():
+def test_v3_readiness_ignores_obsolete_acknowledgement_settings(monkeypatch):
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    compatibility = types.SimpleNamespace(
+        core_version="v3.0.5",
+        adapter="v3_registry",
+    )
+    monkeypatch.setattr(
+        plugin_api_module,
+        "get_setting",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("readiness must not load manual acknowledgements")
+        ),
+    )
+
+    result = readiness.v3_release_readiness(
+        ReadinessDb(
+            coverage=(10, 10, 10, 150.0),
+            tasks=[],
+            link_counts=(10, 0, 0, 0, 10, 0),
+        ),
+        compatibility,
+        readiness_source(),
+        readiness_policy(),
+    )
+
+    assert result["ready"] is True
+    assert result["administrator_acknowledged"] is False
+    assert result["qualified_core_version"] == "v3.0.5"
+    assert result["verification_mode"] == "automatic"
+
+
+def test_v3_readiness_admits_future_patch_from_complete_runtime_evidence():
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
         core_version="v3.0.6",
@@ -4383,21 +6986,45 @@ def test_v3_readiness_never_reuses_administrator_acknowledgement():
     )
 
     result = readiness.v3_release_readiness(
-        ReadinessDb(coverage=(10, 10, 10, 150.0), tasks=readiness_tasks()),
+        ReadinessDb(
+            coverage=(10, 10, 10, 150.0),
+            tasks=[],
+            link_counts=(10, 0, 0, 0, 10, 0),
+        ),
         compatibility,
         readiness_source(),
         readiness_policy(),
-        acknowledgement={
-            "core_version": "v3.0.5",
-            "catalog_instance_id": "catalog-a",
-            "server_id": "server-a",
-            "verification_mode": "fresh",
-        },
     )
 
+    assert result["qualified_core_version"] == "v3.0.6"
+    assert result["detected_core_version"] == "v3.0.6"
+    assert result["status"] == "ready"
     assert result["ready"] is True
-    assert result["administrator_acknowledged"] is False
-    assert result["verification_mode"] == "automatic"
+    assert result["blockers"] == []
+    assert result["admission"]["catalog"]["admitted"] is True
+    assert result["admission"]["analysis"]["admitted"] is True
+
+
+def test_v3_readiness_blocks_analysis_but_keeps_catalogue_when_safety_contract_fails():
+    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
+    policy = {**readiness_policy(), "chromaprint_gate_enabled": False}
+
+    result = readiness.v3_release_readiness(
+        ReadinessDb(
+            coverage=(10, 10, 10, 150.0),
+            tasks=[],
+            link_counts=(10, 0, 0, 0, 10, 0),
+        ),
+        types.SimpleNamespace(core_version="v3.99.0", adapter="v3_registry"),
+        readiness_source(),
+        policy,
+    )
+
+    assert result["admission"]["catalog"]["admitted"] is True
+    assert result["admission"]["analysis"]["admitted"] is False
+    assert result["admission"]["analysis"]["blockers"] == [
+        "chromaprint_gate_disabled"
+    ]
 
 
 def test_v2_readiness_is_not_applicable_without_database_access():
@@ -4419,7 +7046,7 @@ def test_v2_readiness_is_not_applicable_without_database_access():
     assert result["status"] == "not_applicable"
 
 
-def test_settings_no_longer_accepts_manual_release_approval(monkeypatch):
+def test_settings_treats_stale_manual_verification_posts_as_noop(monkeypatch):
     mod = load_plugin()
     monkeypatch.setattr(
         mod,
@@ -4428,7 +7055,7 @@ def test_settings_no_longer_accepts_manual_release_approval(monkeypatch):
     )
     client = plugin_client(mod)
 
-    response = client.post(
+    acknowledge = client.post(
         "/settings",
         data={
             "action": "ack_v3_readiness",
@@ -4437,13 +7064,21 @@ def test_settings_no_longer_accepts_manual_release_approval(monkeypatch):
             "verification_mode": "upgraded",
         },
     )
-    assert response.status_code == 200
-    assert response.get_data(as_text=True) == "settings"
-    assert not hasattr(mod, "acknowledge_v3_release")
-    assert not hasattr(mod, "clear_v3_release_acknowledgement")
+    clear = client.post(
+        "/settings",
+        data={
+            "action": "clear_v3_readiness",
+            "catalog_instance_id": "catalog-a",
+        },
+    )
+
+    assert acknowledge.status_code == 200
+    assert clear.status_code == 200
+    assert "no longer required" in acknowledge.get_data(as_text=True)
+    assert "verifies sonic readiness automatically" in clear.get_data(as_text=True)
 
 
-def test_settings_page_explains_automatic_stream_admission_and_blockers(monkeypatch):
+def test_settings_page_explains_automatic_sonic_status_and_blockers(monkeypatch):
     mod = load_plugin()
     source = readiness_source()
     readiness = {
@@ -4456,26 +7091,154 @@ def test_settings_page_explains_automatic_stream_admission_and_blockers(monkeypa
         "missing_mapping_count": 2,
         "chromaprint_track_count": 8,
         "chromaprint_coverage": 0.8,
+        "ready_link_count": 7,
+        "verified_link_count": 5,
+        "provisional_link_count": 2,
+        "pending_link_count": 2,
+        "suspect_link_count": 1,
+        "missing_link_count": 2,
+        "analysis_sync_allowed": True,
         "task_evidence": {"upgrade_sequence_complete": False},
-        "blockers": ["chromaprint_backfill_incomplete"],
-        "admission": {
-            "catalog": {"admitted": True},
-            "analysis": {"admitted": False},
-        },
+        "blockers": [
+            "analysis_mapping_incomplete",
+            "chromaprint_backfill_incomplete",
+            "analysis_links_pending",
+            "analysis_links_need_repair",
+            "analysis_links_missing",
+            "provisional_links_remaining",
+        ],
     }
     monkeypatch.setattr(mod, "_v3_readiness_sources", lambda: [(source, readiness)])
 
     body = mod.render_v3_readiness_panel()
     compact = " ".join(body.split())
 
-    assert "Automatic sync compatibility" in body
+    assert "2. AudioMuse source analysis" in body
+    assert "AudioMuse source analysis is still filling in" in body
     assert "Chromaprint: 8 of 10 mapped tracks (80.00%)" in compact
     assert "without analysis mapping: 2" in compact
-    assert "Mapped tracks are still missing Chromaprint fingerprints." in body
-    assert "Music catalogue contract: passed" in compact
-    assert "Sonic analysis contract: waiting" in compact
+    assert "Full-library verification is still waiting for Chromaprint" in body
+    assert "Source-analysis links: 7 usable (5 verified; 2 provisional)" in compact
+    assert "1 flagged for repair" in compact
+    assert "Analysis task or schedule produces the missing source" in compact
+    assert "Technical details" in body
+    assert "diagnostic only; it does not gate readiness" in compact
     assert "Confirm fresh installation" not in body
     assert "Confirm upgraded installation" not in body
+    assert "<form" not in body
+
+
+def test_settings_page_explains_automatic_source_rebind(monkeypatch):
+    mod = load_plugin()
+    source = {
+        **readiness_source(),
+        "server_id": "legacy-default",
+        "candidate_server_id": "server-a",
+        "rebind_status": "rebind_required",
+    }
+    readiness = {
+        "detected_core_version": "v3.0.5",
+        "status": "source_rebind_required",
+        "ready": False,
+        "administrator_acknowledged": False,
+        "blockers": ["source_rebind_required"],
+    }
+    monkeypatch.setattr(mod, "_v3_readiness_sources", lambda: [(source, readiness)])
+
+    body = mod.render_v3_readiness_panel()
+
+    assert "verify the AudioMuse source identity during app sync" in body
+    assert "Waiting for Lumae app sync to verify this source automatically" in body
+    assert "No manual confirmation is needed" in body
+    assert "Confirm fresh installation" not in body
+    assert "Confirm upgraded installation" not in body
+
+
+def test_source_analysis_status_remains_visible_on_legacy_core(monkeypatch):
+    mod = load_plugin()
+    source = {
+        **readiness_source(),
+        "analysis": {
+            "status": "complete",
+            "mapped_track_count": 96,
+            "item_count": 94,
+        },
+    }
+    monkeypatch.setattr(mod, "_v3_readiness_sources", lambda: [])
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+
+    body = mod.render_v3_readiness_panel()
+    compact = " ".join(body.split())
+
+    assert "2. AudioMuse source analysis" in body
+    assert "published for 96 provider tracks" in compact
+    assert "AudioMuse analysis items: 94" in compact
+
+
+def test_settings_page_reports_lumae_relationship_generation_separately(monkeypatch):
+    mod = load_plugin()
+    source = {
+        **readiness_source(),
+        "catalog": {"generation": 7, "status": "complete"},
+        "analysis": {"generation": 9, "status": "complete"},
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "status": "complete",
+            "schema_version": mod.RELATIONSHIP_SCHEMA_VERSION,
+            "algorithm_version": mod.RELATIONSHIP_ALGORITHM_VERSION,
+            "source_catalog_generation": 7,
+            "source_analysis_generation": 9,
+            "generation": 4,
+            "album_count": 2400,
+            "artist_count": 870,
+        },
+    )
+
+    body = mod.render_relationship_status_panel()
+    compact = " ".join(body.split())
+
+    assert "4. Similar albums &amp; artists" in body
+    assert "Similarities are ready for 2,400 albums and 870 artists" in compact
+    assert "Lumae’s own ranking algorithm" in body
+    assert "does no relationship matching on the phone" in compact
+    assert "Built from library generation 7 of 7" in compact
+
+
+def test_relationship_status_refreshes_while_automatic_build_runs(monkeypatch):
+    mod = load_plugin()
+    source = {
+        **readiness_source(),
+        "catalog": {"generation": 7, "status": "complete"},
+        "analysis": {"generation": 9, "status": "complete"},
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "status": "running",
+            "schema_version": mod.RELATIONSHIP_SCHEMA_VERSION,
+            "algorithm_version": mod.RELATIONSHIP_ALGORITHM_VERSION,
+            "source_catalog_generation": 6,
+            "source_analysis_generation": 8,
+            "generation": 3,
+            "album_count": 2300,
+            "artist_count": 840,
+        },
+    )
+
+    body = mod.render_relationship_status_panel()
+
+    assert "Similar album and artist relationships are being prepared automatically" in body
+    assert "currently published relationship generation" in body
+    assert "_lumae_relationship_refresh" in body
 
 
 def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypatch):
@@ -4523,10 +7286,13 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.song_hooks == [mod.analyze_song_hook]
     assert ctx.tasks == [
         ("prepare", mod.prepare_lumae_task, "default"),
+        ("profile_backfill", mod.profile_backfill_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
+        ("relationship_preparation", mod.relationship_preparation_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
     ]
     assert ctx.cron_tasks == [
+        ("catalog_reconcile", mod.catalog_reconcile_task, "default"),
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
@@ -4588,6 +7354,7 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     monkeypatch.setattr(mod, "get_db", lambda: object())
     monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [settings_catalog_source()])
     monkeypatch.setattr(mod, "preparation_state", lambda _catalog_id: None)
+    monkeypatch.setattr(mod, "profile_backfill_state", lambda _catalog_id: None)
     monkeypatch.setattr(
         mod,
         "analysis_status_counts",
@@ -4608,10 +7375,10 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     assert response.status_code == 200
     body = response.get_data(as_text=True)
     assert 'class="lumae-meter-fill" style="width: 1%;"' in body
-    assert "Prepare Lumae" in body
-    assert "Analyze next batch" in body
-    assert "Queue all profiles" in body
-    assert "Tracks per catch-up batch" in body
+    assert "Refresh required data" in body
+    assert "Prepare missing volume &amp; ramps" in body
+    assert "Queue all profiles" not in body
+    assert "Tracks per background batch" in body
     assert "15,894 need analysis" in body
     assert "15,894" in body
     assert "Enable scheduled catch-up" not in body
@@ -4619,6 +7386,472 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     assert "Scheduled Tasks" not in body
     assert "Living Collections" in body
     assert "Enable the collection manager" in body
+    assert "View database state" in body
+
+
+def test_database_state_snapshot_is_source_scoped_and_generation_aware():
+    state = importlib.import_module("plugins.LumaeAnalysis.database_state")
+    compatibility_module = importlib.import_module("plugins.LumaeAnalysis.core_compat")
+    compatibility = compatibility_module.CoreCompatibility(
+        "v3.0.5",
+        (3, 0, 5),
+        "v3_registry",
+        "compatible",
+        True,
+    )
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "server_id": "server-a",
+        "provider_type": "navidrome",
+        "name": "Main Navidrome",
+        "is_default": True,
+        "rebind_status": "active",
+        "catalog": {
+            "generation": 7,
+            "epoch": "catalog-epoch",
+            "head_seq": 101,
+            "floor_seq": 4,
+            "status": "complete",
+            "entity_counts": {
+                "library": 1,
+                "artist": 100,
+                "album": 50,
+                "track": 1000,
+            },
+            "field_coverage": {"track_number": {"ratio": 0.98}},
+        },
+        "analysis": {
+            "generation": 9,
+            "epoch": "analysis-epoch",
+            "head_seq": 88,
+            "floor_seq": 3,
+            "status": "complete",
+            "item_count": 900,
+            "mapped_track_count": 950,
+        },
+    }
+
+    class Cursor:
+        def __init__(self, db):
+            self.db = db
+            self.result = None
+
+        def execute(self, sql, params=()):
+            normalized = " ".join(sql.split())
+            self.db.executed.append((normalized, params))
+            if "AS total" in normalized and "track_analysis_links" in normalized:
+                self.result = [(1000, 930, 800, 130, 10, 20, 40, 850)]
+            elif "AS items" in normalized and "analysis_items" in normalized:
+                self.result = [(850, 840, 700)]
+            elif "AS analysis_groups" in normalized:
+                self.result = [(850, 40, 4)]
+            elif "AS catalogue_tracks" in normalized:
+                self.result = [(1000, 600, 550, 20, 5, 25, 400)]
+            elif "FROM plugin_lumae_analysis__preparation_state" in normalized:
+                self.result = [
+                    (
+                        "ready",
+                        "catalog_ready",
+                        20,
+                        2,
+                        None,
+                        "2026-07-26T10:00:00Z",
+                        "2026-07-26T10:01:00Z",
+                        "2026-07-26T10:01:00Z",
+                    )
+                ]
+            elif "FROM plugin_lumae_analysis__profile_backfill_state" in normalized:
+                self.result = [
+                    (
+                        "running",
+                        550,
+                        20,
+                        None,
+                        "2026-07-26T10:01:00Z",
+                        None,
+                        "2026-07-26T10:02:00Z",
+                    )
+                ]
+            elif "FROM plugin_lumae_analysis__analysis_runs" in normalized:
+                self.result = [("complete", 3, "2026-07-26T10:00:00Z")]
+            elif "FROM plugin_lumae_analysis__catalog_changes" in normalized:
+                self.result = [(101,)]
+            elif "FROM plugin_lumae_analysis__analysis_changes" in normalized:
+                self.result = [(88,)]
+            elif "FROM plugin_lumae_analysis__stream_bootstrap_sessions" in normalized:
+                self.result = [(1, 4)]
+            elif "AS mapping_rows" in normalized:
+                self.result = [(950, 850, 850, 840, 700, 725)]
+            else:
+                raise AssertionError(f"Unexpected diagnostic query: {normalized}")
+
+        def fetchone(self):
+            return self.result[0] if self.result else None
+
+        def fetchall(self):
+            return list(self.result or [])
+
+        def close(self):
+            return None
+
+    class Db:
+        def __init__(self):
+            self.executed = []
+            self.rollbacks = 0
+
+        def cursor(self):
+            return Cursor(self)
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    db = Db()
+    snapshot = state.collect_database_state(
+        db,
+        compatibility,
+        [source],
+        readiness_by_source={"catalog-a": {"status": "progressive"}},
+    )
+
+    assert snapshot["status"] == "ready"
+    assert snapshot["errors"] == []
+    assert db.rollbacks == 0
+    result = snapshot["sources"][0]
+    assert result["links"] == {
+        "total": 1000,
+        "usable": 930,
+        "verified": 800,
+        "provisional": 130,
+        "pending": 10,
+        "suspect": 20,
+        "missing": 40,
+        "usable_analysis_ids": 850,
+    }
+    assert result["items"]["shared_groups"] == 40
+    assert result["profiles"]["ready"] == 550
+    assert result["core"]["chromaprint"] == 725
+    assert result["journals"]["bootstrap_leases"]["active"] == 1
+    assert result["readiness"]["status"] == "progressive"
+    projection_queries = [
+        (sql, params)
+        for sql, params in db.executed
+        if "track_analysis_links" in sql or "analysis_items" in sql
+    ]
+    assert projection_queries
+    assert all(params == ("catalog-a", 9) for _sql, params in projection_queries)
+    assert "review_state IN ('needs_repair', 'needs_review')" in projection_queries[0][0]
+    core_query = next(
+        (sql, params) for sql, params in db.executed if "AS mapping_rows" in sql
+    )
+    assert core_query[1] == ("server-a",)
+
+
+def test_database_state_reads_v2_core_as_one_direct_provider():
+    state = importlib.import_module("plugins.LumaeAnalysis.database_state")
+    compatibility_module = importlib.import_module("plugins.LumaeAnalysis.core_compat")
+    compatibility = compatibility_module.CoreCompatibility(
+        "v2.6.2",
+        (2, 6, 2),
+        "v2_single_server",
+        "compatible",
+        True,
+    )
+
+    class Cursor:
+        def __init__(self):
+            self.sql = ""
+
+        def execute(self, sql, params=()):
+            self.sql = " ".join(sql.split())
+            assert params == ()
+
+        def fetchone(self):
+            return (100, 99, 75)
+
+        def close(self):
+            return None
+
+    class Db:
+        def __init__(self):
+            self.cursor_instance = Cursor()
+
+        def cursor(self):
+            return self.cursor_instance
+
+    db = Db()
+    errors = []
+    result = state._core_state(db, compatibility, {}, errors)
+
+    assert errors == []
+    assert result == {
+        "mode": "single_server",
+        "mapping_rows": 100,
+        "canonical_analysis_ids": 100,
+        "scored": 100,
+        "musicnn_vectors": 99,
+        "clap_vectors": 75,
+        "chromaprint": None,
+    }
+    assert "(SELECT count(*) FROM score)" in db.cursor_instance.sql
+    assert "track_server_map" not in db.cursor_instance.sql
+
+
+def test_database_state_explains_an_uninitialized_database():
+    state = importlib.import_module("plugins.LumaeAnalysis.database_state")
+    compatibility_module = importlib.import_module("plugins.LumaeAnalysis.core_compat")
+    compatibility = compatibility_module.CoreCompatibility(
+        "v2.6.2",
+        (2, 6, 2),
+        "v2_single_server",
+        "compatible",
+        True,
+    )
+
+    snapshot = state.collect_database_state(None, compatibility, [])
+    body = state.render_database_state(snapshot)
+
+    assert snapshot["status"] == "database_unavailable"
+    assert snapshot["errors"] == [
+        {
+            "section": "database",
+            "message": "AudioMuse did not provide a database connection.",
+        }
+    ]
+    assert "No published Lumae catalogue yet" in body
+    assert "run Prepare Lumae" in body
+    assert "diagnostic queries database_unavailable" in body
+    assert "app sync not ready" in body
+
+
+def test_database_state_page_renders_partial_state_without_exposing_rows(monkeypatch):
+    mod = load_plugin()
+    source = settings_catalog_source()
+    source["catalog"].update(
+        {
+            "generation": 2,
+            "epoch": "cat-epoch",
+            "head_seq": 12,
+            "floor_seq": 0,
+            "entity_counts": {"track": 100, "album": 12, "artist": 30, "library": 1},
+            "field_coverage": {"track_number": {"ratio": 1.0}},
+            "completed_at": "2026-07-26T10:00:00Z",
+        }
+    )
+    source["analysis"].update(
+        {
+            "generation": 3,
+            "epoch": "analysis-epoch",
+            "head_seq": 7,
+            "floor_seq": 0,
+            "completed_at": "2026-07-26T10:01:00Z",
+        }
+    )
+    snapshot = {
+        "captured_at": "2026-07-26T10:02:00Z",
+        "status": "partial",
+        "core": {
+            "core_version": "v3.0.5",
+            "core_adapter": "v3_registry",
+        },
+        "sources": [
+            {
+                "identity": {
+                    "catalog_instance_id": "catalog-a",
+                    "server_id": "server-a",
+                    "provider_type": "navidrome",
+                    "name": "Main Navidrome",
+                    "is_default": True,
+                    "rebind_status": "active",
+                },
+                "catalog": source["catalog"],
+                "analysis": source["analysis"],
+                "links": {
+                    "total": 100,
+                    "usable": 95,
+                    "verified": 80,
+                    "provisional": 15,
+                    "pending": 1,
+                    "suspect": 2,
+                    "missing": 2,
+                    "usable_analysis_ids": 90,
+                },
+                "items": {
+                    "items": 90,
+                    "musicnn_vectors": 89,
+                    "clap_vectors": 70,
+                    "analysis_groups": 90,
+                    "shared_groups": 5,
+                    "largest_group": 3,
+                },
+                "profiles": {
+                    "catalogue_tracks": 100,
+                    "stored": 60,
+                    "ready": 55,
+                    "pending": 2,
+                    "failed": 1,
+                    "skipped": 2,
+                    "needs_attention": 40,
+                },
+                "workflow": {
+                    "preparation": None,
+                    "backfill": None,
+                    "analysis_runs": [],
+                },
+                "journals": {
+                    "catalog": {"rows": 12, "head": 12, "floor": 0},
+                    "analysis": {"rows": 7, "head": 7, "floor": 0},
+                    "bootstrap_leases": {"active": 0, "completed": 1},
+                },
+                "core": {
+                    "mode": "source_scoped",
+                    "mapping_rows": 98,
+                    "canonical_analysis_ids": 90,
+                    "scored": 90,
+                    "musicnn_vectors": 89,
+                    "clap_vectors": 70,
+                    "chromaprint": 75,
+                },
+                "readiness": {"status": "progressive"},
+                "errors": [
+                    {
+                        "section": "AudioMuse core",
+                        "message": "<private> failed",
+                    }
+                ],
+            }
+        ],
+        "errors": [{"section": "AudioMuse core", "message": "<private> failed"}],
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(mod, "detect_core", lambda: types.SimpleNamespace(
+        adapter="v3_registry",
+        as_dict=lambda: snapshot["core"],
+    ))
+    monkeypatch.setattr(mod, "dedup_policy", lambda: {})
+    monkeypatch.setattr(mod, "v3_release_readiness", lambda *_args: {"status": "progressive"})
+    monkeypatch.setattr(mod, "collect_database_state", lambda *_args, **_kwargs: snapshot)
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+    client = plugin_client(mod)
+
+    response = client.get("/database-state")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    compact = " ".join(body.split())
+    assert "Lumae database state" in body
+    assert "Required for app sync" in body
+    assert "1. Navidrome catalogue" in body
+    assert "Usable sonic coverage" in body
+    assert "Provisional" in body
+    assert "Usable but flagged" in body
+    assert "repair-flagged links stay usable" in compact
+    assert "Chromaprint coverage" in body
+    assert "profiles never remove tracks" in body
+    assert "Journals &amp; leases" in body
+    assert "&lt;private&gt; failed" in body
+    assert "<private> failed" not in body
+    assert 'href="settings"' in body
+
+
+def test_database_state_marks_a_completed_empty_catalogue_not_ready():
+    state = importlib.import_module("plugins.LumaeAnalysis.database_state")
+    zero_counts = {
+        "total": 0,
+        "usable": 0,
+        "verified": 0,
+        "provisional": 0,
+        "pending": 0,
+        "suspect": 0,
+        "missing": 0,
+        "usable_analysis_ids": 0,
+    }
+    snapshot = {
+        "captured_at": "2026-07-26T18:09:35Z",
+        "status": "ready",
+        "core": {"core_version": "v3.0.5", "core_adapter": "v3_registry"},
+        "errors": [],
+        "sources": [
+            {
+                "identity": {
+                    "catalog_instance_id": "catalog-a",
+                    "server_id": "server-a",
+                    "provider_type": "navidrome",
+                    "name": "Navidrome",
+                    "is_default": True,
+                    "rebind_status": "active",
+                },
+                "catalog": {
+                    "generation": 1,
+                    "head_seq": 0,
+                    "floor_seq": 0,
+                    "status": "complete",
+                    "entity_counts": {
+                        "library": 1,
+                        "artist": 0,
+                        "album": 0,
+                        "track": 0,
+                    },
+                    "field_coverage": {},
+                },
+                "analysis": {"generation": 1, "status": "complete"},
+                "links": zero_counts,
+                "items": {
+                    "items": 0,
+                    "musicnn_vectors": 0,
+                    "clap_vectors": 0,
+                    "shared_groups": 0,
+                    "largest_group": 0,
+                },
+                "profiles": {
+                    "catalogue_tracks": 0,
+                    "stored": 0,
+                    "ready": 0,
+                    "pending": 0,
+                    "failed": 0,
+                    "skipped": 0,
+                    "needs_attention": 0,
+                },
+                "workflow": {
+                    "preparation": {
+                        "status": "ready",
+                        "phase": "catalog_ready",
+                        "updated_at": "2026-07-26T18:09:00Z",
+                    },
+                    "backfill": None,
+                    "analysis_runs": [],
+                },
+                "journals": {
+                    "catalog": {"rows": 0, "head": 0, "floor": 0},
+                    "analysis": {"rows": 0, "head": 0, "floor": 0},
+                    "bootstrap_leases": {"active": 0, "completed": 0},
+                },
+                "core": {
+                    "mode": "source_scoped",
+                    "mapping_rows": 0,
+                    "canonical_analysis_ids": 0,
+                    "scored": 0,
+                    "musicnn_vectors": 0,
+                    "clap_vectors": 0,
+                    "chromaprint": 0,
+                },
+                "readiness": {"status": "no_analysis_mappings", "blockers": []},
+                "errors": [],
+            }
+        ],
+    }
+
+    body = state.render_database_state(snapshot)
+    compact = " ".join(body.split())
+
+    assert "Lumae is not ready: the published catalogue is empty" in body
+    assert "App-ready sources" in body
+    assert "0 / 1" in body
+    assert "empty - not ready" in body
+    assert "blocked by empty catalogue" in body
+    assert "invalid (recorded ready)" in body
+    assert "Query / workflow errors" in body
+    assert compact.index("1. Navidrome catalogue") < compact.index("4. Loudness &amp; SmoothFade")
 
 
 def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypatch):
@@ -4629,7 +7862,7 @@ def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypa
     monkeypatch.setattr(mod, "set_setting", lambda key, value: saved.append((key, value)))
     monkeypatch.setattr(mod, "sync_collections_menu", lambda enabled: menu_states.append(enabled))
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 25)
-    monkeypatch.setattr(mod, "render_source_preparation_panel", lambda _batch_size: "")
+    monkeypatch.setattr(mod, "render_source_preparation_sections", lambda _batch_size: ("", ""))
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
     client = plugin_client(mod)
 
@@ -4691,6 +7924,11 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
     monkeypatch.setattr(mod, "preparation_state", lambda _catalog_id: None)
     monkeypatch.setattr(
         mod,
+        "profile_backfill_state",
+        lambda _catalog_id: {"status": "running", "last_error": None},
+    )
+    monkeypatch.setattr(
+        mod,
         "analysis_status_counts",
         lambda **_kwargs: {
             "total_with_files": 100,
@@ -4701,6 +7939,25 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
             "needs_analysis": 11,
         },
     )
+    monkeypatch.setattr(
+        mod,
+        "render_v3_readiness_panel",
+        lambda: '<section><h3>2. AudioMuse source analysis</h3></section>',
+    )
+    monkeypatch.setattr(
+        mod,
+        "relationship_status",
+        lambda _db, _catalog_id: {
+            "status": "complete",
+            "schema_version": mod.RELATIONSHIP_SCHEMA_VERSION,
+            "algorithm_version": mod.RELATIONSHIP_ALGORITHM_VERSION,
+            "source_catalog_generation": 0,
+            "source_analysis_generation": 0,
+            "generation": 1,
+            "album_count": 50,
+            "artist_count": 20,
+        },
+    )
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
     client = plugin_client(mod)
 
@@ -4708,30 +7965,120 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_data(as_text=True)
+    compact = " ".join(body.split())
     assert 'aria-valuenow="82"' in body
-    assert "Profiles: 82 ready of 100" in body
+    assert "82 of 100 volume and ramp profiles ready" in body
     assert "11 need analysis" in body
-    assert "refreshes the provider catalogue" in body
-    assert "publishes its analysis projection" in body
+    assert "1. Library status" in body
+    assert "2. AudioMuse source analysis" in body
+    assert "3. Volume &amp; ramp status" in body
+    assert "4. Similar albums &amp; artists" in body
+    assert "App sync index" in body
+    assert "Ready for app sync: 100 Navidrome tracks are published" in body
+    assert "do not block library sync, AudioMuse source analysis, or Lumae relationships" in compact
+    assert "location.reload" not in body
+    assert 'u.searchParams.set("_lumae_refresh",Date.now().toString())' in body
+    assert "location.replace(u.href)" in body
+    assert (
+        body.index("1. Library status")
+        < body.index("2. AudioMuse source analysis")
+        < body.index("3. Volume &amp; ramp status")
+        < body.index("4. Similar albums &amp; artists")
+    )
 
 
-def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(
+def test_settings_page_recovers_transaction_after_identity_status_query_fails(monkeypatch):
+    mod = load_plugin()
+
+    class Db:
+        def __init__(self):
+            self.aborted = False
+            self.rollbacks = 0
+
+        def rollback(self):
+            self.aborted = False
+            self.rollbacks += 1
+
+    db = Db()
+    source = settings_catalog_source()
+
+    def fail_identity_status(*_args):
+        db.aborted = True
+        raise RuntimeError(
+            'relation "plugin_lumae_analysis__provider_identity_transitions" does not exist'
+        )
+
+    def render_collections():
+        assert db.aborted is False
+        return '<section id="collections-recovered"></section>'
+
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(mod, "provider_transition_health", fail_identity_status)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 25)
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "render_v3_readiness_panel", lambda: "")
+    monkeypatch.setattr(mod, "render_relationship_status_panel", lambda: "")
+    monkeypatch.setattr(mod, "render_source_preparation_sections", lambda _size: ("", ""))
+    monkeypatch.setattr(mod, "render_collections_settings_panel", render_collections)
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+
+    body = mod.render_settings()
+
+    assert db.rollbacks == 1
+    assert 'id="collections-recovered"' in body
+
+
+def test_settings_page_never_labels_a_completed_empty_catalogue_ready(monkeypatch):
+    mod = load_plugin()
+    source = settings_catalog_source()
+    source["catalog"]["entity_counts"] = {"track": 0}
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 25)
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    monkeypatch.setattr(
+        mod,
+        "preparation_state",
+        lambda _catalog_id: {"status": "ready", "phase": "catalog_ready", "last_error": None},
+    )
+    monkeypatch.setattr(mod, "profile_backfill_state", lambda _catalog_id: None)
+    monkeypatch.setattr(
+        mod,
+        "analysis_status_counts",
+        lambda **_kwargs: {
+            "total_with_files": 0,
+            "ready_current": 0,
+            "pending": 0,
+            "failed": 0,
+            "skipped": 0,
+            "needs_analysis": 0,
+        },
+    )
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+
+    body = plugin_client(mod).get("/settings").get_data(as_text=True)
+
+    assert "Not ready - empty catalogue" in body
+    assert "Not ready: no Navidrome tracks were published" in body
+    assert "A completed job with zero tracks is not ready" in body
+    assert "Refresh required data" in body
+    assert body.index("1. Library status") < body.index("3. Volume &amp; ramp status")
+
+
+def test_settings_page_starts_bounded_background_enrichment(
     monkeypatch,
 ):
     mod = load_plugin()
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 250)
     source = settings_catalog_source()
     monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
-    monkeypatch.setattr(mod, "preparation_state", lambda _catalog_id: None)
     monkeypatch.setattr(
         mod,
-        "queue_whole_library",
-        lambda **_kwargs: {"queued": 15894, "jobs": 64, "chunk_size": 250},
+        "start_profile_backfill",
+        lambda **_kwargs: {"queued": True, "coalesced": False, "batch_size": 25},
     )
-    monkeypatch.setattr(mod, "update_preparation_state", lambda *args, **kwargs: None)
-    monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
     monkeypatch.setattr(mod, "set_setting", lambda key, value: None)
-    monkeypatch.setattr(mod, "render_source_preparation_panel", lambda _batch_size: "")
+    monkeypatch.setattr(mod, "render_source_preparation_sections", lambda _batch_size: ("", ""))
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
     client = plugin_client(mod)
 
@@ -4739,7 +8086,7 @@ def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(
         "/settings",
         data={
             "backfill_batch_size": "25",
-            "action": "queue_all",
+            "action": "start_backfill",
             "server_id": "server-a",
             "catalog_instance_id": "catalog-a",
         },
@@ -4748,7 +8095,8 @@ def test_settings_page_queue_whole_library_posts_action_and_reports_job_count(
     assert response.status_code == 200
     body = response.get_data(as_text=True)
     assert 'class="lumae-notice lumae-notice-success" role="status"' in body
-    assert "Queued 15,894 tracks from Main Navidrome across 64 jobs" in body
+    assert "Started background enrichment for Main Navidrome in batches of 25" in body
+    assert "Playback requests are prioritized separately" in body
 
 
 def test_settings_prepare_action_claims_and_enqueues_exact_source_once(monkeypatch):
@@ -4764,7 +8112,7 @@ def test_settings_prepare_action_claims_and_enqueues_exact_source_once(monkeypat
         lambda func, *args, queue="default": calls.append((func.__name__, args, queue)),
     )
     monkeypatch.setattr(mod, "set_setting", lambda *_args: None)
-    monkeypatch.setattr(mod, "render_source_preparation_panel", lambda _batch_size: "")
+    monkeypatch.setattr(mod, "render_source_preparation_sections", lambda _batch_size: ("", ""))
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
 
     response = plugin_client(mod).post(
@@ -4872,7 +8220,13 @@ def test_refresh_shield_stops_before_provider_diff_publication(monkeypatch):
     bridge = RefreshBridge(
         {
             "libraries": [{"id": "library-1", "name": "Music"}],
-            "tracks": [{"id": "new-id", "title": "Song"}],
+            "tracks": [
+                {
+                    "id": "new-id",
+                    "title": "Song",
+                    "_lumae_library_ids": ["library-1"],
+                }
+            ],
         }
     )
     monkeypatch.setattr(
@@ -5051,6 +8405,7 @@ class IdentityInspectionCursor(FakeCursor):
 
     def execute(self, sql, params=None):
         super().execute(sql, params)
+        self.db.executed.append((sql, params))
         if "SELECT COALESCE(c.published_generation" in sql:
             self.rows = [
                 (
@@ -5080,6 +8435,7 @@ class IdentityInspectionDb:
         self.transition_id = "transition-a"
         self.target_fingerprint = None
         self.target_scan_count = 0
+        self.executed = []
 
     def cursor(self):
         return IdentityInspectionCursor(self)
@@ -5099,6 +8455,95 @@ def test_identity_publication_requires_two_identical_full_target_scans():
     assert first["state"] == second["state"] == "transition_pending"
     assert first["target_scan_count"] == 1
     assert second["target_scan_count"] == 2
+
+
+def test_target_scan_fingerprint_treats_contributor_order_as_unordered():
+    from copy import deepcopy
+
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+    from plugins.LumaeAnalysis.provider_identity_rekey import target_scan_fingerprint
+
+    first = normalize_provider_catalog(
+        {
+            "tracks": [
+                {
+                    "id": "track-a",
+                    "title": "Song",
+                    "contributors": [
+                        {"role": "composer", "artist": {"id": "a", "name": "A"}},
+                        {"role": "producer", "artist": {"id": "b", "name": "B"}},
+                    ],
+                    "genres": ["Rock", "Alternative"],
+                }
+            ]
+        },
+        "navidrome",
+    )
+    reordered = deepcopy(first)
+    reordered["tracks"][0]["payload"]["contributors"].reverse()
+
+    assert target_scan_fingerprint(first) == target_scan_fingerprint(reordered)
+
+    changed = deepcopy(reordered)
+    changed["tracks"][0]["payload"]["contributors"][0]["role"] = "lyricist"
+    assert target_scan_fingerprint(first) != target_scan_fingerprint(changed)
+
+    reordered_genres = deepcopy(first)
+    reordered_genres["tracks"][0]["payload"]["genres"].reverse()
+    assert target_scan_fingerprint(first) != target_scan_fingerprint(reordered_genres)
+
+
+def test_provider_identity_queries_lock_only_non_nullable_join_rows():
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    source_db = FakeDb(
+        [
+            (
+                "catalog-a",
+                7,
+                5,
+                "transition-a",
+                "normal",
+                None,
+                "0.63.2",
+                "0.63.2",
+                "pre_transition_version",
+                None,
+                {},
+                None,
+                None,
+                0,
+                None,
+                None,
+                {},
+                None,
+                None,
+                None,
+            )
+        ]
+    )
+    source = guard._source_state(source_db, "server-a", for_update=True)
+    source_query = " ".join(source_db.cursor_obj.executed[0][0].split())
+
+    inspection_db = IdentityInspectionDb("e3b7fc2ae9447bbec37a13bf916e3cf6")
+    guard.inspect_catalog_identity(
+        inspection_db,
+        "catalog-a",
+        ["e3b7fc2ae9447bbec37a13bf916e3cf6"],
+        "0.63.2",
+        "full-fp",
+    )
+    inspection_query = next(
+        " ".join(sql.split())
+        for sql, _params in inspection_db.executed
+        if "SELECT COALESCE(c.published_generation" in sql
+    )
+
+    assert source["catalog_instance_id"] == "catalog-a"
+    assert "LEFT JOIN" in source_query
+    assert "FOR UPDATE OF s" in source_query
+    assert "LEFT JOIN" in inspection_query
+    assert "FOR UPDATE OF c, p" in inspection_query
 
 
 def test_transient_probe_failure_does_not_discard_an_applied_transition(monkeypatch):
@@ -5134,7 +8579,7 @@ def test_transient_probe_failure_does_not_discard_an_applied_transition(monkeypa
     assert captured["required_action"] == "retry_provider_identity_check"
 
 
-def test_identity_recheck_schedule_scans_only_pending_sources(monkeypatch):
+def test_identity_recheck_schedule_skips_normal_sources(monkeypatch):
     mod = load_plugin()
 
     class Bridge:
@@ -5164,6 +8609,147 @@ def test_identity_recheck_schedule_scans_only_pending_sources(monkeypatch):
         assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
     finally:
         refresh.undo()
+
+
+def test_identity_recheck_releases_completed_migration_and_projects_inline(monkeypatch):
+    mod = load_plugin()
+
+    class Bridge:
+        @staticmethod
+        def list_servers():
+            return [{"server_id": "server-a", "supported": True}]
+
+    class Db:
+        commits = 0
+        rollbacks = 0
+
+        def commit(self):
+            self.commits += 1
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    db = Db()
+    projected = []
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
+    monkeypatch.setattr(
+        mod,
+        "resolve_catalog_source",
+        lambda *_args, **_kwargs: [{"catalog_instance_id": "catalog-a"}],
+    )
+    monkeypatch.setattr(
+        mod,
+        "provider_transition_health",
+        lambda *_args: {"state": "applied", "audiomuse_health": "repair_required"},
+    )
+    monkeypatch.setattr(mod, "projection_reconcile_required", lambda *_args: False)
+    monkeypatch.setattr(mod, "refresh_audiomuse_health", lambda *_args, **_kwargs: "ready")
+    monkeypatch.setattr(
+        mod,
+        "analysis_projection_task",
+        lambda server_id=None: projected.append(server_id)
+        or {"status": "complete", "catalog_instance_id": "catalog-a"},
+    )
+
+    result = mod.provider_identity_recheck_task()
+
+    assert result == {
+        "checked": 1,
+        "results": [
+            {
+                "catalog_instance_id": "catalog-a",
+                "server_id": "server-a",
+                "previous_health": "repair_required",
+                "reconcile_required": False,
+                "audiomuse_health": "ready",
+                "projection_queued": False,
+                "projection_processed": True,
+                "projection": {
+                    "status": "complete",
+                    "catalog_instance_id": "catalog-a",
+                },
+            }
+        ],
+    }
+    assert projected == ["server-a"]
+    assert db.commits == 1
+    assert db.rollbacks == 0
+
+
+def test_identity_recheck_durable_request_projects_when_startup_was_already_ready(
+    monkeypatch,
+):
+    mod = load_plugin()
+
+    class Bridge:
+        @staticmethod
+        def list_servers():
+            return [{"server_id": "server-a", "supported": True}]
+
+    class Db:
+        commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    db = Db()
+    projected = []
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
+    monkeypatch.setattr(
+        mod,
+        "resolve_catalog_source",
+        lambda *_args, **_kwargs: [{"catalog_instance_id": "catalog-a"}],
+    )
+    monkeypatch.setattr(
+        mod,
+        "provider_transition_health",
+        lambda *_args: {"state": "applied", "audiomuse_health": "ready"},
+    )
+    reconcile = {"required": False}
+    monkeypatch.setattr(
+        mod,
+        "projection_reconcile_required",
+        lambda *_args: reconcile["required"],
+    )
+    monkeypatch.setattr(
+        mod,
+        "refresh_audiomuse_health",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("ready health must not be rewritten")
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "analysis_projection_task",
+        lambda server_id=None: projected.append(server_id)
+        or {"status": "complete", "catalog_instance_id": "catalog-a"},
+    )
+
+    assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
+    reconcile["required"] = True
+    result = mod.provider_identity_recheck_task()
+
+    assert result["results"] == [
+        {
+            "catalog_instance_id": "catalog-a",
+            "server_id": "server-a",
+            "previous_health": "ready",
+            "reconcile_required": True,
+            "audiomuse_health": "ready",
+            "projection_queued": False,
+            "projection_processed": True,
+            "projection": {
+                "status": "complete",
+                "catalog_instance_id": "catalog-a",
+            },
+        }
+    ]
+    assert projected == ["server-a"]
+    assert db.commits == 1
 
 
 class PublisherCursor(FakeCursor):
@@ -5435,11 +9021,18 @@ class AudioMuseHealthCursor(FakeCursor):
     [
         (1, [], "busy"),
         (0, [], "migration_required"),
-        (0, [("track-new", "different-analysis")], "repair_required"),
+        (0, [("track-new", "different-analysis")], "ready"),
+        (
+            0,
+            [("track-new", "analysis-1"), ("track-new", "different-analysis")],
+            "repair_required",
+        ),
         (0, [("track-new", "analysis-1")], "ready"),
     ],
 )
-def test_audiomuse_health_is_independent_and_exact(active_tasks, mappings, expected):
+def test_audiomuse_health_requires_new_provider_ids_but_allows_analysis_relinking(
+    active_tasks, mappings, expected
+):
     from plugins.LumaeAnalysis.provider_identity_rekey import inspect_audiomuse_health
 
     links = {"track-new": {"analysis_id": "analysis-1"}}
@@ -5453,83 +9046,6 @@ def test_audiomuse_health_is_independent_and_exact(active_tasks, mappings, expec
         )
         == expected
     )
-
-
-@pytest.mark.parametrize(
-    ("health", "expected"),
-    [
-        ("ready", None),
-        ("migration_required", "run_audiomuse_provider_migration"),
-        ("busy", "wait_for_audiomuse_work"),
-        ("repair_required", "investigate_audiomuse_mapping"),
-    ],
-)
-def test_audiomuse_required_action_matches_live_health(health, expected):
-    from plugins.LumaeAnalysis.provider_identity_rekey import audiomuse_required_action
-
-    assert audiomuse_required_action(health) == expected
-
-
-class RefreshHealthCursor:
-    def __init__(self):
-        self.executed = []
-        self.row = None
-
-    def execute(self, sql, params=None):
-        self.executed.append((sql, params))
-        self.row = ("applied", 12) if "SELECT p.state" in sql else None
-
-    def fetchone(self):
-        return self.row
-
-    def close(self):
-        return None
-
-
-class RefreshHealthDb:
-    def __init__(self):
-        self.cur = RefreshHealthCursor()
-        self.commits = 0
-
-    def cursor(self):
-        return self.cur
-
-    def commit(self):
-        self.commits += 1
-
-
-@pytest.mark.parametrize(
-    ("health", "expected_action"),
-    [
-        ("ready", None),
-        ("migration_required", "run_audiomuse_provider_migration"),
-        ("busy", "wait_for_audiomuse_work"),
-        ("repair_required", "investigate_audiomuse_mapping"),
-    ],
-)
-def test_refresh_audiomuse_health_persists_state_specific_action(
-    monkeypatch, health, expected_action
-):
-    from plugins.LumaeAnalysis import provider_identity_rekey as rekey
-
-    db = RefreshHealthDb()
-    monkeypatch.setattr(rekey, "_load_analysis_links", lambda *_args: {})
-    monkeypatch.setattr(rekey, "inspect_audiomuse_health", lambda *_args: health)
-
-    assert (
-        rekey.refresh_audiomuse_health(
-            db, "catalog-a", "server-a", PublisherAdapter()
-        )
-        == health
-    )
-
-    update_params = next(
-        params
-        for sql, params in db.cur.executed
-        if "UPDATE plugin_lumae_analysis__provider_identity_transitions" in sql
-    )
-    assert update_params == (health, expected_action, "catalog-a")
-    assert db.commits == 1
 
 
 def test_transition_manifest_route_downloads_recovery_evidence(monkeypatch):
@@ -5557,3 +9073,165 @@ def test_transition_manifest_route_downloads_recovery_evidence(monkeypatch):
         "old_id": "old",
         "new_id": "new",
     }
+
+
+def test_snapshot_pruning_preserves_generations_pinned_by_active_leases():
+    from plugins.LumaeAnalysis import catalog
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+
+    cur = Cursor()
+    catalog.prune_snapshot_generations(cur, "catalog-a", "catalog", 27)
+
+    deletes = [
+        (sql, params)
+        for sql, params in cur.executed
+        if " AS stale" in sql and sql.lstrip().startswith("DELETE FROM")
+    ]
+    assert len(deletes) == len(catalog.CATALOG_GENERATION_TABLES)
+    assert all(params == ("catalog-a", 27, "catalog") for _sql, params in deletes)
+    assert all("lease.pinned_generation=stale.published_generation" in sql for sql, _ in deletes)
+    assert all("lease.expires_at>now()" in sql for sql, _ in deletes)
+    assert all("lease.completed_at IS NULL" in sql for sql, _ in deletes)
+
+
+def test_change_journal_compaction_advances_floor_and_deletes_expired_events():
+    from plugins.LumaeAnalysis import catalog
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+
+    cur = Cursor()
+    floor = catalog.compact_change_journal(
+        cur,
+        catalog_instance_id="catalog-a",
+        state_table="analysis_state",
+        changes_table="analysis_changes",
+        epoch_column="analysis_epoch",
+        floor_column="analysis_floor_seq",
+        epoch="epoch-a",
+        head_seq=212_002,
+        retention_limit=84_398,
+    )
+
+    assert floor == 127_604
+    assert cur.executed[0][1] == ("catalog-a", "epoch-a", "epoch-a", 127_604)
+    assert "seq<=%s" in cur.executed[0][0]
+    assert cur.executed[1][1] == (127_604, "catalog-a", "epoch-a")
+    assert "GREATEST(analysis_floor_seq, %s)" in cur.executed[1][0]
+
+
+def test_install_cleanup_prunes_backup_generations_and_bounds_core_journals():
+    from plugins.LumaeAnalysis import catalog
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+            self.rows = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+            if "SELECT c.catalog_instance_id" in sql:
+                self.rows = [
+                    (
+                        "catalog-a",
+                        27,
+                        "catalog-epoch",
+                        0,
+                        {"library": 2, "artist": 3478, "album": 1328, "track": 21569},
+                        10,
+                        "analysis-epoch",
+                        212_002,
+                        20_630,
+                        21_569,
+                    )
+                ]
+            else:
+                self.rows = []
+
+        def fetchall(self):
+            return list(self.rows)
+
+        def close(self):
+            pass
+
+    class Db:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+    db = Db()
+    catalog.prune_catalog_storage(db)
+
+    stale_deletes = [
+        params
+        for sql, params in db.cursor_obj.executed
+        if " AS stale" in sql and sql.lstrip().startswith("DELETE FROM")
+    ]
+    assert ("catalog-a", 27, "catalog") in stale_deletes
+    assert ("catalog-a", 10, "analysis") in stale_deletes
+    assert any(
+        params == (127_604, "catalog-a", "analysis-epoch")
+        and "analysis_floor_seq" in sql
+        for sql, params in db.cursor_obj.executed
+    )
+
+
+def test_enrichment_cleanup_bounds_relationship_history_to_two_snapshots():
+    from plugins.LumaeAnalysis import catalog_enrichment
+
+    class Cursor:
+        def __init__(self):
+            self.executed = []
+            self.rows = []
+
+        def execute(self, sql, params=None):
+            self.executed.append((sql, params))
+            if "SELECT p.catalog_instance_id" in sql:
+                self.rows = [
+                    (
+                        "catalog-a",
+                        "profile-epoch",
+                        0,
+                        21_709,
+                        "relationship-epoch",
+                        7_620,
+                        1_324,
+                        581,
+                    )
+                ]
+            else:
+                self.rows = []
+
+        def fetchall(self):
+            return list(self.rows)
+
+        def close(self):
+            pass
+
+    class Db:
+        def __init__(self):
+            self.cursor_obj = Cursor()
+
+        def cursor(self):
+            return self.cursor_obj
+
+    db = Db()
+    catalog_enrichment.compact_enrichment_storage(db)
+
+    assert any(
+        params == (3_810, "catalog-a", "relationship-epoch")
+        and "relationship_state" in sql
+        for sql, params in db.cursor_obj.executed
+    )

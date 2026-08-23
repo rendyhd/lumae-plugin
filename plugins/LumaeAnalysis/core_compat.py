@@ -1,7 +1,7 @@
 """AudioMuse core compatibility detection for the Lumae Analysis plugin.
 
 This module deliberately imports only the plugin API that exists in AudioMuse
-2.6.  Core versions remain useful diagnostics, but the v3 adapter is admitted
+2.6. Core versions remain useful diagnostics, but the v3 adapter is admitted
 from its observable registry API instead of an exact release list.
 """
 

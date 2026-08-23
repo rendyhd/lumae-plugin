@@ -14,6 +14,7 @@ from .core_compat import get_core_adapter
 # Keep the other normalizers below as future-facing compatibility code, but do
 # not admit those providers into a source of truth until the app supports them.
 SUPPORTED_PROVIDER_TYPES = frozenset(("navidrome",))
+NAVIDROME_SMALL_SCOPE_ALBUM_LIMIT = 32
 
 
 class CatalogProviderError(RuntimeError):
@@ -82,7 +83,15 @@ class ProviderCatalogBridge:
             public_iterator = getattr(module, "iter_rich_catalog", None)
             if callable(public_iterator):
                 result = public_iterator()
-                return _coerce_catalog_result(result, self.list_libraries(server_id))
+                candidate = _coerce_catalog_result(result, self.list_libraries(server_id))
+                if server["provider_type"] != "navidrome" or _has_complete_library_memberships(
+                    candidate
+                ):
+                    return candidate
+                # A rich iterator is only authoritative for Lumae when it
+                # preserves provider library membership. Older AudioMuse
+                # iterators omit it, so use the credential-contained provider
+                # bridge rather than publishing an ambiguous catalogue.
             fetcher = {
                 "navidrome": _fetch_navidrome,
                 "jellyfin": _fetch_jellyfin_or_emby,
@@ -147,6 +156,32 @@ def _coerce_catalog_result(result, libraries):
     return {"libraries": list(libraries or []), "albums": [], "tracks": list(result or [])}
 
 
+def _row_library_ids(row):
+    values = row.get("_lumae_library_ids") if isinstance(row, dict) else None
+    if values is None and isinstance(row, dict):
+        value = row.get("musicFolderId") or row.get("LibraryId") or row.get("library_id")
+        values = [value] if value is not None else []
+    if not isinstance(values, (list, tuple, set)):
+        values = [values]
+    return {str(value) for value in values if value is not None and str(value)}
+
+
+def _has_complete_library_memberships(catalog):
+    tracks = list(catalog.get("tracks") or [])
+    libraries = list(catalog.get("libraries") or [])
+    if not tracks or not libraries:
+        return True
+    library_ids = {
+        str(row.get("id") or row.get("Id") or row.get("ItemId"))
+        for row in libraries
+        if isinstance(row, dict) and (row.get("id") or row.get("Id") or row.get("ItemId"))
+    }
+    return bool(library_ids) and all(
+        bool(_row_library_ids(row)) and _row_library_ids(row).issubset(library_ids)
+        for row in tracks
+    )
+
+
 def _fetch_navidrome(module, core, server_id):
     request = getattr(module, "_navidrome_request", None)
     if not callable(request):
@@ -156,45 +191,117 @@ def _fetch_navidrome(module, core, server_id):
     target = getattr(module, "_get_target_music_folder_ids", None)
     if callable(target):
         target_ids = target()
-    tracks = []
-    offset = 0
     page_size = 500
-    while True:
-        response = request(
-            "search3",
-            {"query": "", "songCount": page_size, "songOffset": offset},
-        ) or {}
-        page = ((response.get("searchResult3") or {}).get("song") or [])
-        if isinstance(page, dict):
-            page = [page]
-        raw_page_size = len(page)
-        if target_ids is not None:
-            page = [
-                row for row in page
-                if str(row.get("musicFolderId")) in {str(value) for value in target_ids}
-            ]
-        tracks.extend(page)
-        if raw_page_size < page_size:
-            break
-        offset += raw_page_size
-    album_ids = list(dict.fromkeys(str(row.get("albumId")) for row in tracks if row.get("albumId")))
-    albums = []
-    hydrated_tracks = {}
-    for album_id in album_ids:
-        payload = request("getAlbum", {"id": album_id}) or {}
-        album = payload.get("album") or {}
-        songs = album.pop("song", []) if isinstance(album, dict) else []
-        if album:
-            albums.append(album)
-        if isinstance(songs, dict):
-            songs = [songs]
-        for song in songs:
-            if song.get("id"):
-                hydrated_tracks[str(song["id"])] = song
+    album_library_ids = {}
+    albums_by_id = {}
+    available_folder_ids = {
+        str(row.get("id") or row.get("Id"))
+        for row in libraries
+        if isinstance(row, dict) and (row.get("id") or row.get("Id")) is not None
+    }
+    if target_ids is None:
+        selected_folder_ids = available_folder_ids
+    else:
+        selected_folder_ids = {str(value) for value in target_ids}
+    if not selected_folder_ids:
+        detail = (
+            "The configured Navidrome music-library names did not match any music folder."
+            if target_ids is not None
+            else "Navidrome did not expose any music folders."
+        )
+        raise CatalogProviderError(
+            f"{detail} Check Music Libraries in AudioMuse before preparing Lumae."
+        )
+
+    for folder_id in sorted(selected_folder_ids):
+        offset = 0
+        while True:
+            response = request(
+                "getAlbumList2",
+                {
+                    "type": "newest",
+                    "size": page_size,
+                    "offset": offset,
+                    "musicFolderId": folder_id,
+                },
+            ) or {}
+            album_list = response.get("albumList2")
+            if not isinstance(album_list, dict):
+                raise CatalogProviderError(
+                    f"Navidrome did not return albums for music folder {folder_id}."
+                )
+            page = album_list.get("album") or []
+            if isinstance(page, dict):
+                page = [page]
+            for album in page:
+                album_id = album.get("id")
+                if album_id is None:
+                    continue
+                album_id = str(album_id)
+                album_library_ids.setdefault(album_id, set()).add(folder_id)
+                albums_by_id.setdefault(album_id, dict(album))
+                albums_by_id[album_id]["_lumae_library_ids"] = sorted(
+                    album_library_ids[album_id]
+                )
+            if len(page) < page_size:
+                break
+            offset += len(page)
+
+    tracks = []
+    if len(albums_by_id) <= NAVIDROME_SMALL_SCOPE_ALBUM_LIMIT:
+        for album_id in albums_by_id:
+            payload = request("getAlbum", {"id": album_id}) or {}
+            hydrated_album = dict(payload.get("album") or {})
+            songs = hydrated_album.pop("song", []) if hydrated_album else []
+            if hydrated_album:
+                hydrated_album["_lumae_library_ids"] = sorted(album_library_ids[album_id])
+                albums_by_id[album_id] = {
+                    **albums_by_id[album_id],
+                    **hydrated_album,
+                }
+            if isinstance(songs, dict):
+                songs = [songs]
+            for song in songs:
+                if song.get("id"):
+                    tracks.append(
+                        {
+                            **song,
+                            "_lumae_library_ids": sorted(album_library_ids[album_id]),
+                        }
+                    )
+    else:
+        offset = 0
+        while True:
+            response = request(
+                "search3",
+                {"query": "", "songCount": page_size, "songOffset": offset},
+            ) or {}
+            page = ((response.get("searchResult3") or {}).get("song") or [])
+            if isinstance(page, dict):
+                page = [page]
+            for song in page:
+                album_id = str(song.get("albumId")) if song.get("albumId") is not None else None
+                if album_id in album_library_ids and song.get("id"):
+                    tracks.append(
+                        {
+                            **song,
+                            "_lumae_library_ids": sorted(album_library_ids[album_id]),
+                        }
+                    )
+            if len(page) < page_size:
+                break
+            offset += len(page)
+
+    if not tracks:
+        scope = "the selected music folders" if target_ids is not None else "the music folders"
+        raise CatalogProviderError(
+            f"Navidrome returned no songs for {scope}. "
+            "The empty catalogue was not published; check Navidrome access and Music Libraries."
+        )
     return {
         "libraries": libraries,
-        "albums": albums,
-        "tracks": [hydrated_tracks.get(str(row.get("id")), row) for row in tracks],
+        "albums": list(albums_by_id.values()),
+        "tracks": tracks,
     }
 
 

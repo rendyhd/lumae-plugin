@@ -4,6 +4,7 @@ from datetime import datetime, timezone
 import base64
 import hashlib
 import hmac
+import itertools
 import json
 import re
 import secrets
@@ -19,13 +20,172 @@ from .provider_identity_guard import inspect_catalog_identity, observe_provider_
 
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
+CATALOG_BUILDER_VERSION = 5
 CATALOG_FINGERPRINT_SCHEMA_VERSION = 2
 CHANGE_EVENT_OVERHEAD_BYTES = 192
 SNAPSHOT_ENTITY_OVERHEAD_BYTES = 96
+MIN_RETAINED_CHANGE_EVENTS = 1_000
+CHANGE_EVENT_SNAPSHOT_MULTIPLIER = 2
+
+CATALOG_GENERATION_TABLES = (
+    "catalog_libraries",
+    "catalog_artists",
+    "catalog_albums",
+    "catalog_tracks",
+    "catalog_track_artists",
+    "catalog_album_artists",
+    "catalog_entity_libraries",
+    "catalog_disc_titles",
+)
+ANALYSIS_GENERATION_TABLES = (
+    "analysis_items",
+    "track_analysis_links",
+)
 
 
 def t(name):
     return table(name)
+
+
+def change_journal_retention_limit(entity_count):
+    """Keep enough events for two complete logical snapshots, with a small floor."""
+    return max(
+        MIN_RETAINED_CHANGE_EVENTS,
+        max(0, int(entity_count or 0)) * CHANGE_EVENT_SNAPSHOT_MULTIPLIER,
+    )
+
+
+def compact_change_journal(
+    cur,
+    *,
+    catalog_instance_id,
+    state_table,
+    changes_table,
+    epoch_column,
+    floor_column,
+    epoch,
+    head_seq,
+    retention_limit,
+):
+    """Bound one cursor journal and advance its bootstrap floor atomically."""
+    retained = max(MIN_RETAINED_CHANGE_EVENTS, int(retention_limit or 0))
+    target_floor = max(0, int(head_seq or 0) - retained)
+    if target_floor > 0:
+        cur.execute(
+            f"""
+            DELETE FROM {t(changes_table)}
+             WHERE catalog_instance_id=%s
+               AND (epoch<>%s OR (epoch=%s AND seq<=%s))
+            """,
+            (catalog_instance_id, str(epoch), str(epoch), target_floor),
+        )
+        cur.execute(
+            f"""
+            UPDATE {t(state_table)}
+               SET {floor_column}=GREATEST({floor_column}, %s), updated_at=now()
+             WHERE catalog_instance_id=%s AND {epoch_column}=%s
+            """,
+            (target_floor, catalog_instance_id, str(epoch)),
+        )
+    else:
+        cur.execute(
+            f"DELETE FROM {t(changes_table)} "
+            "WHERE catalog_instance_id=%s AND epoch<>%s",
+            (catalog_instance_id, str(epoch)),
+        )
+    return target_floor
+
+
+def prune_snapshot_generations(cur, catalog_instance_id, stream, active_generation):
+    """Delete superseded snapshots unless an unexpired bootstrap lease pins them."""
+    if stream == "catalog":
+        generation_column = "published_generation"
+        table_names = CATALOG_GENERATION_TABLES
+    elif stream == "analysis":
+        generation_column = "projection_generation"
+        table_names = ANALYSIS_GENERATION_TABLES
+    else:
+        raise ValueError("Unknown snapshot stream")
+    active_generation = int(active_generation or 0)
+    if active_generation <= 0:
+        return
+    cur.execute(
+        f"DELETE FROM {t('stream_bootstrap_sessions')} "
+        "WHERE expires_at<=now() OR completed_at IS NOT NULL"
+    )
+    for table_name in table_names:
+        cur.execute(
+            f"""
+            DELETE FROM {t(table_name)} AS stale
+             WHERE stale.catalog_instance_id=%s
+               AND stale.{generation_column}<%s
+               AND NOT EXISTS (
+                   SELECT 1
+                     FROM {t('stream_bootstrap_sessions')} AS lease
+                    WHERE lease.catalog_instance_id=stale.catalog_instance_id
+                      AND lease.stream=%s
+                      AND lease.pinned_generation=stale.{generation_column}
+                      AND lease.expires_at>now()
+                      AND lease.completed_at IS NULL
+               )
+            """,
+            (catalog_instance_id, active_generation, stream),
+        )
+
+
+def prune_catalog_storage(db, catalog_instance_id=None, cursor=None):
+    """Run idempotent install-time cleanup for snapshots and core change journals."""
+    cur = cursor or db.cursor()
+    cur.execute(
+        f"""
+        SELECT c.catalog_instance_id, c.published_generation, c.catalog_epoch,
+               c.catalog_head_seq, c.entity_counts,
+               COALESCE(a.projection_generation, 0), COALESCE(a.analysis_epoch, ''),
+               COALESCE(a.analysis_head_seq, 0), COALESCE(a.item_count, 0),
+               COALESCE(a.mapped_track_count, 0)
+          FROM {t('catalog_state')} AS c
+          LEFT JOIN {t('analysis_state')} AS a USING (catalog_instance_id)
+         WHERE %s IS NULL OR c.catalog_instance_id=%s
+        """,
+        (catalog_instance_id, catalog_instance_id),
+    )
+    rows = cur.fetchall()
+    for row in rows:
+        source_id = str(row[0])
+        catalog_generation = int(row[1] or 0)
+        catalog_counts = _state_counts(row[4])
+        analysis_generation = int(row[5] or 0)
+        prune_snapshot_generations(cur, source_id, "catalog", catalog_generation)
+        prune_snapshot_generations(cur, source_id, "analysis", analysis_generation)
+        compact_change_journal(
+            cur,
+            catalog_instance_id=source_id,
+            state_table="catalog_state",
+            changes_table="catalog_changes",
+            epoch_column="catalog_epoch",
+            floor_column="catalog_floor_seq",
+            epoch=row[2],
+            head_seq=row[3],
+            retention_limit=change_journal_retention_limit(
+                sum(int(value or 0) for value in catalog_counts.values())
+            ),
+        )
+        if analysis_generation > 0:
+            compact_change_journal(
+                cur,
+                catalog_instance_id=source_id,
+                state_table="analysis_state",
+                changes_table="analysis_changes",
+                epoch_column="analysis_epoch",
+                floor_column="analysis_floor_seq",
+                epoch=row[6],
+                head_seq=row[7],
+                retention_limit=change_journal_retention_limit(
+                    int(row[8] or 0) + int(row[9] or 0)
+                ),
+            )
+    if cursor is None:
+        cur.close()
 
 
 def utc_now():
@@ -67,6 +227,22 @@ def _text(value):
     if value is None:
         return None
     return unicodedata.normalize("NFC", str(value)).strip() or None
+
+
+def _artist_display(value):
+    """Return provider artist names without serializing structured identities."""
+    if value in (None, ""):
+        return None
+    values = value if isinstance(value, (list, tuple, set)) else [value]
+    names = []
+    for item in values:
+        if isinstance(item, dict):
+            name = _text(_value(item, "Name", "name", "display_name", "Artist", "artist"))
+        else:
+            name = _text(item)
+        if name and name not in names:
+            names.append(name)
+    return ", ".join(names) or None
 
 
 def _integer(value):
@@ -149,24 +325,29 @@ def fingerprint(value):
 
 def _artist_rows(row, fallback_name=None, default_role="artist"):
     raw_items = _value(row, "ArtistItems", "artistItems")
+    if raw_items and not isinstance(raw_items, (list, tuple, set)):
+        raw_items = [raw_items]
     if not raw_items:
         names = _value(row, "Artists", "artists")
-        if isinstance(names, str):
-            names = [names]
         if names:
-            raw_items = [{"Name": name} for name in names]
+            raw_items = names if isinstance(names, (list, tuple, set)) else [names]
     if not raw_items:
         name = _value(row, "artist", "Artist", "AlbumArtist", "albumartist", default=fallback_name)
         artist_id = _value(row, "artistId", "ArtistId", "albumArtistId")
-        raw_items = [{"Id": artist_id, "Name": name}] if name else []
+        if isinstance(name, dict):
+            raw_items = [name]
+        elif isinstance(name, (list, tuple, set)):
+            raw_items = name
+        else:
+            raw_items = [{"Id": artist_id, "Name": name}] if name else []
     result = []
     for position, item in enumerate(raw_items or []):
         if not isinstance(item, dict):
             item = {"Name": item}
-        name = _text(_value(item, "Name", "name"))
+        name = _artist_display(item)
         if not name:
             continue
-        native_id = _text(_value(item, "Id", "id"))
+        native_id = _text(_value(item, "Id", "id", "ArtistId", "artistId"))
         provenance = "provider_id" if native_id else "derived_display_name"
         artist_id = native_id or f"derived:{fingerprint({'name': name.casefold()})[:24]}"
         result.append(
@@ -352,7 +533,9 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         metadata = {
             "name": name,
             "sort_name": _text(_value(raw, "SortName", "sortName")),
-            "album_artist_display": _text(_value(raw, "AlbumArtist", "albumArtist", "albumartist"))
+            "album_artist_display": _artist_display(
+                _value(raw, "AlbumArtist", "albumArtist", "albumartist")
+            )
             or ", ".join(artist["name"] for artist in artists)
             or None,
             "added_at": _text(_value(raw, "created", "DateCreated", "added_at")),
@@ -414,10 +597,12 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         metadata = {
             "album_id": album_id,
             "title": title,
-            "artist_display": _text(_value(raw, "artist", "Artist", "AlbumArtist"))
+            "artist_display": _artist_display(_value(raw, "artist", "Artist", "AlbumArtist"))
             or ", ".join(artist["name"] for artist in artists)
             or None,
-            "album_artist_display": _text(_value(raw, "albumArtist", "AlbumArtist", "albumartist"))
+            "album_artist_display": _artist_display(
+                _value(raw, "albumArtist", "AlbumArtist", "albumartist")
+            )
             or (albums_by_id.get(album_id, {}).get("album_artist_display") if album_id else None),
             "disc_number": _integer(_value(raw, "discNumber", "ParentIndexNumber", "disc", "discnumber")),
             "track_number": _integer(_value(raw, "track", "trackNumber", "IndexNumber", "tracknum")),
@@ -453,8 +638,11 @@ def normalize_provider_catalog(raw_catalog, provider_type):
                 "replay_gain": replay_gain,
             }
         )
-        library_id = _text(_value(raw, "musicFolderId", "LibraryId", "library_id"))
-        if library_id:
+        library_ids = _string_list(_value(raw, "_lumae_library_ids"))
+        if not library_ids:
+            library_id = _text(_value(raw, "musicFolderId", "LibraryId", "library_id"))
+            library_ids = [library_id] if library_id else []
+        for library_id in library_ids:
             entity_libraries.append(
                 {
                     "entity_type": "track",
@@ -490,10 +678,12 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         track_libraries.setdefault(membership["entity_id"], set()).add(membership["library_id"])
     album_libraries = {}
     artist_libraries = {}
+    tracks_by_album = {}
     for track in tracks:
         library_ids = sorted(track_libraries.get(track["track_id"], set()))
         if track.get("album_id"):
             album_libraries.setdefault(track["album_id"], set()).update(library_ids)
+            tracks_by_album.setdefault(track["album_id"], []).append(track)
         for credit in track_credits.get(track["track_id"], []):
             artist_libraries.setdefault(credit["artist_id"], set()).update(library_ids)
         catalogue_enrichment = {
@@ -533,7 +723,7 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             artist_libraries.setdefault(credit["artist_id"], set()).update(album_libraries.get(album_id, set()))
 
     for album in albums_by_id.values():
-        album_tracks = [track for track in tracks if track.get("album_id") == album["album_id"]]
+        album_tracks = tracks_by_album.get(album["album_id"], [])
         disc_titles = {}
         for track in album_tracks:
             if track.get("disc_number") is None:
@@ -580,10 +770,10 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             "disc_count": disc_count,
             "duration_ms": duration_ms if any(track.get("duration_ms") is not None for track in album_tracks) else None,
             "compilation": any(
-                track.get("compilation", False) for track in tracks if track.get("album_id") == album["album_id"]
+                track.get("compilation", False) for track in album_tracks
             ),
             "explicit": any(
-                track.get("explicit", False) for track in tracks if track.get("album_id") == album["album_id"]
+                track.get("explicit", False) for track in album_tracks
             ),
         }
         album["payload"]["_lumae"] = enrichment
@@ -810,6 +1000,9 @@ def migrate_catalog(db):
             field_support JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             field_coverage JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             scope_summary JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            catalog_builder_version INTEGER NOT NULL DEFAULT 0,
+            refresh_required BOOLEAN NOT NULL DEFAULT TRUE,
+            refresh_reason TEXT,
             snapshot_estimated_bytes BIGINT NOT NULL DEFAULT 0,
             last_scan_change_counts JSONB NOT NULL DEFAULT '{{}}'::jsonb,
             last_scan_change_reason TEXT,
@@ -1075,12 +1268,38 @@ def migrate_catalog(db):
     ]
     for statement in statements:
         cur.execute(statement)
+    cur.execute(
+        f"ALTER TABLE {t('catalog_state')} "
+        "ADD COLUMN IF NOT EXISTS catalog_builder_version INTEGER NOT NULL DEFAULT 0"
+    )
+    cur.execute(
+        f"ALTER TABLE {t('catalog_state')} "
+        "ADD COLUMN IF NOT EXISTS refresh_required BOOLEAN NOT NULL DEFAULT TRUE"
+    )
+    cur.execute(
+        f"ALTER TABLE {t('catalog_state')} "
+        "ADD COLUMN IF NOT EXISTS refresh_reason TEXT"
+    )
+    cur.execute(
+        f"""
+        UPDATE {t("catalog_state")}
+           SET refresh_required=TRUE,
+               refresh_reason='catalog_builder_upgrade',
+               updated_at=now()
+         WHERE catalog_builder_version < %s
+        """,
+        (CATALOG_BUILDER_VERSION,),
+    )
     cur.close()
 
 
 def _chunks(rows, size=1000):
-    for offset in range(0, len(rows), size):
-        yield rows[offset : offset + size]
+    iterator = iter(rows)
+    while True:
+        batch = list(itertools.islice(iterator, size))
+        if not batch:
+            return
+        yield batch
 
 
 def _json_param(value):
@@ -1138,14 +1357,16 @@ def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, r
     placeholders = ["%s"] * len(columns)
     placeholders[columns.index("payload")] = "%s::jsonb"
     sql = f"INSERT INTO {t(table_name)} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
-    params = []
-    for row in rows:
-        values = [catalog_instance_id, generation, row[id_column]]
-        for field in fields:
-            value = row.get(field)
-            values.append(_json_param(value) if field == "payload" else value)
-        values.extend([True, now, now, None])
-        params.append(tuple(values))
+    def parameters():
+        for row in rows:
+            values = [catalog_instance_id, generation, row[id_column]]
+            for field in fields:
+                value = row.get(field)
+                values.append(_json_param(value) if field == "payload" else value)
+            values.extend([True, now, now, None])
+            yield tuple(values)
+
+    params = parameters()
     for batch in _chunks(params):
         cur.executemany(sql, batch)
 
@@ -1175,7 +1396,7 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
                  artist_id, display_name, role, identity_provenance, payload)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
         """
-        params = [
+        params = (
             (
                 catalog_instance_id,
                 generation,
@@ -1188,7 +1409,7 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
                 "{}",
             )
             for row in rows
-        ]
+        )
         for batch in _chunks(params):
             cur.executemany(sql, batch)
     membership = normalized["entity_libraries"]
@@ -1198,19 +1419,18 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
                 (catalog_instance_id, published_generation, entity_type, entity_id, library_id)
             VALUES (%s, %s, %s, %s, %s)
         """
-        cur.executemany(
-            sql,
-            [
-                (
-                    catalog_instance_id,
-                    generation,
-                    row["entity_type"],
-                    row["entity_id"],
-                    row["library_id"],
-                )
-                for row in membership
-            ],
+        params = (
+            (
+                catalog_instance_id,
+                generation,
+                row["entity_type"],
+                row["entity_id"],
+                row["library_id"],
+            )
+            for row in membership
         )
+        for batch in _chunks(params):
+            cur.executemany(sql, batch)
 
 
 def _published_fingerprints(cur, entity_type, catalog_instance_id, generation):
@@ -1413,18 +1633,15 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         "VALUES (%s, %s, %s, 'scanning', '{}'::jsonb)",
         (scan_id, catalog_instance_id, server_id),
     )
-    if previous_generation == 0:
-        cur.execute(
-            f"UPDATE {t('catalog_state')} SET status='scanning', started_at=now(), "
-            "last_error=NULL, updated_at=now() WHERE catalog_instance_id=%s",
-            (catalog_instance_id,),
-        )
-    else:
-        cur.execute(
-            f"UPDATE {t('catalog_state')} SET started_at=now(), "
-            "last_error=NULL, updated_at=now() WHERE catalog_instance_id=%s",
-            (catalog_instance_id,),
-        )
+    cur.execute(
+        f"""
+        UPDATE {t("catalog_state")}
+           SET status=CASE WHEN published_generation=0 THEN 'scanning' ELSE status END,
+               started_at=now(), last_error=NULL, updated_at=now()
+         WHERE catalog_instance_id=%s
+        """,
+        (catalog_instance_id,),
+    )
     cur.close()
     db.commit()
 
@@ -1433,9 +1650,43 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         normalized = normalize_provider_catalog(raw, server["provider_type"])
         counts = {entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER}
         snapshot_estimated_bytes = _estimate_snapshot_bytes(normalized)
-        old_track_count = int(_state_counts(previous_counts).get("track", 0) or 0)
-        if old_track_count and counts["track"] == 0:
-            raise CatalogScanError("Refusing to replace a non-empty catalogue with an empty scan")
+        if counts["track"] == 0:
+            raise CatalogScanError(
+                "Navidrome returned no usable tracks. The empty catalogue was not published; "
+                "check Navidrome access and the Music Libraries selection in AudioMuse."
+            )
+        track_memberships = [
+            row
+            for row in normalized["entity_libraries"]
+            if row.get("entity_type") == "track"
+        ]
+        if normalized["libraries"]:
+            track_ids = {str(row["track_id"]) for row in normalized["tracks"]}
+            library_ids = {str(row["library_id"]) for row in normalized["libraries"]}
+            mapped_track_ids = {
+                str(row["entity_id"])
+                for row in track_memberships
+                if str(row.get("library_id")) in library_ids
+            }
+            invalid_library_ids = {
+                str(row.get("library_id"))
+                for row in track_memberships
+                if str(row.get("library_id")) not in library_ids
+            }
+            unmapped_track_count = len(track_ids - mapped_track_ids)
+            if invalid_library_ids or unmapped_track_count:
+                detail = (
+                    f"{len(mapped_track_ids):,} of {len(track_ids):,} tracks had valid "
+                    "track-to-library memberships"
+                )
+                if invalid_library_ids:
+                    detail += f"; {len(invalid_library_ids):,} unknown library IDs were rejected"
+                raise CatalogScanError(
+                    f"Navidrome catalogue membership is incomplete: {detail}. "
+                    "The corrupt refresh was not published and the previous catalogue remains "
+                    "available. Lumae Analysis will retry automatically; check AudioMuse Music "
+                    "Libraries if the repair keeps failing."
+                )
 
         if identity_observation and identity_observation.get("observation") != "bridge_unavailable":
             from .provider_identity_rekey import (
@@ -1598,6 +1849,9 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 UPDATE {t("catalog_state")}
                    SET status='complete',
                        fingerprint_schema_version=%s,
+                       catalog_builder_version=%s,
+                       refresh_required=FALSE,
+                       refresh_reason=NULL,
                        snapshot_estimated_bytes=%s,
                        last_scan_change_counts=%s::jsonb,
                        last_scan_change_reason=%s,
@@ -1607,6 +1861,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 """,
                 (
                     CATALOG_FINGERPRINT_SCHEMA_VERSION,
+                    CATALOG_BUILDER_VERSION,
                     snapshot_estimated_bytes,
                     _json_param(change_counts),
                     change_reason,
@@ -1635,6 +1890,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 "catalog_instance_id": catalog_instance_id,
                 "server_id": server_id,
                 "generation": previous_generation,
+                "builder_version": CATALOG_BUILDER_VERSION,
+                "refresh_required": False,
                 "cursor": {"epoch": str(epoch), "seq": head_seq},
                 "counts": counts,
                 "field_coverage": coverage,
@@ -1700,6 +1957,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                    fingerprint_schema_version=%s,
                    entity_counts=%s::jsonb, field_support=%s::jsonb,
                    field_coverage=%s::jsonb, scope_summary=%s::jsonb,
+                   catalog_builder_version=%s, refresh_required=FALSE,
+                   refresh_reason=NULL,
                    snapshot_estimated_bytes=%s,
                    last_scan_change_counts=%s::jsonb,
                    last_scan_change_reason=%s,
@@ -1718,6 +1977,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 _json_param(field_support),
                 _json_param(coverage),
                 _json_param(scope["scope_summary"]),
+                CATALOG_BUILDER_VERSION,
                 snapshot_estimated_bytes,
                 _json_param(change_counts),
                 change_reason,
@@ -1749,12 +2009,26 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             "progress=%s::jsonb WHERE scan_id=%s",
             (_json_param(progress), scan_id),
         )
+        prune_snapshot_generations(cur, catalog_instance_id, "catalog", generation)
+        compact_change_journal(
+            cur,
+            catalog_instance_id=catalog_instance_id,
+            state_table="catalog_state",
+            changes_table="catalog_changes",
+            epoch_column="catalog_epoch",
+            floor_column="catalog_floor_seq",
+            epoch=publication_epoch,
+            head_seq=next_seq,
+            retention_limit=change_journal_retention_limit(sum(counts.values())),
+        )
         cur.close()
         db.commit()
         return {
             "catalog_instance_id": catalog_instance_id,
             "server_id": server_id,
             "generation": generation,
+            "builder_version": CATALOG_BUILDER_VERSION,
+            "refresh_required": False,
             "cursor": {"epoch": publication_epoch, "seq": next_seq},
             "counts": counts,
             "field_coverage": coverage,
@@ -1772,12 +2046,23 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             rollback()
         failure_duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))
         cur = db.cursor()
-        preserved_status = "complete" if previous_generation > 0 else "failed"
         cur.execute(
-            f"UPDATE {t('catalog_state')} SET status='{preserved_status}', last_error=%s, "
-            "last_scan_change_reason='scan_failed', last_scan_duration_ms=%s, "
-            "updated_at=now() WHERE catalog_instance_id=%s",
-            (str(exc)[:1000], failure_duration_ms, catalog_instance_id),
+            f"""
+            UPDATE {t("catalog_state")}
+               SET status=CASE WHEN published_generation=0 THEN 'failed' ELSE status END,
+                   refresh_required=TRUE,
+                   refresh_reason=COALESCE(refresh_reason, 'refresh_failed'),
+                   last_error=%s,
+                   last_scan_change_reason='scan_failed',
+                   last_scan_duration_ms=%s,
+                   updated_at=now()
+             WHERE catalog_instance_id=%s
+            """,
+            (
+                str(exc)[:1000],
+                failure_duration_ms,
+                catalog_instance_id,
+            ),
         )
         cur.execute(
             f"UPDATE {t('catalog_scans')} SET status='failed', completed_at=now(), "
@@ -1822,7 +2107,11 @@ def parse_opaque_cursor(value):
 def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=False):
     cur = db.cursor()
     suffix = " FOR UPDATE OF s, c" if lock else ""
-    if server_id:
+    # Stable catalogue identity wins when both identifiers are supplied. After
+    # a proven v2→v3 rebind, an older client or queued task may still send the
+    # synthetic v2 server ID. Querying by that obsolete ID first would hide the
+    # same catalogue row before its continuity alias can be verified.
+    if catalog_instance_id:
         cur.execute(
             f"""
             SELECT s.catalog_instance_id, s.current_core_server_id, s.provider_type,
@@ -1835,29 +2124,7 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
                    s.library_scope_fp, c.scope_summary,
-                   c.fingerprint_schema_version, c.snapshot_estimated_bytes,
-                   c.last_scan_change_counts, c.last_scan_change_reason,
-                   c.last_scan_duration_ms
-              FROM {t("catalog_sources")} s
-              JOIN {t("catalog_state")} c USING (catalog_instance_id)
-              LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
-             WHERE s.current_core_server_id=%s{suffix}
-            """,
-            (server_id,),
-        )
-    elif catalog_instance_id:
-        cur.execute(
-            f"""
-            SELECT s.catalog_instance_id, s.current_core_server_id, s.provider_type,
-                   s.server_name, s.is_default, s.rebind_status,
-                   c.published_generation, c.catalog_epoch, c.catalog_head_seq,
-                   c.catalog_floor_seq, c.status, c.entity_counts, c.field_support,
-                   c.field_coverage, c.started_at, c.completed_at, c.last_error,
-                   a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
-                   a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
-                   a.completed_at, a.last_error, s.continuity_from,
-                   s.candidate_core_server_id, s.provider_instance_fp,
-                   s.library_scope_fp, c.scope_summary,
+                   c.catalog_builder_version, c.refresh_required, c.refresh_reason,
                    c.fingerprint_schema_version, c.snapshot_estimated_bytes,
                    c.last_scan_change_counts, c.last_scan_change_reason,
                    c.last_scan_duration_ms
@@ -1867,6 +2134,30 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
              WHERE s.catalog_instance_id=%s{suffix}
             """,
             (catalog_instance_id,),
+        )
+    elif server_id:
+        cur.execute(
+            f"""
+            SELECT s.catalog_instance_id, s.current_core_server_id, s.provider_type,
+                   s.server_name, s.is_default, s.rebind_status,
+                   c.published_generation, c.catalog_epoch, c.catalog_head_seq,
+                   c.catalog_floor_seq, c.status, c.entity_counts, c.field_support,
+                   c.field_coverage, c.started_at, c.completed_at, c.last_error,
+                   a.projection_generation, a.analysis_epoch, a.analysis_head_seq,
+                   a.analysis_floor_seq, a.status, a.item_count, a.mapped_track_count,
+                   a.completed_at, a.last_error, s.continuity_from,
+                   s.candidate_core_server_id, s.provider_instance_fp,
+                   s.library_scope_fp, c.scope_summary,
+                   c.catalog_builder_version, c.refresh_required, c.refresh_reason,
+                   c.fingerprint_schema_version, c.snapshot_estimated_bytes,
+                   c.last_scan_change_counts, c.last_scan_change_reason,
+                   c.last_scan_duration_ms
+              FROM {t("catalog_sources")} s
+              JOIN {t("catalog_state")} c USING (catalog_instance_id)
+              LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
+             WHERE s.current_core_server_id=%s{suffix}
+            """,
+            (server_id,),
         )
     else:
         cur.execute(
@@ -1881,6 +2172,7 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    a.completed_at, a.last_error, s.continuity_from,
                    s.candidate_core_server_id, s.provider_instance_fp,
                    s.library_scope_fp, c.scope_summary,
+                   c.catalog_builder_version, c.refresh_required, c.refresh_reason,
                    c.fingerprint_schema_version, c.snapshot_estimated_bytes,
                    c.last_scan_change_counts, c.last_scan_change_reason,
                    c.last_scan_duration_ms
@@ -1897,11 +2189,17 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
         for row in rows
         if str(row[2] or "").strip().lower() in SUPPORTED_PROVIDER_TYPES
     ]
-    if server_id or catalog_instance_id:
-        if not rows:
-            raise KeyError("Unknown catalogue source")
-        rows = rows[:1]
-    return [_source_dto(row) for row in rows]
+    sources = [_source_dto(row) for row in rows]
+    if not (server_id or catalog_instance_id):
+        return sources
+    if not sources:
+        raise KeyError("Unknown catalogue source")
+    source = sources[0]
+    if catalog_instance_id and source["catalog_instance_id"] != str(catalog_instance_id):
+        raise KeyError("Unknown catalogue source")
+    if server_id and not source_matches_server_id(source, server_id):
+        raise KeyError("Unknown catalogue source")
+    return [source]
 
 
 def _iso(value):
@@ -1937,17 +2235,20 @@ def _source_dto(row):
             "snapshot_entity_counts": _state_counts(row[11]),
             "field_support": _state_counts(row[12]),
             "field_coverage": _state_counts(row[13]),
+            "builder_version": int(row[31] or 0) if len(row) > 31 else 0,
+            "refresh_required": bool(row[32]) if len(row) > 32 else False,
+            "refresh_reason": row[33] if len(row) > 33 else None,
             "started_at": _iso(row[14]),
             "completed_at": _iso(row[15]),
             "last_error": row[16],
-            "fingerprint_schema_version": int(row[31] or 1) if len(row) > 31 else 1,
-            "snapshot_estimated_bytes": int(row[32] or 0) if len(row) > 32 else 0,
+            "fingerprint_schema_version": int(row[34] or 1) if len(row) > 34 else 1,
+            "snapshot_estimated_bytes": int(row[35] or 0) if len(row) > 35 else 0,
             "last_scan_change_counts": (
-                _state_counts(row[33]) if len(row) > 33 else {}
+                _state_counts(row[36]) if len(row) > 36 else {}
             ),
-            "last_scan_change_reason": row[34] if len(row) > 34 else None,
+            "last_scan_change_reason": row[37] if len(row) > 37 else None,
             "last_scan_duration_ms": (
-                int(row[35]) if len(row) > 35 and row[35] is not None else None
+                int(row[38]) if len(row) > 38 and row[38] is not None else None
             ),
         },
         "analysis": {
@@ -1962,6 +2263,21 @@ def _source_dto(row):
             "last_error": row[25],
         },
     }
+
+
+def source_matches_server_id(source, server_id):
+    """Accept the active server or one exact, proven continuity alias."""
+    requested = str(server_id or "")
+    return bool(
+        requested
+        and (
+            str(source.get("server_id") or "") == requested
+            or (
+                source.get("rebind_status") == "active"
+                and str(source.get("continuity_from") or "") == requested
+            )
+        )
+    )
 
 
 def _session_hash(token):
@@ -2005,7 +2321,7 @@ def create_bootstrap_session(
     if catalog_instance_id and source["catalog_instance_id"] != catalog_instance_id:
         raise ValueError("Catalogue source identity does not match the current server")
     state = source[stream]
-    if state["status"] not in ("complete", "ready"):
+    if int(state.get("generation") or 0) <= 0:
         raise CatalogScanError(f"{stream.capitalize()} bootstrap is not ready")
     cur = db.cursor()
     cur.execute(f"DELETE FROM {t('stream_bootstrap_sessions')} WHERE expires_at <= now() OR completed_at IS NOT NULL")

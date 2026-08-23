@@ -25,23 +25,6 @@ def t(name):
     return table(name)
 
 
-_AUDIOMUSE_REQUIRED_ACTION_BY_HEALTH = {
-    "ready": None,
-    "migration_required": "run_audiomuse_provider_migration",
-    "busy": "wait_for_audiomuse_work",
-    "repair_required": "investigate_audiomuse_mapping",
-}
-
-
-def audiomuse_required_action(health):
-    """Return the one operator action that matches AudioMuse's live health."""
-
-    try:
-        return _AUDIOMUSE_REQUIRED_ACTION_BY_HEALTH[health]
-    except KeyError as exc:
-        raise ValueError(f"Unsupported AudioMuse health: {health!r}") from exc
-
-
 @dataclass(frozen=True)
 class RekeyEvent:
     entity_type: str
@@ -169,6 +152,24 @@ def build_provider_identity_rekey_plan(previous, normalized):
 def target_scan_fingerprint(normalized):
     from .catalog import canonical_json
 
+    def stable_value(value, parent_key=None):
+        if isinstance(value, dict):
+            return {
+                key: stable_value(item, str(key))
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            items = [stable_value(item) for item in value]
+            # Navidrome's contributor query does not promise a row order. The
+            # contributor objects have roles and identities but no position,
+            # so permutations represent the same provider snapshot. Keep all
+            # other arrays order-sensitive.
+            if str(parent_key or "").casefold() == "contributors":
+                items.sort(key=canonical_json)
+            return items
+        return value
+
+    normalized = stable_value(normalized)
     stable = {
         key: sorted(list(rows), key=canonical_json)
         for key, rows in normalized.items()
@@ -485,12 +486,21 @@ def _copy_analysis_generation(
 
 
 def inspect_audiomuse_health(cur, adapter, server_id, expected_links):
-    """Classify AudioMuse independently from Lumae's publication decision."""
+    """Classify whether AudioMuse has moved its mappings to the new provider IDs.
+
+    The provider migration owns provider IDs, while AudioMuse owns canonical
+    analysis IDs. A later analysis/cleaning pass may legitimately regroup a
+    provider track under a different fingerprint ID, so equality with the
+    carried pre-migration analysis ID is not migration evidence. Lumae keeps
+    serving that carried generation until every previously mapped provider ID
+    exists, then lets the normal atomic projection publish AudioMuse's current
+    grouping.
+    """
 
     cur.execute(
         """
         SELECT COUNT(*) FROM task_status
-         WHERE status NOT IN ('SUCCESS', 'FAILURE', 'REVOKED')
+         WHERE status NOT IN ('SUCCESS', 'FAILURE', 'FAIL', 'REVOKED')
            AND (task_type ILIKE '%migration%'
                 OR task_type IN ('main_analysis', 'cleaning'))
         """
@@ -508,11 +518,15 @@ def inspect_audiomuse_health(cur, adapter, server_id, expected_links):
         return "ready"
     sql = adapter.analysis_mapping_sql()
     cur.execute(sql, (server_id,) if "%s" in sql else None)
-    actual = {
-        str(row[0]): str(row[1]) if row[1] is not None else None
-        for row in cur.fetchall()
-    }
-    if any(actual.get(track_id) not in (None, analysis_id) for track_id, analysis_id in expected.items()):
+    actual = {}
+    conflicting = False
+    for row in cur.fetchall():
+        track_id = str(row[0])
+        analysis_id = str(row[1]) if row[1] is not None else None
+        if track_id in actual and actual[track_id] != analysis_id:
+            conflicting = True
+        actual[track_id] = analysis_id
+    if conflicting:
         return "repair_required"
     if any(actual.get(track_id) is None for track_id in expected):
         return "migration_required"
@@ -823,7 +837,7 @@ def _publish_provider_identity_rekey(
             manifest_sha256,
         ),
     )
-    required_action = audiomuse_required_action(audiomuse_health)
+    required_action = None if audiomuse_health == "ready" else "run_audiomuse_provider_migration"
     cur.execute(
         f"""
         UPDATE {t('provider_identity_transitions')}
@@ -932,16 +946,16 @@ def refresh_audiomuse_health(db, catalog_instance_id, server_id, adapter, commit
         return None
     links = _load_analysis_links(cur, catalog_instance_id, int(state[1] or 0))
     health = inspect_audiomuse_health(cur, adapter, server_id, links)
-    required_action = audiomuse_required_action(health)
     cur.execute(
         f"""
         UPDATE {t('provider_identity_transitions')}
            SET audiomuse_health=%s,
-               required_action=%s,
+               required_action=CASE WHEN %s='ready' THEN NULL
+                                    ELSE 'run_audiomuse_provider_migration' END,
                checked_at=now(), updated_at=now()
          WHERE catalog_instance_id=%s AND state='applied'
         """,
-        (health, required_action, catalog_instance_id),
+        (health, health, catalog_instance_id),
     )
     cur.close()
     if commit:

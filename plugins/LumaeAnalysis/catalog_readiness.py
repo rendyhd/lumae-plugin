@@ -1,14 +1,27 @@
-"""Runtime catalogue and analysis admission for AudioMuse 3.
+"""Runtime catalogue and sonic-analysis admission for AudioMuse 3.
 
-Core versions are diagnostic inputs, never allow-list decisions.  Catalogue
-and analysis are admitted independently from observable source, projection,
-policy, and repair evidence.  V2 never executes the AudioMuse 3 queries.
+Core versions are diagnostic inputs, never allow-list decisions. Catalogue and
+analysis are admitted independently from observable source, projection, policy,
+and per-link evidence. V2 never executes these queries.
 """
+
+import json
 
 from plugin.api import table
 
 
 CONTRACT_REVISION = 1
+CATALOG_SEMANTIC_CONTRACTS = [
+    "provider_track_ids_v1",
+    "complete_catalog_generation_v1",
+    "contiguous_change_journal_v1",
+]
+ANALYSIS_SEMANTIC_CONTRACTS = [
+    "analysis_link_evidence_v1",
+    "musicnn_f32le_200_v1",
+    "clap_f32le_512_v1",
+    "audiomuse_musicnn_scalars_v1",
+]
 
 
 def t(name):
@@ -23,8 +36,6 @@ def _task_details(value):
     if isinstance(value, dict):
         return value
     if isinstance(value, str):
-        import json
-
         try:
             parsed = json.loads(value)
             return parsed if isinstance(parsed, dict) else {}
@@ -104,9 +115,8 @@ def _task_evidence(db):
         "analysis_before_cleaning": before,
         "cleaning": cleaning,
         "analysis_after_cleaning": after,
-        # Kept for older diagnostics; final automatic verification also
-        # requires Chromaprint completion to predate Cleaning.
         "upgrade_sequence_complete": bool(before and cleaning and after),
+        "diagnostics_available": True,
     }
 
 
@@ -155,7 +165,50 @@ def _coverage(db, source):
     }
 
 
-def _analysis_policy_blockers(policy):
+def _link_coverage(db, source, eligible_track_count=0):
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""
+            SELECT count(*) FILTER (WHERE status='ready') AS ready_links,
+                   count(*) FILTER (WHERE status='pending') AS pending_links,
+                   count(*) FILTER (
+                     WHERE status='suspect'
+                        OR review_state IN ('needs_repair', 'needs_review')
+                   ) AS suspect_links,
+                   count(*) FILTER (WHERE status='missing') AS missing_links,
+                   count(*) FILTER (
+                     WHERE status='ready' AND evidence_complete=TRUE
+                   ) AS verified_links,
+                   count(*) FILTER (
+                     WHERE status='ready' AND evidence_complete=FALSE
+                   ) AS provisional_links
+              FROM {t("track_analysis_links")}
+             WHERE catalog_instance_id=%s AND projection_generation=%s
+            """,
+            (
+                source["catalog_instance_id"],
+                source.get("analysis", {}).get("generation", 0),
+            ),
+        )
+        row = cur.fetchone() or (0, 0, 0, 0, 0, 0)
+    finally:
+        cur.close()
+    eligible = int(eligible_track_count or 0)
+    ready = int(row[0] or 0)
+    return {
+        "ready_link_count": ready,
+        "pending_link_count": int(row[1] or 0),
+        "suspect_link_count": int(row[2] or 0),
+        "missing_link_count": int(row[3] or 0),
+        "evidence_complete_link_count": int(row[4] or 0),
+        "verified_link_count": int(row[4] or 0),
+        "provisional_link_count": int(row[5] or 0),
+        "usable_analysis_coverage": ready / eligible if eligible else 0.0,
+    }
+
+
+def _policy_blockers(policy):
     blockers = []
     if policy.get("catalogue_id_scheme_version") != 4:
         blockers.append("fp_4_not_active")
@@ -171,109 +224,33 @@ def _analysis_policy_blockers(policy):
     return blockers
 
 
-def _catalogue_admission(source):
-    blockers = []
-    if not source.get("catalog_instance_id") or not source.get("server_id"):
-        blockers.append("catalog_not_initialized")
-    if (source.get("catalog") or {}).get("status") != "complete":
-        blockers.append("catalog_generation_incomplete")
-    admitted = not blockers
+def _stream_admission(admitted, semantics, blockers, status=None):
     return {
         "contract_revision": CONTRACT_REVISION,
         "schema_version": 2,
-        "status": "ready" if admitted else "not_ready",
+        "status": status or ("ready" if admitted else "not_ready"),
         "admitted": admitted,
-        "semantic_contracts": [
-            "provider_track_ids_v1",
-            "complete_catalog_generation_v1",
-            "contiguous_change_journal_v1",
-        ],
-        "blockers": blockers,
+        "semantic_contracts": list(semantics),
+        "blockers": list(blockers),
     }
 
 
-def _analysis_admission(db, source, policy):
-    blockers = _analysis_policy_blockers(policy)
-    if (source.get("analysis") or {}).get("status") != "complete":
-        blockers.append("analysis_projection_incomplete")
-
-    try:
-        coverage = _coverage(db, source)
-        tasks = _task_evidence(db)
-    except Exception:
-        return (
-            {
-                "eligible_track_count": 0,
-                "mapped_track_count": 0,
-                "missing_mapping_count": 0,
-                "chromaprint_track_count": 0,
-                "chromaprint_missing_count": 0,
-                "chromaprint_coverage": 0.0,
-                "latest_chromaprint_at_unix": None,
-            },
-            {},
-            {
-                "contract_revision": CONTRACT_REVISION,
-                "schema_version": 2,
-                "status": "not_ready",
-                "admitted": False,
-                "semantic_contracts": [
-                    "analysis_link_evidence_v1",
-                    "musicnn_f32le_200_v1",
-                    "clap_f32le_512_v1",
-                    "audiomuse_musicnn_scalars_v1",
-                ],
-                "blockers": ["readiness_unavailable"],
-            },
-        )
-
-    if coverage["eligible_track_count"] > 0 and coverage["mapped_track_count"] == 0:
-        blockers.append("no_analysis_mappings")
-    elif coverage["chromaprint_missing_count"]:
-        blockers.append("chromaprint_backfill_incomplete")
-
-    cleaning = tasks.get("cleaning") or {}
-    analysis_after = tasks.get("analysis_after_cleaning") or {}
-    cleaning_time = cleaning.get("completed_at_unix")
-    latest_chromaprint_at = coverage.get("latest_chromaprint_at_unix")
-    chromaprint_complete_before_cleaning = bool(
-        coverage["mapped_track_count"] == 0
-        or (
-            cleaning_time is not None
-            and latest_chromaprint_at is not None
-            and latest_chromaprint_at <= cleaning_time
-        )
-    )
-    verification_sequence_complete = bool(
-        coverage["mapped_track_count"] == 0
-        or (
-            chromaprint_complete_before_cleaning
-            and analysis_after.get("completed_at_unix") is not None
-        )
-    )
-    tasks["chromaprint_complete_before_cleaning"] = chromaprint_complete_before_cleaning
-    tasks["verification_sequence_complete"] = verification_sequence_complete
-    tasks["upgrade_sequence_complete"] = verification_sequence_complete
-    if coverage["mapped_track_count"] > 0 and not verification_sequence_complete:
-        blockers.append("analysis_verification_sequence_incomplete")
-
-    admitted = not blockers
-    return (
-        coverage,
-        tasks,
-        {
-            "contract_revision": CONTRACT_REVISION,
-            "schema_version": 2,
-            "status": "ready" if admitted else "not_ready",
-            "admitted": admitted,
-            "semantic_contracts": [
-                "analysis_link_evidence_v1",
-                "musicnn_f32le_200_v1",
-                "clap_f32le_512_v1",
-                "audiomuse_musicnn_scalars_v1",
-            ],
-            "blockers": blockers,
-        },
+def _catalogue_admission(source):
+    blockers = []
+    if source.get("rebind_status") == "rebind_required":
+        blockers.append("source_rebind_required")
+    if not source.get("catalog_instance_id") or not source.get("server_id"):
+        blockers.append("catalog_not_initialized")
+    catalog = source.get("catalog") or {}
+    if catalog.get("status") != "complete":
+        blockers.append("catalog_generation_incomplete")
+    if catalog.get("refresh_required") is True:
+        blockers.append("catalog_refresh_required")
+    return _stream_admission(
+        not blockers,
+        CATALOG_SEMANTIC_CONTRACTS,
+        blockers,
+        blockers[0] if blockers else "ready",
     )
 
 
@@ -285,18 +262,17 @@ def v3_release_readiness(
     acknowledgement=None,
     requested_mode=None,
 ):
-    """Return automatic source-scoped stream admission.
+    """Return automatic, source-scoped stream admission.
 
-    ``acknowledgement`` and ``requested_mode`` remain accepted for one plugin
-    release so callers compiled against the old helper do not break.  They no
-    longer influence admission.
+    The obsolete acknowledgement arguments remain accepted for one plugin
+    release so older callers do not break. They never influence admission.
     """
 
     del acknowledgement, requested_mode
     detected_core_version = _detected_core_version(compatibility)
     base = {
-        # Legacy fields remain additive/backwards-compatible.  New clients use
-        # the explicit per-stream admission object below.
+        # These legacy fields remain additive for older app releases. They now
+        # report the detected version rather than an allow-listed release.
         "qualified_core_version": detected_core_version,
         "detected_core_version": detected_core_version,
         "applicable": compatibility.adapter == "v3_registry",
@@ -315,35 +291,136 @@ def v3_release_readiness(
 
     catalog_admission = _catalogue_admission(source)
     if not catalog_admission["admitted"]:
+        analysis_admission = _stream_admission(
+            False,
+            ANALYSIS_SEMANTIC_CONTRACTS,
+            ["catalog_not_ready"],
+        )
         return {
             **base,
-            "status": "catalog_not_ready",
+            "status": catalog_admission["status"],
             "blockers": list(catalog_admission["blockers"]),
             "admission": {
                 "catalog": catalog_admission,
-                "analysis": {
-                    "contract_revision": CONTRACT_REVISION,
-                    "schema_version": 2,
-                    "status": "not_ready",
-                    "admitted": False,
-                    "semantic_contracts": [],
-                    "blockers": ["catalog_not_ready"],
-                },
+                "analysis": analysis_admission,
             },
         }
 
-    coverage, tasks, analysis_admission = _analysis_admission(db, source, policy)
-    ready = analysis_admission["admitted"]
+    try:
+        coverage = _coverage(db, source)
+        link_coverage = _link_coverage(
+            db,
+            source,
+            coverage["eligible_track_count"],
+        )
+    except Exception:
+        analysis_admission = _stream_admission(
+            False,
+            ANALYSIS_SEMANTIC_CONTRACTS,
+            ["readiness_unavailable"],
+        )
+        return {
+            **base,
+            "status": "readiness_unavailable",
+            "blockers": ["readiness_unavailable"],
+            "admission": {
+                "catalog": catalog_admission,
+                "analysis": analysis_admission,
+            },
+        }
+    try:
+        tasks = _task_evidence(db)
+    except Exception:
+        tasks = {
+            "analysis_before_cleaning": None,
+            "cleaning": None,
+            "analysis_after_cleaning": None,
+            "upgrade_sequence_complete": False,
+            "diagnostics_available": False,
+        }
+
+    cleaning = tasks.get("cleaning") or {}
+    cleaning_time = cleaning.get("completed_at_unix")
+    latest_chromaprint_at = coverage.get("latest_chromaprint_at_unix")
+    chromaprint_complete_before_cleaning = bool(
+        cleaning_time is not None
+        and latest_chromaprint_at is not None
+        and latest_chromaprint_at <= cleaning_time
+    )
+    task_order_complete = tasks["upgrade_sequence_complete"]
+    tasks["chromaprint_complete_before_cleaning"] = chromaprint_complete_before_cleaning
+    tasks["upgrade_sequence_complete"] = bool(
+        task_order_complete and chromaprint_complete_before_cleaning
+    )
+
+    blockers = _policy_blockers(policy)
+    admission_blockers = list(blockers)
+    if source.get("analysis", {}).get("status") != "complete":
+        blockers.append("analysis_projection_incomplete")
+        admission_blockers.append("analysis_projection_incomplete")
+    if coverage["mapped_track_count"] == 0:
+        blockers.append("no_analysis_mappings")
+        admission_blockers.append("no_analysis_mappings")
+    else:
+        if coverage["missing_mapping_count"]:
+            blockers.append("analysis_mapping_incomplete")
+        if coverage["chromaprint_missing_count"]:
+            blockers.append("chromaprint_backfill_incomplete")
+    if link_coverage["pending_link_count"]:
+        blockers.append("analysis_links_pending")
+    if link_coverage["suspect_link_count"]:
+        blockers.append("analysis_links_need_repair")
+    if link_coverage["missing_link_count"]:
+        blockers.append("analysis_links_missing")
+    if link_coverage["provisional_link_count"]:
+        blockers.append("provisional_links_remaining")
+    if (
+        link_coverage["verified_link_count"] != coverage["eligible_track_count"]
+        and not any(
+            code in blockers
+            for code in (
+                "no_analysis_mappings",
+                "analysis_mapping_incomplete",
+                "analysis_links_pending",
+                "analysis_links_need_repair",
+                "analysis_links_missing",
+                "provisional_links_remaining",
+            )
+        )
+    ):
+        blockers.append("sonic_evidence_incomplete")
+    if policy.get("per_link_chromaprint_evidence_available") is not True:
+        blockers.append("per_link_evidence_unavailable")
+        admission_blockers.append("per_link_evidence_unavailable")
+
+    analysis_sync_allowed = not admission_blockers
+    ready = analysis_sync_allowed and not blockers
+    if ready:
+        status = "ready"
+    elif analysis_sync_allowed:
+        status = "progressive"
+    else:
+        status = "repair_incomplete"
+    analysis_admission = _stream_admission(
+        analysis_sync_allowed,
+        ANALYSIS_SEMANTIC_CONTRACTS,
+        admission_blockers,
+        status,
+    )
     return {
         **base,
         **coverage,
-        "status": "ready" if ready else "repair_incomplete",
+        **link_coverage,
+        "status": status,
         "ready": ready,
         "fully_verified": ready,
-        "analysis_sync_allowed": ready,
-        "verification_mode": "automatic",
+        "analysis_sync_allowed": analysis_sync_allowed,
+        "progressive_analysis": analysis_sync_allowed and not ready,
+        "verification_mode": "automatic" if analysis_sync_allowed else None,
+        "administrator_acknowledged": False,
+        "acknowledged_at": None,
         "task_evidence": tasks,
-        "blockers": list(analysis_admission["blockers"]),
+        "blockers": blockers,
         "admission": {
             "catalog": catalog_admission,
             "analysis": analysis_admission,

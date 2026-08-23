@@ -160,7 +160,12 @@ def parse_navidrome_server_version(raw_value: object) -> ParsedNavidromeVersion:
 def is_after_last_known_pre_canonical_version(raw_value: object) -> Optional[bool]:
     parsed = parse_navidrome_server_version(raw_value)
     baseline = parse_navidrome_server_version(LAST_KNOWN_PRE_CANONICAL_NAVIDROME_VERSION)
-    if parsed.semantic_version is None or baseline.semantic_version is None:
+    # A develop/prerelease build can contain the pending canonical-ID migration
+    # while retaining the numeric version of the last safe tagged release.
+    if (
+        parsed.kind != "release"
+        or parsed.semantic_version is None
+        or baseline.semantic_version is None
+    ):
         return None
     return parsed.semantic_version > baseline.semantic_version
-

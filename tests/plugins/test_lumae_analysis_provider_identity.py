@@ -58,10 +58,10 @@ def test_parse_navidrome_server_version(raw, kind, semantic_version, prerelease,
     assert parsed.commit_sha == commit_sha
 
 
-def test_conservative_version_boundary_requires_a_newer_numeric_version():
+def test_conservative_version_boundary_trusts_only_tagged_releases():
     assert is_after_last_known_pre_canonical_version("0.63.2") is False
-    assert is_after_last_known_pre_canonical_version("0.63.2-SNAPSHOT") is False
+    assert is_after_last_known_pre_canonical_version("0.63.2-SNAPSHOT") is None
     assert is_after_last_known_pre_canonical_version("0.63.3") is True
-    assert is_after_last_known_pre_canonical_version("0.64.0-SNAPSHOT (abcdef0)") is True
+    assert is_after_last_known_pre_canonical_version("0.64.0-SNAPSHOT (abcdef0)") is None
     assert is_after_last_known_pre_canonical_version("master (abcdef0)") is None
     assert is_after_last_known_pre_canonical_version("custom-build") is None
