@@ -94,8 +94,8 @@
       "min_core_version": "3.2.0",
       "changelog": "Restore AudioMuse 3.4 compatibility by removing private RQ imports and replacing task-within-task queueing with a database-driven one-action reconciliation watchdog; recover stranded analysis runs and make profile, relationship, catalogue, and provider follow-ups restart-safe.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.7.zip",
+      "checksum": "a36070655916dcb807507c299a47cf30"
     },
     {
       "version": "1.1.6",
