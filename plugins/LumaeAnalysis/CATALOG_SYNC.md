@@ -1,8 +1,16 @@
 # Catalogue sync operations
 
-Lumae Analysis 1.1.7 publishes catalogue schema 3. Schema 3 is additive to the
+Lumae Analysis 1.1.8 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
+
+Version 1.1.8 makes the durable catalogue watchdog adaptive. Runnable work uses
+minute cadence, an active AudioMuse parent is checked every five minutes,
+failures back off for 1, 5, 15, then 60 minutes, and current or paused systems
+run one hourly safety sweep at minute 11. Every work admission re-arms the
+minute schedule in the same PostgreSQL transaction. Lumae settings show the
+current action and a bounded 25-event-per-source journal; idle sweeps do not
+enter that journal.
 
 Version 1.1.7 uses only AudioMuse's public plugin API for initial root tasks.
 Follow-up work is stored in plugin-owned PostgreSQL state and a one-minute

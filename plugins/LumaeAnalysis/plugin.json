@@ -90,6 +90,14 @@
   },
   "versions": [
     {
+      "version": "1.1.8",
+      "min_core_version": "3.2.0",
+      "changelog": "Reduce reconcile dashboard noise with adaptive active, waiting, retry, and hourly-idle schedules; add bounded Lumae-owned action progress and history; and back off failed work independently without losing restart recovery.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "1.1.7",
       "min_core_version": "3.2.0",
       "changelog": "Restore AudioMuse 3.4 compatibility by removing private RQ imports and replacing task-within-task queueing with a database-driven one-action reconciliation watchdog; recover stranded analysis runs and make profile, relationship, catalogue, and provider follow-ups restart-safe.",

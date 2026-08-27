@@ -41,13 +41,25 @@ page. Pausing stops new catalogue, projection, waveform, and relationship work;
 it does not delete or hide already published catalogue, profile, collection, or
 relationship data.
 
+### Adaptive reconciliation in 1.1.8
+
+Lumae keeps the public-API-only queue compatibility introduced in 1.1.7, but
+the catalogue reconciler no longer runs every minute while idle. It runs every
+minute only when durable work is ready, every five minutes while an AudioMuse
+analysis parent is still running, uses 1/5/15/60-minute retry backoff, and falls
+back to an hourly safety sweep at minute 11 when current or paused.
+
+The plugin settings page reports the real action, phase, duration, retry, and a
+bounded journal of meaningful work. AudioMuse may still label its generic task
+row `Songs analyzed: 0`; that core-owned label is not used by Lumae status.
+
 ### AudioMuse 3.4 queue compatibility in 1.1.7
 
 Lumae no longer imports RQ queues, jobs, dependencies, or retry objects from
 AudioMuse. Song-analysis hooks only record a pending source run in PostgreSQL.
-The catalogue watchdog runs every minute and advances at most one settled
-analysis finalizer, catalogue preparation, relationship build, or waveform
-batch. Each step is claimed atomically, so worker restarts and a manual job
+The catalogue watchdog advances at most one settled analysis finalizer,
+catalogue preparation, relationship build, or waveform batch per active source
+invocation. Each step is claimed atomically, so worker restarts and a manual job
 racing the watchdog are safe.
 
 The ONNX Runtime message `No registered plugin EP device found for

@@ -25,6 +25,8 @@ import numpy as np
 
 from plugin.api import get_db, table
 
+from .reconcile import arm_reconcile
+
 from .catalog import (
     CatalogScanError,
     canonical_json,
@@ -1436,7 +1438,7 @@ def claim_relationship_preparation(db, catalog_instance_id):
         f"""
         UPDATE {t("relationship_state")}
            SET status='queued', last_error=NULL, started_at=now(),
-               completed_at=NULL, updated_at=now()
+               completed_at=NULL, retry_count=0, next_retry_at=NULL, updated_at=now()
          WHERE catalog_instance_id=%s
            AND (status NOT IN ('queued', 'running')
                 OR updated_at < now() - interval '{ENRICHMENT_STALE_HOURS} hours')
@@ -1445,12 +1447,14 @@ def claim_relationship_preparation(db, catalog_instance_id):
         (catalog_instance_id,),
     )
     claimed = cur.fetchone() is not None
+    if claimed:
+        arm_reconcile(db, "relationship_preparation_admitted")
     db.commit()
     cur.close()
     return claimed
 
 
-def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None):
+def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None, progress=None):
     """Build one bounded, atomically published relationship generation."""
     db = db or get_db()
     candidate_lookup = candidate_lookup or _ivf_candidate_track_ids
@@ -1460,6 +1464,8 @@ def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None):
     source = sources[0]
     if source["catalog"]["status"] != "complete" or source["analysis"]["status"] != "complete":
         raise CatalogScanError("Catalogue and sonic analysis must be published first")
+    if callable(progress):
+        progress("building album and artist relationships")
     cur = db.cursor()
     cur.execute(
         f"""
@@ -1665,6 +1671,8 @@ def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None):
             ),
         )
         db.commit()
+        if callable(progress):
+            progress("published relationship generation")
         return {
             "catalog_instance_id": catalog_instance_id,
             "status": "complete",

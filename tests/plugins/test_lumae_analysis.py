@@ -104,7 +104,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.1.7"
+    assert manifest["versions"][0]["version"] == "1.1.8"
     assert manifest["versions"][0]["min_core_version"] == "3.2.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -197,7 +197,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.1.7",
+        "plugin_version": "1.1.8",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -328,7 +328,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.1.7"
+    assert body["plugin_version"] == "1.1.8"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -2584,6 +2584,7 @@ def test_settled_analysis_run_selector_is_scoped_and_terminal_aware():
         "server_id": "server-a",
         "catalog_instance_id": "catalog-a",
         "run_id": "shared-run",
+        "retry_count": 0,
     }
     sql = db.cursor_obj.executed[-1][0]
     assert "parent.task_id=r.run_id" in sql
@@ -3181,6 +3182,54 @@ class CronDb(FakeDb):
     def __init__(self, existing=None):
         self.cursor_obj = CronCursor(existing)
         self.commits = 0
+
+
+class ReconcileScheduleCursor:
+    def __init__(self, db):
+        self.db = db
+        self.current_row = None
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+        normalized = " ".join(sql.split())
+        self.current_row = None
+        if "WHERE name='catalog_reconcile' FOR UPDATE" in normalized:
+            self.current_row = (self.db.mode, self.db.cron_expr)
+        elif normalized.startswith("WITH candidates AS"):
+            self.current_row = self.db.summary
+        elif normalized.startswith("UPDATE plugin_lumae_analysis__reconcile_control SET mode"):
+            self.db.mode = params[0]
+            self.db.cron_expr = params[1]
+            self.db.control_update = params
+        elif normalized.startswith("UPDATE cron SET name="):
+            self.db.cron_update = params
+
+    def fetchone(self):
+        return self.current_row
+
+    def fetchall(self):
+        return []
+
+    def close(self):
+        pass
+
+
+class ReconcileScheduleDb:
+    def __init__(self, summary=(0, 0, None, None)):
+        self.summary = summary
+        self.mode = "idle"
+        self.cron_expr = "11 * * * *"
+        self.control_update = None
+        self.cron_update = None
+        self.commits = 0
+        self.cursor_obj = ReconcileScheduleCursor(self)
+
+    def cursor(self):
+        return self.cursor_obj
+
+    def commit(self):
+        self.commits += 1
 
 
 class FakeCtx:
@@ -4129,7 +4178,11 @@ def test_catalog_preparation_claim_does_not_inherit_legacy_profile_queue_lock():
     source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
 
     assert mod.claim_preparation(source, db=db) is True
-    sql, _params = db.cursor_obj.executed[-1]
+    sql, _params = next(
+        (sql, params)
+        for sql, params in db.cursor_obj.executed
+        if "INSERT INTO plugin_lumae_analysis__preparation_state" in sql
+    )
     assert "status NOT IN ('queued', 'running')" in sql
     assert "profiles_queued" not in sql
 
@@ -4147,7 +4200,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
 
     mod.migrate(db)
 
-    assert db.commits == 1
+    assert db.commits == 2
     assert queued == []
     assert (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
@@ -4163,7 +4216,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         (
             mod.CATALOG_RECONCILE_TASK_TYPE,
             mod.CATALOG_RECONCILE_TASK_TYPE,
-            "* * * * *",
+            "11 * * * *",
         ),
         (
             mod.PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
@@ -4219,8 +4272,12 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "provider_identity_transitions",
         "provider_identity_manifests",
         "catalog_generation_pins",
+        "reconcile_control",
+        "reconcile_events",
     ):
         assert f"plugin_lumae_analysis__{table_name}" in migration_sql
+    assert "ADD COLUMN IF NOT EXISTS retry_count" in migration_sql
+    assert "ADD COLUMN IF NOT EXISTS next_retry_at" in migration_sql
 
 
 def test_bounded_enqueue_delegates_only_to_the_public_plugin_api(monkeypatch):
@@ -4337,7 +4394,7 @@ def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch)
     first_sql = [sql for sql, _params in db.cursor_obj.executed]
     mod.migrate(db)
 
-    assert db.commits == 2
+    assert db.commits == 4
     assert all("DROP TABLE" not in sql.upper() for sql, _params in db.cursor_obj.executed)
     assert sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql, _ in db.cursor_obj.executed) == (
         2 * sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql in first_sql)
@@ -4404,13 +4461,23 @@ def test_reconcile_watchdog_is_a_noop_for_current_attested_catalogues(monkeypatc
     mod = load_plugin()
     db = object()
     monkeypatch.setattr(mod, "get_db", lambda: db)
-    monkeypatch.setattr(mod, "next_settled_analysis_run", lambda db=None: None)
     monkeypatch.setattr(
-        mod, "enqueue_required_catalog_preparations", lambda db=None: 0
+        mod, "next_settled_analysis_run", lambda db=None, server_id=None: None
     )
-    monkeypatch.setattr(mod, "next_preparation_run", lambda db=None: None)
-    monkeypatch.setattr(mod, "next_relationship_run", lambda db=None: None)
-    monkeypatch.setattr(mod, "next_profile_backfill_run", lambda db=None: None)
+    monkeypatch.setattr(
+        mod,
+        "enqueue_required_catalog_preparations",
+        lambda db=None, server_id=None: 0,
+    )
+    monkeypatch.setattr(
+        mod, "next_preparation_run", lambda db=None, server_id=None: None
+    )
+    monkeypatch.setattr(
+        mod, "next_relationship_run", lambda db=None, server_id=None: None
+    )
+    monkeypatch.setattr(
+        mod, "next_profile_backfill_run", lambda db=None, server_id=None: None
+    )
 
     assert mod.catalog_reconcile_task() == {
         "status": "current",
@@ -4428,7 +4495,7 @@ def test_reconcile_watchdog_processes_only_the_highest_priority_action(monkeypat
     monkeypatch.setattr(
         mod,
         "next_settled_analysis_run",
-        lambda db=None: {
+        lambda db=None, server_id=None: {
             "server_id": "server-a",
             "catalog_instance_id": "catalog-a",
             "run_id": "run-a",
@@ -4453,6 +4520,154 @@ def test_reconcile_watchdog_processes_only_the_highest_priority_action(monkeypat
         "result": {"status": "complete"},
     }
     assert calls == [("analysis", ("server-a", "catalog-a", "run-a"))]
+
+
+@pytest.mark.parametrize(
+    ("summary", "expected_mode", "expected_cron"),
+    [
+        ((2, 0, None, None), "active", "* * * * *"),
+        ((0, 1, None, None), "waiting", "*/5 * * * *"),
+        ((0, 0, 1, "2026-08-26T22:01:00Z"), "backoff", "* * * * *"),
+        ((0, 0, 2, "2026-08-26T22:05:00Z"), "backoff", "*/5 * * * *"),
+        ((0, 0, 3, "2026-08-26T22:15:00Z"), "backoff", "*/15 * * * *"),
+        ((0, 0, 4, "2026-08-26T23:00:00Z"), "backoff", "11 * * * *"),
+        ((0, 0, None, None), "idle", "11 * * * *"),
+    ],
+)
+def test_reconcile_schedule_adapts_to_durable_work(summary, expected_mode, expected_cron):
+    reconcile = importlib.import_module("plugins.LumaeAnalysis.reconcile")
+    db = ReconcileScheduleDb(summary)
+
+    result = reconcile.reconcile_schedule_from_state(db)
+
+    assert result["mode"] == expected_mode
+    assert result["cron_expr"] == expected_cron
+    assert db.control_update[:2] == (expected_mode, expected_cron)
+    assert db.cron_update[1] == expected_cron
+    assert db.commits == 1
+    sql = "\n".join(statement for statement, _params in db.cursor_obj.executed)
+    assert "FOR UPDATE" in sql
+    assert "worker heartbeat expired" in sql
+
+
+def test_reconcile_work_admission_arms_minute_cadence_in_callers_transaction():
+    reconcile = importlib.import_module("plugins.LumaeAnalysis.reconcile")
+    db = ReconcileScheduleDb()
+
+    reconcile.arm_reconcile(db, "analysis_hook", commit=False)
+
+    assert db.mode == "active"
+    assert db.cron_expr == "* * * * *"
+    assert db.control_update[2] == "analysis_hook"
+    assert db.commits == 0
+
+
+def test_reconcile_failure_records_backoff_and_propagates(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    calls = []
+    monkeypatch.setattr(mod, "begin_event", lambda *_args, **_kwargs: 9)
+    monkeypatch.setattr(mod, "progress_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "update_work_retry",
+        lambda *_args, **kwargs: calls.append(("retry", kwargs))
+        or {"retry_count": 1, "next_retry_at": "later"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "finish_event",
+        lambda *_args, **kwargs: calls.append(("event", kwargs)),
+    )
+
+    with pytest.raises(RuntimeError, match="transient failure"):
+        mod._run_reconcile_action(
+            db,
+            "catalog_preparation",
+            "server-a",
+            "catalog-a",
+            "catalog-a",
+            0,
+            lambda: (_ for _ in ()).throw(RuntimeError("transient failure")),
+        )
+
+    assert calls[0] == ("retry", {"work_key": "catalog-a", "failed": True})
+    assert calls[1][0] == "event"
+    assert calls[1][1]["phase"] == "failed"
+    assert calls[1][1]["next_retry_at"] == "later"
+
+
+def test_reconcile_scopes_idle_checks_to_active_audio_muse_server(monkeypatch):
+    mod = load_plugin()
+    seen = []
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(
+        mod,
+        "get_core_adapter",
+        lambda: types.SimpleNamespace(active_server_id=lambda: "server-b"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "next_settled_analysis_run",
+        lambda db=None, server_id=None: seen.append(("analysis", server_id)) or None,
+    )
+    monkeypatch.setattr(
+        mod,
+        "enqueue_required_catalog_preparations",
+        lambda db=None, server_id=None: seen.append(("admission", server_id)) or 0,
+    )
+    for name in ("next_preparation_run", "next_relationship_run", "next_profile_backfill_run"):
+        monkeypatch.setattr(
+            mod,
+            name,
+            lambda db=None, server_id=None, selected=name: seen.append((selected, server_id))
+            or None,
+        )
+    monkeypatch.setattr(mod, "_safe_reconcile_schedule", lambda *_args, **_kwargs: None)
+
+    assert mod.catalog_reconcile_task()["status"] == "current"
+    assert {server_id for _name, server_id in seen} == {"server-b"}
+
+
+def test_reconcile_status_panel_reports_real_work_and_escapes_errors(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(
+        mod,
+        "read_reconcile_status",
+        lambda _db: {
+            "control": {
+                "mode": "idle",
+                "cron_expr": "11 * * * *",
+                "reason": "catalog_current",
+                "last_sweep_at": None,
+                "next_retry_at": None,
+                "updated_at": None,
+            },
+            "pending": {"volume and ramps": 0},
+            "events": [
+                {
+                    "action": "profile_backfill",
+                    "status": "failed",
+                    "phase": "failed",
+                    "attempt": 2,
+                    "duration_ms": 7500,
+                    "summary": {"processed": 2},
+                    "last_error": "<boom>",
+                    "next_retry_at": None,
+                }
+            ],
+        },
+    )
+
+    body = mod.render_reconcile_status_panel()
+
+    assert "Hourly safety sweep at :11" in body
+    assert "Profile Backfill" in body
+    assert "7.5 s" in body
+    assert "processed: 2" in body
+    assert "&lt;boom&gt;" in body
+    assert "Songs analyzed: 0" in body
 
 
 def test_worker_attestation_rejects_a_stale_audio_muse_worker(monkeypatch):
@@ -8025,7 +8240,7 @@ def test_settings_page_recovers_transaction_after_identity_status_query_fails(mo
 
     body = mod.render_settings()
 
-    assert db.rollbacks == 1
+    assert db.rollbacks == 2
     assert 'id="collections-recovered"' in body
 
 

@@ -81,10 +81,24 @@ from .collection_manager import (
     register_collection_routes,
     render_collections_settings_panel,
 )
+from .reconcile import (
+    arm_reconcile,
+    begin_event,
+    defer_work,
+    discard_event,
+    finish_event,
+    iso as reconcile_iso,
+    migrate_reconcile,
+    progress_event,
+    read_reconcile_status,
+    reconcile_schedule_from_state,
+    set_paused as set_reconcile_paused,
+    update_work_retry,
+)
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.1.7"
+PLUGIN_VERSION = "1.1.8"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -347,24 +361,8 @@ def ensure_catalog_refresh_schedule(db):
 
 
 def ensure_catalog_reconcile_schedule(db):
-    """Keep a cheap repair watchdog enabled without periodically rebuilding."""
-    cur = db.cursor()
-    cur.execute(
-        """
-        INSERT INTO cron (name, task_type, cron_expr, enabled)
-        VALUES (%s, %s, %s, TRUE)
-        ON CONFLICT (task_type) DO UPDATE SET
-            name=EXCLUDED.name,
-            cron_expr=EXCLUDED.cron_expr,
-            enabled=TRUE
-        """,
-        (
-            CATALOG_RECONCILE_TASK_TYPE,
-            CATALOG_RECONCILE_TASK_TYPE,
-            "* * * * *",
-        ),
-    )
-    cur.close()
+    """Install additive reconciliation state and an initially quiet schedule."""
+    migrate_reconcile(db)
 
 
 def ensure_provider_identity_recheck_schedule(db):
@@ -428,13 +426,13 @@ def catalog_refresh_task(server_id=None):
     return refresh_catalog(server_id=resolved_server_id)
 
 
-def next_settled_analysis_run(db=None):
+def next_settled_analysis_run(db=None, server_id=None):
     """Return one durable run whose AudioMuse parent can no longer emit hooks."""
     db = db or get_db()
     cur = db.cursor()
     cur.execute(
         f"""
-        SELECT r.server_id, r.catalog_instance_id, r.run_id
+        SELECT r.server_id, r.catalog_instance_id, r.run_id, r.retry_count
           FROM {analysis_runs_table()} r
           LEFT JOIN task_status parent
             ON parent.task_id=r.run_id AND parent.task_type='main_analysis'
@@ -442,6 +440,8 @@ def next_settled_analysis_run(db=None):
                              'enqueue_failed', 'failed')
                 OR (r.status='running' AND r.updated_at
                     < now() - interval '{ANALYSIS_RUN_STALE_MINUTES} minutes'))
+           AND (r.next_retry_at IS NULL OR r.next_retry_at <= now())
+           AND (%s IS NULL OR r.server_id=%s)
            AND (
                 parent.status IN ('SUCCESS', 'FAILURE', 'FAIL', 'REVOKED')
                 OR (
@@ -461,7 +461,8 @@ def next_settled_analysis_run(db=None):
            )
          ORDER BY r.last_seen_at, r.catalog_instance_id, r.run_id
          LIMIT 1
-        """
+        """,
+        (server_id, server_id),
     )
     row = cur.fetchone()
     cur.close()
@@ -471,71 +472,238 @@ def next_settled_analysis_run(db=None):
         "server_id": str(row[0]),
         "catalog_instance_id": str(row[1]),
         "run_id": str(row[2]),
+        "retry_count": int(row[3] or 0) if len(row) > 3 else 0,
     }
 
 
-def next_preparation_run(db=None):
+def next_preparation_run(db=None, server_id=None):
     db = db or get_db()
     cur = db.cursor()
     cur.execute(
         f"""
-        SELECT server_id, catalog_instance_id
+        SELECT server_id, catalog_instance_id, retry_count
           FROM {preparation_state_table()}
-         WHERE status='queued'
+         WHERE (status='queued'
+            OR (status='failed' AND (next_retry_at IS NULL OR next_retry_at <= now()))
             OR (status='running' AND updated_at
-                < now() - interval '{PREPARATION_STALE_HOURS} hours')
+                < now() - interval '{PREPARATION_STALE_HOURS} hours'))
+           AND (%s IS NULL OR server_id=%s)
          ORDER BY updated_at, catalog_instance_id
          LIMIT 1
-        """
+        """,
+        (server_id, server_id),
     )
     row = cur.fetchone()
     cur.close()
-    return (str(row[0]), str(row[1])) if row else None
+    return (str(row[0]), str(row[1]), int(row[2] or 0)) if row else None
 
 
-def next_relationship_run(db=None):
+def next_relationship_run(db=None, server_id=None):
     db = db or get_db()
     cur = db.cursor()
     cur.execute(
         f"""
-        SELECT s.current_core_server_id, r.catalog_instance_id
+        SELECT s.current_core_server_id, r.catalog_instance_id, r.retry_count
           FROM {table('relationship_state')} r
           JOIN {table('catalog_sources')} s USING (catalog_instance_id)
          WHERE s.rebind_status='active'
            AND (r.status='queued'
+                OR (r.status IN ('failed', 'waiting_for_index')
+                    AND (r.next_retry_at IS NULL OR r.next_retry_at <= now()))
                 OR (r.status='running' AND r.updated_at
                     < now() - interval '{PREPARATION_STALE_HOURS} hours'))
+           AND (%s IS NULL OR s.current_core_server_id=%s)
          ORDER BY r.updated_at, r.catalog_instance_id
          LIMIT 1
-        """
+        """,
+        (server_id, server_id),
     )
     row = cur.fetchone()
     cur.close()
-    return (str(row[0]), str(row[1])) if row else None
+    return (str(row[0]), str(row[1]), int(row[2] or 0)) if row else None
 
 
-def next_profile_backfill_run(db=None):
+def next_profile_backfill_run(db=None, server_id=None):
     db = db or get_db()
     cur = db.cursor()
     cur.execute(
         f"""
-        SELECT server_id, catalog_instance_id
+        SELECT server_id, catalog_instance_id, retry_count
           FROM {profile_backfill_state_table()}
-         WHERE status='queued'
+         WHERE (status='queued'
+            OR (status='failed' AND (next_retry_at IS NULL OR next_retry_at <= now()))
             OR (status='running' AND updated_at
-                < now() - interval '{BACKFILL_STALE_MINUTES} minutes')
+                < now() - interval '{BACKFILL_STALE_MINUTES} minutes'))
+           AND (%s IS NULL OR server_id=%s)
          ORDER BY updated_at, catalog_instance_id
          LIMIT 1
-        """
+        """,
+        (server_id, server_id),
     )
     row = cur.fetchone()
     cur.close()
-    return (str(row[0]), str(row[1])) if row else None
+    return (str(row[0]), str(row[1]), int(row[2] or 0)) if row else None
+
+
+def _rollback_if_possible(db):
+    rollback = getattr(db, "rollback", None)
+    if callable(rollback):
+        rollback()
+
+
+def _safe_reconcile_schedule(db, paused=None):
+    try:
+        return reconcile_schedule_from_state(
+            db,
+            paused=maintenance_paused() if paused is None else bool(paused),
+        )
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not update the adaptive reconcile schedule")
+        return None
+
+
+def _safe_progress(phase, current=None, total=None):
+    try:
+        progress_event(phase, current=current, total=total)
+    except Exception:
+        db = get_db()
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not update reconcile progress")
+
+
+def _reconcile_result_summary(result):
+    if not isinstance(result, dict):
+        return {"status": str(result)[:200]}
+    allowed = (
+        "status",
+        "songs_seen",
+        "processed",
+        "queued_next",
+        "queued_profiles",
+        "generation",
+        "changes",
+        "album_count",
+        "artist_count",
+        "track_count",
+    )
+    return {key: result[key] for key in allowed if key in result}
+
+
+def _run_reconcile_action(
+    db,
+    action,
+    server_id,
+    catalog_instance_id,
+    work_key,
+    retry_count,
+    function,
+    *args,
+):
+    event_id = None
+    try:
+        event_id = begin_event(
+            db,
+            action,
+            server_id,
+            catalog_instance_id,
+            work_key=work_key,
+            attempt=int(retry_count or 0) + 1,
+        )
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not start the reconcile status event")
+    try:
+        _safe_progress("starting")
+        result = function(*args)
+        result_status = str((result or {}).get("status") or "complete")
+        if result_status in ("coalesced", "already_finalized", "paused"):
+            try:
+                discard_event(db, event_id)
+            except Exception:
+                _rollback_if_possible(db)
+            return result
+        if result_status == "waiting_for_index":
+            next_retry_at = None
+            try:
+                next_retry_at = defer_work(
+                    db,
+                    action,
+                    catalog_instance_id,
+                    work_key=work_key,
+                    minutes=60,
+                )
+                finish_event(
+                    db,
+                    event_id,
+                    "deferred",
+                    phase="waiting for AudioMuse index",
+                    summary=_reconcile_result_summary(result),
+                    next_retry_at=next_retry_at,
+                )
+            except Exception:
+                _rollback_if_possible(db)
+                logger.exception("lumae_analysis could not record deferred reconcile work")
+            return result
+        if result_status in ("failed", "failure", "error"):
+            raise RuntimeError(str((result or {}).get("error") or result_status))
+        try:
+            update_work_retry(
+                db,
+                action,
+                catalog_instance_id,
+                work_key=work_key,
+                failed=False,
+            )
+            finish_event(
+                db,
+                event_id,
+                "success",
+                phase="complete",
+                summary=_reconcile_result_summary(result),
+            )
+        except Exception:
+            _rollback_if_possible(db)
+            logger.exception("lumae_analysis could not finish reconcile success state")
+        return result
+    except Exception as exc:
+        _rollback_if_possible(db)
+        retry = {"next_retry_at": None}
+        try:
+            retry = update_work_retry(
+                db,
+                action,
+                catalog_instance_id,
+                work_key=work_key,
+                failed=True,
+            )
+        except Exception:
+            _rollback_if_possible(db)
+            logger.exception("lumae_analysis could not record reconcile retry state")
+        try:
+            finish_event(
+                db,
+                event_id,
+                "failed",
+                phase="failed",
+                error=exc,
+                next_retry_at=retry.get("next_retry_at"),
+            )
+        except Exception:
+            _rollback_if_possible(db)
+            logger.exception("lumae_analysis could not finish the reconcile status event")
+        raise
 
 
 def catalog_reconcile_task():
-    """Execute at most one durable follow-up action per watchdog tick."""
+    """Execute at most one durable action for the active source, then retune cadence."""
+    db = get_db()
     if maintenance_paused():
+        try:
+            set_reconcile_paused(db, True)
+        except Exception:
+            _rollback_if_possible(db)
+            logger.exception("lumae_analysis could not pause the reconcile schedule")
         return {
             "status": "paused",
             "requested": 0,
@@ -543,41 +711,85 @@ def catalog_reconcile_task():
             "catalog_builder_version": CATALOG_BUILDER_VERSION,
         }
 
-    db = get_db()
-    run = next_settled_analysis_run(db=db)
-    if run:
-        result = finalize_analysis_run_task(
-            run["server_id"], run["catalog_instance_id"], run["run_id"]
-        )
-        return {"status": "processed", "action": "analysis_run", "result": result}
+    try:
+        server_id = str(get_core_adapter().active_server_id() or "") or None
+    except Exception:
+        server_id = None
 
-    requested = enqueue_required_catalog_preparations(db=db)
-    preparation = next_preparation_run(db=db)
-    if preparation:
-        result = prepare_lumae_task(*preparation)
+    requested = 0
+    try:
+        run = next_settled_analysis_run(db=db, server_id=server_id)
+        if run:
+            result = _run_reconcile_action(
+                db,
+                "analysis_run",
+                run["server_id"],
+                run["catalog_instance_id"],
+                run["run_id"],
+                run.get("retry_count", 0),
+                finalize_analysis_run_task,
+                run["server_id"],
+                run["catalog_instance_id"],
+                run["run_id"],
+            )
+            return {"status": "processed", "action": "analysis_run", "result": result}
+
+        requested = enqueue_required_catalog_preparations(db=db, server_id=server_id)
+        preparation = next_preparation_run(db=db, server_id=server_id)
+        if preparation:
+            result = _run_reconcile_action(
+                db,
+                "catalog_preparation",
+                preparation[0],
+                preparation[1],
+                preparation[1],
+                preparation[2] if len(preparation) > 2 else 0,
+                prepare_lumae_task,
+                *preparation[:2],
+            )
+            return {
+                "status": "processed",
+                "action": "catalog_preparation",
+                "requested": int(requested),
+                "result": result,
+            }
+
+        relationship = next_relationship_run(db=db, server_id=server_id)
+        if relationship:
+            result = _run_reconcile_action(
+                db,
+                "relationships",
+                relationship[0],
+                relationship[1],
+                relationship[1],
+                relationship[2] if len(relationship) > 2 else 0,
+                relationship_preparation_task,
+                *relationship[:2],
+            )
+            return {"status": "processed", "action": "relationships", "result": result}
+
+        profile = next_profile_backfill_run(db=db, server_id=server_id)
+        if profile:
+            result = _run_reconcile_action(
+                db,
+                "profile_backfill",
+                profile[0],
+                profile[1],
+                profile[1],
+                profile[2] if len(profile) > 2 else 0,
+                profile_backfill_task,
+                *profile[:2],
+            )
+            return {"status": "processed", "action": "profile_backfill", "result": result}
+
         return {
-            "status": "processed",
-            "action": "catalog_preparation",
+            "status": "current",
             "requested": int(requested),
-            "result": result,
+            "plugin_version": PLUGIN_VERSION,
+            "catalog_builder_version": CATALOG_BUILDER_VERSION,
         }
-
-    relationship = next_relationship_run(db=db)
-    if relationship:
-        result = relationship_preparation_task(*relationship)
-        return {"status": "processed", "action": "relationships", "result": result}
-
-    profile = next_profile_backfill_run(db=db)
-    if profile:
-        result = profile_backfill_task(*profile)
-        return {"status": "processed", "action": "profile_backfill", "result": result}
-
-    return {
-        "status": "current",
-        "requested": int(requested),
-        "plugin_version": PLUGIN_VERSION,
-        "catalog_builder_version": CATALOG_BUILDER_VERSION,
-    }
+    finally:
+        _safe_reconcile_schedule(db)
 
 
 def analysis_projection_task(server_id=None):
@@ -609,7 +821,7 @@ def analysis_projection_task(server_id=None):
     return result
 
 
-def enqueue_required_catalog_preparations(db=None):
+def enqueue_required_catalog_preparations(db=None, server_id=None):
     """Durably request first-run and builder-upgrade preparation.
 
     The historical name remains API-compatible. No queue operation occurs;
@@ -627,6 +839,8 @@ def enqueue_required_catalog_preparations(db=None):
         return 0
     requested = 0
     for source in sources:
+        if server_id is not None and str(source.get("server_id") or "") != str(server_id):
+            continue
         catalog = source.get("catalog") or {}
         if source.get("rebind_status") != "active":
             continue
@@ -743,6 +957,12 @@ def observe_provider_identities_on_start():
             rollback()
         logger.exception("lumae_analysis could not ensure provider identity schema")
         return
+    try:
+        migrate_reconcile(db)
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not ensure reconcile schema")
     bridge = ProviderCatalogBridge()
     for server in bridge.list_servers():
         if not server.get("supported"):
@@ -757,6 +977,8 @@ def observe_provider_identities_on_start():
                 "lumae_analysis could not observe provider identity for %s",
                 server["server_id"],
             )
+    enqueue_required_catalog_preparations(db=db)
+    _safe_reconcile_schedule(db)
     # The scheduled provider-identity recheck consumes durable transition
     # state. Startup never reaches into queue internals or creates root work.
 
@@ -938,7 +1160,7 @@ def migrate(db):
                 < now() - interval '{ANALYSIS_RUN_STALE_MINUTES} minutes')
         """
     )
-    # Retarget work admitted by an older plugin process so a reloaded 1.1.7
+    # Retarget work admitted by an older plugin process so a reloaded 1.1.8
     # worker can attest and execute it. The claim remains coalesced in SQL.
     cur.execute(
         f"""
@@ -969,6 +1191,7 @@ def migrate(db):
     # is admitted here; ordinary analysis hooks and explicit prepare requests
     # own later enrichment.
     enqueue_required_catalog_preparations(db=db)
+    _safe_reconcile_schedule(db)
     # Provider and catalogue watchdogs consume the durable requests above.
     # Install hooks remain schema-only and never queue root work.
 
@@ -2507,12 +2730,23 @@ def record_analysis_run(server_id, catalog_instance_id, run_id, db=None):
                     THEN {analysis_runs_table()}.last_error
                 ELSE NULL
             END,
+            retry_count=CASE
+                WHEN {analysis_runs_table()}.status IN ('running', 'complete')
+                    THEN {analysis_runs_table()}.retry_count
+                ELSE 0
+            END,
+            next_retry_at=CASE
+                WHEN {analysis_runs_table()}.status IN ('running', 'complete')
+                    THEN {analysis_runs_table()}.next_retry_at
+                ELSE NULL
+            END,
             updated_at=now()
         RETURNING status, songs_seen
         """,
         (catalog_instance_id, run_id, server_id),
     )
     row = cur.fetchone()
+    arm_reconcile(db, "analysis_hook")
     db.commit()
     cur.close()
     return {
@@ -2530,7 +2764,7 @@ def claim_analysis_run(catalog_instance_id, run_id, finalizer_job_id=None, db=No
         f"""
         UPDATE {analysis_runs_table()}
            SET status='running', started_at=COALESCE(started_at, now()),
-               last_error=NULL, updated_at=now()
+               last_error=NULL, next_retry_at=NULL, updated_at=now()
          WHERE catalog_instance_id=%s AND run_id=%s
            AND (status IN ('pending', 'registering', 'queued',
                            'enqueue_failed', 'failed')
@@ -2558,6 +2792,7 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
     if songs_seen is None:
         return {"status": "already_finalized", "run_id": run_id}
     try:
+        _safe_progress("refreshing catalogue")
         source = resolve_profile_source(
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
@@ -2567,18 +2802,21 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
         catalog_result = refresh_catalog(server_id=server_id)
         if catalog_result["catalog_instance_id"] != catalog_instance_id:
             raise CatalogScanError("Catalogue identity changed during run finalization")
+        _safe_progress("projecting AudioMuse analysis")
         projection_result = project_analysis(
             server_id=server_id,
             adapter=get_core_adapter(),
         )
         if projection_result["catalog_instance_id"] != catalog_instance_id:
             raise CatalogScanError("Analysis identity changed during run finalization")
+        _safe_progress("admitting volume and ramp work")
         profile_result = start_profile_backfill(
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
             enqueue_job=False,
         )
         try:
+            _safe_progress("admitting relationship work")
             relationship_result = start_relationship_preparation(
                 catalog_instance_id=catalog_instance_id,
                 server_id=server_id,
@@ -2787,6 +3025,9 @@ def analyze_tracks_task(
         }
     results = []
     for index, track_id in enumerate(ids):
+        _safe_progress("analyzing volume and ramps", current=index, total=len(ids))
+        if priority == "background" and catalog_instance_id:
+            heartbeat_profile_backfill(catalog_instance_id)
         if maintenance_paused():
             remaining = ids[index:]
             release_pending(
@@ -2815,6 +3056,9 @@ def analyze_tracks_task(
                 server_id=server_id,
             )
         )
+        _safe_progress("analyzing volume and ramps", current=index + 1, total=len(ids))
+        if priority == "background" and catalog_instance_id:
+            heartbeat_profile_backfill(catalog_instance_id)
     summary = {
         "ready": sum(1 for result in results if result["status"] == "ready"),
         "already_ready": sum(
@@ -3160,7 +3404,7 @@ def claim_profile_backfill(source, db=None):
         ON CONFLICT (catalog_instance_id) DO UPDATE SET
             server_id=EXCLUDED.server_id, status='queued', processed_profiles=0,
             queued_profiles=0, last_error=NULL, started_at=now(),
-            completed_at=NULL, updated_at=now()
+            completed_at=NULL, retry_count=0, next_retry_at=NULL, updated_at=now()
         WHERE {profile_backfill_state_table()}.status NOT IN ('queued', 'running')
            OR {profile_backfill_state_table()}.updated_at
               < now() - interval '{BACKFILL_STALE_MINUTES} minutes'
@@ -3169,6 +3413,8 @@ def claim_profile_backfill(source, db=None):
         (source["catalog_instance_id"], source["server_id"]),
     )
     claimed = cur.fetchone() is not None
+    if claimed:
+        arm_reconcile(db, "profile_backfill_admitted")
     db.commit()
     cur.close()
     return claimed
@@ -3181,9 +3427,10 @@ def claim_profile_backfill_batch(catalog_instance_id, db=None):
     cur.execute(
         f"""
         UPDATE {profile_backfill_state_table()}
-           SET status='running', last_error=NULL, updated_at=now()
+           SET status='running', last_error=NULL, next_retry_at=NULL, updated_at=now()
          WHERE catalog_instance_id=%s
            AND (status='queued'
+                OR (status='failed' AND (next_retry_at IS NULL OR next_retry_at <= now()))
                 OR (status='running' AND updated_at
                     < now() - interval '{BACKFILL_STALE_MINUTES} minutes'))
         RETURNING catalog_instance_id
@@ -3194,6 +3441,27 @@ def claim_profile_backfill_batch(catalog_instance_id, db=None):
     db.commit()
     cur.close()
     return claimed
+
+
+def heartbeat_profile_backfill(catalog_instance_id, db=None):
+    """Keep a long bounded waveform batch from looking abandoned."""
+    db = db or get_db()
+    if db is None:
+        return False
+    try:
+        cur = db.cursor()
+        cur.execute(
+            f"UPDATE {profile_backfill_state_table()} SET updated_at=now() "
+            "WHERE catalog_instance_id=%s AND status='running'",
+            (catalog_instance_id,),
+        )
+        cur.close()
+        db.commit()
+        return True
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not heartbeat profile backfill")
+        return False
 
 
 def update_profile_backfill_state(
@@ -3311,6 +3579,7 @@ def profile_backfill_task(server_id, catalog_instance_id):
         }
     claimed_ids = []
     try:
+        _safe_progress("selecting volume and ramp batch")
         resolve_profile_source(
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
@@ -3424,9 +3693,11 @@ def claim_relationship_preparation_run(catalog_instance_id, db=None):
         f"""
         UPDATE {table('relationship_state')}
            SET status='running', last_error=NULL,
-               started_at=COALESCE(started_at, now()), updated_at=now()
+               started_at=COALESCE(started_at, now()), next_retry_at=NULL, updated_at=now()
          WHERE catalog_instance_id=%s
            AND (status='queued'
+                OR (status IN ('failed', 'waiting_for_index')
+                    AND (next_retry_at IS NULL OR next_retry_at <= now()))
                 OR (status='running' AND updated_at
                     < now() - interval '{PREPARATION_STALE_HOURS} hours'))
         RETURNING catalog_instance_id
@@ -3445,13 +3716,14 @@ def relationship_preparation_task(server_id, catalog_instance_id):
     if not claim_relationship_preparation_run(catalog_instance_id):
         return {"status": "coalesced", "reason": "already_running"}
     try:
+        _safe_progress("loading relationship inputs")
         source = resolve_profile_source(
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
         )
         if source["catalog_instance_id"] != catalog_instance_id:
             raise CatalogScanError("Catalogue identity changed before relationship preparation")
-        return prepare_relationships(catalog_instance_id)
+        return prepare_relationships(catalog_instance_id, progress=_safe_progress)
     except Exception as exc:
         db = get_db()
         cur = db.cursor()
@@ -3632,7 +3904,8 @@ def claim_preparation(source, db=None):
             target_plugin_version=EXCLUDED.target_plugin_version,
             target_catalog_builder_version=EXCLUDED.target_catalog_builder_version,
             worker_plugin_version=NULL, worker_catalog_builder_version=NULL,
-            last_error=NULL, started_at=now(), completed_at=NULL, updated_at=now()
+            last_error=NULL, started_at=now(), completed_at=NULL,
+            retry_count=0, next_retry_at=NULL, updated_at=now()
         WHERE {preparation_state_table()}.status NOT IN ('queued', 'running')
            OR {preparation_state_table()}.updated_at < now() - interval '{PREPARATION_STALE_HOURS} hours'
         RETURNING catalog_instance_id
@@ -3645,6 +3918,8 @@ def claim_preparation(source, db=None):
         ),
     )
     claimed = cur.fetchone() is not None
+    if claimed:
+        arm_reconcile(db, "catalog_preparation_admitted")
     db.commit()
     cur.close()
     return claimed
@@ -3658,9 +3933,10 @@ def claim_preparation_run(catalog_instance_id, db=None):
         f"""
         UPDATE {preparation_state_table()}
            SET status='running', phase='starting', last_error=NULL,
-               started_at=COALESCE(started_at, now()), updated_at=now()
+               started_at=COALESCE(started_at, now()), next_retry_at=NULL, updated_at=now()
          WHERE catalog_instance_id=%s
            AND (status='queued'
+                OR (status='failed' AND (next_retry_at IS NULL OR next_retry_at <= now()))
                 OR (status='running' AND updated_at
                     < now() - interval '{PREPARATION_STALE_HOURS} hours'))
         RETURNING catalog_instance_id
@@ -3801,6 +4077,7 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
                 "catalog_instance_id": resolved_catalog_instance_id,
             }
         assert_preparation_worker_current(resolved_catalog_instance_id)
+        _safe_progress("refreshing catalogue")
         update_preparation_state(
             resolved_catalog_instance_id,
             resolved_server_id,
@@ -3817,6 +4094,7 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
             raise CatalogScanError(
                 "Catalogue refresh finished without publishing the current builder version"
             )
+        _safe_progress("projecting AudioMuse analysis")
         update_preparation_state(
             resolved_catalog_instance_id,
             resolved_server_id,
@@ -3837,6 +4115,7 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
             completed=True,
         )
         try:
+            _safe_progress("admitting volume and ramp work")
             profile_result = start_profile_backfill(
                 catalog_instance_id=resolved_catalog_instance_id,
                 server_id=resolved_server_id,
@@ -3848,6 +4127,7 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
             logger.exception("lumae_analysis could not start background profile enrichment")
             profile_result = {"queued": False, "coalesced": False, "error": str(exc)}
         try:
+            _safe_progress("admitting relationship work")
             relationship_result = start_relationship_preparation(
                 catalog_instance_id=resolved_catalog_instance_id,
                 server_id=resolved_server_id,
@@ -4572,6 +4852,140 @@ def render_provider_identity_panel():
     """
 
 
+def _reconcile_duration(milliseconds):
+    if milliseconds is None:
+        return "running"
+    value = max(0, int(milliseconds or 0))
+    if value < 1000:
+        return f"{value} ms"
+    seconds = value / 1000
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    return f"{seconds / 60:.1f} min"
+
+
+def _reconcile_event_summary(event):
+    summary = event.get("summary") or {}
+    if isinstance(summary, str):
+        try:
+            summary = json.loads(summary)
+        except (TypeError, ValueError):
+            summary = {}
+    parts = []
+    for key in (
+        "songs_seen",
+        "processed",
+        "generation",
+        "changes",
+        "album_count",
+        "artist_count",
+        "track_count",
+    ):
+        if key in summary:
+            parts.append(f"{key.replace('_', ' ')}: {escape(str(summary[key]))}")
+    return "; ".join(parts) or escape(str(summary.get("status") or event.get("phase") or "complete"))
+
+
+def render_reconcile_status_panel():
+    try:
+        snapshot = read_reconcile_status(get_db())
+    except Exception:
+        db = get_db()
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not render reconcile status")
+        return """
+          <section class="lumae-panel" aria-label="Background reconcile status">
+            <span class="lumae-section-priority lumae-section-advanced">Scheduler</span>
+            <h3>Background reconcile status is unavailable</h3>
+            <p class="lumae-help">The operational status tables could not be read. Published
+              Lumae data is unaffected; restart AudioMuse after verifying the plugin migration.</p>
+          </section>
+        """
+    control = snapshot["control"]
+    mode = control.get("mode") or "unknown"
+    cadence = {
+        "active": "Every minute while work is ready",
+        "waiting": "Every five minutes while AudioMuse analysis finishes",
+        "backoff": f"Retry schedule: {control.get('cron_expr') or 'adaptive'}",
+        "idle": "Hourly safety sweep at :11",
+        "paused": "Paused; hourly safety check at :11",
+    }.get(mode, "Schedule unavailable")
+    pending = snapshot.get("pending") or {}
+    pending_html = "".join(
+        f"<li><strong>{int(count):,}</strong> {escape(str(label))}</li>"
+        for label, count in pending.items()
+    ) or "<li><strong>0</strong> pending actions</li>"
+    events = snapshot.get("events") or []
+    running = next((event for event in events if event.get("status") == "running"), None)
+    running_html = ""
+    if running:
+        progress = ""
+        if running.get("progress_total") is not None:
+            progress = (
+                f" · {int(running.get('progress_current') or 0):,}/"
+                f"{int(running.get('progress_total') or 0):,}"
+            )
+        running_html = f"""
+          <div class="lumae-notice lumae-notice-info" role="status">
+            <strong>{escape(str(running.get('action') or 'background work').replace('_', ' ').title())}</strong>
+            <span>{escape(str(running.get('phase') or 'running'))}{progress}; attempt
+              {int(running.get('attempt') or 1)}.</span>
+          </div>
+        """
+    rows = []
+    for event in events:
+        if event.get("status") == "running":
+            continue
+        retry = (
+            f"; retry {escape(reconcile_iso(event.get('next_retry_at')) or '')}"
+            if event.get("next_retry_at")
+            else ""
+        )
+        error = (
+            f'<div class="lumae-help">{escape(str(event.get("last_error")))}</div>'
+            if event.get("last_error")
+            else ""
+        )
+        rows.append(
+            f"""
+            <li>
+              <strong>{escape(str(event.get('action') or '').replace('_', ' ').title())}</strong>
+              — {escape(str(event.get('status') or 'unknown'))},
+              {_reconcile_duration(event.get('duration_ms'))}{retry}
+              <div class="lumae-help">{_reconcile_event_summary(event)}</div>
+              {error}
+            </li>
+            """
+        )
+    journal_html = "".join(rows) or "<li>No meaningful background actions recorded yet.</li>"
+    next_retry = (
+        f"<p class=\"lumae-help\">Next retry: "
+        f"{escape(reconcile_iso(control.get('next_retry_at')) or '')}.</p>"
+        if control.get("next_retry_at")
+        else ""
+    )
+    refresh_script = """
+      <script>setTimeout(()=>{const u=new URL(location.href);u.searchParams.set(
+        "_lumae_reconcile_refresh",Date.now().toString());location.replace(u.href)},5000)</script>
+    """ if running else ""
+    return f"""
+      <section class="lumae-panel" aria-label="Background reconcile status">
+        <span class="lumae-section-priority lumae-section-advanced">Scheduler</span>
+        <h3>Background reconcile is {escape(str(mode).replace('_', ' '))}</h3>
+        <p class="lumae-action-copy">{escape(cadence)}. AudioMuse may label these tasks
+          “Songs analyzed: 0”; the action and phase below are Lumae’s authoritative status.</p>
+        {running_html}
+        <ul class="lumae-help">{pending_html}</ul>
+        {next_retry}
+        <details>
+          <summary>Recent meaningful background actions</summary>
+          <ul>{journal_html}</ul>
+        </details>
+        {refresh_script}
+      </section>
+    """
+
+
 def render_settings(message=None, error=None):
     batch_size = configured_backfill_limit()
     paused = maintenance_paused()
@@ -4596,6 +5010,7 @@ def render_settings(message=None, error=None):
     readiness_html = render_v3_readiness_panel()
     relationships_html = render_relationship_status_panel()
     catalogue_html, waveform_html = render_source_preparation_sections(batch_size)
+    reconcile_html = render_reconcile_status_panel()
     maintenance_html = f"""
       <section class="lumae-panel" aria-label="Background maintenance control">
         <span class="lumae-section-priority">Safety control</span>
@@ -5010,6 +5425,7 @@ def render_settings(message=None, error=None):
           </header>
 
           {maintenance_html}
+          {reconcile_html}
           {catalogue_html}
           {identity_html}
           {readiness_html}
@@ -5032,6 +5448,7 @@ def settings():
             if action in ("pause_maintenance", "resume_maintenance"):
                 paused = action == "pause_maintenance"
                 set_setting("maintenance_paused", paused)
+                _safe_reconcile_schedule(get_db(), paused=paused)
                 message = (
                     "Background maintenance paused. Published Lumae data remains available."
                     if paused
