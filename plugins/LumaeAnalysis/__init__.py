@@ -580,6 +580,12 @@ def _reconcile_result_summary(result):
         "status",
         "songs_seen",
         "processed",
+        "attempted",
+        "ready",
+        "failed",
+        "skipped",
+        "already_ready",
+        "promoted",
         "queued_next",
         "queued_profiles",
         "generation",
@@ -648,6 +654,11 @@ def _run_reconcile_action(
             return result
         if result_status in ("failed", "failure", "error"):
             raise RuntimeError(str((result or {}).get("error") or result_status))
+        # Track failures do not mean the batch itself crashed. Keep its normal
+        # retry lifecycle, but persist a warning verdict for the journal.
+        has_track_failures = (
+            action == "profile_backfill" and int((result or {}).get("failed") or 0) > 0
+        )
         try:
             update_work_retry(
                 db,
@@ -660,7 +671,7 @@ def _run_reconcile_action(
                 db,
                 event_id,
                 "success",
-                phase="complete",
+                phase="completed with warnings" if has_track_failures else "complete",
                 summary=_reconcile_result_summary(result),
             )
         except Exception:
@@ -2990,6 +3001,7 @@ def analyze_tracks_task(
             reason="Lumae background maintenance is paused",
         )
         return {
+            "attempted": 0,
             "ready": 0,
             "already_ready": 0,
             "promoted": 0,
@@ -3017,6 +3029,7 @@ def analyze_tracks_task(
             except Exception:
                 logger.exception("lumae_analysis could not migrate a legacy backfill job")
         return {
+            "attempted": 0,
             "ready": 0,
             "already_ready": 0,
             "promoted": 0,
@@ -3025,6 +3038,7 @@ def analyze_tracks_task(
             "deferred": len(ids),
         }
     results = []
+    attempted = 0
     for index, track_id in enumerate(ids):
         _safe_progress("analyzing volume and ramps", current=index, total=len(ids))
         if priority == "background" and catalog_instance_id:
@@ -3050,6 +3064,7 @@ def analyze_tracks_task(
         if disposition != "analyze":
             results.append({"track_id": track_id, "status": disposition})
             continue
+        attempted += 1
         results.append(
             analyze_one_track(
                 track_id,
@@ -3061,6 +3076,7 @@ def analyze_tracks_task(
         if priority == "background" and catalog_instance_id:
             heartbeat_profile_backfill(catalog_instance_id)
     summary = {
+        "attempted": attempted,
         "ready": sum(1 for result in results if result["status"] == "ready"),
         "already_ready": sum(
             1 for result in results if result["status"] == "already_ready"
@@ -4869,6 +4885,12 @@ def _reconcile_event_summary(event):
     for key in (
         "songs_seen",
         "processed",
+        "attempted",
+        "ready",
+        "failed",
+        "skipped",
+        "already_ready",
+        "promoted",
         "generation",
         "changes",
         "album_count",
@@ -4930,6 +4952,9 @@ def render_reconcile_status_panel():
     for event in events:
         if event.get("status") == "running":
             continue
+        status = str(event.get("status") or "unknown")
+        if status == "success" and event.get("phase") == "completed with warnings":
+            status = "completed with warnings"
         retry = (
             f"; retry {escape(reconcile_iso(event.get('next_retry_at')) or '')}"
             if event.get("next_retry_at")
@@ -4944,7 +4969,7 @@ def render_reconcile_status_panel():
             f"""
             <li>
               <strong>{escape(str(event.get('action') or '').replace('_', ' ').title())}</strong>
-              — {escape(str(event.get('status') or 'unknown'))},
+              — {escape(status)},
               {_reconcile_duration(event.get('duration_ms'))}{retry}
               <div class="lumae-help">{_reconcile_event_summary(event)}</div>
               {error}

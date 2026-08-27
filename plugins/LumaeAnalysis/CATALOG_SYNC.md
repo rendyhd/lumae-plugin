@@ -10,7 +10,12 @@ failures back off for 1, 5, 15, then 60 minutes, and current or paused systems
 run one hourly safety sweep at minute 11. Every work admission re-arms the
 minute schedule in the same PostgreSQL transaction. Lumae settings show the
 current action and a bounded 25-event-per-source journal; idle sweeps do not
-enter that journal.
+enter that journal. Waveform batches retain attempted, ready, failed, skipped,
+already-ready, and promoted track counts. Attempted counts tracks dispatched
+for per-track processing, excluding already-ready and promoted tracks. Batches
+with track failures display "completed with warnings" while preserving normal
+batch completion and retry behavior; individual failures remain recorded on
+their profiles.
 
 Version 1.1.7 uses only AudioMuse's public plugin API for initial root tasks.
 Follow-up work is stored in plugin-owned PostgreSQL state and a one-minute

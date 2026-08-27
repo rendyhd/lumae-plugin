@@ -3546,6 +3546,7 @@ def test_backfill_uses_configured_batch_size(monkeypatch):
     monkeypatch.setattr(mod, "find_backfill_ids", lambda limit: seen_limits.append(limit) or [])
 
     assert mod.backfill_missing_profiles() == {
+        "attempted": 0,
         "ready": 0,
         "already_ready": 0,
         "promoted": 0,
@@ -3948,6 +3949,7 @@ def test_legacy_oversized_background_job_is_drained_into_bounded_chain(monkeypat
 
     result = mod.analyze_tracks_task(ids, "catalog-a", "server-a")
 
+    assert result["attempted"] == 0
     assert result["deferred"] == len(ids)
     assert calls[0][0:3] == ("release", ids, "catalog-a")
     assert "bounded 0.8.1" in calls[0][3]
@@ -3993,6 +3995,7 @@ def test_background_task_skips_ready_and_interactively_promoted_tracks(monkeypat
     result = mod.analyze_tracks_task(["ready", "promoted"], "catalog-a", "server-a")
 
     assert result == {
+        "attempted": 0,
         "ready": 0,
         "already_ready": 1,
         "promoted": 1,
@@ -4000,6 +4003,71 @@ def test_background_task_skips_ready_and_interactively_promoted_tracks(monkeypat
         "skipped": 0,
         "deferred": 0,
     }
+
+
+def test_track_batch_counts_attempts_separately_from_reused_and_promoted_tracks(monkeypatch):
+    mod = load_plugin()
+    attempted = []
+    outcomes = {"good": "ready", "bad": "failed", "missing": "skipped_no_file"}
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "_safe_progress", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "heartbeat_profile_backfill", lambda _catalog_id: None)
+    monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
+    monkeypatch.setattr(
+        mod,
+        "profile_task_disposition",
+        lambda track_id, **_kwargs: {"cached": "already_ready", "playing": "promoted"}.get(
+            track_id, "analyze"
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "analyze_one_track",
+        lambda track_id, **_kwargs: attempted.append(track_id)
+        or {"track_id": track_id, "status": outcomes[track_id]},
+    )
+
+    result = mod.analyze_tracks_task(
+        ["good", "bad", "missing", "cached", "playing"], "catalog-a", "server-a"
+    )
+
+    assert attempted == ["good", "bad", "missing"]
+    assert result == {
+        "attempted": 3,
+        "ready": 1,
+        "failed": 1,
+        "skipped": 1,
+        "already_ready": 1,
+        "promoted": 1,
+        "deferred": 0,
+    }
+
+
+def test_track_batch_does_not_count_tracks_paused_before_dispatch_as_attempted(monkeypatch):
+    mod = load_plugin()
+    pause_checks = iter([False, False, True])
+    released = []
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: next(pause_checks))
+    monkeypatch.setattr(mod, "_safe_progress", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "heartbeat_profile_backfill", lambda _catalog_id: None)
+    monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
+    monkeypatch.setattr(mod, "profile_task_disposition", lambda *_args, **_kwargs: "analyze")
+    monkeypatch.setattr(
+        mod,
+        "analyze_one_track",
+        lambda track_id, **_kwargs: {"track_id": track_id, "status": "ready"},
+    )
+    monkeypatch.setattr(
+        mod, "release_pending", lambda ids, **_kwargs: released.extend(ids)
+    )
+
+    result = mod.analyze_tracks_task(["a", "b", "c"], "catalog-a", "server-a")
+
+    assert result["attempted"] == 1
+    assert result["ready"] == 1
+    assert result["failed"] == 0
+    assert result["skipped"] == 2
+    assert released == ["b", "c"]
 
 
 def test_profile_enqueue_failure_releases_pending_rows_for_retry(monkeypatch):
@@ -4353,6 +4421,7 @@ def test_maintenance_pause_blocks_background_work_but_preserves_control_state(
         ["track-a", "track-b"],
         catalog_instance_id="catalog-a",
     ) == {
+        "attempted": 0,
         "ready": 0,
         "already_ready": 0,
         "promoted": 0,
@@ -4595,6 +4664,120 @@ def test_reconcile_failure_records_backoff_and_propagates(monkeypatch):
     assert calls[1][0] == "event"
     assert calls[1][1]["phase"] == "failed"
     assert calls[1][1]["next_retry_at"] == "later"
+
+
+@pytest.mark.parametrize("failed_count", [0, 1, 2])
+@pytest.mark.parametrize("more_work", [False, True])
+def test_reconcile_profile_batch_reports_track_outcomes_without_batch_retry(
+    monkeypatch, failed_count, more_work
+):
+    mod = load_plugin()
+    db = object()
+    ids = ["track-a", "track-b"]
+    failed_ids = set(ids[:failed_count])
+    batches = iter([ids, ["track-c"] if more_work else []])
+    events = []
+    retries = []
+    states = []
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "begin_event", lambda *_args, **_kwargs: 9)
+    monkeypatch.setattr(mod, "progress_event", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "claim_profile_backfill_batch", lambda _catalog_id: True)
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: settings_catalog_source())
+    monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda _catalog_id: 0)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 2)
+    monkeypatch.setattr(mod, "find_backfill_ids", lambda *_args, **_kwargs: next(batches))
+    monkeypatch.setattr(mod, "mark_pending", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "heartbeat_profile_backfill", lambda _catalog_id: None)
+    monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
+    monkeypatch.setattr(mod, "profile_task_disposition", lambda *_args, **_kwargs: "analyze")
+    monkeypatch.setattr(
+        mod,
+        "analyze_one_track",
+        lambda track_id, **_kwargs: {
+            "track_id": track_id,
+            "status": "failed" if track_id in failed_ids else "ready",
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "update_profile_backfill_state",
+        lambda *args, **_kwargs: states.append(args[2]),
+    )
+    monkeypatch.setattr(
+        mod, "update_work_retry", lambda *_args, **kwargs: retries.append(kwargs)
+    )
+    monkeypatch.setattr(
+        mod,
+        "finish_event",
+        lambda _db, event_id, status, **kwargs: events.append(
+            {"event_id": event_id, "status": status, "action": "profile_backfill", **kwargs}
+        ),
+    )
+
+    result = mod._run_reconcile_action(
+        db, "profile_backfill", "server-a", "catalog-a", "catalog-a", 2,
+        mod.profile_backfill_task, "server-a", "catalog-a",
+    )
+
+    expected_state = "queued" if more_work else "complete"
+    assert result["status"] == expected_state
+    assert states == [expected_state]
+    assert retries == [{"work_key": "catalog-a", "failed": False}]
+    assert len(events) == 1
+    event = events[0]
+    # The batch completed normally, even when every individual track failed.
+    assert event["status"] == "success"
+    assert event["phase"] == ("completed with warnings" if failed_count else "complete")
+    assert event["summary"] == {
+        "status": expected_state,
+        "processed": 2,
+        "attempted": 2,
+        "ready": 2 - failed_count,
+        "failed": failed_count,
+        "skipped": 0,
+        "already_ready": 0,
+        "promoted": 0,
+        "queued_next": False,
+    }
+    monkeypatch.setattr(
+        mod,
+        "read_reconcile_status",
+        lambda _db: {
+            "control": {"mode": "active" if more_work else "idle"},
+            "events": [{**event, "summary": json.dumps(event["summary"])}],
+        },
+    )
+
+    body = mod.render_reconcile_status_panel()
+
+    assert "attempted: 2" in body
+    assert f"ready: {2 - failed_count}" in body
+    assert f"failed: {failed_count}" in body
+    assert "skipped: 0" in body
+    assert "already ready: 0" in body
+    assert "promoted: 0" in body
+    assert ("completed with warnings" in body) is bool(failed_count)
+
+
+def test_reconcile_track_summary_stays_bounded_and_escapes_display_values():
+    mod = load_plugin()
+    result = {
+        "attempted": 2,
+        "ready": 1,
+        "failed": 1,
+        "skipped": 0,
+        "track_ids": ["private-track"],
+        "file_path": "/private/library/track.flac",
+    }
+
+    summary = mod._reconcile_result_summary(result)
+
+    assert summary == {"attempted": 2, "ready": 1, "failed": 1, "skipped": 0}
+    body = mod._reconcile_event_summary({"summary": {**summary, "ready": "<unsafe>"}})
+    assert "ready: &lt;unsafe&gt;" in body
+    assert "<unsafe>" not in body
 
 
 def test_reconcile_scopes_idle_checks_to_active_audio_muse_server(monkeypatch):
