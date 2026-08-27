@@ -53,6 +53,11 @@ The plugin settings page reports the real action, phase, duration, retry, and a
 bounded journal of meaningful work. AudioMuse may still label its generic task
 row `Songs analyzed: 0`; that core-owned label is not used by Lumae status.
 
+Settings status updates in the background without reloading the page. One
+request updates the status panels every five seconds during active work and
+every thirty seconds while idle; hidden tabs do not poll. Unsaved batch sizes,
+expanded details, and the current scroll position are preserved.
+
 ### AudioMuse 3.4 queue compatibility in 1.1.7
 
 Lumae no longer imports RQ queues, jobs, dependencies, or retry objects from

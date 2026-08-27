@@ -4,7 +4,7 @@ import os
 from datetime import datetime, timezone
 from html import escape
 
-from flask import Blueprint, Response, g, jsonify, request
+from flask import Blueprint, Response, g, jsonify, request, url_for
 
 from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
 
@@ -62,6 +62,7 @@ from .catalog_enrichment import (
 from .catalog_readiness import CONTRACT_REVISION, v3_release_readiness
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .database_state import collect_database_state, render_database_state
+from .settings_ui import SETTINGS_STATUS_SCRIPT
 from .provider_identity_guard import (
     TRANSITION_BLOCKER,
     complete_projection_reconcile,
@@ -4245,6 +4246,7 @@ def _render_basic_source_analysis_panel():
         cards.append(
             f"""
             <article class="lumae-source-card"
+              data-lumae-source="{escape(str(source['catalog_instance_id']))}"
               aria-label="AudioMuse source analysis for {escape(str(source.get('name') or source['server_id']))}">
               <header class="lumae-source-header">
                 <div>
@@ -4368,6 +4370,7 @@ def render_v3_readiness_panel():
         cards.append(
             f"""
             <article class="lumae-source-card"
+              data-lumae-source="{escape(str(source['catalog_instance_id']))}"
               aria-label="AudioMuse source analysis for {escape(str(source.get('name') or source['server_id']))}">
               <header class="lumae-source-header">
                 <div>
@@ -4419,7 +4422,7 @@ def render_relationship_status_panel():
     if not sources:
         return ""
     cards = []
-    auto_refresh = False
+    active_work = False
     for source in sources:
         catalog_instance_id = source["catalog_instance_id"]
         try:
@@ -4444,7 +4447,7 @@ def render_relationship_status_panel():
             and int(state.get("algorithm_version") or 0) == RELATIONSHIP_ALGORITHM_VERSION
         )
         active = status in ("queued", "running")
-        auto_refresh = auto_refresh or active
+        active_work = active_work or active
         albums = int(state.get("album_count") or 0)
         artists = int(state.get("artist_count") or 0)
         if current:
@@ -4499,6 +4502,7 @@ def render_relationship_status_panel():
         cards.append(
             f"""
             <article class="lumae-source-card"
+              data-lumae-source="{escape(str(catalog_instance_id))}"
               aria-label="Similar albums and artists for {escape(str(source.get('name') or source['server_id']))}">
               <header class="lumae-source-header">
                 <div>
@@ -4525,20 +4529,14 @@ def render_relationship_status_panel():
             """
         )
     return f"""
-      <section class="lumae-panel" aria-label="Similar albums and artists status">
+      <section class="lumae-panel" aria-label="Similar albums and artists status"
+        data-lumae-active="{str(active_work).lower()}">
         <span class="lumae-section-priority lumae-section-optional">4 - Automatic background</span>
         <h3>4. Similar albums &amp; artists</h3>
         <p class="lumae-action-copy">The plugin runs Lumae’s own album and artist relationship
           algorithm from the published library and AudioMuse source inputs. It automatically
           rebuilds when either input generation changes.</p>
         {''.join(cards)}
-        {(
-            '<script>setTimeout(()=>{const u=new URL(location.href);'
-            'u.searchParams.set("_lumae_relationship_refresh",Date.now().toString());'
-            'location.replace(u.href)},5000)</script>'
-            if auto_refresh
-            else ""
-        )}
       </section>
     """
 
@@ -4559,7 +4557,7 @@ def render_source_preparation_sections(batch_size):
         return "", ""
     catalogue_cards = []
     waveform_cards = []
-    auto_refresh = False
+    active_work = False
     paused = maintenance_paused()
     for source in sources:
         catalog_instance_id = source["catalog_instance_id"]
@@ -4577,7 +4575,7 @@ def render_source_preparation_sections(batch_size):
         queueable = int(counts["needs_analysis"])
         preparation_active = preparation_is_active(state)
         backfill_active = profile_backfill_is_active(backfill)
-        auto_refresh = auto_refresh or preparation_active or backfill_active
+        active_work = active_work or preparation_active or backfill_active
         catalog_status = str(source["catalog"]["status"] or "not initialized")
         projection_status = str(source["analysis"]["status"] or "not initialized")
         catalogue_ready = catalog_status == "complete" and published_tracks > 0
@@ -4656,6 +4654,7 @@ def render_source_preparation_sections(batch_size):
         catalogue_cards.append(
             f"""
             <article class="lumae-source-card"
+              data-lumae-source="{escape(str(catalog_instance_id))}"
               aria-label="Catalogue readiness for {escape(str(source['name']))}">
               <header class="lumae-source-header">
                 <div>
@@ -4696,6 +4695,7 @@ def render_source_preparation_sections(batch_size):
         waveform_cards.append(
             f"""
             <article class="lumae-source-card"
+              data-lumae-source="{escape(str(catalog_instance_id))}"
               aria-label="Volume and ramp status for {escape(str(source['name']))}">
               <header class="lumae-source-header">
                 <div>
@@ -4749,20 +4749,14 @@ def render_source_preparation_sections(batch_size):
       </section>
     """
     waveform_html = f"""
-      <section class="lumae-panel" aria-label="Volume and ramp status">
+      <section class="lumae-panel" aria-label="Volume and ramp status"
+        data-lumae-active="{str(active_work).lower()}">
         <span class="lumae-section-priority lumae-section-optional">3 - Automatic background</span>
         <h3>3. Volume &amp; ramp status</h3>
         <p class="lumae-action-copy">Loudness profiles normalize volume and MixRamp profiles power
           SmoothFade. Their progress is independent from library readiness, AudioMuse source
           analysis, and the similar-album/artist relationship build.</p>
         {''.join(waveform_cards)}
-        {(
-            '<script>setTimeout(()=>{const u=new URL(location.href);'
-            'u.searchParams.set("_lumae_refresh",Date.now().toString());'
-            'location.replace(u.href)},5000)</script>'
-            if auto_refresh
-            else ""
-        )}
       </section>
     """
     return catalogue_html, waveform_html
@@ -4964,12 +4958,9 @@ def render_reconcile_status_panel():
         if control.get("next_retry_at")
         else ""
     )
-    refresh_script = """
-      <script>setTimeout(()=>{const u=new URL(location.href);u.searchParams.set(
-        "_lumae_reconcile_refresh",Date.now().toString());location.replace(u.href)},5000)</script>
-    """ if running else ""
     return f"""
-      <section class="lumae-panel" aria-label="Background reconcile status">
+      <section class="lumae-panel" aria-label="Background reconcile status"
+        data-lumae-active="{str(bool(running)).lower()}">
         <span class="lumae-section-priority lumae-section-advanced">Scheduler</span>
         <h3>Background reconcile is {escape(str(mode).replace('_', ' '))}</h3>
         <p class="lumae-action-copy">{escape(cadence)}. AudioMuse may label these tasks
@@ -4981,9 +4972,27 @@ def render_reconcile_status_panel():
           <summary>Recent meaningful background actions</summary>
           <ul>{journal_html}</ul>
         </details>
-        {refresh_script}
       </section>
     """
+
+
+def render_settings_status_panels(batch_size):
+    readiness_html = render_v3_readiness_panel()
+    relationships_html = render_relationship_status_panel()
+    catalogue_html, waveform_html = render_source_preparation_sections(batch_size)
+    return {
+        "readiness": readiness_html,
+        "relationships": relationships_html,
+        "catalogue": catalogue_html,
+        "waveform": waveform_html,
+        "reconcile": render_reconcile_status_panel(),
+        "identity": render_provider_identity_panel(),
+    }
+
+
+@bp.get("/settings/status")
+def settings_status():
+    return _private_json({"panels": render_settings_status_panels(configured_backfill_limit())})
 
 
 def render_settings(message=None, error=None):
@@ -5007,10 +5016,13 @@ def render_settings(message=None, error=None):
         if error
         else ""
     )
-    readiness_html = render_v3_readiness_panel()
-    relationships_html = render_relationship_status_panel()
-    catalogue_html, waveform_html = render_source_preparation_sections(batch_size)
-    reconcile_html = render_reconcile_status_panel()
+    panels = {
+        name: (
+            f'<div data-lumae-status-panel="{name}"{" hidden" if not html.strip() else ""}>'
+            f'{html}</div>'
+        )
+        for name, html in render_settings_status_panels(batch_size).items()
+    }
     maintenance_html = f"""
       <section class="lumae-panel" aria-label="Background maintenance control">
         <span class="lumae-section-priority">Safety control</span>
@@ -5025,7 +5037,6 @@ def render_settings(message=None, error=None):
         </form>
       </section>
     """
-    identity_html = render_provider_identity_panel()
     return render_page(
         f"""
         <style>
@@ -5407,7 +5418,8 @@ def render_settings(message=None, error=None):
           }}
         </style>
 
-        <section class="lumae-analysis-settings" aria-label="Lumae analysis settings">
+        <section class="lumae-analysis-settings" aria-label="Lumae analysis settings"
+          data-status-url="{escape(url_for('lumae_analysis.settings_status'))}">
           {message_html}
           {error_html}
 
@@ -5417,6 +5429,8 @@ def render_settings(message=None, error=None):
             <p>Library readiness controls app sync. AudioMuse supplies raw source analysis;
               volume and ramp profiles improve playback; Lumae then prepares similar albums and
               artists with its own algorithm. Ready never means a completed but empty library.</p>
+            <p class="lumae-help" data-lumae-refresh-notice role="status">Status updates
+              automatically without reloading this page.</p>
             <div class="lumae-actions">
               <a class="lumae-button lumae-button-secondary" href="database-state">
                 View database state
@@ -5425,14 +5439,15 @@ def render_settings(message=None, error=None):
           </header>
 
           {maintenance_html}
-          {reconcile_html}
-          {catalogue_html}
-          {identity_html}
-          {readiness_html}
-          {waveform_html}
-          {relationships_html}
+          {panels['reconcile']}
+          {panels['catalogue']}
+          {panels['identity']}
+          {panels['readiness']}
+          {panels['waveform']}
+          {panels['relationships']}
           {render_collections_settings_panel()}
         </section>
+        {SETTINGS_STATUS_SCRIPT}
         """,
         title="Lumae Analysis",
     )

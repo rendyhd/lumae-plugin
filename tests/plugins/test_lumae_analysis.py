@@ -4629,7 +4629,8 @@ def test_reconcile_scopes_idle_checks_to_active_audio_muse_server(monkeypatch):
     assert {server_id for _name, server_id in seen} == {"server-b"}
 
 
-def test_reconcile_status_panel_reports_real_work_and_escapes_errors(monkeypatch):
+@pytest.mark.parametrize("running", [False, True])
+def test_reconcile_status_panel_reports_real_work_and_escapes_errors(monkeypatch, running):
     mod = load_plugin()
     monkeypatch.setattr(mod, "get_db", lambda: object())
     monkeypatch.setattr(
@@ -4656,7 +4657,7 @@ def test_reconcile_status_panel_reports_real_work_and_escapes_errors(monkeypatch
                     "last_error": "<boom>",
                     "next_retry_at": None,
                 }
-            ],
+            ] + ([{"action": "catalog_prepare", "status": "running"}] if running else []),
         },
     )
 
@@ -4668,6 +4669,8 @@ def test_reconcile_status_panel_reports_real_work_and_escapes_errors(monkeypatch
     assert "processed: 2" in body
     assert "&lt;boom&gt;" in body
     assert "Songs analyzed: 0" in body
+    assert f'data-lumae-active="{str(running).lower()}"' in body
+    assert "<script>" not in body
 
 
 def test_worker_attestation_rejects_a_stale_audio_muse_worker(monkeypatch):
@@ -7425,7 +7428,8 @@ def test_settings_page_reports_lumae_relationship_generation_separately(monkeypa
     assert "Built from library generation 7 of 7" in compact
 
 
-def test_relationship_status_refreshes_while_automatic_build_runs(monkeypatch):
+@pytest.mark.parametrize("status, active", [("running", "true"), ("complete", "false")])
+def test_relationship_status_reports_activity_without_reloading(monkeypatch, status, active):
     mod = load_plugin()
     source = {
         **readiness_source(),
@@ -7438,7 +7442,7 @@ def test_relationship_status_refreshes_while_automatic_build_runs(monkeypatch):
         mod,
         "relationship_status",
         lambda _db, _catalog_id: {
-            "status": "running",
+            "status": status,
             "schema_version": mod.RELATIONSHIP_SCHEMA_VERSION,
             "algorithm_version": mod.RELATIONSHIP_ALGORITHM_VERSION,
             "source_catalog_generation": 6,
@@ -7451,9 +7455,11 @@ def test_relationship_status_refreshes_while_automatic_build_runs(monkeypatch):
 
     body = mod.render_relationship_status_panel()
 
-    assert "Similar album and artist relationships are being prepared automatically" in body
-    assert "currently published relationship generation" in body
-    assert "_lumae_relationship_refresh" in body
+    if status == "running":
+        assert "Similar album and artist relationships are being prepared automatically" in body
+        assert "currently published relationship generation" in body
+    assert f'data-lumae-active="{active}"' in body
+    assert "<script>" not in body
 
 
 def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypatch):
@@ -8192,8 +8198,10 @@ def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
     assert "Ready for app sync: 100 Navidrome tracks are published" in body
     assert "do not block library sync, AudioMuse source analysis, or Lumae relationships" in compact
     assert "location.reload" not in body
-    assert 'u.searchParams.set("_lumae_refresh",Date.now().toString())' in body
-    assert "location.replace(u.href)" in body
+    assert "location.replace" not in body
+    assert 'data-lumae-active="true"' in body
+    assert 'data-status-url="/settings/status"' in body
+    assert body.count("<script>") == 1
     assert (
         body.index("1. Library status")
         < body.index("2. AudioMuse source analysis")
@@ -8238,10 +8246,60 @@ def test_settings_page_recovers_transaction_after_identity_status_query_fails(mo
     monkeypatch.setattr(mod, "render_collections_settings_panel", render_collections)
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
 
-    body = mod.render_settings()
+    body = plugin_client(mod).get("/settings").get_data(as_text=True)
 
     assert db.rollbacks == 2
     assert 'id="collections-recovered"' in body
+
+
+def test_settings_status_returns_private_fragments_without_rendering_page(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 3)
+    monkeypatch.setattr(mod, "render_v3_readiness_panel", lambda: "<p>Analysis ready</p>")
+    monkeypatch.setattr(mod, "render_relationship_status_panel", lambda: "<p>Matching albums</p>")
+    monkeypatch.setattr(
+        mod, "render_source_preparation_sections",
+        lambda size: ("<p>Library ready</p>", f"<p>Batch size: {size}</p>"),
+    )
+    monkeypatch.setattr(mod, "render_reconcile_status_panel", lambda: "<p>Idle</p>")
+    monkeypatch.setattr(mod, "render_provider_identity_panel", lambda: "")
+    monkeypatch.setattr(mod, "render_page", lambda *_args, **_kwargs: pytest.fail("full page"))
+    monkeypatch.setattr(mod, "set_setting", lambda *_args: pytest.fail("settings write"))
+    monkeypatch.setattr(mod, "enqueue", lambda *_args, **_kwargs: pytest.fail("queued work"))
+
+    response = plugin_client(mod).get("/settings/status")
+
+    assert response.status_code == 200
+    assert response.headers["Cache-Control"] == "private, no-store"
+    assert response.headers["Vary"] == "Authorization, Cookie"
+    assert response.get_json() == {"panels": {
+        "readiness": "<p>Analysis ready</p>",
+        "relationships": "<p>Matching albums</p>",
+        "catalogue": "<p>Library ready</p>",
+        "waveform": "<p>Batch size: 3</p>",
+        "reconcile": "<p>Idle</p>",
+        "identity": "",
+    }}
+
+
+def test_settings_polling_url_respects_plugin_mount_prefix(monkeypatch):
+    mod = load_plugin()
+    panels = dict.fromkeys(
+        ("readiness", "relationships", "catalogue", "waveform", "reconcile", "identity"), "",
+    )
+    monkeypatch.setattr(mod, "render_settings_status_panels", lambda _size: panels)
+    monkeypatch.setattr(mod, "render_collections_settings_panel", lambda: "")
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+    app = Flask(__name__)
+    app.register_blueprint(mod.bp, url_prefix="/plugins/lumae_analysis")
+
+    body = app.test_client().get("/plugins/lumae_analysis/settings").get_data(as_text=True)
+
+    assert 'data-status-url="/plugins/lumae_analysis/settings/status"' in body
+    assert 'data-lumae-status-panel="identity" hidden' in body
+    assert app.test_client().get("/plugins/lumae_analysis/settings/status").get_json() == {
+        "panels": panels,
+    }
 
 
 def test_settings_page_never_labels_a_completed_empty_catalogue_ready(monkeypatch):
