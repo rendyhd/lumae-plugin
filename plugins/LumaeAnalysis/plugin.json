@@ -94,8 +94,8 @@
       "min_core_version": "3.2.0",
       "changelog": "Reduce reconcile dashboard noise with adaptive active, waiting, retry, and hourly-idle schedules; add bounded Lumae-owned action progress and history; and back off failed work independently without losing restart recovery.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/codex/test-lumae-analysis-1.1.8/dist/lumae_analysis/lumae_analysis_1.1.8.zip",
+      "checksum": "6ca08df157edac114d923b68c6326019"
     },
     {
       "version": "1.1.7",

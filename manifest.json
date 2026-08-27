@@ -5,7 +5,7 @@
       "name": "Lumae Analysis",
       "author": "Lumae",
       "description": "Mirrors supported Navidrome catalogues and prepares Lumae volume, SmoothFade, album-similarity, and artist-similarity data away from the phone.",
-      "pluginUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/plugins/LumaeAnalysis/plugin.json"
+      "pluginUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/codex/test-lumae-analysis-1.1.8/plugins/LumaeAnalysis/plugin.json"
     }
   ]
 }
