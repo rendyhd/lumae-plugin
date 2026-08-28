@@ -1,0 +1,57 @@
+{
+  "schema_version": 1,
+  "catalog_instance_id": "catalog-a",
+  "track_id": "track-a",
+  "media_revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "representation_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "source": {
+    "sample_rate": 48000,
+    "channel_layout": "stereo",
+    "decoded_frames": 10003,
+    "decoder": "pcm-input-v1",
+    "padding": "decoder-output-v1",
+    "timeline_verified": true
+  },
+  "measurement": {
+    "method": "lumae-weighted-power-48k-k2-v1",
+    "sample_rate": 48000,
+    "channel_rule": "mean-power",
+    "quantization": "s16le-centidb-v1",
+    "resampler": "pyav-16.1.0-swr-6.1.100"
+  },
+  "leading_silence": {
+    "frames": 403,
+    "method": "digital-zero",
+    "verified": true
+  },
+  "head": {
+    "origin_frame": 0,
+    "covered_frames": 10003,
+    "bin_count": 3,
+    "boundaries": [
+      0,
+      4800,
+      9600,
+      10003
+    ],
+    "valid": "Bw==",
+    "level_cdb": "sfbY9uH2",
+    "peak_cdb": "Mfgx+DH4"
+  },
+  "tail": {
+    "origin_frame": 0,
+    "covered_frames": 10003,
+    "bin_count": 3,
+    "boundaries": [
+      0,
+      4800,
+      9600,
+      10003
+    ],
+    "valid": "Bw==",
+    "level_cdb": "sfbY9uH2",
+    "peak_cdb": "Mfgx+DH4"
+  },
+  "profile_digest": "ade3d84c428655173cc7c1f99a4b2d60878f81013bbca9fab53aa619e8b3aac1"
+}

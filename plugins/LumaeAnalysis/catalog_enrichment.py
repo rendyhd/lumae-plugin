@@ -26,6 +26,8 @@ import numpy as np
 from plugin.api import get_db, table
 
 from .reconcile import arm_reconcile
+from .edge_profiles import opaque_revision
+from .edge_profile_store import edge_join
 
 from .catalog import (
     CatalogScanError,
@@ -319,8 +321,10 @@ def serialize_profile(
     analyzer_ver,
     analyzed_at,
     media_signature,
+    edge_profile=None,
 ):
-    return {
+    revision = opaque_revision(media_signature)
+    payload = {
         "track_id": str(track_id),
         "source": "waveform",
         "sample_rate": int(sample_rate),
@@ -330,8 +334,13 @@ def serialize_profile(
         "end_ramp": base64.b64encode(_bytes(end_ramp)).decode("ascii"),
         "analyzer_ver": int(analyzer_ver),
         "analyzed_at": _iso(analyzed_at),
-        "media_signature": media_signature,
+        "media_signature": revision,
+        "media_revision": revision,
     }
+    if (isinstance(edge_profile, dict) and edge_profile.get("track_id") == str(track_id)
+            and revision and edge_profile.get("media_revision") == revision):
+        payload["edge_profile"] = edge_profile
+    return payload
 
 
 def record_profile_change(cur, catalog_instance_id, track_id, status, payload=None):
@@ -378,11 +387,11 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
 def _profile_rows(cur, catalog_instance_id, after_track_id, limit):
     cur.execute(
         f"""
-        SELECT track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
-               analyzer_ver, analyzed_at, media_signature
-          FROM {t("source_profiles")}
-         WHERE catalog_instance_id=%s AND status='ready' AND track_id > %s
-         ORDER BY track_id LIMIT %s
+        SELECT p.track_id, p.sample_rate, p.duration_ms, p.ref_lufs, p.start_ramp, p.end_ramp,
+               p.analyzer_ver, p.analyzed_at, p.media_signature, edge.payload
+          FROM {t("source_profiles")} p {edge_join()}
+         WHERE p.catalog_instance_id=%s AND p.status='ready' AND p.track_id > %s
+         ORDER BY p.track_id LIMIT %s
         """,
         (catalog_instance_id, after_track_id or "", limit),
     )

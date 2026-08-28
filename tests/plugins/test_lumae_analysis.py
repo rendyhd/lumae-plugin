@@ -212,9 +212,157 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "scope": "shared",
             },
             "catalog_mirror": mod.catalog_capability(),
+            "edge_profiles": {
+                "schema_version": 1,
+                "method": mod.EDGE_METHOD,
+                "available": mod.edge_runtime_available(),
+                "enabled": mod.edge_profiles_enabled(),
+            },
         },
         "status": "ok",
     }
+
+
+@pytest.fixture
+def edge_publication_db(lumae_postgres_db, monkeypatch):
+    mod = load_plugin()
+    from plugins.LumaeAnalysis import catalog, catalog_enrichment, edge_profile_store
+    db = lumae_postgres_db
+    catalog.migrate_catalog(db)
+    cur = db.cursor()
+    cur.execute("""INSERT INTO plugin_lumae_analysis__catalog_sources
+        (catalog_instance_id, current_core_server_id, provider_type, server_name, is_default, rebind_status)
+        VALUES ('catalog-a','server-a','navidrome','Test',TRUE,'active')""")
+    cur.execute("""CREATE TABLE plugin_lumae_analysis__source_profiles (
+        catalog_instance_id TEXT NOT NULL, track_id TEXT NOT NULL, media_signature TEXT,
+        sample_rate INTEGER, duration_ms INTEGER, ref_lufs REAL, start_ramp BYTEA, end_ramp BYTEA,
+        analyzer_ver INTEGER, analyzed_at TEXT, status TEXT, last_error TEXT,
+        PRIMARY KEY (catalog_instance_id, track_id))""")
+    cur.execute("""INSERT INTO plugin_lumae_analysis__source_profiles
+        VALUES ('catalog-a','track-a','private/path:123:456',48000,209,-14,%s,%s,1,
+                '2026-08-28T00:00:00Z','ready',NULL)""", (b'\x01\x02\x03', b'\x04\x05\x06'))
+    cur.close()
+    catalog_enrichment.migrate_enrichment(db)
+    edge_profile_store.migrate_edge_profiles(db)
+    db.commit()
+    monkeypatch.setattr(mod, 'get_db', lambda: db)
+    monkeypatch.setattr(mod, 'resolve_profile_source', lambda **_: {'catalog_instance_id': 'catalog-a', 'server_id': 'server-a'})
+    return db
+
+
+def _edge_payload_for_job(job):
+    from plugins.LumaeAnalysis.edge_profiles import analyze_edge_blocks
+    return analyze_edge_blocks([np.zeros((1, 10003), dtype=np.float32)], 48000,
+        catalog_instance_id='catalog-a', track_id=job['track_id'], media_revision=job['media_revision'],
+        content_sha256='b' * 64, channel_layout='mono', timeline_verified=True)
+
+
+def test_edge_upgrade_publication_is_atomic_identical_on_all_routes_and_idempotent(edge_publication_db):
+    mod = load_plugin()
+    from plugins.LumaeAnalysis import catalog_enrichment as enrichment, edge_profile_store as store
+    db = edge_publication_db
+    jobs, ready = store.claim_edge_jobs(db, 'catalog-a', ['track-a', 'track-a'])
+    assert ready == [] and len(jobs) == 1
+    assert store.claim_edge_jobs(db, 'catalog-a', ['track-a']) == ([], [])
+    job = jobs[0]
+    payload = _edge_payload_for_job(job)
+    assert store.update_edge_job(db, 'catalog-a', job, 'running')
+    assert store.publish_edge_profile(db, 'catalog-a', job, payload, 'private/path:123:456')
+    assert not store.publish_edge_profile(db, 'catalog-a', job, payload, 'private/path:123:456')
+    direct = mod.serialize_ready_profile(mod.fetch_profile_rows(['track-a'], 'catalog-a')[0])
+    cur = db.cursor()
+    bootstrap = enrichment._profile_rows(cur, 'catalog-a', '', 100)[0]
+    cur.execute('SELECT payload FROM plugin_lumae_analysis__profile_changes ORDER BY seq')
+    deltas = [row[0] for row in cur.fetchall()]
+    assert deltas == [bootstrap] == [direct]
+    assert direct['edge_profile'] == payload
+    assert direct['media_signature'] == direct['media_revision'] == job['media_revision']
+    assert 'private/path' not in json.dumps(direct)
+    cur.execute('SELECT head_seq FROM plugin_lumae_analysis__profile_stream_state')
+    assert cur.fetchone()[0] == 1
+    assert store.claim_edge_jobs(db, 'catalog-a', ['track-a']) == ([], ['track-a'])
+    assert store.edge_backfill_candidates(db, 'catalog-a') == []
+    cur.close()
+
+
+def test_edge_upgrade_failure_retains_ready_legacy_and_independent_retry_status(edge_publication_db, monkeypatch):
+    mod = load_plugin()
+    from plugins.LumaeAnalysis import edge_profile_store as store
+    db = edge_publication_db
+    monkeypatch.setattr(mod, 'edge_profiles_enabled', lambda: True)
+    monkeypatch.setattr(mod, 'maintenance_paused', lambda: False)
+    monkeypatch.setattr(mod, 'load_track_file', lambda *_, **__: (_ for _ in ()).throw(ValueError('decode failed')))
+    jobs, _ = store.claim_edge_jobs(db, 'catalog-a', ['track-a'])
+    assert mod.analyze_edges_task(jobs, 'catalog-a', 'server-a') == [{'track_id': 'track-a', 'status': 'failed'}]
+    cur = db.cursor()
+    cur.execute('SELECT status, ref_lufs, start_ramp FROM plugin_lumae_analysis__source_profiles')
+    status, gain, ramp = cur.fetchone()
+    assert (status, gain, bytes(ramp)) == ('ready', -14, b'\x01\x02\x03')
+    cur.execute('SELECT status, last_error FROM plugin_lumae_analysis__edge_profile_jobs')
+    assert cur.fetchone() == ('failed', 'edge-analysis-unavailable')
+    assert store.claim_edge_jobs(db, 'catalog-a', ['track-a']) == ([], [])
+    cur.execute("UPDATE plugin_lumae_analysis__edge_profile_jobs SET updated_at=now()-interval '7 hours'")
+    db.commit()
+    assert store.edge_backfill_candidates(db, 'catalog-a') == ['track-a']
+    retried, _ = store.claim_edge_jobs(db, 'catalog-a', ['track-a'])
+    assert len(retried) == 1 and retried[0]['job_token'] != jobs[0]['job_token']
+    assert not store.update_edge_job(db, 'catalog-a', jobs[0], 'running')
+    cur.close()
+
+
+def test_replaced_source_rejects_completed_old_job_and_never_serializes_stale_edge(edge_publication_db):
+    mod = load_plugin()
+    from plugins.LumaeAnalysis import edge_profile_store as store
+    db = edge_publication_db
+    jobs, _ = store.claim_edge_jobs(db, 'catalog-a', ['track-a'])
+    job = jobs[0]
+    payload = _edge_payload_for_job(job)
+    cur = db.cursor()
+    cur.execute("UPDATE plugin_lumae_analysis__source_profiles SET media_signature='new master'")
+    db.commit()
+    assert not store.publish_edge_profile(db, 'catalog-a', job, payload, 'private/path:123:456')
+    assert 'edge_profile' not in mod.serialize_ready_profile(mod.fetch_profile_rows(['track-a'], 'catalog-a')[0])
+    new_jobs, _ = store.claim_edge_jobs(db, 'catalog-a', ['track-a'])
+    assert new_jobs[0]['media_revision'] != job['media_revision']
+    payload = _edge_payload_for_job(new_jobs[0])
+    assert store.publish_edge_profile(db, 'catalog-a', new_jobs[0], payload, 'new master')
+    cur.execute("UPDATE plugin_lumae_analysis__source_profiles SET media_signature='third master'")
+    db.commit()
+    assert 'edge_profile' not in mod.serialize_ready_profile(mod.fetch_profile_rows(['track-a'], 'catalog-a')[0])
+    cur.close()
+
+
+def test_edge_publish_rolls_back_payload_and_cursor_when_journal_fails(edge_publication_db, monkeypatch):
+    from plugins.LumaeAnalysis import edge_profile_store as store, catalog_enrichment as enrichment
+    db = edge_publication_db
+    jobs, _ = store.claim_edge_jobs(db, 'catalog-a', ['track-a'])
+    original = enrichment.record_profile_change
+    def fail_after_journal(*args):
+        original(*args)
+        raise RuntimeError('simulated publication interruption')
+    monkeypatch.setattr(enrichment, 'record_profile_change', fail_after_journal)
+    with pytest.raises(RuntimeError):
+        store.publish_edge_profile(db, 'catalog-a', jobs[0], _edge_payload_for_job(jobs[0]), 'private/path:123:456')
+    db.rollback()  # worker error handler owns the transaction rollback
+    cur = db.cursor()
+    cur.execute('SELECT COUNT(*) FROM plugin_lumae_analysis__edge_profiles')
+    assert cur.fetchone()[0] == 0
+    cur.execute('SELECT head_seq FROM plugin_lumae_analysis__profile_stream_state')
+    assert cur.fetchone()[0] == 0
+    cur.close()
+
+
+def test_edge_api_old_runtime_disabled_and_bounded_requests(edge_publication_db, monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, 'edge_profiles_enabled', lambda: False)
+    client = plugin_client(mod)
+    response = client.post('/api/profiles/edges/analyze', json={'catalog_instance_id': 'catalog-a', 'ids': ['track-a']})
+    assert response.status_code == 202
+    assert response.get_json() == {'available': False, 'accepted': [], 'already_ready': []}
+    assert client.post('/api/profiles/edges/analyze', json={'ids': ['x'] * 101}).status_code == 400
+    for limit in [0, 101, None, True, 'invalid']:
+        assert client.post('/api/profiles/edges/backfill', json={'limit': limit}).status_code == 400
+    assert client.post('/api/profiles/edges/backfill', json={'after': ''}).status_code == 202
 
 
 def test_catalog_health_uses_v2_single_server_adapter():
@@ -435,6 +583,7 @@ def test_catalog_cursor_is_opaque_round_trippable_and_source_bound():
 
 def test_profile_stream_serializes_waveform_payload_without_device_analysis():
     from plugins.LumaeAnalysis.catalog_enrichment import serialize_profile
+    from plugins.LumaeAnalysis.edge_profiles import opaque_revision
 
     payload = serialize_profile(
         "track-a",
@@ -458,7 +607,8 @@ def test_profile_stream_serializes_waveform_payload_without_device_analysis():
         "end_ramp": "AwQ=",
         "analyzer_ver": 1,
         "analyzed_at": "2026-07-27T12:00:00Z",
-        "media_signature": "catalog-media:abc",
+        "media_signature": opaque_revision("catalog-media:abc"),
+        "media_revision": opaque_revision("catalog-media:abc"),
     }
 
 

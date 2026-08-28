@@ -14,6 +14,11 @@ from .loudness import (
     SilentAudioError,
     analyze_file,
 )
+from .edge_profiles import analyze_edge_file, edge_runtime_available, opaque_revision, METHOD as EDGE_METHOD
+from .edge_profile_store import (
+    migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
+    publish_edge_profile, edge_backfill_candidates,
+)
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -1046,6 +1051,7 @@ def migrate(db):
         f"CREATE INDEX IF NOT EXISTS {table('source_profiles_status_idx')} "
         f"ON {source_profiles_table()} (catalog_instance_id, status)"
     )
+    migrate_edge_profiles(db)
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {table('profile_migrations')} (
@@ -1229,10 +1235,11 @@ def fetch_profile_rows(ids, catalog_instance_id=None):
     if catalog_instance_id:
         cur.execute(
             f"""
-            SELECT track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
-                   analyzer_ver, analyzed_at, media_signature, status, last_error
-              FROM {source_profiles_table()}
-             WHERE catalog_instance_id=%s AND track_id = ANY(%s)
+            SELECT p.track_id, p.sample_rate, p.duration_ms, p.ref_lufs, p.start_ramp, p.end_ramp,
+                   p.analyzer_ver, p.analyzed_at, p.media_signature, p.status, p.last_error,
+                   edge.payload AS edge_profile
+              FROM {source_profiles_table()} p {edge_join()}
+             WHERE p.catalog_instance_id=%s AND p.track_id = ANY(%s)
             """,
             (catalog_instance_id, ids),
         )
@@ -1264,18 +1271,11 @@ def _bytes(value):
 
 
 def serialize_ready_profile(row):
-    return {
-        "track_id": row["track_id"],
-        "source": "waveform",
-        "sample_rate": int(row["sample_rate"]),
-        "duration_ms": int(row["duration_ms"]),
-        "ref_lufs": float(row["ref_lufs"]),
-        "start_ramp": base64.b64encode(_bytes(row["start_ramp"])).decode("ascii"),
-        "end_ramp": base64.b64encode(_bytes(row["end_ramp"])).decode("ascii"),
-        "analyzer_ver": int(row["analyzer_ver"]),
-        "analyzed_at": str(row["analyzed_at"]),
-        "media_signature": row.get("media_signature"),
-    }
+    return serialize_profile(
+        row["track_id"], row["sample_rate"], row["duration_ms"], row["ref_lufs"],
+        row["start_ramp"], row["end_ramp"], row["analyzer_ver"], str(row["analyzed_at"]),
+        row.get("media_signature"), edge_profile=row.get("edge_profile"),
+    )
 
 
 def split_analyze_ids(ids, catalog_instance_id=None):
@@ -1677,6 +1677,8 @@ def health():
             "schema_version": SCHEMA_VERSION,
             "analyzer_version": ANALYZER_VERSION,
             "capabilities": {
+                "edge_profiles": {"schema_version": 1, "method": EDGE_METHOD,
+                                  "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
                 "collections": {
                     "schema_version": COLLECTIONS_SCHEMA_VERSION,
                     "backup_version": COLLECTIONS_BACKUP_VERSION,
@@ -2540,6 +2542,103 @@ def analyze():
     ), 202
 
 
+def edge_profiles_enabled():
+    return str(get_setting("edge_profiles_enabled", "true")).lower() in ("true", "1", "yes") and edge_runtime_available()
+
+
+def enqueue_edge_profiles(ids, catalog_instance_id, server_id, *, priority="background"):
+    if not edge_profiles_enabled() or maintenance_paused():
+        return {"available": False, "accepted": [], "already_ready": []}
+    jobs, ready = claim_edge_jobs(get_db(), catalog_instance_id, ids)
+    if jobs:
+        submitted = 0
+        try:
+            for job in jobs:
+                enqueue_bounded(analyze_edges_task, [job], catalog_instance_id, server_id,
+                                queue="high" if priority == "interactive" else "default",
+                                timeout=PROFILE_JOB_TIMEOUT_SECONDS)
+                submitted += 1
+        except Exception:
+            for job in jobs[submitted:]:
+                update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-enqueue-failed")
+            raise
+    return {"available": True, "accepted": [job["track_id"] for job in jobs], "already_ready": ready}
+
+
+def _schedule_edge_upgrade(track_id, catalog_instance_id, server_id):
+    if not catalog_instance_id or not edge_profiles_enabled():
+        return
+    try:
+        enqueue_edge_profiles([track_id], catalog_instance_id, server_id)
+    except Exception:
+        rollback = getattr(get_db(), "rollback", None)
+        if callable(rollback):
+            rollback()
+        logger.warning("lumae_analysis optional edge upgrade could not be scheduled")
+
+
+@bp.post("/api/profiles/edges/analyze")
+def edge_analyze_api():
+    try:
+        body = _json_body(max_bytes=64000)
+        source = resolve_profile_source(catalog_instance_id=body.get("catalog_instance_id"))
+        ids = body.get("ids")
+        if not isinstance(ids, list) or len(ids) > 100 or any(not isinstance(i, str) or not 0 < len(i) <= 512 for i in ids):
+            raise ValueError("ids must contain at most 100 track IDs")
+        return _private_json(enqueue_edge_profiles(ids, source["catalog_instance_id"], source["server_id"], priority="interactive")), 202
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_edge_request", str(exc), 400)
+
+
+@bp.post("/api/profiles/edges/backfill")
+def edge_backfill_api():
+    try:
+        body = _json_body(max_bytes=64000)
+        source = resolve_profile_source(catalog_instance_id=body.get("catalog_instance_id"))
+        after = body.get("after", "")
+        if not isinstance(after, str) or len(after) > 512:
+            raise ValueError("invalid backfill cursor")
+        limit = body.get("limit", 100)
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        ids = edge_backfill_candidates(get_db(), source["catalog_instance_id"], after, limit)
+        result = enqueue_edge_profiles(ids, source["catalog_instance_id"], source["server_id"])
+        result["next_after"] = ids[-1] if ids else None
+        return _private_json(result), 202
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_edge_request", str(exc), 400)
+
+
+def analyze_edges_task(jobs, catalog_instance_id, server_id):
+    outcomes = []
+    for job in jobs[:100]:
+        if not update_edge_job(get_db(), catalog_instance_id, job, "running"):
+            continue
+        info = None
+        try:
+            if maintenance_paused() or not edge_profiles_enabled():
+                raise ValueError("edge-worker-unavailable")
+            info = load_track_file(job["track_id"], catalog_instance_id=catalog_instance_id, server_id=server_id)
+            if not info or opaque_revision(info.get("media_signature")) != job["media_revision"]:
+                raise ValueError("edge-source-replaced")
+            payload = analyze_edge_file(info["file_path"], catalog_instance_id=catalog_instance_id,
+                                        track_id=job["track_id"], media_revision=job["media_revision"])
+            applied = publish_edge_profile(get_db(), catalog_instance_id, job, payload, info["media_signature"])
+            if not applied:
+                update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-source-replaced")
+            outcomes.append({"track_id": job["track_id"], "status": "ready" if applied else "superseded"})
+        except Exception:
+            rollback = getattr(get_db(), "rollback", None)
+            if callable(rollback):
+                rollback()
+            update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-analysis-unavailable")
+            outcomes.append({"track_id": job["track_id"], "status": "failed"})
+        finally:
+            if info:
+                remove_downloaded_file(info.get("cleanup_path"))
+    return outcomes
+
+
 def analyze_one_track(track_id, catalog_instance_id=None, server_id=None):
     if maintenance_paused():
         release_pending(
@@ -2584,6 +2683,7 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None):
             info["media_signature"],
             catalog_instance_id=catalog_instance_id,
         )
+        _schedule_edge_upgrade(track_id, catalog_instance_id, server_id)
         return {"track_id": track_id, "status": "ready"}
     except SilentAudioError as exc:
         upsert_profile(
@@ -2936,6 +3036,7 @@ def analyze_song_hook(song):
             media_sig,
             catalog_instance_id=catalog_instance_id,
         )
+        _schedule_edge_upgrade(track_id, catalog_instance_id, source_server_id)
         return {"track_id": track_id, "status": "ready"}
     except SilentAudioError as exc:
         upsert_profile(

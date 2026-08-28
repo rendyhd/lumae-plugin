@@ -7,12 +7,14 @@ on:
       - 'plugins/**'
       - 'tests/**'
       - 'requirements-dev.txt'
+      - 'requirements-edge.txt'
       - '.github/workflows/build.yml'
   pull_request:
     paths:
       - 'plugins/**'
       - 'tests/**'
       - 'requirements-dev.txt'
+      - 'requirements-edge.txt'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 
@@ -26,6 +28,22 @@ concurrency:
 jobs:
   test:
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_USER: lumae_test
+          POSTGRES_PASSWORD: disposable_ci_test
+          POSTGRES_DB: lumae_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      LUMAE_POSTGRES_TEST_DSN: postgresql://lumae_test:disposable_ci_test@localhost:5432/lumae_test
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -35,10 +53,12 @@ jobs:
         with:
           python-version: '3.12'
           cache: pip
-          cache-dependency-path: requirements-dev.txt
+          cache-dependency-path: |
+            requirements-dev.txt
+            requirements-edge.txt
 
       - name: Install test dependencies
-        run: python -m pip install -r requirements-dev.txt
+        run: python -m pip install -r requirements-dev.txt -r requirements-edge.txt
 
       - name: Compile plugin sources
         run: python -m compileall -q plugins/LumaeAnalysis
@@ -47,6 +67,7 @@ jobs:
         run: >-
           python -m pytest
           tests/plugins/test_lumae_analysis.py
+          tests/plugins/test_edge_profiles.py
           tests/plugins/test_lumae_analysis_provider_identity.py
           tests/plugins/test_collection_library_postgres_integration.py
           -q

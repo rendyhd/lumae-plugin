@@ -1,0 +1,3 @@
+# Optional EdgeProfileV1 measurement branch. Install explicitly on each worker;
+# legacy analysis remains available when this contract is not installed.
+av==16.1.0
