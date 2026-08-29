@@ -19,6 +19,27 @@ from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
     publish_edge_profile, edge_backfill_candidates,
 )
+from .dj_analysis import (
+    JOB_DEADLINE_SECONDS as DJ_JOB_TIMEOUT_SECONDS,
+    METHOD as DJ_METHOD,
+    SCHEMA_VERSION as DJ_SCHEMA_VERSION,
+    DjAnalysisError,
+    analyze_dj_file,
+    runtime_status as dj_runtime_status,
+)
+from .dj_analysis_store import (
+    cancel_dj_jobs,
+    claim_dj_requests,
+    claim_next_dj_job,
+    dj_backfill_candidates,
+    dj_job_cancelled,
+    dj_jobs_pending,
+    finish_dj_job,
+    migrate_dj_analysis,
+    publish_dj_analysis,
+    read_dj_analysis,
+    update_dj_progress,
+)
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -188,6 +209,8 @@ ANALYSIS_RUN_SETTLE_GRACE_MINUTES = 2
 ANALYSIS_RUN_STALE_MINUTES = 30
 PROFILE_JOB_TIMEOUT_SECONDS = 20 * 60
 PROFILE_BACKFILL_JOB_TIMEOUT_SECONDS = 30 * 60
+MAX_DJ_ANALYSIS_IDS = 100
+_DJ_CAPABILITY_CACHE = {}
 CATALOG_JOB_TIMEOUT_SECONDS = 90 * 60
 RELATIONSHIP_JOB_TIMEOUT_SECONDS = 60 * 60
 COLLECTIONS_MENU_LABEL = "Living Collections"
@@ -1052,6 +1075,7 @@ def migrate(db):
         f"ON {source_profiles_table()} (catalog_instance_id, status)"
     )
     migrate_edge_profiles(db)
+    migrate_dj_analysis(db)
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {table('profile_migrations')} (
@@ -1606,6 +1630,62 @@ def catalog_capability():
     }
 
 
+def dj_analysis_enabled():
+    value = get_setting("dj_analysis_enabled", False)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def dj_analysis_capability():
+    """Return a path-free capability report with playback held behind qualification."""
+    enabled = dj_analysis_enabled()
+    model_path = str(get_setting("dj_model_path", "") or "") if enabled else ""
+    if model_path:
+        try:
+            model_stat = os.stat(model_path)
+            cache_key = (
+                enabled,
+                model_path,
+                model_stat.st_dev,
+                model_stat.st_ino,
+                model_stat.st_size,
+                model_stat.st_mtime_ns,
+            )
+        except OSError:
+            cache_key = (enabled, model_path, None)
+    else:
+        cache_key = (enabled, "", None)
+    if _DJ_CAPABILITY_CACHE.get("key") == cache_key:
+        return json.loads(json.dumps(_DJ_CAPABILITY_CACHE["value"]))
+    status = dj_runtime_status(
+        model_path,
+        verify_model=enabled,
+    )
+    worker_available = bool(status["available"]) if enabled else False
+    status.update(
+        {
+            "enabled": enabled,
+            "worker_available": worker_available,
+            # The CPU reference-host and listening gates are evidence gates,
+            # not administrator toggles. Keep playback unavailable until a
+            # reviewed qualification artifact changes this shipped contract.
+            "available": False,
+            "reason": (
+                "disabled"
+                if not enabled
+                else "reference_host_unqualified"
+                if worker_available
+                else status["reason"]
+            ),
+        }
+    )
+    _DJ_CAPABILITY_CACHE.update(
+        {"key": cache_key, "value": json.loads(json.dumps(status))}
+    )
+    return status
+
+
 def sync_contract(compatibility):
     """Describe breaking schemas and semantic formats independently of core version."""
     return {
@@ -1634,6 +1714,11 @@ def sync_contract(compatibility):
                 "schema_version": SCHEMA_VERSION,
                 "analyzer_version": ANALYZER_VERSION,
                 "semantic_contracts": ["lumae_playback_profile_v1"],
+            },
+            "dj_analysis": {
+                "schema_version": DJ_SCHEMA_VERSION,
+                "method": DJ_METHOD,
+                "semantic_contracts": ["lumae_dj_analysis_v1"],
             },
             "relationships": {
                 "schema_version": RELATIONSHIP_SCHEMA_VERSION,
@@ -1679,6 +1764,7 @@ def health():
             "capabilities": {
                 "edge_profiles": {"schema_version": 1, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
+                "dj_analysis": dj_analysis_capability(),
                 "collections": {
                     "schema_version": COLLECTIONS_SCHEMA_VERSION,
                     "backup_version": COLLECTIONS_BACKUP_VERSION,
@@ -2637,6 +2723,269 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id):
             if info:
                 remove_downloaded_file(info.get("cleanup_path"))
     return outcomes
+
+
+def _validate_dj_ids(value):
+    if not isinstance(value, list) or len(value) > MAX_DJ_ANALYSIS_IDS:
+        raise ValueError("ids must contain at most 100 track IDs")
+    ids = []
+    seen = set()
+    for track_id in value:
+        if (
+            not isinstance(track_id, str)
+            or not track_id
+            or len(track_id) > 512
+        ):
+            raise ValueError("ids must contain at most 100 track IDs")
+        if track_id not in seen:
+            ids.append(track_id)
+            seen.add(track_id)
+    return ids
+
+
+def _profile_work_pending(db=None):
+    """Fail closed so CPU DJ work never jumps ahead of playback preparation."""
+    db = db or get_db()
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""SELECT (
+                EXISTS (SELECT 1 FROM {source_profiles_table()}
+                        WHERE status IN ('pending', 'pending_interactive'))
+                OR EXISTS (SELECT 1 FROM {table('edge_profile_jobs')}
+                           WHERE status IN ('pending', 'running'))
+                OR EXISTS (SELECT 1 FROM {profile_backfill_state_table()}
+                           WHERE status IN ('queued', 'running'))
+            )"""
+        )
+        row = cur.fetchone()
+        return not row or bool(row[0])
+    except Exception:
+        rollback = getattr(db, "rollback", None)
+        if callable(rollback):
+            rollback()
+        logger.exception("lumae_analysis could not verify DJ worker priority")
+        return True
+    finally:
+        cur.close()
+
+
+def _enqueue_dj_worker():
+    return enqueue_bounded(
+        dj_analysis_task,
+        queue="default",
+        timeout=DJ_JOB_TIMEOUT_SECONDS,
+    )
+
+
+def _request_dj_jobs(source, ids, *, priority=0):
+    capability = dj_analysis_capability()
+    if maintenance_paused():
+        return {
+            "capability": capability,
+            "accepted": [],
+            "already_ready": [],
+            "deferred": True,
+            "reason": "maintenance_paused",
+        }, 503
+    if not capability["worker_available"]:
+        return {
+            "capability": capability,
+            "accepted": [],
+            "already_ready": [],
+            "deferred": True,
+            "reason": capability["reason"],
+        }, 503
+    jobs, ready = claim_dj_requests(
+        get_db(), source["catalog_instance_id"], ids, priority=priority
+    )
+    deferred = False
+    if jobs:
+        try:
+            _enqueue_dj_worker()
+        except Exception:
+            # Jobs are durable. The registered watchdog will resume them.
+            deferred = True
+            logger.exception("lumae_analysis could not queue the DJ worker")
+    return {
+        "capability": capability,
+        "accepted": [job["track_id"] for job in jobs],
+        "already_ready": ready,
+        "deferred": deferred,
+    }, 202
+
+
+@bp.get("/api/dj/analysis")
+def dj_analysis_api():
+    try:
+        source = resolve_profile_source(
+            catalog_instance_id=request.args.get("catalog_instance_id"),
+            server_id=request.args.get("server_id"),
+        )
+        ids = _validate_dj_ids(parse_ids(request.args.get("ids", "")))
+        result = read_dj_analysis(get_db(), source["catalog_instance_id"], ids)
+        return _private_json(
+            {
+                "schema_version": DJ_SCHEMA_VERSION,
+                "method": DJ_METHOD,
+                "catalog_instance_id": source["catalog_instance_id"],
+                "capability": dj_analysis_capability(),
+                **result,
+            }
+        )
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_dj_request", str(exc), 400)
+
+
+@bp.post("/api/dj/analysis/analyze")
+def dj_analysis_request_api():
+    try:
+        body = _json_body(max_bytes=64_000)
+        source = resolve_profile_source(
+            catalog_instance_id=body.get("catalog_instance_id"),
+            server_id=body.get("server_id"),
+        )
+        ids = _validate_dj_ids(body.get("ids"))
+        result, status = _request_dj_jobs(source, ids, priority=10)
+        return _private_json(result, status)
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_dj_request", str(exc), 400)
+
+
+@bp.post("/api/dj/analysis/backfill")
+def dj_analysis_backfill_api():
+    try:
+        body = _json_body(max_bytes=16_000)
+        source = resolve_profile_source(
+            catalog_instance_id=body.get("catalog_instance_id"),
+            server_id=body.get("server_id"),
+        )
+        after = body.get("after", "")
+        limit = body.get("limit", 100)
+        if not isinstance(after, str) or len(after) > 512:
+            raise ValueError("invalid backfill cursor")
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer from 1 to 100")
+        ids = dj_backfill_candidates(
+            get_db(), source["catalog_instance_id"], after, limit
+        )
+        result, status = _request_dj_jobs(source, ids)
+        result["next_after"] = ids[-1] if ids else None
+        return _private_json(result, status)
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_dj_request", str(exc), 400)
+
+
+@bp.post("/api/dj/analysis/cancel")
+def dj_analysis_cancel_api():
+    try:
+        body = _json_body(max_bytes=64_000)
+        source = resolve_profile_source(
+            catalog_instance_id=body.get("catalog_instance_id"),
+            server_id=body.get("server_id"),
+        )
+        ids = _validate_dj_ids(body.get("ids"))
+        cancelled = cancel_dj_jobs(get_db(), source["catalog_instance_id"], ids)
+        return _private_json({"cancelled": cancelled})
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_dj_request", str(exc), 400)
+
+
+def dj_analysis_task():
+    """Process at most one durable job after all profile work has cleared."""
+    if maintenance_paused():
+        return {"status": "deferred", "reason": "maintenance_paused"}
+    capability = dj_analysis_capability()
+    if not capability["worker_available"]:
+        return {"status": "deferred", "reason": capability["reason"]}
+    db = get_db()
+    if _profile_work_pending(db):
+        return {"status": "deferred", "reason": "profile_work_pending"}
+    job = claim_next_dj_job(db)
+    if not job:
+        return {"status": "idle"}
+
+    info = None
+    outcome = {"status": "failed", "track_id": job["track_id"]}
+    try:
+        source = resolve_profile_source(
+            catalog_instance_id=job["catalog_instance_id"]
+        )
+        info = load_track_file(
+            job["track_id"],
+            catalog_instance_id=job["catalog_instance_id"],
+            server_id=source["server_id"],
+        )
+        if (
+            not info
+            or opaque_revision(info.get("media_signature")) != job["media_revision"]
+        ):
+            raise DjAnalysisError("source_replaced")
+        payload = analyze_dj_file(
+            info["file_path"],
+            catalog_instance_id=job["catalog_instance_id"],
+            track_id=job["track_id"],
+            media_revision=job["media_revision"],
+            model_path=get_setting("dj_model_path", ""),
+            cancelled=lambda: dj_job_cancelled(get_db(), job),
+            progress=lambda frames: update_dj_progress(get_db(), job, frames),
+        )
+        applied = publish_dj_analysis(
+            get_db(), job, payload, info["media_signature"]
+        )
+        if not applied:
+            finish_dj_job(get_db(), job, "failed", "source_replaced")
+        outcome = {
+            "status": "ready" if applied else "superseded",
+            "track_id": job["track_id"],
+        }
+    except DjAnalysisError as exc:
+        rollback = getattr(get_db(), "rollback", None)
+        if callable(rollback):
+            rollback()
+        unsupported = {
+            "empty_audio",
+            "invalid_model_output",
+            "model_timeline_mismatch",
+            "non_finite_audio",
+            "source_duration_unsupported",
+            "source_too_short",
+            "source_timeline_changed",
+            "unsupported_audio_streams",
+        }
+        status = (
+            "cancelled"
+            if exc.code == "cancelled"
+            else "unsupported"
+            if exc.code in unsupported
+            else "failed"
+        )
+        finish_dj_job(get_db(), job, status, exc.code)
+        outcome = {"status": status, "track_id": job["track_id"], "reason": exc.code}
+    except Exception:
+        rollback = getattr(get_db(), "rollback", None)
+        if callable(rollback):
+            rollback()
+        finish_dj_job(get_db(), job, "failed", "internal_error")
+        logger.exception("lumae_analysis DJ worker failed")
+        outcome = {
+            "status": "failed",
+            "track_id": job["track_id"],
+            "reason": "internal_error",
+        }
+    finally:
+        if info:
+            remove_downloaded_file(info.get("cleanup_path"))
+
+    queued_next = False
+    try:
+        if dj_jobs_pending(get_db()) and not _profile_work_pending(get_db()):
+            _enqueue_dj_worker()
+            queued_next = True
+    except Exception:
+        logger.exception("lumae_analysis DJ watchdog will resume pending work")
+    outcome["queued_next"] = queued_next
+    return outcome
 
 
 def analyze_one_track(track_id, catalog_instance_id=None, server_id=None):
@@ -5714,6 +6063,7 @@ def register(ctx):
     ctx.on_song_analyzed(analyze_song_hook)
     ctx.add_task("prepare", prepare_lumae_task, queue="default")
     ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
+    ctx.add_task("dj_analysis", dj_analysis_task, queue="default")
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_task(
         "relationship_preparation", relationship_preparation_task, queue="default"
@@ -5725,3 +6075,4 @@ def register(ctx):
         "provider_identity_recheck", provider_identity_recheck_task, queue="default"
     )
     ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")
+    ctx.add_cron_task("dj_analysis", dj_analysis_task, queue="default")

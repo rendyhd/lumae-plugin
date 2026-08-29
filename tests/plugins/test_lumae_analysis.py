@@ -218,9 +218,174 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "available": mod.edge_runtime_available(),
                 "enabled": mod.edge_profiles_enabled(),
             },
+            "dj_analysis": mod.dj_analysis_capability(),
         },
         "status": "ok",
     }
+
+
+def test_dj_capability_is_disabled_path_free_and_qualification_gated(monkeypatch):
+    mod = load_plugin()
+    settings = {
+        "dj_analysis_enabled": False,
+        "dj_model_path": "/private/models/beat-this-final0.ckpt",
+    }
+    monkeypatch.setattr(
+        mod, "get_setting", lambda key, default=None: settings.get(key, default)
+    )
+
+    capability = mod.dj_analysis_capability()
+
+    assert capability["enabled"] is False
+    assert capability["worker_available"] is False
+    assert capability["available"] is False
+    assert capability["reference_host_qualified"] is False
+    assert capability["reason"] == "disabled"
+    assert settings["dj_model_path"] not in json.dumps(capability)
+
+
+def test_dj_capability_caches_verified_artifact_by_file_identity(monkeypatch, tmp_path):
+    mod = load_plugin()
+    model = tmp_path / "beat-this.ckpt"
+    model.write_bytes(b"model")
+    calls = []
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
+    monkeypatch.setattr(
+        mod,
+        "get_setting",
+        lambda key, default=None: str(model) if key == "dj_model_path" else default,
+    )
+
+    def runtime_status(path, verify_model=True):
+        calls.append((path, verify_model))
+        return {
+            "schema_version": 1,
+            "method": mod.DJ_METHOD,
+            "available": True,
+            "reason": None,
+            "runtime_mismatches": [],
+            "model": {"verified": True},
+            "limits": {},
+            "reference_host_qualified": False,
+        }
+
+    monkeypatch.setattr(mod, "dj_runtime_status", runtime_status)
+    mod._DJ_CAPABILITY_CACHE.clear()
+
+    first = mod.dj_analysis_capability()
+    second = mod.dj_analysis_capability()
+
+    assert calls == [(str(model), True)]
+    assert first == second
+    assert first["worker_available"] is True
+    assert first["available"] is False
+    assert first["reason"] == "reference_host_unqualified"
+    assert str(model) not in json.dumps(first)
+
+
+def test_dj_request_fails_closed_without_creating_jobs(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **_kwargs: {
+            "catalog_instance_id": "catalog-a",
+            "server_id": "server-a",
+        },
+    )
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: False)
+    monkeypatch.setattr(
+        mod,
+        "claim_dj_requests",
+        lambda *_args, **_kwargs: pytest.fail("disabled capability must not create a job"),
+    )
+
+    response = plugin_client(mod).post(
+        "/api/dj/analysis/analyze",
+        json={"catalog_instance_id": "catalog-a", "ids": ["track-a"]},
+    )
+
+    assert response.status_code == 503
+    assert response.get_json()["reason"] == "disabled"
+
+
+def test_dj_worker_defers_before_claim_when_profile_work_is_pending(monkeypatch):
+    mod = load_plugin()
+    database = object()
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(
+        mod,
+        "dj_analysis_capability",
+        lambda: {"worker_available": True, "reason": "reference_host_unqualified"},
+    )
+    monkeypatch.setattr(mod, "get_db", lambda: database)
+    monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: True)
+    monkeypatch.setattr(
+        mod,
+        "claim_next_dj_job",
+        lambda _db: pytest.fail("DJ job must not be claimed ahead of profile work"),
+    )
+
+    assert mod.dj_analysis_task() == {
+        "status": "deferred",
+        "reason": "profile_work_pending",
+    }
+
+
+def test_dj_worker_publishes_one_source_bound_job_and_cleans_temp(monkeypatch):
+    mod = load_plugin()
+    database = object()
+    job = {
+        "catalog_instance_id": "catalog-a",
+        "track_id": "track-a",
+        "media_revision": mod.opaque_revision("catalog-media:revision-a"),
+        "job_token": "token-a",
+    }
+    info = {
+        "file_path": "/private/temp/track-a.flac",
+        "media_signature": "catalog-media:revision-a",
+        "cleanup_path": "/private/temp/track-a.flac",
+    }
+    removed = []
+    analyzed = []
+    published = []
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(
+        mod,
+        "dj_analysis_capability",
+        lambda: {"worker_available": True, "reason": "reference_host_unqualified"},
+    )
+    monkeypatch.setattr(mod, "get_db", lambda: database)
+    monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: False)
+    monkeypatch.setattr(mod, "claim_next_dj_job", lambda _db: job)
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+    monkeypatch.setattr(mod, "load_track_file", lambda *_args, **_kwargs: info)
+    monkeypatch.setattr(
+        mod,
+        "analyze_dj_file",
+        lambda path, **kwargs: analyzed.append((path, kwargs)) or {"payload": True},
+    )
+    monkeypatch.setattr(
+        mod,
+        "publish_dj_analysis",
+        lambda db, value, payload, signature: (
+            published.append((db, value, payload, signature)) or True
+        ),
+    )
+    monkeypatch.setattr(mod, "dj_jobs_pending", lambda _db: False)
+    monkeypatch.setattr(mod, "remove_downloaded_file", removed.append)
+
+    result = mod.dj_analysis_task()
+
+    assert result == {"status": "ready", "track_id": "track-a", "queued_next": False}
+    assert analyzed[0][0] == info["file_path"]
+    assert analyzed[0][1]["media_revision"] == job["media_revision"]
+    assert published == [(database, job, {"payload": True}, info["media_signature"])]
+    assert removed == [info["cleanup_path"]]
 
 
 @pytest.fixture
@@ -7841,6 +8006,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.tasks == [
         ("prepare", mod.prepare_lumae_task, "default"),
         ("profile_backfill", mod.profile_backfill_task, "default"),
+        ("dj_analysis", mod.dj_analysis_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
         ("relationship_preparation", mod.relationship_preparation_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
@@ -7850,6 +8016,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
+        ("dj_analysis", mod.dj_analysis_task, "default"),
     ]
     assert ctx.menu_items == []
 
