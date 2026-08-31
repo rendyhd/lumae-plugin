@@ -40,6 +40,7 @@ from .dj_analysis_store import (
     read_dj_analysis,
     update_dj_progress,
 )
+from .provision_dj_model import provision as provision_dj_model
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -210,6 +211,8 @@ ANALYSIS_RUN_STALE_MINUTES = 30
 PROFILE_JOB_TIMEOUT_SECONDS = 20 * 60
 PROFILE_BACKFILL_JOB_TIMEOUT_SECONDS = 30 * 60
 MAX_DJ_ANALYSIS_IDS = 100
+DEFAULT_DJ_MODEL_PATH = "/var/lib/audiomuse/lumae-models/beat-this-final0.ckpt"
+DJ_TASK_QUEUE = "default"
 _DJ_CAPABILITY_CACHE = {}
 CATALOG_JOB_TIMEOUT_SECONDS = 90 * 60
 RELATIONSHIP_JOB_TIMEOUT_SECONDS = 60 * 60
@@ -1637,10 +1640,15 @@ def dj_analysis_enabled():
     return bool(value)
 
 
+def configured_dj_model_path():
+    value = get_setting("dj_model_path", DEFAULT_DJ_MODEL_PATH)
+    return str(value or DEFAULT_DJ_MODEL_PATH).strip()
+
+
 def dj_analysis_capability():
     """Return a path-free capability report with playback held behind qualification."""
     enabled = dj_analysis_enabled()
-    model_path = str(get_setting("dj_model_path", "") or "") if enabled else ""
+    model_path = configured_dj_model_path() if enabled else ""
     if model_path:
         try:
             model_stat = os.stat(model_path)
@@ -2773,9 +2781,28 @@ def _profile_work_pending(db=None):
 def _enqueue_dj_worker():
     return enqueue_bounded(
         dj_analysis_task,
-        queue="default",
+        queue=DJ_TASK_QUEUE,
         timeout=DJ_JOB_TIMEOUT_SECONDS,
     )
+
+
+def prepare_dj_runtime():
+    """Provision the pinned model only after the administrator opts in."""
+    if not dj_analysis_enabled():
+        return dj_analysis_capability()
+    capability = dj_analysis_capability()
+    if capability["worker_available"] or capability.get("runtime_mismatches"):
+        return capability
+    try:
+        provision_dj_model(configured_dj_model_path())
+    except Exception:
+        logger.exception("lumae_analysis could not provision the optional DJ model")
+        capability["worker_available"] = False
+        capability["available"] = False
+        capability["reason"] = "model_download_failed"
+        return capability
+    _DJ_CAPABILITY_CACHE.clear()
+    return dj_analysis_capability()
 
 
 def _request_dj_jobs(source, ids, *, priority=0):
@@ -2895,7 +2922,7 @@ def dj_analysis_task():
     """Process at most one durable job after all profile work has cleared."""
     if maintenance_paused():
         return {"status": "deferred", "reason": "maintenance_paused"}
-    capability = dj_analysis_capability()
+    capability = prepare_dj_runtime()
     if not capability["worker_available"]:
         return {"status": "deferred", "reason": capability["reason"]}
     db = get_db()
@@ -2926,7 +2953,7 @@ def dj_analysis_task():
             catalog_instance_id=job["catalog_instance_id"],
             track_id=job["track_id"],
             media_revision=job["media_revision"],
-            model_path=get_setting("dj_model_path", ""),
+            model_path=configured_dj_model_path(),
             cancelled=lambda: dj_job_cancelled(get_db(), job),
             progress=lambda frames: update_dj_progress(get_db(), job, frames),
         )
@@ -5451,6 +5478,68 @@ def render_reconcile_status_panel():
     """
 
 
+def render_dj_analysis_panel():
+    enabled = dj_analysis_enabled()
+    capability = dj_analysis_capability()
+    reason = str(capability.get("reason") or "")
+    if not enabled:
+        status = "Off"
+        status_class = ""
+        detail = "No Beat This model will be downloaded or loaded. SmoothFade remains available."
+    elif capability.get("worker_available") is True:
+        status = "Ready"
+        status_class = "lumae-source-state-ready"
+        detail = "The dedicated worker verified the pinned Beat This model and runtime."
+    elif reason in {
+        "disabled",
+        "model_missing",
+        "model_size_mismatch",
+        "model_checksum_mismatch",
+        "worker_not_attested",
+    }:
+        status = "Preparing"
+        status_class = "lumae-source-state-working"
+        detail = "The DJ worker is downloading and verifying the pinned 77.3 MiB model."
+    else:
+        status = "Needs attention"
+        status_class = "lumae-source-state-danger"
+        detail = {
+            "dedicated_worker_required": "A dedicated DJ worker has not connected.",
+            "model_download_failed": "The model download failed. Save the enabled switch to retry.",
+            "runtime_dependency_mismatch": "The DJ worker does not have the pinned optional runtime.",
+        }.get(reason, "The DJ worker is not ready yet.")
+    checked = " checked" if enabled else ""
+    return f"""
+      <section class="lumae-panel" aria-label="Optional DJ Mode"
+        data-lumae-active="{str(enabled and not capability.get('worker_available')).lower()}">
+        <span class="lumae-section-priority lumae-section-optional">Optional download</span>
+        <header class="lumae-source-header">
+          <div>
+            <h3>DJ Mode</h3>
+            <p class="lumae-action-copy">Adds beat-grid and phrase-boundary analysis for Lumae’s
+              best transitions. It is separate from standard SmoothFade.</p>
+          </div>
+          <span class="lumae-source-state {status_class}">{status}</span>
+        </header>
+        <p class="lumae-help">{escape(detail)}</p>
+        <form class="lumae-form" method="post">
+          <label class="lumae-toggle">
+            <input type="checkbox" role="switch" name="dj_analysis_enabled"{checked}>
+            <span>Enable DJ Mode</span>
+          </label>
+          <p class="lumae-help">Turning this on downloads the checksum-pinned 77.3 MiB Beat This
+            model on the DJ worker and confirms: “I reviewed the Beat This license and training-data
+            caveat.” Turning it off prevents model loading and new DJ analysis; an already verified
+            model stays cached for a faster future enable.</p>
+          <div class="lumae-actions">
+            <button class="lumae-button-secondary" type="submit" name="action"
+              value="save_dj_analysis">Save DJ Mode setting</button>
+          </div>
+        </form>
+      </section>
+    """
+
+
 def render_settings_status_panels(batch_size):
     readiness_html = render_v3_readiness_panel()
     relationships_html = render_relationship_status_panel()
@@ -5462,6 +5551,7 @@ def render_settings_status_panels(batch_size):
         "waveform": waveform_html,
         "reconcile": render_reconcile_status_panel(),
         "identity": render_provider_identity_panel(),
+        "dj": render_dj_analysis_panel(),
     }
 
 
@@ -5919,6 +6009,7 @@ def render_settings(message=None, error=None):
           {panels['identity']}
           {panels['readiness']}
           {panels['waveform']}
+          {panels['dj']}
           {panels['relationships']}
           {render_collections_settings_panel()}
         </section>
@@ -5949,6 +6040,21 @@ def settings():
                 set_setting("collection_manager_enabled", enabled)
                 sync_collections_menu(enabled)
                 message = f"Living Collections {'enabled' if enabled else 'disabled'}."
+            elif action == "save_dj_analysis":
+                enabled = request.form.get("dj_analysis_enabled") == "on"
+                set_setting("dj_analysis_enabled", enabled)
+                _DJ_CAPABILITY_CACHE.clear()
+                if enabled:
+                    try:
+                        _enqueue_dj_worker()
+                    except Exception:
+                        logger.exception("lumae_analysis could not queue DJ model setup")
+                    message = (
+                        "DJ Mode enabled. The DJ worker will download and verify the optional "
+                        "Beat This model."
+                    )
+                else:
+                    message = "DJ Mode disabled. No DJ model will be loaded or downloaded."
             elif action in ("ack_v3_readiness", "clear_v3_readiness"):
                 message = (
                     "Manual AudioMuse verification is no longer required. "

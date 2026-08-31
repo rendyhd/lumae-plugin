@@ -283,6 +283,95 @@ def test_dj_capability_caches_verified_artifact_by_file_identity(monkeypatch, tm
     assert str(model) not in json.dumps(first)
 
 
+def test_dj_runtime_never_provisions_before_explicit_opt_in(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: False)
+    monkeypatch.setattr(
+        mod,
+        "dj_analysis_capability",
+        lambda: {"enabled": False, "worker_available": False, "reason": "disabled"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "provision_dj_model",
+        lambda *_args, **_kwargs: pytest.fail("disabled DJ Mode must not provision a model"),
+    )
+
+    assert mod.prepare_dj_runtime() == {
+        "enabled": False,
+        "worker_available": False,
+        "reason": "disabled",
+    }
+
+
+def test_dj_runtime_provisions_only_after_opt_in(monkeypatch):
+    mod = load_plugin()
+    model_path = "/models/beat-this-final0.ckpt"
+    capabilities = iter(
+        [
+            {"enabled": True, "worker_available": False, "reason": "model_missing"},
+            {"enabled": True, "worker_available": True, "reason": "reference_host_unqualified"},
+        ]
+    )
+    provisioned = []
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
+    monkeypatch.setattr(mod, "dj_analysis_capability", lambda: next(capabilities))
+    monkeypatch.setattr(mod, "configured_dj_model_path", lambda: model_path)
+    monkeypatch.setattr(mod, "provision_dj_model", provisioned.append)
+
+    result = mod.prepare_dj_runtime()
+
+    assert provisioned == [model_path]
+    assert result["worker_available"] is True
+
+
+def test_dj_settings_switch_is_off_by_default_and_explains_download(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: False)
+    monkeypatch.setattr(
+        mod,
+        "dj_analysis_capability",
+        lambda: {"enabled": False, "worker_available": False, "reason": "disabled"},
+    )
+
+    body = mod.render_dj_analysis_panel()
+
+    assert 'role="switch" name="dj_analysis_enabled"' in body
+    assert 'name="dj_analysis_enabled" checked' not in body
+    assert "No Beat This model will be downloaded or loaded" in body
+    assert "77.3 MiB" in body
+
+
+def test_dj_settings_switch_controls_setup_queue(monkeypatch):
+    mod = load_plugin()
+    saved = []
+    queued = []
+    monkeypatch.setattr(mod, "set_setting", lambda key, value: saved.append((key, value)))
+    monkeypatch.setattr(mod, "_enqueue_dj_worker", lambda: queued.append("dj"))
+    monkeypatch.setattr(
+        mod,
+        "render_settings",
+        lambda message=None, error=None: message or error or "settings",
+    )
+
+    enabled = plugin_client(mod).post(
+        "/settings",
+        data={"action": "save_dj_analysis", "dj_analysis_enabled": "on"},
+    )
+    disabled = plugin_client(mod).post(
+        "/settings",
+        data={"action": "save_dj_analysis"},
+    )
+
+    assert enabled.status_code == 200
+    assert disabled.status_code == 200
+    assert saved == [
+        ("dj_analysis_enabled", True),
+        ("dj_analysis_enabled", False),
+    ]
+    assert queued == ["dj"]
+
+
 def test_dj_request_fails_closed_without_creating_jobs(monkeypatch):
     mod = load_plugin()
     monkeypatch.setattr(
@@ -315,7 +404,7 @@ def test_dj_worker_defers_before_claim_when_profile_work_is_pending(monkeypatch)
     monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
     monkeypatch.setattr(
         mod,
-        "dj_analysis_capability",
+        "prepare_dj_runtime",
         lambda: {"worker_available": True, "reason": "reference_host_unqualified"},
     )
     monkeypatch.setattr(mod, "get_db", lambda: database)
@@ -352,7 +441,7 @@ def test_dj_worker_publishes_one_source_bound_job_and_cleans_temp(monkeypatch):
     monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
     monkeypatch.setattr(
         mod,
-        "dj_analysis_capability",
+        "prepare_dj_runtime",
         lambda: {"worker_available": True, "reason": "reference_host_unqualified"},
     )
     monkeypatch.setattr(mod, "get_db", lambda: database)
@@ -8763,6 +8852,7 @@ def test_settings_status_returns_private_fragments_without_rendering_page(monkey
     )
     monkeypatch.setattr(mod, "render_reconcile_status_panel", lambda: "<p>Idle</p>")
     monkeypatch.setattr(mod, "render_provider_identity_panel", lambda: "")
+    monkeypatch.setattr(mod, "render_dj_analysis_panel", lambda: "<p>DJ Mode off</p>")
     monkeypatch.setattr(mod, "render_page", lambda *_args, **_kwargs: pytest.fail("full page"))
     monkeypatch.setattr(mod, "set_setting", lambda *_args: pytest.fail("settings write"))
     monkeypatch.setattr(mod, "enqueue", lambda *_args, **_kwargs: pytest.fail("queued work"))
@@ -8777,15 +8867,16 @@ def test_settings_status_returns_private_fragments_without_rendering_page(monkey
         "relationships": "<p>Matching albums</p>",
         "catalogue": "<p>Library ready</p>",
         "waveform": "<p>Batch size: 3</p>",
-        "reconcile": "<p>Idle</p>",
-        "identity": "",
-    }}
+            "reconcile": "<p>Idle</p>",
+            "identity": "",
+            "dj": "<p>DJ Mode off</p>",
+        }}
 
 
 def test_settings_polling_url_respects_plugin_mount_prefix(monkeypatch):
     mod = load_plugin()
     panels = dict.fromkeys(
-        ("readiness", "relationships", "catalogue", "waveform", "reconcile", "identity"), "",
+        ("readiness", "relationships", "catalogue", "waveform", "reconcile", "identity", "dj"), "",
     )
     monkeypatch.setattr(mod, "render_settings_status_panels", lambda _size: panels)
     monkeypatch.setattr(mod, "render_collections_settings_panel", lambda: "")

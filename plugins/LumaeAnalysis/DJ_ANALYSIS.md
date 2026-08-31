@@ -3,11 +3,25 @@
 Status: implemented behind an unavailable-by-default capability; reference-host
 and musical qualification are still required.
 
-## Explicit installation
+## Explicit opt-in
 
-The ordinary Lumae Analysis plugin does not install PyTorch or a model. An
-administrator must install the exact packages in `requirements-dj.txt`, review
-`BEAT_THIS_LICENSE.txt` and the upstream training-data caveat, then run:
+The ordinary Lumae Analysis plugin does not bundle PyTorch or the Beat This
+checkpoint. A DJ-capable worker image installs the exact packages in
+`requirements-dj.txt`, but it still contains no model. DJ Mode defaults off.
+While it is off, plugin startup, health checks, app requests, playback requests,
+and scheduled tasks neither download nor load the model.
+
+An administrator enables **DJ Mode** on the Lumae Analysis settings page after
+reviewing `BEAT_THIS_LICENSE.txt` and the upstream training-data caveat. That
+single explicit switch stores consent and queues model setup on the DJ worker.
+The worker downloads the 77.3 MiB checkpoint, verifies its pinned size and
+SHA-256, publishes readiness, and only then accepts DJ analysis. Repeated setup
+reuses an already verified checkpoint. Turning DJ Mode off immediately removes
+readiness and prevents model loading and new DJ work; the verified file remains
+cached for a faster future enable.
+
+The equivalent administrator-run setup command remains available for controlled
+deployments:
 
 ```bash
 python -m pip install torch==2.6.0 torchaudio==2.6.0 \
@@ -22,8 +36,8 @@ The worker accepts the official `2.6.0+cpu` wheel metadata variant and rejects
 CUDA/ROCm builds. The package index is an explicit administrator choice and is
 never contacted by an API or playback request.
 
-Configure that absolute local path as `dj_model_path` and explicitly enable
-`dj_analysis_enabled`. API/playback requests cannot download or select a model.
+The settings action and this explicit command are the only model-provisioning
+paths. API/playback requests cannot download or select a model.
 The worker accepts only Beat This 1.1.0 `final0`: 81,058,141 bytes, SHA-256
 `8c328b45f59d8dd3dff219253ff6a8d6482be57d0133a29140e2febbf8eb8331`.
 

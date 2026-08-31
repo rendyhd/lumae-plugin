@@ -34,6 +34,7 @@ try:
     sys.modules[package_name] = package
     edge = _load(f"{package_name}.edge_profiles", "edge_profiles.py")
     dj = _load(f"{package_name}.dj_analysis", "dj_analysis.py")
+    provisioner = _load(f"{package_name}.provision_dj_model", "provision_dj_model.py")
     store = _load(f"{package_name}.dj_analysis_store", "dj_analysis_store.py")
 finally:
     if previous_plugin is None:
@@ -70,6 +71,21 @@ def model_output(duration_seconds=192, beat_step=25, downbeat_offset=1):
         "source_sample_rate": 48_000,
         "source_decoded_frames": duration_seconds * 48_000,
     }
+
+
+def test_provisioner_reuses_an_already_verified_model(monkeypatch, tmp_path):
+    target = tmp_path / "beat-this.ckpt"
+    target.write_bytes(b"verified")
+    monkeypatch.setattr(
+        provisioner,
+        "verify_model_artifact",
+        lambda path: {"path": Path(path), "verified": True},
+    )
+
+    def unexpected_download(*_args, **_kwargs):
+        pytest.fail("an already verified model must not be downloaded again")
+
+    assert provisioner.provision(target, opener=unexpected_download) == target.resolve()
 
 
 def build(output=None, **kwargs):

@@ -1,4 +1,4 @@
-"""Explicit Beat This model provisioner. Never imported by playback/API code."""
+"""Pinned Beat This model provisioner with no import-time network or file I/O."""
 
 import argparse
 import hashlib
@@ -7,7 +7,13 @@ import sys
 import urllib.request
 from pathlib import Path
 
-from .dj_analysis import MODEL_BYTES, MODEL_SHA256, MODEL_URL
+from .dj_analysis import (
+    MODEL_BYTES,
+    MODEL_SHA256,
+    MODEL_URL,
+    DjAnalysisError,
+    verify_model_artifact,
+)
 
 
 ACKNOWLEDGEMENT = "I reviewed the Beat This license and training-data caveat"
@@ -15,6 +21,11 @@ ACKNOWLEDGEMENT = "I reviewed the Beat This license and training-data caveat"
 
 def provision(output, *, opener=urllib.request.urlopen):
     target = Path(output).expanduser().resolve()
+    try:
+        verify_model_artifact(target)
+        return target
+    except DjAnalysisError:
+        pass
     target.parent.mkdir(parents=True, exist_ok=True)
     partial = target.with_name(target.name + ".partial")
     digest = hashlib.sha256()
