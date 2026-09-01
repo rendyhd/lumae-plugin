@@ -213,7 +213,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
             },
             "catalog_mirror": mod.catalog_capability(),
             "edge_profiles": {
-                "schema_version": 1,
+                "schema_version": 2,
                 "method": mod.EDGE_METHOD,
                 "available": mod.edge_runtime_available(),
                 "enabled": mod.edge_profiles_enabled(),
@@ -248,34 +248,50 @@ def test_dj_capability_caches_verified_artifact_by_file_identity(monkeypatch, tm
     mod = load_plugin()
     model = tmp_path / "beat-this.ckpt"
     model.write_bytes(b"model")
+    yamnet_model = tmp_path / "yamnet.tflite"
+    yamnet_model.write_bytes(b"yamnet")
     calls = []
     monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
+    monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
+    monkeypatch.setattr(mod, "dj_setup_state", lambda: "ready")
+    monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
     monkeypatch.setattr(
         mod,
         "get_setting",
-        lambda key, default=None: str(model) if key == "dj_model_path" else default,
+        lambda key, default=None: (
+            str(model)
+            if key == "dj_model_path"
+            else str(yamnet_model)
+            if key == "dj_yamnet_model_path"
+            else default
+        ),
     )
 
-    def runtime_status(path, verify_model=True):
-        calls.append((path, verify_model))
+    def runtime_status(path, yamnet_path, verify_model=True):
+        calls.append((path, yamnet_path, verify_model))
         return {
-            "schema_version": 1,
+            "schema_version": 2,
             "method": mod.DJ_METHOD,
             "available": True,
             "reason": None,
             "runtime_mismatches": [],
-            "model": {"verified": True},
+            "models": {
+                "beat_this": {"verified": True},
+                "yamnet": {"verified": True},
+            },
             "limits": {},
             "reference_host_qualified": False,
+            "supported_analysis_versions": [2],
+            "supported_plan_versions": [2],
         }
 
     monkeypatch.setattr(mod, "dj_runtime_status", runtime_status)
     mod._DJ_CAPABILITY_CACHE.clear()
 
-    first = mod.dj_analysis_capability()
-    second = mod.dj_analysis_capability()
+    first = mod.local_dj_worker_capability()
+    second = mod.local_dj_worker_capability()
 
-    assert calls == [(str(model), True)]
+    assert calls == [(str(model), str(yamnet_model), True)]
     assert first == second
     assert first["worker_available"] is True
     assert first["available"] is False
@@ -283,30 +299,146 @@ def test_dj_capability_caches_verified_artifact_by_file_identity(monkeypatch, tm
     assert str(model) not in json.dumps(first)
 
 
+def test_dj_capability_reads_only_fresh_worker_attestation(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    attested = {
+        "schema_version": 2,
+        "method": mod.DJ_METHOD,
+        "worker_available": True,
+        "internal_test_eligible": True,
+        "reference_host_qualified": False,
+        "models": {"beat_this": {"verified": True}, "yamnet": {"verified": True}},
+    }
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
+    monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "read_dj_worker_capability",
+        lambda value, version: attested if value is db and version == mod.PLUGIN_VERSION else None,
+    )
+    monkeypatch.setattr(
+        mod,
+        "dj_runtime_status",
+        lambda *_args, **_kwargs: pytest.fail("Flask must not probe the worker runtime"),
+    )
+
+    capability = mod.dj_analysis_capability()
+
+    assert capability["worker_available"] is True
+    assert capability["internal_test_eligible"] is True
+    assert capability["available"] is False
+    assert capability["reason"] == "reference_host_unqualified"
+
+
+def test_dj_worker_attestation_is_version_bound_and_dedicated(monkeypatch):
+    mod = load_plugin()
+    db = object()
+    migrated = []
+    written = []
+    monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "migrate_dj_analysis", lambda value: migrated.append(value))
+    monkeypatch.setattr(
+        mod,
+        "local_dj_worker_capability",
+        lambda: {"enabled": False, "worker_available": False, "reason": "disabled"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "write_dj_worker_capability",
+        lambda value, version, payload: written.append((value, version, payload)) or payload,
+    )
+
+    result = mod.attest_dj_worker_capability()
+
+    assert result["reason"] == "disabled"
+    assert migrated == [db]
+    assert written == [(db, mod.PLUGIN_VERSION, result)]
+
+
+def test_non_dedicated_worker_never_probes_or_provisions_models(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.delenv("LUMAE_DJ_WORKER", raising=False)
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
+    monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
+    monkeypatch.setattr(mod, "dj_setup_state", lambda: "initializing")
+    monkeypatch.setattr(
+        mod,
+        "dj_runtime_status",
+        lambda *_args, **_kwargs: pytest.fail("non-DJ workers must not load optional runtimes"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "provision_dj_models",
+        lambda *_args, **_kwargs: pytest.fail("non-DJ workers must not provision models"),
+    )
+
+    result = mod.prepare_dj_runtime()
+
+    assert result["worker_available"] is False
+    assert result["reason"] == "dedicated_worker_required"
+
+
+def test_dj_v2_migration_clears_legacy_one_model_opt_in(monkeypatch):
+    mod = load_plugin()
+    values = {
+        "dj_analysis_enabled": True,
+        "dj_models_acknowledged": False,
+        "dj_setup_state": "error",
+    }
+    writes = []
+    monkeypatch.setattr(mod, "get_setting", lambda key, default=None: values.get(key, default))
+    monkeypatch.setattr(
+        mod,
+        "set_setting",
+        lambda key, value: (writes.append((key, value)), values.__setitem__(key, value)),
+    )
+
+    mod.migrate_dj_opt_in()
+
+    assert writes == [
+        ("dj_analysis_enabled", False),
+        ("dj_setup_state", "disabled"),
+    ]
+
+
+def test_dj_v2_migration_preserves_explicit_combined_opt_in(monkeypatch):
+    mod = load_plugin()
+    values = {
+        "dj_analysis_enabled": True,
+        "dj_models_acknowledged": True,
+        "dj_setup_state": "ready",
+    }
+    writes = []
+    monkeypatch.setattr(mod, "get_setting", lambda key, default=None: values.get(key, default))
+    monkeypatch.setattr(mod, "set_setting", lambda key, value: writes.append((key, value)))
+
+    mod.migrate_dj_opt_in()
+
+    assert writes == []
+
+
 def test_dj_runtime_never_provisions_before_explicit_opt_in(monkeypatch):
     mod = load_plugin()
     monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: False)
     monkeypatch.setattr(
         mod,
-        "dj_analysis_capability",
-        lambda: {"enabled": False, "worker_available": False, "reason": "disabled"},
-    )
-    monkeypatch.setattr(
-        mod,
-        "provision_dj_model",
-        lambda *_args, **_kwargs: pytest.fail("disabled DJ Mode must not provision a model"),
+        "provision_dj_models",
+        lambda *_args, **_kwargs: pytest.fail("disabled DJ Mode must not provision models"),
     )
 
-    assert mod.prepare_dj_runtime() == {
-        "enabled": False,
-        "worker_available": False,
-        "reason": "disabled",
-    }
+    result = mod.prepare_dj_runtime()
+    assert result["enabled"] is False
+    assert result["worker_available"] is False
+    assert result["reason"] == "disabled"
 
 
 def test_dj_runtime_provisions_only_after_opt_in(monkeypatch):
     mod = load_plugin()
     model_path = "/models/beat-this-final0.ckpt"
+    yamnet_path = "/models/yamnet.tflite"
     capabilities = iter(
         [
             {"enabled": True, "worker_available": False, "reason": "model_missing"},
@@ -314,14 +446,28 @@ def test_dj_runtime_provisions_only_after_opt_in(monkeypatch):
         ]
     )
     provisioned = []
+    states = []
     monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
-    monkeypatch.setattr(mod, "dj_analysis_capability", lambda: next(capabilities))
+    monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
+    monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setattr(mod, "attest_dj_worker_capability", lambda: next(capabilities))
     monkeypatch.setattr(mod, "configured_dj_model_path", lambda: model_path)
-    monkeypatch.setattr(mod, "provision_dj_model", provisioned.append)
+    monkeypatch.setattr(mod, "configured_yamnet_model_path", lambda: yamnet_path)
+    monkeypatch.setattr(mod, "set_setting", lambda key, value: states.append((key, value)))
+    monkeypatch.setattr(
+        mod,
+        "provision_dj_models",
+        lambda beat_path, vocal_path: provisioned.append((beat_path, vocal_path)),
+    )
 
     result = mod.prepare_dj_runtime()
 
-    assert provisioned == [model_path]
+    assert provisioned == [(model_path, yamnet_path)]
+    assert states == [
+        ("dj_setup_state", "downloading"),
+        ("dj_setup_state", "initializing"),
+        ("dj_setup_state", "ready"),
+    ]
     assert result["worker_available"] is True
 
 
@@ -338,8 +484,11 @@ def test_dj_settings_switch_is_off_by_default_and_explains_download(monkeypatch)
 
     assert 'role="switch" name="dj_analysis_enabled"' in body
     assert 'name="dj_analysis_enabled" checked' not in body
-    assert "No Beat This model will be downloaded or loaded" in body
+    assert "No Beat This or YAMNet model will be downloaded or loaded" in body
     assert "77.3 MiB" in body
+    assert "official YAMNet Lite (3.9 MiB)" in body
+    assert "training-data and calibration caveats" in body
+    assert 'value="remove_dj_models"' in body
 
 
 def test_dj_settings_switch_controls_setup_queue(monkeypatch):
@@ -356,7 +505,11 @@ def test_dj_settings_switch_controls_setup_queue(monkeypatch):
 
     enabled = plugin_client(mod).post(
         "/settings",
-        data={"action": "save_dj_analysis", "dj_analysis_enabled": "on"},
+        data={
+            "action": "save_dj_analysis",
+            "dj_analysis_enabled": "on",
+            "dj_models_acknowledged": "on",
+        },
     )
     disabled = plugin_client(mod).post(
         "/settings",
@@ -367,9 +520,36 @@ def test_dj_settings_switch_controls_setup_queue(monkeypatch):
     assert disabled.status_code == 200
     assert saved == [
         ("dj_analysis_enabled", True),
+        ("dj_models_acknowledged", True),
+        ("dj_setup_state", "downloading"),
         ("dj_analysis_enabled", False),
+        ("dj_models_acknowledged", False),
+        ("dj_setup_state", "disabled"),
     ]
     assert queued == ["dj"]
+
+
+def test_dj_settings_refuses_enable_without_combined_acknowledgement(monkeypatch):
+    mod = load_plugin()
+    saved = []
+    queued = []
+    monkeypatch.setattr(mod, "set_setting", lambda key, value: saved.append((key, value)))
+    monkeypatch.setattr(mod, "_enqueue_dj_worker", lambda: queued.append("dj"))
+    monkeypatch.setattr(
+        mod,
+        "render_settings",
+        lambda message=None, error=None: message or error or "settings",
+    )
+
+    response = plugin_client(mod).post(
+        "/settings",
+        data={"action": "save_dj_analysis", "dj_analysis_enabled": "on"},
+    )
+
+    assert response.status_code == 200
+    assert b"Review and accept the Beat This and YAMNet/AudioSet caveats" in response.data
+    assert saved == []
+    assert queued == []
 
 
 def test_dj_request_fails_closed_without_creating_jobs(monkeypatch):
@@ -3642,6 +3822,7 @@ class FakeCtx:
         self.settings_endpoint = None
         self.install_hooks = []
         self.flask_hooks = []
+        self.worker_hooks = []
         self.song_hooks = []
         self.cron_tasks = []
         self.tasks = []
@@ -3661,6 +3842,9 @@ class FakeCtx:
 
     def on_flask_start(self, func):
         self.flask_hooks.append(func)
+
+    def on_worker_start(self, func):
+        self.worker_hooks.append(func)
 
     def on_song_analyzed(self, func):
         self.song_hooks.append(func)
@@ -8091,11 +8275,12 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.settings_endpoint == "lumae_analysis.settings"
     assert ctx.install_hooks == [mod.migrate]
     assert ctx.flask_hooks == [mod.observe_provider_identities_on_start]
+    assert ctx.worker_hooks == [mod.prepare_dj_runtime]
     assert ctx.song_hooks == [mod.analyze_song_hook]
     assert ctx.tasks == [
         ("prepare", mod.prepare_lumae_task, "default"),
         ("profile_backfill", mod.profile_backfill_task, "default"),
-        ("dj_analysis", mod.dj_analysis_task, "default"),
+        ("dj_analysis", mod.dj_analysis_task, "lumae-dj"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
         ("relationship_preparation", mod.relationship_preparation_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
@@ -8105,7 +8290,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
-        ("dj_analysis", mod.dj_analysis_task, "default"),
+        ("dj_analysis", mod.dj_analysis_task, "lumae-dj"),
     ]
     assert ctx.menu_items == []
 

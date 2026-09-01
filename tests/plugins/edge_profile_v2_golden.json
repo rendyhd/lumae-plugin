@@ -1,0 +1,87 @@
+{
+  "analyzer_version": "lumae-edge-v2.0.0",
+  "catalog_instance_id": "catalog-a",
+  "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "head": {
+    "bin_count": 3,
+    "boundaries": [
+      0,
+      4800,
+      9600,
+      10003
+    ],
+    "covered_frames": 10003,
+    "high_power_cdb": "5fUM9g32",
+    "level_cdb": "sfbY9uH2",
+    "low_power_cdb": "S+nE58zn",
+    "mid_power_cdb": "gvap9qT2",
+    "onset_density_q15": "AAAAAAAA",
+    "origin_frame": 0,
+    "peak_cdb": "Mfgx+DH4",
+    "spectral_flux_q15": "KQQAAN4D",
+    "true_peak_cdb": "Mfgx+DH4",
+    "valid": "Bw=="
+  },
+  "landmarks": {
+    "audible_end_frame": 10003,
+    "audible_start_frame": 403,
+    "body_end_frame": 10003,
+    "body_start_frame": 403,
+    "confidence_q15": 27682,
+    "hidden_content_guard": false,
+    "leading_padding_frames": 403,
+    "terminal_silence_confidence_q15": 0,
+    "trailing_padding_frames": 0
+  },
+  "leading_silence": {
+    "frames": 403,
+    "method": "digital-zero",
+    "verified": true
+  },
+  "measurement": {
+    "channel_rule": "mean-power",
+    "crossover_hz": [
+      150,
+      2500
+    ],
+    "method": "lumae-edge-kweighted-bands-48k-k4-v2",
+    "quantization": "s16le-centidb-u16le-q15-v2",
+    "resampler": "pyav-16.1.0-swr-6.1.100",
+    "sample_rate": 48000,
+    "true_peak_oversample": 4
+  },
+  "media_revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "noise_floor_cdb": -2383,
+  "profile_digest": "29aa50286114359e0d4603802b06d0c9049e4b1316763d36144b6ca827f17f10",
+  "representation_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "schema_version": 2,
+  "source": {
+    "channel_layout": "stereo",
+    "decoded_frames": 10003,
+    "decoder": "pcm-input-v1",
+    "padding": "decoder-output-v1",
+    "sample_rate": 48000,
+    "timeline_verified": true
+  },
+  "tail": {
+    "bin_count": 3,
+    "boundaries": [
+      0,
+      4800,
+      9600,
+      10003
+    ],
+    "covered_frames": 10003,
+    "high_power_cdb": "5fUM9g32",
+    "level_cdb": "sfbY9uH2",
+    "low_power_cdb": "S+nE58zn",
+    "mid_power_cdb": "gvap9qT2",
+    "onset_density_q15": "AAAAAAAA",
+    "origin_frame": 0,
+    "peak_cdb": "Mfgx+DH4",
+    "spectral_flux_q15": "KQQAAN4D",
+    "true_peak_cdb": "Mfgx+DH4",
+    "valid": "Bw=="
+  },
+  "track_id": "track-a"
+}

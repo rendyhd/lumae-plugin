@@ -1,19 +1,30 @@
 import hashlib
 import importlib.util
+import io
+import json
 from pathlib import Path
 import sys
 import types
+import zipfile
 
 import numpy as np
 import pytest
 
 
-ROOT = Path(__file__).resolve().parents[3] / "lumae-plugin"
+ROOT = Path(__file__).resolve().parents[2]
 SOURCE = ROOT / "plugins" / "LumaeAnalysis"
 
 
 def _load(name, filename):
     spec = importlib.util.spec_from_file_location(name, SOURCE / filename)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def _load_path(name, path):
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
     spec.loader.exec_module(module)
@@ -47,6 +58,53 @@ finally:
         sys.modules["plugin.api"] = previous_plugin_api
 
 
+def test_private_prerelease_builder_isolated_from_public_channel(tmp_path):
+    builder = _load_path(
+        "lumae_private_dj_builder",
+        ROOT / "scripts/build_private_dj_prerelease.py",
+    )
+    public_before = (ROOT / "plugins/LumaeAnalysis/plugin.json").read_bytes()
+
+    result = builder.build_private_prerelease(
+        repository_root=ROOT,
+        output_root=tmp_path,
+        version="1.2.0-djtest.7",
+        base_url="https://private.example/lumae/djtest.7",
+    )
+
+    destination = Path(result["directory"])
+    private_metadata = json.loads((destination / "plugin.json").read_text())
+    private_manifest = json.loads((destination / "manifest.json").read_text())
+    with zipfile.ZipFile(result["zip"]) as archive:
+        assert "plugin.json" not in archive.namelist()
+        runtime = archive.read("__init__.py").decode("utf-8")
+    assert 'PLUGIN_VERSION = "1.2.0-djtest.7"' in runtime
+    assert private_metadata["channel"] == "private-dj-test"
+    assert [entry["version"] for entry in private_metadata["versions"]] == [
+        "1.2.0-djtest.7"
+    ]
+    assert private_manifest["channel"] == "private-dj-test"
+    assert (ROOT / "plugins/LumaeAnalysis/plugin.json").read_bytes() == public_before
+
+
+@pytest.mark.parametrize(
+    "version",
+    ["1.2.0", "1.2.0-djtest.0", "1.2.0-djtest", "1.2.1-djtest.1"],
+)
+def test_private_prerelease_builder_rejects_non_test_versions(tmp_path, version):
+    builder = _load_path(
+        "lumae_private_dj_builder_invalid",
+        ROOT / "scripts/build_private_dj_prerelease.py",
+    )
+    with pytest.raises(ValueError, match="1.2.0-djtest.N"):
+        builder.build_private_prerelease(
+            repository_root=ROOT,
+            output_root=tmp_path,
+            version=version,
+            base_url="https://private.example/lumae",
+        )
+
+
 def model_output(duration_seconds=192, beat_step=25, downbeat_offset=1):
     frames = duration_seconds * dj.MODEL_FPS
     beat = np.full(frames, -8.0)
@@ -68,6 +126,9 @@ def model_output(duration_seconds=192, beat_step=25, downbeat_offset=1):
         "downbeat_logits": downbeat,
         "energy": energy,
         "spectral_flux": flux,
+        "low_energy": np.zeros(frames),
+        "mid_energy": np.zeros(frames),
+        "high_energy": np.zeros(frames),
         "source_sample_rate": 48_000,
         "source_decoded_frames": duration_seconds * 48_000,
     }
@@ -86,6 +147,62 @@ def test_provisioner_reuses_an_already_verified_model(monkeypatch, tmp_path):
         pytest.fail("an already verified model must not be downloaded again")
 
     assert provisioner.provision(target, opener=unexpected_download) == target.resolve()
+
+
+def test_model_download_resumes_a_verified_partial(monkeypatch, tmp_path):
+    payload = b"0123456789"
+    partial = tmp_path / "model.bin.partial"
+    partial.write_bytes(payload[:4])
+    requests = []
+
+    class Response(io.BytesIO):
+        status = 206
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            self.close()
+
+    def opener(request, timeout):
+        assert timeout == 60
+        requests.append(request)
+        return Response(payload[4:])
+
+    def verifier(path):
+        if not Path(path).is_file() or Path(path).read_bytes() != payload:
+            raise dj.DjAnalysisError("model_checksum_mismatch")
+
+    result = provisioner._verified_download(
+        "https://example.invalid/model",
+        tmp_path / "model.bin",
+        expected_bytes=len(payload),
+        expected_sha256=hashlib.sha256(payload).hexdigest(),
+        verifier=verifier,
+        opener=opener,
+    )
+    assert result.read_bytes() == payload
+    assert requests[0].get_header("Range") == "bytes=4-"
+    assert not partial.exists()
+
+
+def test_model_removal_deletes_only_configured_artifacts_and_partials(tmp_path):
+    beat = tmp_path / "beat-this.ckpt"
+    yamnet = tmp_path / "yamnet.tflite"
+    normal_analysis = tmp_path / "normal-analysis.sqlite"
+    for path in (beat, yamnet, normal_analysis):
+        path.write_bytes(path.name.encode())
+    beat_partial = beat.with_name(beat.name + ".partial")
+    yamnet_partial = yamnet.with_name(yamnet.name + ".partial")
+    beat_partial.write_bytes(b"partial")
+    yamnet_partial.write_bytes(b"partial")
+
+    removed = provisioner.remove_stack(beat, yamnet)
+
+    assert sorted(removed) == sorted(
+        map(str, (beat.resolve(), beat_partial.resolve(), yamnet.resolve(), yamnet_partial.resolve()))
+    )
+    assert normal_analysis.read_bytes() == b"normal-analysis.sqlite"
 
 
 def build(output=None, **kwargs):
@@ -155,6 +272,65 @@ def test_runtime_requires_every_exact_pin_and_never_resolves_a_remote_model():
     ]
 
 
+def test_yamnet_adapter_requires_the_pinned_float32_litert_contract(monkeypatch, tmp_path):
+    model = tmp_path / "yamnet.tflite"
+    model.write_bytes(b"pinned-yamnet")
+    info = model.stat()
+    monkeypatch.setattr(
+        dj,
+        "verify_yamnet_model_artifact",
+        lambda *_args, **_kwargs: {
+            "path": model.resolve(),
+            "device": info.st_dev,
+            "inode": info.st_ino,
+            "bytes": info.st_size,
+            "mtime_ns": info.st_mtime_ns,
+        },
+    )
+    monkeypatch.setattr(
+        dj,
+        "_sha256_file",
+        lambda *_args, **_kwargs: dj.YAMNET_MODEL_SHA256,
+    )
+
+    class FakeInterpreter:
+        def __init__(self, *, model_path, num_threads):
+            assert model_path == str(model.resolve())
+            assert num_threads == 1
+
+        def allocate_tensors(self):
+            return None
+
+        def get_input_details(self):
+            return [
+                {
+                    "shape": np.asarray([dj.YAMNET_WINDOW_SAMPLES]),
+                    "dtype": np.float32,
+                    "index": 0,
+                }
+            ]
+
+        def get_output_details(self):
+            return [
+                {
+                    "shape": np.asarray([dj.YAMNET_CLASS_COUNT]),
+                    "dtype": np.float32,
+                    "index": 1,
+                }
+            ]
+
+    package = types.ModuleType("ai_edge_litert")
+    interpreter_module = types.ModuleType("ai_edge_litert.interpreter")
+    interpreter_module.Interpreter = FakeInterpreter
+    monkeypatch.setitem(sys.modules, "ai_edge_litert", package)
+    monkeypatch.setitem(sys.modules, "ai_edge_litert.interpreter", interpreter_module)
+
+    adapter = dj.YamnetLiteAdapter(model, rss_reader=lambda: 1)
+
+    assert adapter.input["dtype"] == np.float32
+    assert adapter.output["dtype"] == np.float32
+
+
 def test_window_geometry_matches_upstream_split_and_keep_first_ownership():
     # This length makes upstream append a near-duplicate final window before
     # shifting it to the end. Keeping the earlier owner is intentional.
@@ -190,6 +366,64 @@ def test_stable_four_four_regions_keep_raw_alignment_and_structural_candidates()
     assert result["model"]["output_semantics"] == "uncalibrated_logits"
     assert result["model"]["downbeat_snapping_authorizes_alignment"] is False
     assert result["analysis_digest"] == dj.analysis_digest(result)
+    assert result["schema_version"] == 2
+    assert result["vocal_risk"]["calibration"]["cuts_authorized"] is False
+    assert result["structure"]["meter"] == {
+        "beats_per_bar": 4,
+        "confidence": "region-guarded",
+    }
+    band_energy = result["structure"]["band_energy"]
+    assert band_energy["unit"] == "mean-log-mel"
+    assert band_energy["window"] == "bar"
+    assert 0 < len(band_energy["windows"]) < len(model_output()["beat_logits"]) // 10
+    assert all(
+        set(window) == {
+            "start_ms",
+            "end_ms",
+            "region_index",
+            "eligible",
+            "low",
+            "mid",
+            "high",
+        }
+        and window["end_ms"] > window["start_ms"]
+        for window in band_energy["windows"]
+    )
+
+
+def test_yamnet_scores_remain_uncalibrated_evidence_and_never_authorize_cuts():
+    indices = list(dj.YAMNET_VOCAL_CLASSES)
+    scores = [0.0] * len(indices)
+    scores[indices.index(31)] = 0.91
+    result = build(
+        vocal_output={
+            "positions_ms": [480, 960],
+            "class_indices": indices,
+            "scores": [scores, [0.1] * len(indices)],
+        }
+    )
+    risk = result["vocal_risk"]
+    assert risk["frames"][0] == {
+        "position_ms": 480,
+        "raw_vocal_evidence": 0.91,
+        "dominant_class_index": 31,
+        "calibrated_risk": None,
+    }
+    assert risk["calibration"] == {
+        "status": "uncalibrated",
+        "scores_are_probabilities": False,
+        "cuts_authorized": False,
+    }
+    assert result["quality"]["vocal_calibration_ready"] is False
+
+    with pytest.raises(dj.DjAnalysisError, match="invalid_yamnet_output"):
+        build(
+            vocal_output={
+                "positions_ms": [480],
+                "class_indices": indices,
+                "scores": [[2.0] * len(indices)],
+            }
+        )
 
 
 def test_unstable_or_misaligned_regions_are_not_track_level_ready():
@@ -350,6 +584,33 @@ def test_store_migration_has_one_running_worker_and_durable_progress():
     assert "WHERE status='running'" in sql
     assert "progress_frames BIGINT NOT NULL" in sql
     assert "worker_restarted" in sql
+    assert "dj_worker_capability" in sql
+    assert "plugin_version TEXT NOT NULL" in sql
+
+
+def test_worker_capability_store_is_version_bound_and_path_free():
+    payload = {
+        "schema_version": 2,
+        "method": dj.METHOD,
+        "worker_available": True,
+        "models": {"beat_this": {"verified": True}, "yamnet": {"verified": True}},
+    }
+    writer = Database()
+
+    published = store.write_dj_worker_capability(writer, "1.2.0-djtest.2", payload)
+
+    sql, params = writer.cur.executed[-1]
+    assert "ON CONFLICT (singleton)" in sql
+    assert params[0:2] == ("1.2.0-djtest.2", dj.METHOD)
+    assert writer.commits == 1
+    assert published == payload
+    assert "/" not in json.dumps(published)
+
+    reader = Database(rows=[(payload,)])
+    assert store.read_dj_worker_capability(reader, "1.2.0-djtest.2") == payload
+    read_sql, read_params = reader.cur.executed[-1]
+    assert "updated_at >= now()-interval '10 minutes'" in read_sql
+    assert read_params == ("1.2.0-djtest.2", dj.METHOD)
 
 
 @pytest.fixture

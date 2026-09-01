@@ -36,8 +36,82 @@ def test_published_cross_language_golden_contract():
     pcm[:, :403] = 0
     result = edge.analyze_edge_blocks([pcm], 48000, catalog_instance_id='catalog-a', track_id='track-a',
         media_revision='sha256:' + 'a' * 64, content_sha256='b' * 64, timeline_verified=True)
-    golden = json.loads((Path(__file__).parent / 'edge_profile_v1_golden.json').read_text(encoding='utf-8'))
+    golden = json.loads((Path(__file__).parent / 'edge_profile_v2_golden.json').read_text(encoding='utf-8'))
     assert result == golden
+
+
+def test_v2_contract_series_are_bounded_exact_and_true_peak_is_conservative():
+    rate = 48000
+    time = np.arange(rate * 2 + 17, dtype=np.float64) / rate
+    pcm = np.asarray([
+        .85 * np.sin(2 * np.pi * 80 * time),
+        .65 * np.sin(2 * np.pi * 6000 * time),
+    ], dtype=np.float32)
+    result = measure(pcm, rate)
+    assert result['schema_version'] == 2
+    assert result['analyzer_version'] == 'lumae-edge-v2.0.0'
+    assert result['measurement'] == {
+        'method': 'lumae-edge-kweighted-bands-48k-k4-v2',
+        'sample_rate': 48000,
+        'channel_rule': 'mean-power',
+        'quantization': 's16le-centidb-u16le-q15-v2',
+        'resampler': 'pyav-16.1.0-swr-6.1.100',
+        'true_peak_oversample': 4,
+        'crossover_hz': [150, 2500],
+    }
+    for window_name in ('head', 'tail'):
+        window = result[window_name]
+        count = window['bin_count']
+        assert count <= 300
+        for name in ('level_cdb', 'peak_cdb', 'true_peak_cdb', 'low_power_cdb',
+                     'mid_power_cdb', 'high_power_cdb', 'spectral_flux_q15',
+                     'onset_density_q15'):
+            assert len(base64.b64decode(window[name])) == count * 2
+        sample_peak = values(result, window_name, 'peak_cdb').astype(int)
+        true_peak = values(result, window_name, 'true_peak_cdb').astype(int)
+        assert np.all(true_peak >= sample_peak)
+
+
+def test_hidden_track_guard_and_uncertain_quiet_are_never_padding():
+    rate = 48000
+    pcm = np.zeros((1, rate * 12), dtype=np.float32)
+    tone = .04 * np.sin(2 * np.pi * 440 * np.arange(rate * 3) / rate)
+    pcm[0, :rate * 3] = tone
+    pcm[0, rate * 7:rate * 10] = tone
+    # Analog noise after the late material is quiet, but not verified padding.
+    pcm[0, rate * 10:] = 1e-6
+    result = measure(pcm, rate)
+    assert result['landmarks']['hidden_content_guard'] is True
+    assert result['landmarks']['trailing_padding_frames'] == 0
+    assert result['landmarks']['terminal_silence_confidence_q15'] == 0
+    assert result['landmarks']['audible_end_frame'] >= rate * 10
+
+
+def test_exact_terminal_zero_is_the_only_authorized_trim():
+    rate = 48000
+    pcm = np.full((1, rate * 4), .01, dtype=np.float32)
+    pcm[:, -1733:] = 0
+    verified = edge.analyze_edge_blocks(
+        [pcm], rate, catalog_instance_id='catalog-a', track_id='track-a',
+        media_revision='sha256:' + 'a' * 64, content_sha256='b' * 64,
+        channel_layout='mono', timeline_verified=True,
+    )
+    assert verified['landmarks']['trailing_padding_frames'] == 1733
+    assert verified['landmarks']['audible_end_frame'] == pcm.shape[1] - 1733
+    assert verified['landmarks']['terminal_silence_confidence_q15'] == 32768
+
+
+def test_low_and_high_tones_land_in_the_expected_complementary_bands():
+    rate = 48000
+    time = np.arange(rate * 2, dtype=np.float64) / rate
+    low = measure(np.asarray([.1 * np.sin(2 * np.pi * 70 * time)], dtype=np.float32), rate)
+    high = measure(np.asarray([.1 * np.sin(2 * np.pi * 8000 * time)], dtype=np.float32), rate)
+    low_low = np.median(values(low, series='low_power_cdb'))
+    low_high = np.median(values(low, series='high_power_cdb'))
+    high_low = np.median(values(high, series='low_power_cdb'))
+    high_high = np.median(values(high, series='high_power_cdb'))
+    assert low_low > low_high + 1200
+    assert high_high > high_low + 1200
 
 
 def test_peak_quantization_never_rounds_below_original_at_centidb_boundaries():
@@ -112,6 +186,8 @@ def test_short_track_partial_bin_overlap_and_digital_zero_are_exact():
     assert result["head"]["boundaries"] == [0, 4800, 5501]
     assert result["leading_silence"] == {"frames": 701, "method": "digital-zero", "verified": True}
     assert result["source"]["timeline_verified"] is False
+    assert result['landmarks']['leading_padding_frames'] == 701
+    assert result['landmarks']['trailing_padding_frames'] == 0
     assert base64.b64decode(result["head"]["valid"]) == bytes([3])
 
 
@@ -132,6 +208,8 @@ def test_exact_zero_is_not_a_missing_measurement():
     assert values(result, series="peak_cdb").tolist() == [-32768]
     assert result["head"]["valid"] == "AQ=="
     assert result["leading_silence"]["frames"] == 4800
+    assert result['landmarks']['audible_start_frame'] == 4800
+    assert result['landmarks']['body_start_frame'] == 4800
 
 
 @pytest.mark.parametrize("bad", [float("nan"), float("inf"), -1, 1e40, 1e-100])

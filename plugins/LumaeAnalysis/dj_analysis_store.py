@@ -1,5 +1,6 @@
 """Durable, source-scoped DJ analysis jobs and publications."""
 
+import json
 import uuid
 
 from plugin.api import table
@@ -50,12 +51,67 @@ def migrate_dj_analysis(db):
         f"""CREATE INDEX IF NOT EXISTS {table('dj_analysis_jobs_queue_idx')}
         ON {table('dj_analysis_jobs')} (status, priority DESC, requested_at, track_id)"""
     )
+    # Flask and workers may run on separate hosts. Only the dedicated worker can
+    # attest its optional Python runtime and model files truthfully; the Flask
+    # process reads this path-free, version-bound row instead of probing itself.
+    cur.execute(
+        f"""CREATE TABLE IF NOT EXISTS {table('dj_worker_capability')} (
+            singleton BOOLEAN PRIMARY KEY DEFAULT TRUE CHECK (singleton),
+            plugin_version TEXT NOT NULL,
+            method TEXT NOT NULL,
+            payload JSONB NOT NULL,
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )"""
+    )
     cur.execute(
         f"""UPDATE {table('dj_analysis_jobs')} SET status='pending', started_at=NULL,
             error_code='worker_restarted', updated_at=now()
         WHERE status='running' AND updated_at < now()-interval '20 minutes'"""
     )
     cur.close()
+
+
+def write_dj_worker_capability(db, plugin_version, payload):
+    """Publish one sanitized capability attestation from the worker host."""
+    public = json.loads(canonical_json(payload))
+    cur = db.cursor()
+    cur.execute(
+        f"""INSERT INTO {table('dj_worker_capability')} AS current
+            (singleton, plugin_version, method, payload, updated_at)
+        VALUES (TRUE, %s, %s, %s::jsonb, now())
+        ON CONFLICT (singleton) DO UPDATE SET
+            plugin_version=EXCLUDED.plugin_version,
+            method=EXCLUDED.method,
+            payload=EXCLUDED.payload,
+            updated_at=now()
+        WHERE EXCLUDED.payload->>'worker_available'='true'
+           OR current.plugin_version<>EXCLUDED.plugin_version
+           OR current.method<>EXCLUDED.method
+           OR current.updated_at < now()-interval '10 minutes'""",
+        (str(plugin_version), METHOD, canonical_json(public)),
+    )
+    db.commit()
+    cur.close()
+    return public
+
+
+def read_dj_worker_capability(db, plugin_version):
+    """Read a fresh attestation produced by this exact plugin/DJ contract."""
+    cur = db.cursor()
+    cur.execute(
+        f"""SELECT payload FROM {table('dj_worker_capability')}
+        WHERE singleton=TRUE AND plugin_version=%s AND method=%s
+          AND updated_at >= now()-interval '10 minutes'""",
+        (str(plugin_version), METHOD),
+    )
+    row = cur.fetchone()
+    cur.close()
+    if not row:
+        return None
+    payload = row[0]
+    if isinstance(payload, str):
+        payload = json.loads(payload)
+    return json.loads(canonical_json(payload)) if isinstance(payload, dict) else None
 
 
 def _current_sources(cur, catalog_id, ids):

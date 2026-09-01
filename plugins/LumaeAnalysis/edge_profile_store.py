@@ -7,7 +7,7 @@ import uuid
 
 from plugin.api import table
 
-from .edge_profiles import METHOD, canonical_json, opaque_revision, profile_digest
+from .edge_profiles import METHOD, SCHEMA_VERSION, canonical_json, opaque_revision, profile_digest
 
 
 def migrate_edge_profiles(db):
@@ -60,7 +60,7 @@ def claim_edge_jobs(db, catalog_id, ids):
         revision = opaque_revision(signature)
         if not revision:
             continue
-        if payload and payload.get('schema_version') == 1 and payload.get('measurement', {}).get('method') == METHOD:
+        if payload and payload.get('schema_version') == SCHEMA_VERSION and payload.get('measurement', {}).get('method') == METHOD:
             ready.append(track_id)
             continue
         token = str(uuid.uuid4())
@@ -98,7 +98,7 @@ def update_edge_job(db, catalog_id, job, status, reason=None):
 def publish_edge_profile(db, catalog_id, job, payload, signature):
     from .catalog_enrichment import record_profile_change, serialize_profile
 
-    if (payload.get('schema_version') != 1 or payload.get('catalog_instance_id') != catalog_id or
+    if (payload.get('schema_version') != SCHEMA_VERSION or payload.get('catalog_instance_id') != catalog_id or
             payload.get('track_id') != job['track_id'] or payload.get('media_revision') != job['media_revision'] or
             opaque_revision(signature) != job['media_revision'] or profile_digest(payload) != payload.get('profile_digest')):
         raise ValueError('edge publication identity/digest mismatch')

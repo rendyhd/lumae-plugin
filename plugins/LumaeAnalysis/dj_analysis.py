@@ -22,8 +22,8 @@ from pathlib import Path
 import numpy as np
 
 
-SCHEMA_VERSION = 1
-METHOD = "beat-this-1.1.0-final0-lumae-dj-v1"
+SCHEMA_VERSION = 2
+METHOD = "beat-this-1.1.0-yamnet-lite-1-lumae-dj-v2"
 BEAT_THIS_VERSION = "1.1.0"
 MODEL_NAME = "final0"
 MODEL_URL = (
@@ -31,6 +31,40 @@ MODEL_URL = (
 )
 MODEL_BYTES = 81_058_141
 MODEL_SHA256 = "8c328b45f59d8dd3dff219253ff6a8d6482be57d0133a29140e2febbf8eb8331"
+YAMNET_MODEL_NAME = "yamnet-classification-tflite-1"
+YAMNET_MODEL_URL = (
+    "https://tfhub.dev/google/lite-model/yamnet/classification/tflite/1"
+    "?lite-format=tflite"
+)
+YAMNET_MODEL_BYTES = 4_126_810
+YAMNET_MODEL_SHA256 = "10c95ea3eb9a7bb4cb8bddf6feb023250381008177ac162ce169694d05c317de"
+YAMNET_SAMPLE_RATE = 16_000
+YAMNET_WINDOW_SAMPLES = 15_600
+YAMNET_HOP_SAMPLES = 7_680
+YAMNET_CLASS_COUNT = 521
+YAMNET_CLASS_MAP_SHA256 = "cdf24d193e196d9e95912a2667051ae203e92a2ba09449218ccb40ef787c6df2"
+YAMNET_VOCAL_CLASSES = {
+    0: "Speech",
+    1: "Child speech, kid speaking",
+    2: "Conversation",
+    3: "Narration, monologue",
+    4: "Babbling",
+    5: "Speech synthesizer",
+    12: "Whispering",
+    24: "Singing",
+    25: "Choir",
+    27: "Chant",
+    28: "Mantra",
+    29: "Child singing",
+    30: "Synthetic singing",
+    31: "Rapping",
+    32: "Humming",
+    63: "Chatter",
+    65: "Hubbub, speech noise, speech babble",
+    249: "Vocal music",
+    250: "A capella",
+    261: "Song",
+}
 MODEL_SAMPLE_RATE = 22_050
 MODEL_FPS = 50
 MODEL_N_FFT = 1_024
@@ -61,6 +95,7 @@ PINNED_PACKAGES = {
     "av": "16.1.0",
     "numpy": "2.1.3",
     "psutil": "6.1.1",
+    "ai-edge-litert": "2.2.0",
 }
 PINNED_PACKAGE_VARIANTS = {
     "torch": ("2.6.0", "2.6.0+cpu"),
@@ -132,13 +167,30 @@ def verify_model_artifact(
         raise DjAnalysisError("model_checksum_mismatch")
     return {
         "path": resolved,
+        "device": info.st_dev,
+        "inode": info.st_ino,
         "bytes": info.st_size,
         "sha256": expected_sha256,
         "mtime_ns": info.st_mtime_ns,
     }
 
 
-def runtime_status(model_path, *, package_version=None, verify_model=True):
+def verify_yamnet_model_artifact(model_path, *, deadline=None):
+    return verify_model_artifact(
+        model_path,
+        expected_bytes=YAMNET_MODEL_BYTES,
+        expected_sha256=YAMNET_MODEL_SHA256,
+        deadline=deadline,
+    )
+
+
+def runtime_status(
+    model_path,
+    yamnet_model_path=None,
+    *,
+    package_version=None,
+    verify_model=True,
+):
     package_version = package_version or importlib.metadata.version
     mismatches = []
     for name, expected in PINNED_PACKAGES.items():
@@ -153,12 +205,18 @@ def runtime_status(model_path, *, package_version=None, verify_model=True):
                 {"package": name, "reason": "version", "expected": expected, "actual": actual}
             )
     model = None
+    yamnet_model = None
     model_error = None
     if verify_model:
         try:
             model = verify_model_artifact(model_path)
         except DjAnalysisError as exc:
             model_error = exc.code
+        if model_error is None:
+            try:
+                yamnet_model = verify_yamnet_model_artifact(yamnet_model_path)
+            except DjAnalysisError as exc:
+                model_error = f"yamnet_{exc.code}"
     available = not mismatches and model_error is None
     return {
         "schema_version": SCHEMA_VERSION,
@@ -168,12 +226,25 @@ def runtime_status(model_path, *, package_version=None, verify_model=True):
         if available
         else model_error or "runtime_dependency_mismatch",
         "runtime_mismatches": mismatches,
-        "model": {
-            "name": MODEL_NAME,
-            "sha256": MODEL_SHA256,
-            "bytes": MODEL_BYTES,
-            "verified": model is not None,
+        "models": {
+            "beat_this": {
+                "name": MODEL_NAME,
+                "sha256": MODEL_SHA256,
+                "bytes": MODEL_BYTES,
+                "verified": model is not None,
+            },
+            "yamnet": {
+                "name": YAMNET_MODEL_NAME,
+                "sha256": YAMNET_MODEL_SHA256,
+                "bytes": YAMNET_MODEL_BYTES,
+                "verified": yamnet_model is not None,
+                "io_type": "float32",
+                "weight_quantization": "dynamic-range",
+                "scores_calibrated": False,
+            },
         },
+        "supported_analysis_versions": [SCHEMA_VERSION],
+        "supported_plan_versions": [2],
         "limits": {
             "max_concurrent_jobs": 1,
             "rss_bytes": RSS_CAP_BYTES,
@@ -429,6 +500,163 @@ def _key_evidence(value):
     }
 
 
+def _vocal_risk_timeline(value, duration_seconds):
+    if value is None:
+        return {
+            "method": YAMNET_MODEL_NAME,
+            "class_map_sha256": YAMNET_CLASS_MAP_SHA256,
+            "classes": [
+                {"index": index, "name": name}
+                for index, name in YAMNET_VOCAL_CLASSES.items()
+            ],
+            "frames": [],
+            "calibration": {
+                "status": "missing",
+                "scores_are_probabilities": False,
+                "cuts_authorized": False,
+            },
+        }
+    positions = value.get("positions_ms")
+    scores = value.get("scores")
+    indices = value.get("class_indices")
+    expected_indices = list(YAMNET_VOCAL_CLASSES)
+    if indices != expected_indices or not isinstance(positions, list) or not isinstance(scores, list):
+        raise DjAnalysisError("invalid_yamnet_output")
+    if len(positions) != len(scores) or len(positions) > int(duration_seconds * 4) + 8:
+        raise DjAnalysisError("invalid_yamnet_output")
+    frames = []
+    previous = -1
+    for position, row in zip(positions, scores):
+        if (
+            isinstance(position, bool)
+            or not isinstance(position, int)
+            or position < 0
+            or position > int(round(duration_seconds * 1000)) + 1000
+            or position <= previous
+            or not isinstance(row, (list, tuple))
+            or len(row) != len(expected_indices)
+        ):
+            raise DjAnalysisError("invalid_yamnet_output")
+        numeric = np.asarray(row, dtype=np.float64)
+        if not np.all(np.isfinite(numeric)) or np.any(numeric < 0) or np.any(numeric > 1):
+            raise DjAnalysisError("invalid_yamnet_output")
+        frames.append(
+            {
+                "position_ms": position,
+                "raw_vocal_evidence": round(float(np.max(numeric)), 8),
+                "dominant_class_index": expected_indices[int(np.argmax(numeric))],
+                "calibrated_risk": None,
+            }
+        )
+        previous = position
+    return {
+        "method": YAMNET_MODEL_NAME,
+        "class_map_sha256": YAMNET_CLASS_MAP_SHA256,
+        "classes": [
+            {"index": index, "name": name}
+            for index, name in YAMNET_VOCAL_CLASSES.items()
+        ],
+        "frames": frames,
+        "calibration": {
+            "status": "uncalibrated",
+            "scores_are_probabilities": False,
+            "cuts_authorized": False,
+        },
+    }
+
+
+def _structural_timeline(
+    regions,
+    candidates,
+    model_output,
+    beat_frames,
+    matched_downbeats,
+    fps,
+):
+    band_vectors = {}
+    for name in ("low_energy", "mid_energy", "high_energy"):
+        raw = model_output.get(name)
+        band_vectors[name] = (
+            _finite_vector(name, raw, len(model_output["beat_logits"]))
+            if raw is not None
+            else None
+        )
+
+    band_windows = []
+    if all(vector is not None for vector in band_vectors.values()):
+        for region_index, region in enumerate(regions):
+            downbeats = [
+                item
+                for item in matched_downbeats
+                if region["start_beat_index"]
+                <= item["beat_index"]
+                <= region["end_beat_index"]
+            ]
+            for position, item in enumerate(downbeats):
+                start = item["snapped_frame"]
+                if position + 1 < len(downbeats):
+                    end = downbeats[position + 1]["snapped_frame"]
+                else:
+                    end_beat = min(item["beat_index"] + 4, region["end_beat_index"])
+                    end = beat_frames[end_beat]
+                if end <= start:
+                    continue
+                band_windows.append(
+                    {
+                        "start_ms": int(round(start * 1000 / fps)),
+                        "end_ms": int(round(end * 1000 / fps)),
+                        "region_index": region_index,
+                        "eligible": region["eligible"],
+                        "low": round(float(np.mean(band_vectors["low_energy"][start:end])), 8),
+                        "mid": round(float(np.mean(band_vectors["mid_energy"][start:end])), 8),
+                        "high": round(float(np.mean(band_vectors["high_energy"][start:end])), 8),
+                    }
+                )
+
+    phrases = []
+    for kind in ("entries", "exits"):
+        for candidate in candidates[kind]:
+            region = regions[candidate["region_index"]]
+            phrases.append(
+                {
+                    "position_ms": candidate["time_ms"],
+                    "kind": "intro" if kind == "entries" else "outro",
+                    "region_index": candidate["region_index"],
+                    "downbeat_confidence": region["beat_peak_activation_mean"],
+                    "structural_boundary": candidate["boundary"],
+                    "eligible": bool(
+                        region["eligible"]
+                        and candidate["boundary"] == "eight_bar_downbeat"
+                    ),
+                }
+            )
+    phrases.sort(key=lambda item: (item["position_ms"], item["kind"]))
+    return {
+        "meter": {"beats_per_bar": 4, "confidence": "region-guarded"},
+        "local_tempo": [
+            {
+                "start_ms": region["start_ms"],
+                "end_ms": region["end_ms"],
+                "bpm": region["tempo_bpm"],
+                "interval_cv": region["interval_cv"],
+                "eligible": region["eligible"],
+            }
+            for region in regions
+        ],
+        "phrase_candidates": phrases,
+        "band_energy": {
+            "unit": "mean-log-mel",
+            "window": "bar",
+            "windows": band_windows,
+        },
+        "chroma": {
+            "available": False,
+            "reason": "deterministic_chroma_calibration_pending",
+            "frames": [],
+        },
+    }
+
+
 def build_dj_analysis(
     model_output,
     *,
@@ -440,6 +668,7 @@ def build_dj_analysis(
     duration_seconds,
     source,
     key_evidence=None,
+    vocal_output=None,
 ):
     for token in (catalog_instance_id, track_id):
         if not isinstance(token, str) or not 0 < len(token) <= 512:
@@ -477,6 +706,7 @@ def build_dj_analysis(
     matched = _match_downbeats(beat_frames, raw_downbeat_frames, MODEL_FPS)
     regions = _regions(beat_frames, matched, beat_logits, MODEL_FPS)
     candidates = _novelty_candidates(regions, matched, energy, spectral_flux, MODEL_FPS)
+    vocal_risk = _vocal_risk_timeline(vocal_output, duration_seconds)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "method": METHOD,
@@ -501,6 +731,14 @@ def build_dj_analysis(
             "short_end_mode": "shift_to_end",
             "output_semantics": "uncalibrated_logits",
             "downbeat_snapping_authorizes_alignment": False,
+            "yamnet": {
+                "name": YAMNET_MODEL_NAME,
+                "artifact_sha256": YAMNET_MODEL_SHA256,
+                "sample_rate": YAMNET_SAMPLE_RATE,
+                "window_samples": YAMNET_WINDOW_SAMPLES,
+                "hop_samples": YAMNET_HOP_SAMPLES,
+                "output_semantics": "uncalibrated_scores",
+            },
         },
         "beats": {
             "positions_ms": [int(round(frame * 1000 / MODEL_FPS)) for frame in beat_frames],
@@ -515,6 +753,15 @@ def build_dj_analysis(
         },
         "regions": regions,
         "candidates": candidates,
+        "structure": _structural_timeline(
+            regions,
+            candidates,
+            model_output,
+            beat_frames,
+            matched,
+            MODEL_FPS,
+        ),
+        "vocal_risk": vocal_risk,
         "natural_boundaries": {"entry_ms": 0, "exit_ms": int(round(duration_seconds * 1000))},
         "key_evidence": _key_evidence(key_evidence),
         "quality": {
@@ -523,6 +770,8 @@ def build_dj_analysis(
             "beat_count": len(beat_frames),
             "raw_downbeat_count": len(raw_downbeat_frames),
             "model_outputs_are_probabilities": False,
+            "vocal_calibration_ready":
+                vocal_risk["calibration"]["status"] == "ready",
         },
     }
     payload["analysis_digest"] = analysis_digest(payload)
@@ -669,7 +918,18 @@ class BeatThisWindowAdapter:
                 axis=1,
                 dtype=np.float64,
             )
-        return beat, downbeat, energy, spectral_flux
+        low_energy = np.mean(log_mel[:, :32], axis=1, dtype=np.float64)
+        mid_energy = np.mean(log_mel[:, 32:80], axis=1, dtype=np.float64)
+        high_energy = np.mean(log_mel[:, 80:], axis=1, dtype=np.float64)
+        return (
+            beat,
+            downbeat,
+            energy,
+            spectral_flux,
+            low_energy,
+            mid_energy,
+            high_energy,
+        )
 
     def analyze(self, path, *, deadline, cancelled=None, progress=None):
         import av
@@ -729,8 +989,14 @@ class BeatThisWindowAdapter:
                 name: np.full(frame_count, -1000.0, dtype=np.float64)
                 for name in ("beat_logits", "downbeat_logits")
             }
-            outputs["energy"] = np.zeros(frame_count, dtype=np.float64)
-            outputs["spectral_flux"] = np.zeros(frame_count, dtype=np.float64)
+            for name in (
+                "energy",
+                "spectral_flux",
+                "low_energy",
+                "mid_energy",
+                "high_energy",
+            ):
+                outputs[name] = np.zeros(frame_count, dtype=np.float64)
             owned = np.zeros(frame_count, dtype=np.bool_)
             pcm = np.memmap(
                 pcm_file,
@@ -787,6 +1053,130 @@ class BeatThisWindowAdapter:
         return result
 
 
+class YamnetLiteAdapter:
+    """Pinned CPU LiteRT adapter returning time-resolved uncalibrated evidence."""
+
+    def __init__(self, model_path, *, rss_reader=_rss_bytes, deadline=None, cancelled=None):
+        self.artifact = verify_yamnet_model_artifact(model_path, deadline=deadline)
+        self.rss_reader = rss_reader
+        _check_deadline(deadline, cancelled)
+        from ai_edge_litert.interpreter import Interpreter
+
+        self.interpreter = Interpreter(model_path=str(self.artifact["path"]), num_threads=1)
+        self.interpreter.allocate_tensors()
+        opened = self.artifact["path"].stat()
+        if (
+            opened.st_dev != self.artifact["device"]
+            or opened.st_ino != self.artifact["inode"]
+            or opened.st_size != self.artifact["bytes"]
+            or opened.st_mtime_ns != self.artifact["mtime_ns"]
+            or _sha256_file(
+                self.artifact["path"], deadline=deadline, cancelled=cancelled
+            )
+            != YAMNET_MODEL_SHA256
+        ):
+            raise DjAnalysisError("yamnet_model_changed")
+        inputs = self.interpreter.get_input_details()
+        outputs = self.interpreter.get_output_details()
+        if len(inputs) != 1 or len(outputs) != 1:
+            raise DjAnalysisError("yamnet_contract_mismatch")
+        input_shape = tuple(int(value) for value in inputs[0]["shape"])
+        output_shape = tuple(int(value) for value in outputs[0]["shape"])
+        if input_shape not in ((YAMNET_WINDOW_SAMPLES,), (1, YAMNET_WINDOW_SAMPLES)):
+            raise DjAnalysisError("yamnet_contract_mismatch")
+        if output_shape not in ((YAMNET_CLASS_COUNT,), (1, YAMNET_CLASS_COUNT)):
+            raise DjAnalysisError("yamnet_contract_mismatch")
+        if np.dtype(inputs[0]["dtype"]) != np.dtype(np.float32) or np.dtype(
+            outputs[0]["dtype"]
+        ) != np.dtype(np.float32):
+            raise DjAnalysisError("yamnet_contract_mismatch")
+        self.input = inputs[0]
+        self.output = outputs[0]
+        if self.rss_reader() > RSS_CAP_BYTES:
+            raise DjAnalysisError("rss_cap_exceeded")
+
+    def analyze(self, path, *, deadline, cancelled=None):
+        import av
+
+        source_rate = None
+        resampled_frames = 0
+        with tempfile.TemporaryFile() as pcm_file:
+            with av.open(str(path)) as container:
+                streams = [stream for stream in container.streams if stream.type == "audio"]
+                if len(streams) != 1:
+                    raise DjAnalysisError("unsupported_audio_streams")
+                resampler = av.AudioResampler(
+                    format="fltp", layout="mono", rate=YAMNET_SAMPLE_RATE
+                )
+                for frame in container.decode(streams[0]):
+                    _check_deadline(deadline, cancelled)
+                    rate = int(
+                        frame.sample_rate
+                        or streams[0].codec_context.sample_rate
+                        or 0
+                    )
+                    if rate <= 0 or (source_rate is not None and source_rate != rate):
+                        raise DjAnalysisError("source_timeline_changed")
+                    source_rate = rate
+                    for converted in resampler.resample(frame):
+                        block = converted.to_ndarray().astype(np.float32, copy=False).reshape(-1)
+                        if not np.all(np.isfinite(block)):
+                            raise DjAnalysisError("non_finite_audio")
+                        pcm_file.write(block.astype("<f4", copy=False).tobytes())
+                        resampled_frames += len(block)
+                        if resampled_frames > MAX_SOURCE_SECONDS * YAMNET_SAMPLE_RATE:
+                            raise DjAnalysisError("source_duration_unsupported")
+                        if self.rss_reader() > RSS_CAP_BYTES:
+                            raise DjAnalysisError("rss_cap_exceeded")
+                for converted in resampler.resample(None):
+                    block = converted.to_ndarray().astype(np.float32, copy=False).reshape(-1)
+                    if not np.all(np.isfinite(block)):
+                        raise DjAnalysisError("non_finite_audio")
+                    pcm_file.write(block.astype("<f4", copy=False).tobytes())
+                    resampled_frames += len(block)
+            if not resampled_frames:
+                raise DjAnalysisError("empty_audio")
+            if resampled_frames > MAX_SOURCE_SECONDS * YAMNET_SAMPLE_RATE:
+                raise DjAnalysisError("source_duration_unsupported")
+            pcm_file.flush()
+            pcm = np.memmap(pcm_file, dtype="<f4", mode="r", shape=(resampled_frames,))
+            positions = []
+            rows = []
+            try:
+                last_start = max(0, resampled_frames - YAMNET_WINDOW_SAMPLES)
+                starts = list(range(0, last_start + 1, YAMNET_HOP_SAMPLES))
+                if not starts or starts[-1] != last_start:
+                    starts.append(last_start)
+                for start in starts:
+                    _check_deadline(deadline, cancelled)
+                    window = np.zeros(YAMNET_WINDOW_SAMPLES, dtype=np.float32)
+                    available = min(YAMNET_WINDOW_SAMPLES, resampled_frames - start)
+                    window[:available] = pcm[start : start + available]
+                    tensor = window if tuple(self.input["shape"]) == (YAMNET_WINDOW_SAMPLES,) else window[None, :]
+                    self.interpreter.set_tensor(self.input["index"], tensor)
+                    self.interpreter.invoke()
+                    scores = np.asarray(
+                        self.interpreter.get_tensor(self.output["index"]), dtype=np.float32
+                    ).reshape(-1)
+                    if len(scores) != YAMNET_CLASS_COUNT or not np.all(np.isfinite(scores)):
+                        raise DjAnalysisError("invalid_yamnet_output")
+                    positions.append(
+                        int(round((start + min(available, YAMNET_WINDOW_SAMPLES) / 2) * 1000 / YAMNET_SAMPLE_RATE))
+                    )
+                    rows.append(
+                        [round(float(scores[index]), 8) for index in YAMNET_VOCAL_CLASSES]
+                    )
+                    if self.rss_reader() > RSS_CAP_BYTES:
+                        raise DjAnalysisError("rss_cap_exceeded")
+            finally:
+                del pcm
+        return {
+            "positions_ms": positions,
+            "class_indices": list(YAMNET_VOCAL_CLASSES),
+            "scores": rows,
+        }
+
+
 def analyze_dj_file(
     path,
     *,
@@ -794,7 +1184,9 @@ def analyze_dj_file(
     track_id,
     media_revision,
     model_path,
+    yamnet_model_path=None,
     adapter=None,
+    yamnet_adapter=None,
     deadline_seconds=JOB_DEADLINE_SECONDS,
     cancelled=None,
     progress=None,
@@ -814,6 +1206,22 @@ def analyze_dj_file(
         deadline=deadline,
         cancelled=cancelled,
         progress=progress,
+    )
+    vocal_worker = yamnet_adapter
+    if vocal_worker is None and yamnet_model_path:
+        vocal_worker = YamnetLiteAdapter(
+            yamnet_model_path,
+            deadline=deadline,
+            cancelled=cancelled,
+        )
+    vocal_output = (
+        vocal_worker.analyze(
+            source_path,
+            deadline=deadline,
+            cancelled=cancelled,
+        )
+        if vocal_worker is not None
+        else None
     )
     after = source_path.stat()
     if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (
@@ -850,4 +1258,5 @@ def analyze_dj_file(
         duration_seconds=duration_seconds,
         source=source,
         key_evidence=key_evidence,
+        vocal_output=vocal_output,
     )

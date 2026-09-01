@@ -1,22 +1,68 @@
-# Optional edge profiles
+# Optional EdgeProfileV2
 
-EdgeProfileV1 adds source-bound head/tail measurements to waveform profiles. It does not replace legacy loudness or MixRamp data. Direct profile fetches, profile bootstrap and profile deltas publish the same optional `edge_profile` object. The outer schema/analyzer versions remain 1.
+EdgeProfileV2 adds source-bound transition evidence to waveform profiles. It is
+additive: legacy loudness, MixRamp, sync and existing databases continue to work
+without it. Direct fetches, bootstrap and deltas expose the same optional
+`edge_profile` object.
 
-Install `requirements-edge.txt` explicitly in the worker environment and restart it. This pins PyAV 16.1.0; the producer requires libswresample 6.1.100. No request installs packages or downloads models. Without that runtime, health reports `capabilities.edge_profiles.available=false`; normal legacy analysis remains available. The setting `edge_profiles_enabled=false` disables scheduling.
+Install `requirements-edge.txt` on the analysis worker and restart it. The
+producer pins PyAV 16.1.0 and requires libswresample 6.1.100. No request installs
+packages or downloads models. If the runtime is absent, health reports
+`capabilities.edge_profiles.available=false`; normal analysis remains available.
+The setting `edge_profiles_enabled=false` disables scheduling.
 
-Successful legacy analysis schedules a separate optional upgrade. Ready legacy rows are never marked failed because an upgrade failed. Source revision and a unique job token protect publication from source replacement, retries and duplicate workers. Edge data, job readiness and the profile delta/cursor commit together. Internal path/size/mtime signatures are published only as opaque SHA-256 tokens in both `media_signature` and the additive `media_revision`.
+Successful legacy analysis schedules a separate optional upgrade. A failed V2
+job never changes a ready legacy row. An opaque media revision and unique job
+token protect publication from source replacement, duplicate workers and stale
+retries. Edge data, job readiness and the profile cursor commit atomically.
+Internal paths and media signatures are never published.
 
-Within the existing authenticated plugin API:
+Authenticated endpoints:
 
-- `POST /api/profiles/edges/analyze`: `catalog_instance_id`, `ids` (at most 100). Uses interactive priority.
-- `POST /api/profiles/edges/backfill`: `catalog_instance_id`, optional `after` track ID and `limit` (integer 1–100). Returns `next_after`; restart from the beginning after pending jobs finish or failed jobs become retryable. This is a bounded pass, not proof all profiles are ready.
+- `POST /api/profiles/edges/analyze`: `catalog_instance_id`, `ids` (maximum 100)
+- `POST /api/profiles/edges/backfill`: `catalog_instance_id`, optional `after`
+  track ID and `limit` (1–100)
 
-Pending/running jobs coalesce, abandoned jobs can retry after 30 minutes, and failed upgrades back off six hours. Changed source revisions may retry immediately. Workers reacquire the authorized source instead of depending on expired hook downloads. Each file measurement has a 15-minute deadline and a 6,553.6-second source-duration cap.
+Pending or running jobs coalesce. Abandoned jobs retry after 30 minutes and
+failed jobs back off for six hours. Source revision changes may retry
+immediately. Each file has a 15 minute deadline and a 6,553.6 second decoded
+duration ceiling.
 
-Measurement keeps the first/last 30 seconds, including partial 100 ms bins. It uses a canonical 48 kHz resampler with continuous state, fixed two-stage weighting, and ungated channel-mean power. Source sample peaks and exact digital silence are measured before resampling/filtering. V1 accepts explicit mono/stereo layouts only. This is versioned weighted power, not standardized LUFS. Unknown layouts, non-finite samples and centidB overflow fail the optional upgrade without changing the ready legacy profile.
+## Measurement contract
 
-Values are base64 signed int16 little-endian centidB, with `-32768` reserved for exactly zero. Separate validity masks use least-significant-bit-first indexing. Peaks round upward; missing bins cannot be treated as silence. Bin boundaries refer to decoded source frames. Short sources can have identical head and tail coverage.
+The analyzer retains only the first and last 30 seconds, including partial
+100 ms bins. The decoder and 48 kHz resampler remain continuous for the complete
+source. It publishes:
 
-The golden contract fixture is `tests/plugins/edge_profile_v1_golden.json`; the app carries the same fixture. SHA-256 covers UTF-8 sorted-key compact JSON excluding only `profile_digest`. The content hash is checked before and after decode. Producer timeline verification is limited to the declared lossless decoder path; a client must still independently bind the actual playback representation and seek behavior before trimming or overlap decisions. Transcoded streams and duration guesses are not verified originals.
+- continuous K-weighted mean power and source sample peak
+- four-times polyphase oversampled true peak
+- continuous complementary fourth-order low, mid and high analysis bands at
+  150 Hz and 2.5 kHz
+- bounded spectral-flux and onset-density evidence in unsigned Q15
+- an adaptive noise floor, ramp/body landmarks and confidence
+- exact leading and trailing digital-zero counts
+- a hidden-content guard when late audio follows a long quiet span
 
-Tests require `requirements-dev.txt` and `requirements-edge.txt`. Set `LUMAE_POSTGRES_TEST_DSN` to a disposable database to run transaction tests. CI provisions its own database. No production database is required. CPU/RSS performance, native route safety and listening preference remain separate qualification gates.
+Exact digital zero is the only padding evidence. Adaptive quiet, a noise floor,
+or a ramp landmark never authorizes destructive trim. Raw source peaks also
+protect quiet material that K-weighting attenuates. Unknown layouts, non-finite
+PCM, changed source identity, timeline inconsistencies and quantization overflow
+fail only the optional upgrade.
+
+All positions use decoded source frames. Values are base64 little-endian signed
+int16 centidB (`-32768` is exact zero) or unsigned Q15. Validity masks are LSB
+first. Peak bounds round upward. Short files may have identical head and tail
+windows. `profile_digest` is SHA-256 over sorted-key compact UTF-8 JSON excluding
+only the digest itself.
+
+`tests/plugins/edge_profile_v2_golden.json` is the published producer fixture.
+The source hash is checked before and after decode. `timeline_verified=true` is
+limited to the declared lossless decoder path. A client must still bind the
+profile to the exact playback representation, decoder and seek behavior before
+executing a trim or transition. A provider transcode is a different
+representation and invalidates the plan.
+
+Tests need `requirements-dev.txt` and `requirements-edge.txt`. Set
+`LUMAE_POSTGRES_TEST_DSN` to a disposable database for transaction tests. CPU and
+RSS soak, native route safety, transition rendering and listening preference are
+separate qualification gates.

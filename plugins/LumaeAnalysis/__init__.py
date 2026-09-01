@@ -14,7 +14,10 @@ from .loudness import (
     SilentAudioError,
     analyze_file,
 )
-from .edge_profiles import analyze_edge_file, edge_runtime_available, opaque_revision, METHOD as EDGE_METHOD
+from .edge_profiles import (
+    analyze_edge_file, edge_runtime_available, opaque_revision,
+    METHOD as EDGE_METHOD, SCHEMA_VERSION as EDGE_SCHEMA_VERSION,
+)
 from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
     publish_edge_profile, edge_backfill_candidates,
@@ -37,10 +40,16 @@ from .dj_analysis_store import (
     finish_dj_job,
     migrate_dj_analysis,
     publish_dj_analysis,
+    read_dj_worker_capability,
     read_dj_analysis,
     update_dj_progress,
+    write_dj_worker_capability,
 )
-from .provision_dj_model import provision as provision_dj_model
+from .provision_dj_model import (
+    ACKNOWLEDGEMENT as DJ_MODEL_ACKNOWLEDGEMENT,
+    provision_stack as provision_dj_models,
+    remove_stack as remove_dj_models,
+)
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -212,7 +221,8 @@ PROFILE_JOB_TIMEOUT_SECONDS = 20 * 60
 PROFILE_BACKFILL_JOB_TIMEOUT_SECONDS = 30 * 60
 MAX_DJ_ANALYSIS_IDS = 100
 DEFAULT_DJ_MODEL_PATH = "/var/lib/audiomuse/lumae-models/beat-this-final0.ckpt"
-DJ_TASK_QUEUE = "default"
+DEFAULT_YAMNET_MODEL_PATH = "/var/lib/audiomuse/lumae-models/yamnet-classification-tflite-1.tflite"
+DJ_TASK_QUEUE = "lumae-dj"
 _DJ_CAPABILITY_CACHE = {}
 CATALOG_JOB_TIMEOUT_SECONDS = 90 * 60
 RELATIONSHIP_JOB_TIMEOUT_SECONDS = 60 * 60
@@ -1231,6 +1241,7 @@ def migrate(db):
     ensure_analysis_projection_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
+    migrate_dj_opt_in()
     # Installation is schema work, not a reason to rebuild the full analysis
     # and relationship projections. Only a missing/stale catalogue publication
     # is admitted here; ordinary analysis hooks and explicit prepare requests
@@ -1645,36 +1656,105 @@ def configured_dj_model_path():
     return str(value or DEFAULT_DJ_MODEL_PATH).strip()
 
 
-def dj_analysis_capability():
-    """Return a path-free capability report with playback held behind qualification."""
+def configured_yamnet_model_path():
+    value = get_setting("dj_yamnet_model_path", DEFAULT_YAMNET_MODEL_PATH)
+    return str(value or DEFAULT_YAMNET_MODEL_PATH).strip()
+
+
+def dj_models_acknowledged():
+    value = get_setting("dj_models_acknowledged", False)
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "yes", "on")
+    return bool(value)
+
+
+def dj_setup_state():
+    value = str(get_setting("dj_setup_state", "disabled") or "disabled")
+    return value if value in ("disabled", "downloading", "initializing", "ready", "error") else "error"
+
+
+def migrate_dj_opt_in():
+    """Require the new combined two-model consent after older DJ test builds."""
     enabled = dj_analysis_enabled()
+    acknowledged = dj_models_acknowledged()
+    if enabled and not acknowledged:
+        # The previous one-model switch is not consent to download YAMNet or to
+        # run DJ Analysis V2. Fail closed and require the new combined switch.
+        set_setting("dj_analysis_enabled", False)
+        enabled = False
+    if not enabled:
+        set_setting("dj_setup_state", "disabled")
+    _DJ_CAPABILITY_CACHE.clear()
+
+
+def _disabled_dj_capability():
+    return {
+        "schema_version": DJ_SCHEMA_VERSION,
+        "method": DJ_METHOD,
+        "enabled": False,
+        "acknowledged": False,
+        "lifecycle": "disabled",
+        "worker_available": False,
+        "internal_test_eligible": False,
+        "available": False,
+        "reference_host_qualified": False,
+        "reason": "disabled",
+        "supported_analysis_versions": [DJ_SCHEMA_VERSION],
+        "supported_plan_versions": [2],
+    }
+
+
+def local_dj_worker_capability():
+    """Probe models and optional dependencies only on the dedicated worker."""
+    enabled = dj_analysis_enabled()
+    acknowledged = dj_models_acknowledged() if enabled else False
+    if not enabled:
+        return _disabled_dj_capability()
+    if os.environ.get("LUMAE_DJ_WORKER") != "1":
+        return {
+            **_disabled_dj_capability(),
+            "enabled": True,
+            "acknowledged": acknowledged,
+            "lifecycle": dj_setup_state(),
+            "reason": (
+                "acknowledgement_required"
+                if not acknowledged
+                else "dedicated_worker_required"
+            ),
+        }
     model_path = configured_dj_model_path() if enabled else ""
-    if model_path:
-        try:
-            model_stat = os.stat(model_path)
-            cache_key = (
-                enabled,
-                model_path,
-                model_stat.st_dev,
-                model_stat.st_ino,
-                model_stat.st_size,
-                model_stat.st_mtime_ns,
-            )
-        except OSError:
-            cache_key = (enabled, model_path, None)
+    yamnet_path = configured_yamnet_model_path() if enabled else ""
+    if model_path and yamnet_path:
+        stats = []
+        for path in (model_path, yamnet_path):
+            try:
+                info = os.stat(path)
+                stats.append((path, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
+            except OSError:
+                stats.append((path, None))
+        cache_key = (enabled, acknowledged, dj_setup_state(), tuple(stats))
     else:
-        cache_key = (enabled, "", None)
+        cache_key = (enabled, False, "disabled", ())
     if _DJ_CAPABILITY_CACHE.get("key") == cache_key:
         return json.loads(json.dumps(_DJ_CAPABILITY_CACHE["value"]))
     status = dj_runtime_status(
         model_path,
+        yamnet_path,
         verify_model=enabled,
     )
-    worker_available = bool(status["available"]) if enabled else False
+    worker_available = bool(status["available"]) if acknowledged else False
+    lifecycle = dj_setup_state() if enabled else "disabled"
+    if worker_available:
+        lifecycle = "ready"
+    elif enabled and lifecycle == "ready":
+        lifecycle = "error"
     status.update(
         {
             "enabled": enabled,
+            "acknowledged": acknowledged,
+            "lifecycle": lifecycle,
             "worker_available": worker_available,
+            "internal_test_eligible": worker_available,
             # The CPU reference-host and listening gates are evidence gates,
             # not administrator toggles. Keep playback unavailable until a
             # reviewed qualification artifact changes this shipped contract.
@@ -1682,6 +1762,8 @@ def dj_analysis_capability():
             "reason": (
                 "disabled"
                 if not enabled
+                else "acknowledgement_required"
+                if not acknowledged
                 else "reference_host_unqualified"
                 if worker_available
                 else status["reason"]
@@ -1690,6 +1772,61 @@ def dj_analysis_capability():
     )
     _DJ_CAPABILITY_CACHE.update(
         {"key": cache_key, "value": json.loads(json.dumps(status))}
+    )
+    return status
+
+
+def attest_dj_worker_capability():
+    """Persist the dedicated worker's path-free, version-bound result."""
+    db = get_db()
+    migrate_dj_analysis(db)
+    capability = local_dj_worker_capability()
+    return write_dj_worker_capability(db, PLUGIN_VERSION, capability)
+
+
+def dj_analysis_capability():
+    """Project the latest dedicated-worker attestation to Flask and clients."""
+    enabled = dj_analysis_enabled()
+    if not enabled:
+        return _disabled_dj_capability()
+    acknowledged = dj_models_acknowledged()
+    if not acknowledged:
+        return {
+            **_disabled_dj_capability(),
+            "enabled": True,
+            "lifecycle": dj_setup_state(),
+            "reason": "acknowledgement_required",
+        }
+    try:
+        status = read_dj_worker_capability(get_db(), PLUGIN_VERSION)
+    except Exception:
+        logger.exception("lumae_analysis could not read the DJ worker capability")
+        status = None
+    if not status:
+        return {
+            **_disabled_dj_capability(),
+            "enabled": True,
+            "acknowledged": True,
+            "lifecycle": dj_setup_state(),
+            "reason": "worker_not_attested",
+        }
+    worker_available = status.get("worker_available") is True
+    status.update(
+        {
+            "enabled": True,
+            "acknowledged": True,
+            "worker_available": worker_available,
+            "internal_test_eligible": bool(
+                worker_available and status.get("internal_test_eligible") is True
+            ),
+            # Private test eligibility never promotes the public capability.
+            "available": False,
+            "reason": (
+                "reference_host_unqualified"
+                if worker_available
+                else status.get("reason") or "worker_unavailable"
+            ),
+        }
     )
     return status
 
@@ -1770,7 +1907,7 @@ def health():
             "schema_version": SCHEMA_VERSION,
             "analyzer_version": ANALYZER_VERSION,
             "capabilities": {
-                "edge_profiles": {"schema_version": 1, "method": EDGE_METHOD,
+                "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
                 "dj_analysis": dj_analysis_capability(),
                 "collections": {
@@ -2787,22 +2924,43 @@ def _enqueue_dj_worker():
 
 
 def prepare_dj_runtime():
-    """Provision the pinned model only after the administrator opts in."""
-    if not dj_analysis_enabled():
-        return dj_analysis_capability()
-    capability = dj_analysis_capability()
+    """Provision both pinned models only on the opted-in dedicated worker."""
+    if not dj_analysis_enabled() or os.environ.get("LUMAE_DJ_WORKER") != "1":
+        return local_dj_worker_capability()
+    if not dj_models_acknowledged():
+        set_setting("dj_setup_state", "error")
+        _DJ_CAPABILITY_CACHE.clear()
+        return attest_dj_worker_capability()
+    capability = attest_dj_worker_capability()
     if capability["worker_available"] or capability.get("runtime_mismatches"):
         return capability
     try:
-        provision_dj_model(configured_dj_model_path())
+        set_setting("dj_setup_state", "downloading")
+        _DJ_CAPABILITY_CACHE.clear()
+        provision_dj_models(
+            configured_dj_model_path(),
+            configured_yamnet_model_path(),
+        )
+        set_setting("dj_setup_state", "initializing")
+        _DJ_CAPABILITY_CACHE.clear()
+        capability = attest_dj_worker_capability()
+        set_setting(
+            "dj_setup_state",
+            "ready" if capability["worker_available"] else "error",
+        )
+        capability["lifecycle"] = (
+            "ready" if capability["worker_available"] else "error"
+        )
     except Exception:
+        set_setting("dj_setup_state", "error")
         logger.exception("lumae_analysis could not provision the optional DJ model")
         capability["worker_available"] = False
+        capability["internal_test_eligible"] = False
         capability["available"] = False
         capability["reason"] = "model_download_failed"
-        return capability
+        return write_dj_worker_capability(get_db(), PLUGIN_VERSION, capability)
     _DJ_CAPABILITY_CACHE.clear()
-    return dj_analysis_capability()
+    return capability
 
 
 def _request_dj_jobs(source, ids, *, priority=0):
@@ -2954,6 +3112,7 @@ def dj_analysis_task():
             track_id=job["track_id"],
             media_revision=job["media_revision"],
             model_path=configured_dj_model_path(),
+            yamnet_model_path=configured_yamnet_model_path(),
             cancelled=lambda: dj_job_cancelled(get_db(), job),
             progress=lambda frames: update_dj_progress(get_db(), job, frames),
         )
@@ -5485,21 +5644,24 @@ def render_dj_analysis_panel():
     if not enabled:
         status = "Off"
         status_class = ""
-        detail = "No Beat This model will be downloaded or loaded. SmoothFade remains available."
+        detail = "No Beat This or YAMNet model will be downloaded or loaded. SmoothFade remains available."
     elif capability.get("worker_available") is True:
         status = "Ready"
         status_class = "lumae-source-state-ready"
-        detail = "The dedicated worker verified the pinned Beat This model and runtime."
+        detail = "The dedicated worker verified the pinned Beat This and YAMNet models and runtime."
     elif reason in {
         "disabled",
         "model_missing",
         "model_size_mismatch",
         "model_checksum_mismatch",
+        "yamnet_model_missing",
+        "yamnet_model_size_mismatch",
+        "yamnet_model_checksum_mismatch",
         "worker_not_attested",
     }:
         status = "Preparing"
         status_class = "lumae-source-state-working"
-        detail = "The DJ worker is downloading and verifying the pinned 77.3 MiB model."
+        detail = "The DJ worker is downloading or verifying both pinned optional models. Downloads resume after interruption."
     else:
         status = "Needs attention"
         status_class = "lumae-source-state-danger"
@@ -5525,15 +5687,23 @@ def render_dj_analysis_panel():
         <form class="lumae-form" method="post">
           <label class="lumae-toggle">
             <input type="checkbox" role="switch" name="dj_analysis_enabled"{checked}>
-            <span>Enable DJ Mode</span>
+            <span>Enable DJ analysis</span>
           </label>
-          <p class="lumae-help">Turning this on downloads the checksum-pinned 77.3 MiB Beat This
-            model on the DJ worker and confirms: “I reviewed the Beat This license and training-data
-            caveat.” Turning it off prevents model loading and new DJ analysis; an already verified
-            model stays cached for a faster future enable.</p>
+          <label class="lumae-toggle">
+            <input type="checkbox" name="dj_models_acknowledged"
+              {' checked' if dj_models_acknowledged() else ''}>
+            <span>{escape(DJ_MODEL_ACKNOWLEDGEMENT)}</span>
+          </label>
+          <p class="lumae-help">Turning this on downloads checksum-pinned Beat This (77.3 MiB)
+            and official YAMNet Lite (3.9 MiB) models only on the DJ worker. YAMNet scores are
+            uncalibrated AudioSet evidence, not probabilities or permission to cut. Turning this
+            off prevents model loading and new DJ analysis. Existing music, sync data, and normal
+            analysis remain usable.</p>
           <div class="lumae-actions">
             <button class="lumae-button-secondary" type="submit" name="action"
               value="save_dj_analysis">Save DJ Mode setting</button>
+            <button class="lumae-button-secondary" type="submit" name="action"
+              value="remove_dj_models">Remove downloaded DJ models</button>
           </div>
         </form>
       </section>
@@ -6042,7 +6212,14 @@ def settings():
                 message = f"Living Collections {'enabled' if enabled else 'disabled'}."
             elif action == "save_dj_analysis":
                 enabled = request.form.get("dj_analysis_enabled") == "on"
+                acknowledged = request.form.get("dj_models_acknowledged") == "on"
+                if enabled and not acknowledged:
+                    raise ValueError(
+                        "Review and accept the Beat This and YAMNet/AudioSet caveats before enabling DJ analysis."
+                    )
                 set_setting("dj_analysis_enabled", enabled)
+                set_setting("dj_models_acknowledged", acknowledged)
+                set_setting("dj_setup_state", "downloading" if enabled else "disabled")
                 _DJ_CAPABILITY_CACHE.clear()
                 if enabled:
                     try:
@@ -6051,10 +6228,21 @@ def settings():
                         logger.exception("lumae_analysis could not queue DJ model setup")
                     message = (
                         "DJ Mode enabled. The DJ worker will download and verify the optional "
-                        "Beat This model."
+                        "Beat This and YAMNet models."
                     )
                 else:
-                    message = "DJ Mode disabled. No DJ model will be loaded or downloaded."
+                    message = "DJ analysis disabled. No DJ model will be loaded or downloaded."
+            elif action == "remove_dj_models":
+                set_setting("dj_analysis_enabled", False)
+                set_setting("dj_setup_state", "disabled")
+                removed = remove_dj_models(
+                    configured_dj_model_path(), configured_yamnet_model_path()
+                )
+                _DJ_CAPABILITY_CACHE.clear()
+                message = (
+                    f"DJ analysis disabled and {len(removed)} model file(s) removed. "
+                    "Normal analysis and synced data were not changed."
+                )
             elif action in ("ack_v3_readiness", "clear_v3_readiness"):
                 message = (
                     "Manual AudioMuse verification is no longer required. "
@@ -6166,10 +6354,11 @@ def register(ctx):
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
     ctx.on_install(migrate)
     ctx.on_flask_start(observe_provider_identities_on_start)
+    ctx.on_worker_start(prepare_dj_runtime)
     ctx.on_song_analyzed(analyze_song_hook)
     ctx.add_task("prepare", prepare_lumae_task, queue="default")
     ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
-    ctx.add_task("dj_analysis", dj_analysis_task, queue="default")
+    ctx.add_task("dj_analysis", dj_analysis_task, queue=DJ_TASK_QUEUE)
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_task(
         "relationship_preparation", relationship_preparation_task, queue="default"
@@ -6181,4 +6370,4 @@ def register(ctx):
         "provider_identity_recheck", provider_identity_recheck_task, queue="default"
     )
     ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")
-    ctx.add_cron_task("dj_analysis", dj_analysis_task, queue="default")
+    ctx.add_cron_task("dj_analysis", dj_analysis_task, queue=DJ_TASK_QUEUE)
