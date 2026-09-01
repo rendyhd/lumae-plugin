@@ -94,8 +94,8 @@
       "min_core_version": "3.2.0",
       "changelog": "Allow trusted pre-canonical Navidrome releases to publish ordinary catalogue removals and library-scope changes instead of misclassifying them as incomplete provider-ID migrations; preserve fail-closed inspection for pending or blocked identity transitions.",
       "imageUrl": "",
-      "sourceUrl": "",
-      "checksum": ""
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.1.9.zip",
+      "checksum": "16219acbd0e6364499b044854ad04622"
     },
     {
       "version": "1.1.8",
