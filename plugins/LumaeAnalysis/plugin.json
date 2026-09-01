@@ -90,6 +90,14 @@
   },
   "versions": [
     {
+      "version": "1.1.9",
+      "min_core_version": "3.2.0",
+      "changelog": "Allow trusted pre-canonical Navidrome releases to publish ordinary catalogue removals and library-scope changes instead of misclassifying them as incomplete provider-ID migrations; preserve fail-closed inspection for pending or blocked identity transitions.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    },
+    {
       "version": "1.1.8",
       "min_core_version": "3.2.0",
       "changelog": "Reduce reconcile dashboard noise with adaptive active, waiting, retry, and hourly-idle schedules; add bounded Lumae-owned action progress and history; and back off failed work independently without losing restart recovery.",

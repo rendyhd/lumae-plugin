@@ -104,7 +104,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.1.8"
+    assert manifest["versions"][0]["version"] == "1.1.9"
     assert manifest["versions"][0]["min_core_version"] == "3.2.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -197,7 +197,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.1.8",
+        "plugin_version": "1.1.9",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -328,7 +328,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.1.8"
+    assert body["plugin_version"] == "1.1.9"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -8690,6 +8690,7 @@ def test_refresh_shield_stops_before_provider_diff_publication(monkeypatch):
         "observe_provider_version",
         lambda *_args, **_kwargs: {
             "observation": "verified",
+            "state": "transition_pending",
             "current_provider_version": "0.64.0",
         },
     )
@@ -8704,6 +8705,76 @@ def test_refresh_shield_stops_before_provider_diff_publication(monkeypatch):
     assert result["change_reason"] == "provider_identity_wait"
     assert not any("INSERT INTO plugin_lumae_analysis__catalog_changes" in sql for sql, _ in db.executed)
     assert not any("SET published_generation=" in sql for sql, _ in db.executed)
+
+
+def test_safe_provider_version_publishes_ordinary_catalog_removals(monkeypatch):
+    from plugins.LumaeAnalysis import catalog
+
+    tracks = [
+        {
+            "id": f"{value:032x}",
+            "title": f"Song {value}",
+            "_lumae_library_ids": ["library-1"],
+        }
+        for value in range(30)
+    ]
+    previous = catalog.normalize_provider_catalog(
+        {
+            "libraries": [{"id": "library-1", "name": "Music"}],
+            "tracks": tracks,
+        },
+        "navidrome",
+    )
+    db = RefreshDb(
+        previous_counts={"library": 1, "track": 30},
+        previous_generation=1,
+        published_fingerprints={
+            "catalog_libraries": [
+                (row["library_id"], row["metadata_fp"])
+                for row in previous["libraries"]
+            ],
+            "catalog_tracks": [
+                (
+                    row["track_id"],
+                    row["metadata_fp"],
+                    row["media_fp"],
+                    row["artwork_fp"],
+                )
+                for row in previous["tracks"]
+            ],
+        },
+    )
+    bridge = RefreshBridge(
+        {
+            "libraries": [{"id": "library-1", "name": "Music"}],
+            "tracks": tracks[4:],
+        }
+    )
+    monkeypatch.setattr(
+        catalog,
+        "observe_provider_version",
+        lambda *_args, **_kwargs: {
+            "observation": "verified",
+            "state": "normal",
+            "current_provider_version": "0.63.2",
+            "detection_reason": "pre_transition_version",
+        },
+    )
+    monkeypatch.setattr(
+        catalog,
+        "inspect_catalog_identity",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            AssertionError("safe provider versions must bypass identity inspection")
+        ),
+    )
+
+    result = catalog.refresh_catalog("server-a", db=db, bridge=bridge)
+
+    assert result["generation"] == 2
+    assert result["change_reason"] == "provider_diff"
+    assert result["change_counts"]["deletions"] == 4
+    assert result["change_counts"]["upserts"] == 0
+    assert any("SET published_generation=" in sql for sql, _ in db.executed)
 
 
 def test_analysis_shield_runs_before_reading_current_audiomuse_mapping(monkeypatch):
@@ -9033,6 +9104,45 @@ def test_transient_probe_failure_does_not_discard_an_applied_transition(monkeypa
     assert result["state"] == "applied"
     assert captured["state"] == "applied"
     assert captured["required_action"] == "retry_provider_identity_check"
+
+
+def test_safe_provider_version_clears_a_stale_blocked_transition(monkeypatch):
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    source = {
+        "catalog_instance_id": "catalog-a",
+        "catalog_generation": 8,
+        "analysis_generation": 6,
+        "transition_id": "transition-a",
+        "state": "blocked",
+        "current_provider_version": "0.64.0",
+        "last_checked_provider_version": None,
+        "detection_reason": "incomplete",
+        "required_action": "resolve_provider_identity_conflict",
+    }
+    captured = {}
+    monkeypatch.setattr(guard, "_source_state", lambda *_args, **_kwargs: source)
+    monkeypatch.setattr(guard, "_ensure_transition_row", lambda *_args: None)
+    monkeypatch.setattr(
+        guard,
+        "_update_observation",
+        lambda *_args, **kwargs: captured.update(kwargs),
+    )
+
+    class SafeBridge:
+        @staticmethod
+        def probe_server_identity(_server_id):
+            return {"server_version": "0.63.2"}
+
+    db = types.SimpleNamespace(commit=lambda: None)
+    result = guard.observe_provider_version(db, SafeBridge(), "server-a")
+
+    assert result["state"] == "normal"
+    assert result["detection_reason"] == "pre_transition_version"
+    assert result["required_action"] is None
+    assert captured["state"] == "normal"
+    assert captured["detection_reason"] == "pre_transition_version"
+    assert captured["required_action"] is None
 
 
 def test_identity_recheck_schedule_skips_normal_sources(monkeypatch):

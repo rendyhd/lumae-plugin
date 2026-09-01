@@ -41,6 +41,13 @@ page. Pausing stops new catalogue, projection, waveform, and relationship work;
 it does not delete or hide already published catalogue, profile, collection, or
 relationship data.
 
+### Provider-identity reconciliation fix in 1.1.9
+
+Trusted pre-canonical Navidrome releases now publish ordinary track removals and
+music-library scope changes through the normal catalogue diff. Exact identity
+inspection remains fail-closed for pending, uncertain, or blocked canonical-ID
+transitions.
+
 ### Adaptive reconciliation in 1.1.8
 
 Lumae keeps the public-API-only queue compatibility introduced in 1.1.7, but

@@ -1688,7 +1688,13 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                     "Libraries if the repair keeps failing."
                 )
 
-        if identity_observation and identity_observation.get("observation") != "bridge_unavailable":
+        identity_state = (
+            identity_observation.get("state") if identity_observation else None
+        )
+        # The version observation is the admission gate. A trusted pre-transition
+        # release can legitimately lose tracks or change library scope; treating
+        # those removals as incomplete rekey evidence permanently blocks refresh.
+        if identity_state in ("transition_pending", "blocked"):
             from .provider_identity_rekey import (
                 publish_provider_identity_rekey,
                 target_scan_fingerprint,

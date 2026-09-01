@@ -99,7 +99,7 @@ from .reconcile import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.1.8"
+PLUGIN_VERSION = "1.1.9"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -1172,8 +1172,8 @@ def migrate(db):
                 < now() - interval '{ANALYSIS_RUN_STALE_MINUTES} minutes')
         """
     )
-    # Retarget work admitted by an older plugin process so a reloaded 1.1.8
-    # worker can attest and execute it. The claim remains coalesced in SQL.
+    # Retarget work admitted by an older plugin process so a reloaded worker can
+    # attest and execute it. The claim remains coalesced in SQL.
     cur.execute(
         f"""
         UPDATE {preparation_state_table()}
