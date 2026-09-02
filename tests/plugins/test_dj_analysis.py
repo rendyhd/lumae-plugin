@@ -45,6 +45,7 @@ try:
     sys.modules[package_name] = package
     edge = _load(f"{package_name}.edge_profiles", "edge_profiles.py")
     dj = _load(f"{package_name}.dj_analysis", "dj_analysis.py")
+    vocal = sys.modules[f"{package_name}.vocal_calibration"]
     provisioner = _load(f"{package_name}.provision_dj_model", "provision_dj_model.py")
     store = _load(f"{package_name}.dj_analysis_store", "dj_analysis_store.py")
 finally:
@@ -413,6 +414,7 @@ def test_yamnet_scores_remain_uncalibrated_evidence_and_never_authorize_cuts():
         "status": "uncalibrated",
         "scores_are_probabilities": False,
         "cuts_authorized": False,
+        "cache_key": "uncalibrated-v1",
     }
     assert result["quality"]["vocal_calibration_ready"] is False
 
@@ -424,6 +426,59 @@ def test_yamnet_scores_remain_uncalibrated_evidence_and_never_authorize_cuts():
                 "scores": [[2.0] * len(indices)],
             }
         )
+
+
+def test_reviewed_held_out_calibration_publishes_bounded_vocal_risk():
+    rows = []
+    for split, count in (("calibration", 100), ("holdout", 200)):
+        for index in range(count):
+            track_id = f"{split}-{index}"
+            rows.extend(
+                [
+                    {
+                        "track_id": track_id,
+                        "split": split,
+                        "position_ms": 480,
+                        "raw_vocal_evidence": 0.05,
+                        "vocal_conflict": 0,
+                    },
+                    {
+                        "track_id": track_id,
+                        "split": split,
+                        "position_ms": 960,
+                        "raw_vocal_evidence": 0.95,
+                        "vocal_conflict": 1,
+                    },
+                ]
+            )
+    artifact = vocal.fit_artifact(
+        rows,
+        yamnet_model_sha256=dj.YAMNET_MODEL_SHA256,
+        class_map_sha256=dj.YAMNET_CLASS_MAP_SHA256,
+        reviewed=True,
+        authorize_cuts=True,
+    )
+    indices = list(dj.YAMNET_VOCAL_CLASSES)
+    quiet = [0.0] * len(indices)
+    singing = [0.0] * len(indices)
+    quiet[indices.index(31)] = 0.05
+    singing[indices.index(24)] = 0.95
+
+    result = build(
+        vocal_output={
+            "positions_ms": [480, 960],
+            "class_indices": indices,
+            "scores": [quiet, singing],
+        },
+        vocal_calibration=artifact,
+    )
+
+    risk = result["vocal_risk"]
+    assert [frame["calibrated_risk"] for frame in risk["frames"]] == [0.0, 1.0]
+    assert risk["calibration"]["status"] == "ready"
+    assert risk["calibration"]["cuts_authorized"] is True
+    assert risk["calibration"]["artifact_digest"] == artifact["artifact_digest"]
+    assert result["quality"]["vocal_calibration_ready"] is True
 
 
 def test_unstable_or_misaligned_regions_are_not_track_level_ready():
@@ -586,6 +641,20 @@ def test_store_migration_has_one_running_worker_and_durable_progress():
     assert "worker_restarted" in sql
     assert "dj_worker_capability" in sql
     assert "plugin_version TEXT NOT NULL" in sql
+
+
+def test_backfill_invalidates_analysis_when_vocal_calibration_changes():
+    db = Database(rows=[("track-a",)])
+
+    assert store.dj_backfill_candidates(
+        db,
+        "catalog-a",
+        expected_vocal_calibration_cache_key="c" * 64,
+    ) == ["track-a"]
+
+    sql, params = db.cur.executed[-1]
+    assert "analysis.payload#>>'{vocal_risk,calibration,cache_key}'=%s" in sql
+    assert params == (dj.METHOD, "c" * 64, "catalog-a", "", 100)
 
 
 def test_worker_capability_store_is_version_bound_and_path_free():

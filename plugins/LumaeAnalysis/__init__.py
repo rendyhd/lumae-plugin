@@ -26,6 +26,8 @@ from .dj_analysis import (
     JOB_DEADLINE_SECONDS as DJ_JOB_TIMEOUT_SECONDS,
     METHOD as DJ_METHOD,
     SCHEMA_VERSION as DJ_SCHEMA_VERSION,
+    YAMNET_CLASS_MAP_SHA256 as DJ_YAMNET_CLASS_MAP_SHA256,
+    YAMNET_MODEL_SHA256 as DJ_YAMNET_MODEL_SHA256,
     DjAnalysisError,
     analyze_dj_file,
     runtime_status as dj_runtime_status,
@@ -49,6 +51,11 @@ from .provision_dj_model import (
     ACKNOWLEDGEMENT as DJ_MODEL_ACKNOWLEDGEMENT,
     provision_stack as provision_dj_models,
     remove_stack as remove_dj_models,
+)
+from .vocal_calibration import (
+    METHOD as VOCAL_CALIBRATION_METHOD,
+    VocalCalibrationError,
+    load_artifact as load_vocal_calibration_artifact,
 )
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
@@ -1673,6 +1680,19 @@ def dj_setup_state():
     return value if value in ("disabled", "downloading", "initializing", "ready", "error") else "error"
 
 
+def configured_vocal_calibration_path():
+    """Optional, administrator-provided held-out calibration artifact."""
+    return str(os.environ.get("LUMAE_DJ_VOCAL_CALIBRATION", "") or "").strip()
+
+
+def load_configured_vocal_calibration():
+    return load_vocal_calibration_artifact(
+        configured_vocal_calibration_path(),
+        yamnet_model_sha256=DJ_YAMNET_MODEL_SHA256,
+        class_map_sha256=DJ_YAMNET_CLASS_MAP_SHA256,
+    )
+
+
 def migrate_dj_opt_in():
     """Require the new combined two-model consent after older DJ test builds."""
     enabled = dj_analysis_enabled()
@@ -1699,6 +1719,13 @@ def _disabled_dj_capability():
         "available": False,
         "reference_host_qualified": False,
         "reason": "disabled",
+        "vocal_calibration": {
+            "method": VOCAL_CALIBRATION_METHOD,
+            "status": "unconfigured",
+            "artifact_digest": None,
+            "cache_key": "uncalibrated-v1",
+            "cuts_authorized": False,
+        },
         "supported_analysis_versions": [DJ_SCHEMA_VERSION],
         "supported_plan_versions": [2],
     }
@@ -1724,9 +1751,13 @@ def local_dj_worker_capability():
         }
     model_path = configured_dj_model_path() if enabled else ""
     yamnet_path = configured_yamnet_model_path() if enabled else ""
+    calibration_path = configured_vocal_calibration_path() if enabled else ""
     if model_path and yamnet_path:
         stats = []
-        for path in (model_path, yamnet_path):
+        for path in (model_path, yamnet_path, calibration_path):
+            if not path:
+                stats.append(("vocal-calibration", None))
+                continue
             try:
                 info = os.stat(path)
                 stats.append((path, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
@@ -1742,6 +1773,32 @@ def local_dj_worker_capability():
         yamnet_path,
         verify_model=enabled,
     )
+    calibration = None
+    calibration_error = None
+    try:
+        calibration = load_configured_vocal_calibration()
+    except (OSError, ValueError, VocalCalibrationError):
+        calibration_error = "vocal_calibration_invalid"
+    status["vocal_calibration"] = {
+        "method": VOCAL_CALIBRATION_METHOD,
+        "status": (
+            "error"
+            if calibration_error
+            else "ready"
+            if calibration is not None
+            else "unconfigured"
+        ),
+        "artifact_digest": calibration.get("artifact_digest") if calibration else None,
+        "cache_key": (
+            calibration["artifact_digest"] if calibration is not None else "uncalibrated-v1"
+        ),
+        "cuts_authorized": bool(
+            calibration and calibration["authorization"]["cuts_authorized"]
+        ),
+    }
+    if calibration_error:
+        status["available"] = False
+        status["reason"] = calibration_error
     worker_available = bool(status["available"]) if acknowledged else False
     lifecycle = dj_setup_state() if enabled else "disabled"
     if worker_available:
@@ -2782,15 +2839,15 @@ def enqueue_edge_profiles(ids, catalog_instance_id, server_id, *, priority="back
         return {"available": False, "accepted": [], "already_ready": []}
     jobs, ready = claim_edge_jobs(get_db(), catalog_instance_id, ids)
     if jobs:
-        submitted = 0
         try:
-            for job in jobs:
-                enqueue_bounded(analyze_edges_task, [job], catalog_instance_id, server_id,
-                                queue="high" if priority == "interactive" else "default",
-                                timeout=PROFILE_JOB_TIMEOUT_SECONDS)
-                submitted += 1
+            # AudioMuse admits one root task per plugin. Submit the bounded
+            # source-bound batch as one task; per-track tasks would make the
+            # second item contend with the first and strand its durable job.
+            enqueue_bounded(analyze_edges_task, jobs, catalog_instance_id, server_id,
+                            queue="high" if priority == "interactive" else "default",
+                            timeout=PROFILE_JOB_TIMEOUT_SECONDS)
         except Exception:
-            for job in jobs[submitted:]:
+            for job in jobs:
                 update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-enqueue-failed")
             raise
     return {"available": True, "accepted": [job["track_id"] for job in jobs], "already_ready": ready}
@@ -2923,44 +2980,101 @@ def _enqueue_dj_worker():
     )
 
 
+DJ_RUNTIME_PREPARE_LOCK_ID = 0x4C554D4145444A32
+
+
+def _acquire_dj_runtime_prepare_lock():
+    """Elect one setup hook across the worker processes sharing PostgreSQL."""
+    db = get_db()
+    if db is None:
+        # Isolated unit tests do not install the AudioMuse database adapter.
+        return None, True
+    cur = db.cursor()
+    try:
+        cur.execute("SELECT pg_try_advisory_lock(%s)", (DJ_RUNTIME_PREPARE_LOCK_ID,))
+        row = cur.fetchone()
+        return db, bool(row and row[0])
+    except Exception:
+        rollback = getattr(db, "rollback", None)
+        if callable(rollback):
+            rollback()
+        logger.exception("lumae_analysis could not acquire the DJ setup lock")
+        return db, False
+    finally:
+        cur.close()
+
+
+def _release_dj_runtime_prepare_lock(db, acquired):
+    if db is None or not acquired:
+        return
+    cur = db.cursor()
+    try:
+        cur.execute("SELECT pg_advisory_unlock(%s)", (DJ_RUNTIME_PREPARE_LOCK_ID,))
+        commit = getattr(db, "commit", None)
+        if callable(commit):
+            commit()
+    except Exception:
+        rollback = getattr(db, "rollback", None)
+        if callable(rollback):
+            rollback()
+        logger.exception("lumae_analysis could not release the DJ setup lock")
+    finally:
+        cur.close()
+
+
 def prepare_dj_runtime():
     """Provision both pinned models only on the opted-in dedicated worker."""
     if not dj_analysis_enabled() or os.environ.get("LUMAE_DJ_WORKER") != "1":
         return local_dj_worker_capability()
-    if not dj_models_acknowledged():
-        set_setting("dj_setup_state", "error")
-        _DJ_CAPABILITY_CACHE.clear()
-        return attest_dj_worker_capability()
-    capability = attest_dj_worker_capability()
-    if capability["worker_available"] or capability.get("runtime_mismatches"):
+    lock_db, lock_acquired = _acquire_dj_runtime_prepare_lock()
+    if not lock_acquired:
+        capability = local_dj_worker_capability()
+        if not capability.get("worker_available"):
+            capability["reason"] = "setup_in_progress"
         return capability
     try:
-        set_setting("dj_setup_state", "downloading")
-        _DJ_CAPABILITY_CACHE.clear()
-        provision_dj_models(
-            configured_dj_model_path(),
-            configured_yamnet_model_path(),
-        )
-        set_setting("dj_setup_state", "initializing")
-        _DJ_CAPABILITY_CACHE.clear()
+        if not dj_models_acknowledged():
+            set_setting("dj_setup_state", "error")
+            _DJ_CAPABILITY_CACHE.clear()
+            return attest_dj_worker_capability()
         capability = attest_dj_worker_capability()
-        set_setting(
-            "dj_setup_state",
-            "ready" if capability["worker_available"] else "error",
-        )
-        capability["lifecycle"] = (
-            "ready" if capability["worker_available"] else "error"
-        )
-    except Exception:
-        set_setting("dj_setup_state", "error")
-        logger.exception("lumae_analysis could not provision the optional DJ model")
-        capability["worker_available"] = False
-        capability["internal_test_eligible"] = False
-        capability["available"] = False
-        capability["reason"] = "model_download_failed"
-        return write_dj_worker_capability(get_db(), PLUGIN_VERSION, capability)
-    _DJ_CAPABILITY_CACHE.clear()
-    return capability
+        if capability["worker_available"]:
+            if dj_setup_state() != "ready":
+                set_setting("dj_setup_state", "ready")
+                _DJ_CAPABILITY_CACHE.clear()
+            capability["lifecycle"] = "ready"
+            return capability
+        if capability.get("runtime_mismatches"):
+            return capability
+        try:
+            set_setting("dj_setup_state", "downloading")
+            _DJ_CAPABILITY_CACHE.clear()
+            provision_dj_models(
+                configured_dj_model_path(),
+                configured_yamnet_model_path(),
+            )
+            set_setting("dj_setup_state", "initializing")
+            _DJ_CAPABILITY_CACHE.clear()
+            capability = attest_dj_worker_capability()
+            set_setting(
+                "dj_setup_state",
+                "ready" if capability["worker_available"] else "error",
+            )
+            capability["lifecycle"] = (
+                "ready" if capability["worker_available"] else "error"
+            )
+        except Exception:
+            set_setting("dj_setup_state", "error")
+            logger.exception("lumae_analysis could not provision the optional DJ model")
+            capability["worker_available"] = False
+            capability["internal_test_eligible"] = False
+            capability["available"] = False
+            capability["reason"] = "model_download_failed"
+            return write_dj_worker_capability(get_db(), PLUGIN_VERSION, capability)
+        _DJ_CAPABILITY_CACHE.clear()
+        return capability
+    finally:
+        _release_dj_runtime_prepare_lock(lock_db, lock_acquired)
 
 
 def _request_dj_jobs(source, ids, *, priority=0):
@@ -2982,7 +3096,13 @@ def _request_dj_jobs(source, ids, *, priority=0):
             "reason": capability["reason"],
         }, 503
     jobs, ready = claim_dj_requests(
-        get_db(), source["catalog_instance_id"], ids, priority=priority
+        get_db(),
+        source["catalog_instance_id"],
+        ids,
+        priority=priority,
+        expected_vocal_calibration_cache_key=(
+            capability.get("vocal_calibration", {}).get("cache_key")
+        ),
     )
     deferred = False
     if jobs:
@@ -3051,8 +3171,15 @@ def dj_analysis_backfill_api():
             raise ValueError("invalid backfill cursor")
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer from 1 to 100")
+        capability = dj_analysis_capability()
         ids = dj_backfill_candidates(
-            get_db(), source["catalog_instance_id"], after, limit
+            get_db(),
+            source["catalog_instance_id"],
+            after,
+            limit,
+            expected_vocal_calibration_cache_key=(
+                capability.get("vocal_calibration", {}).get("cache_key")
+            ),
         )
         result, status = _request_dj_jobs(source, ids)
         result["next_after"] = ids[-1] if ids else None
@@ -3115,6 +3242,7 @@ def dj_analysis_task():
             yamnet_model_path=configured_yamnet_model_path(),
             cancelled=lambda: dj_job_cancelled(get_db(), job),
             progress=lambda frames: update_dj_progress(get_db(), job, frames),
+            vocal_calibration=load_configured_vocal_calibration(),
         )
         applied = publish_dj_analysis(
             get_db(), job, payload, info["media_signature"]

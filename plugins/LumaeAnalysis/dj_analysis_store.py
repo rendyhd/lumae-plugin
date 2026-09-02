@@ -124,7 +124,14 @@ def _current_sources(cur, catalog_id, ids):
     return [(track_id, signature) for track_id, signature in cur.fetchall()]
 
 
-def claim_dj_requests(db, catalog_id, ids, *, priority=0):
+def claim_dj_requests(
+    db,
+    catalog_id,
+    ids,
+    *,
+    priority=0,
+    expected_vocal_calibration_cache_key=None,
+):
     cur = db.cursor()
     accepted = []
     ready = []
@@ -132,11 +139,20 @@ def claim_dj_requests(db, catalog_id, ids, *, priority=0):
         revision = opaque_revision(signature)
         if not revision:
             continue
+        calibration_clause = (
+            "AND payload#>>'{vocal_risk,calibration,cache_key}'=%s"
+            if expected_vocal_calibration_cache_key is not None
+            else ""
+        )
+        parameters = [catalog_id, track_id, revision, signature, METHOD]
+        if expected_vocal_calibration_cache_key is not None:
+            parameters.append(str(expected_vocal_calibration_cache_key))
         cur.execute(
             f"""SELECT 1 FROM {table('dj_analyses')}
             WHERE catalog_instance_id=%s AND track_id=%s AND media_revision=%s
-              AND media_signature=%s AND payload->>'method'=%s LIMIT 1""",
-            (catalog_id, track_id, revision, signature, METHOD),
+              AND media_signature=%s AND payload->>'method'=%s
+              {calibration_clause} LIMIT 1""",
+            tuple(parameters),
         )
         if cur.fetchone():
             ready.append(track_id)
@@ -376,9 +392,25 @@ def read_dj_analysis(db, catalog_id, ids):
     return result
 
 
-def dj_backfill_candidates(db, catalog_id, after="", limit=100):
+def dj_backfill_candidates(
+    db,
+    catalog_id,
+    after="",
+    limit=100,
+    *,
+    expected_vocal_calibration_cache_key=None,
+):
     """Return source-ready tracks without a current analysis or fresh job."""
     cur = db.cursor()
+    calibration_clause = (
+        "AND analysis.payload#>>'{vocal_risk,calibration,cache_key}'=%s"
+        if expected_vocal_calibration_cache_key is not None
+        else ""
+    )
+    parameters = [METHOD]
+    if expected_vocal_calibration_cache_key is not None:
+        parameters.append(str(expected_vocal_calibration_cache_key))
+    parameters.extend([catalog_id, str(after), max(1, min(100, int(limit)))])
     cur.execute(
         f"""SELECT p.track_id FROM {table('source_profiles')} p
         LEFT JOIN LATERAL (
@@ -386,7 +418,7 @@ def dj_backfill_candidates(db, catalog_id, after="", limit=100):
             WHERE analysis.catalog_instance_id=p.catalog_instance_id
               AND analysis.track_id=p.track_id
               AND analysis.media_signature=p.media_signature
-              AND analysis.payload->>'method'=%s LIMIT 1
+              AND analysis.payload->>'method'=%s {calibration_clause} LIMIT 1
         ) analysis ON TRUE
         LEFT JOIN {table('dj_analysis_jobs')} job
           ON job.catalog_instance_id=p.catalog_instance_id AND job.track_id=p.track_id
@@ -398,7 +430,7 @@ def dj_backfill_candidates(db, catalog_id, after="", limit=100):
                OR (job.status IN ('unsupported', 'failed', 'cancelled')
                    AND job.updated_at < now()-interval '6 hours'))
         ORDER BY p.track_id LIMIT %s""",
-        (METHOD, catalog_id, str(after), max(1, min(100, int(limit)))),
+        tuple(parameters),
     )
     ids = [row[0] for row in cur.fetchall()]
     cur.close()

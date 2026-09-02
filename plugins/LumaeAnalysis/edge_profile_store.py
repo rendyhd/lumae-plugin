@@ -72,6 +72,8 @@ def claim_edge_jobs(db, catalog_id, ids):
                 status='pending', last_error=NULL, updated_at=now()
             WHERE job.media_revision<>EXCLUDED.media_revision
                OR (job.status IN ('pending', 'running') AND job.updated_at < now()-interval '30 minutes')
+               OR (job.status='failed' AND job.last_error='edge-enqueue-failed'
+                   AND job.updated_at < now()-interval '2 seconds')
                OR (job.status NOT IN ('pending', 'running') AND job.updated_at < now()-interval '6 hours')
             RETURNING job_token""", (catalog_id, track_id, revision, token))
         if cur.fetchone():

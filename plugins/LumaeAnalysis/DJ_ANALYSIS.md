@@ -82,6 +82,30 @@ See `YAMNET_NOTICE.md` for the separate YAMNet and AudioSet caveats.
 Ordinary profile work retains priority. Missing or unavailable DJ analysis does
 not affect EdgeProfileV2, recommendation membership, normal sync, or SmoothFade.
 
+## Vocal-risk calibration
+
+Structural cuts remain locked until an administrator supplies a reviewed
+`lumae-yamnet-vocal-risk-isotonic-v1` artifact through
+`LUMAE_DJ_VOCAL_CALIBRATION`. Build it from JSONL labels with:
+
+```bash
+python scripts/build_vocal_calibration.py \
+  --input vocal-conflict-labels.jsonl \
+  --output yamnet-vocal-calibration-v1.json \
+  --reviewed --authorize-cuts \
+  --acknowledgement "I reviewed the track-disjoint vocal-conflict labels and holdout metrics"
+```
+
+Each JSONL row contains `track_id`, `split` (`calibration` or `holdout`),
+`position_ms`, `raw_vocal_evidence`, and binary `vocal_conflict`. The builder
+requires at least 100 calibration tracks and 200 disjoint holdout tracks, both
+positive and negative labels in each split, a monotonic isotonic mapping, and
+fixed holdout gates for Brier score, expected calibration error, and unsafe
+false negatives at the cut threshold. The artifact binds to the exact YAMNet
+and class-map hashes and has its own digest. Installing or replacing it changes
+the DJ analysis cache key, so uncalibrated or differently calibrated rows are
+recomputed. An invalid configured artifact makes the worker fail closed.
+
 ## Private prerelease packaging
 
 DJ development is not added to the public `plugin.json`, official catalog, or

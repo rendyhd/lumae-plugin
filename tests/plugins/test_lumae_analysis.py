@@ -299,6 +299,51 @@ def test_dj_capability_caches_verified_artifact_by_file_identity(monkeypatch, tm
     assert str(model) not in json.dumps(first)
 
 
+def test_dj_capability_fails_closed_for_configured_invalid_vocal_calibration(
+    monkeypatch, tmp_path
+):
+    mod = load_plugin()
+    model = tmp_path / "beat-this.ckpt"
+    yamnet_model = tmp_path / "yamnet.tflite"
+    calibration = tmp_path / "calibration.json"
+    model.write_bytes(b"model")
+    yamnet_model.write_bytes(b"yamnet")
+    calibration.write_text('{"not":"qualified"}', encoding="utf-8")
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
+    monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
+    monkeypatch.setattr(mod, "dj_setup_state", lambda: "ready")
+    monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setenv("LUMAE_DJ_VOCAL_CALIBRATION", str(calibration))
+    monkeypatch.setattr(
+        mod,
+        "get_setting",
+        lambda key, default=None: (
+            str(model)
+            if key == "dj_model_path"
+            else str(yamnet_model)
+            if key == "dj_yamnet_model_path"
+            else default
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "dj_runtime_status",
+        lambda *_args, **_kwargs: {
+            "available": True,
+            "reason": None,
+            "models": {},
+        },
+    )
+    mod._DJ_CAPABILITY_CACHE.clear()
+
+    capability = mod.local_dj_worker_capability()
+
+    assert capability["worker_available"] is False
+    assert capability["reason"] == "vocal_calibration_invalid"
+    assert capability["vocal_calibration"]["status"] == "error"
+    assert str(calibration) not in json.dumps(capability)
+
+
 def test_dj_capability_reads_only_fresh_worker_attestation(monkeypatch):
     mod = load_plugin()
     db = object()
@@ -469,6 +514,68 @@ def test_dj_runtime_provisions_only_after_opt_in(monkeypatch):
         ("dj_setup_state", "ready"),
     ]
     assert result["worker_available"] is True
+
+
+def test_dj_runtime_repairs_stale_lifecycle_when_models_are_already_ready(monkeypatch):
+    mod = load_plugin()
+    states = []
+    released = []
+    lock_db = object()
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
+    monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
+    monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setattr(mod, "dj_setup_state", lambda: "downloading")
+    monkeypatch.setattr(
+        mod,
+        "attest_dj_worker_capability",
+        lambda: {"enabled": True, "worker_available": True, "lifecycle": "ready"},
+    )
+    monkeypatch.setattr(mod, "set_setting", lambda key, value: states.append((key, value)))
+    monkeypatch.setattr(
+        mod,
+        "provision_dj_models",
+        lambda *_args: pytest.fail("verified models must not be downloaded again"),
+    )
+    monkeypatch.setattr(mod, "_acquire_dj_runtime_prepare_lock", lambda: (lock_db, True))
+    monkeypatch.setattr(
+        mod,
+        "_release_dj_runtime_prepare_lock",
+        lambda db, acquired: released.append((db, acquired)),
+    )
+
+    result = mod.prepare_dj_runtime()
+
+    assert result["lifecycle"] == "ready"
+    assert states == [("dj_setup_state", "ready")]
+    assert released == [(lock_db, True)]
+
+
+def test_dj_runtime_setup_contention_does_not_migrate_or_download(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
+    monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
+    monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setattr(mod, "_acquire_dj_runtime_prepare_lock", lambda: (object(), False))
+    monkeypatch.setattr(
+        mod,
+        "local_dj_worker_capability",
+        lambda: {"enabled": True, "worker_available": False, "reason": "model_missing"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "attest_dj_worker_capability",
+        lambda: pytest.fail("a contending setup hook must not migrate or attest"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "provision_dj_models",
+        lambda *_args: pytest.fail("a contending setup hook must not download"),
+    )
+
+    result = mod.prepare_dj_runtime()
+
+    assert result["worker_available"] is False
+    assert result["reason"] == "setup_in_progress"
 
 
 def test_dj_settings_switch_is_off_by_default_and_explains_download(monkeypatch):
@@ -744,6 +851,28 @@ def test_edge_upgrade_failure_retains_ready_legacy_and_independent_retry_status(
     cur.close()
 
 
+def test_edge_enqueue_failure_has_short_retry_without_weakening_analysis_failure_backoff(edge_publication_db):
+    from plugins.LumaeAnalysis import edge_profile_store as store
+    db = edge_publication_db
+    jobs, _ = store.claim_edge_jobs(db, 'catalog-a', ['track-a'])
+    assert len(jobs) == 1
+    assert store.update_edge_job(
+        db, 'catalog-a', jobs[0], 'failed', 'edge-enqueue-failed'
+    )
+    assert store.claim_edge_jobs(db, 'catalog-a', ['track-a']) == ([], [])
+
+    cur = db.cursor()
+    cur.execute(
+        "UPDATE plugin_lumae_analysis__edge_profile_jobs "
+        "SET updated_at=now()-interval '3 seconds'"
+    )
+    db.commit()
+    retried, _ = store.claim_edge_jobs(db, 'catalog-a', ['track-a'])
+    assert len(retried) == 1
+    assert retried[0]['job_token'] != jobs[0]['job_token']
+    cur.close()
+
+
 def test_replaced_source_rejects_completed_old_job_and_never_serializes_stale_edge(edge_publication_db):
     mod = load_plugin()
     from plugins.LumaeAnalysis import edge_profile_store as store
@@ -797,6 +926,40 @@ def test_edge_api_old_runtime_disabled_and_bounded_requests(edge_publication_db,
     for limit in [0, 101, None, True, 'invalid']:
         assert client.post('/api/profiles/edges/backfill', json={'limit': limit}).status_code == 400
     assert client.post('/api/profiles/edges/backfill', json={'after': ''}).status_code == 202
+
+
+def test_edge_enqueue_submits_one_root_task_for_the_bounded_batch(monkeypatch):
+    mod = load_plugin()
+    jobs = [
+        {'track_id': 'track-a', 'media_revision': 'sha256:a', 'job_token': 'a'},
+        {'track_id': 'track-b', 'media_revision': 'sha256:b', 'job_token': 'b'},
+    ]
+    submitted = []
+    monkeypatch.setattr(mod, 'edge_profiles_enabled', lambda: True)
+    monkeypatch.setattr(mod, 'maintenance_paused', lambda: False)
+    monkeypatch.setattr(mod, 'get_db', lambda: object())
+    monkeypatch.setattr(mod, 'claim_edge_jobs', lambda *_args: (jobs, []))
+    monkeypatch.setattr(
+        mod,
+        'enqueue_bounded',
+        lambda *args, **kwargs: submitted.append((args, kwargs)),
+    )
+
+    result = mod.enqueue_edge_profiles(
+        ['track-a', 'track-b'], 'catalog-a', 'server-a', priority='interactive'
+    )
+
+    assert result == {
+        'available': True,
+        'accepted': ['track-a', 'track-b'],
+        'already_ready': [],
+    }
+    assert submitted == [
+        (
+            (mod.analyze_edges_task, jobs, 'catalog-a', 'server-a'),
+            {'queue': 'high', 'timeout': mod.PROFILE_JOB_TIMEOUT_SECONDS},
+        )
+    ]
 
 
 def test_catalog_health_uses_v2_single_server_adapter():

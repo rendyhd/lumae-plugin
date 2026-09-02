@@ -21,6 +21,8 @@ from pathlib import Path
 
 import numpy as np
 
+from .vocal_calibration import calibrated_risk as apply_vocal_calibration
+
 
 SCHEMA_VERSION = 2
 METHOD = "beat-this-1.1.0-yamnet-lite-1-lumae-dj-v2"
@@ -500,7 +502,12 @@ def _key_evidence(value):
     }
 
 
-def _vocal_risk_timeline(value, duration_seconds):
+def _vocal_risk_timeline(value, duration_seconds, calibration_artifact=None):
+    calibration_cache_key = (
+        calibration_artifact["artifact_digest"]
+        if calibration_artifact is not None
+        else "uncalibrated-v1"
+    )
     if value is None:
         return {
             "method": YAMNET_MODEL_NAME,
@@ -514,6 +521,7 @@ def _vocal_risk_timeline(value, duration_seconds):
                 "status": "missing",
                 "scores_are_probabilities": False,
                 "cuts_authorized": False,
+                "cache_key": calibration_cache_key,
             },
         }
     positions = value.get("positions_ms")
@@ -540,15 +548,38 @@ def _vocal_risk_timeline(value, duration_seconds):
         numeric = np.asarray(row, dtype=np.float64)
         if not np.all(np.isfinite(numeric)) or np.any(numeric < 0) or np.any(numeric > 1):
             raise DjAnalysisError("invalid_yamnet_output")
+        raw_evidence = round(float(np.max(numeric)), 8)
         frames.append(
             {
                 "position_ms": position,
-                "raw_vocal_evidence": round(float(np.max(numeric)), 8),
+                "raw_vocal_evidence": raw_evidence,
                 "dominant_class_index": expected_indices[int(np.argmax(numeric))],
-                "calibrated_risk": None,
+                "calibrated_risk": (
+                    round(apply_vocal_calibration(raw_evidence, calibration_artifact), 8)
+                    if calibration_artifact is not None
+                    else None
+                ),
             }
         )
         previous = position
+    calibration = {
+        "status": "ready" if calibration_artifact is not None else "uncalibrated",
+        "scores_are_probabilities": False,
+        "cuts_authorized": bool(
+            calibration_artifact
+            and calibration_artifact["authorization"]["cuts_authorized"]
+        ),
+        "cache_key": calibration_cache_key,
+    }
+    if calibration_artifact is not None:
+        calibration.update(
+            {
+                "method": calibration_artifact["method"],
+                "artifact_digest": calibration_artifact["artifact_digest"],
+                "label_definition": calibration_artifact["label_definition"],
+                "holdout": calibration_artifact["holdout"],
+            }
+        )
     return {
         "method": YAMNET_MODEL_NAME,
         "class_map_sha256": YAMNET_CLASS_MAP_SHA256,
@@ -557,11 +588,7 @@ def _vocal_risk_timeline(value, duration_seconds):
             for index, name in YAMNET_VOCAL_CLASSES.items()
         ],
         "frames": frames,
-        "calibration": {
-            "status": "uncalibrated",
-            "scores_are_probabilities": False,
-            "cuts_authorized": False,
-        },
+        "calibration": calibration,
     }
 
 
@@ -669,6 +696,7 @@ def build_dj_analysis(
     source,
     key_evidence=None,
     vocal_output=None,
+    vocal_calibration=None,
 ):
     for token in (catalog_instance_id, track_id):
         if not isinstance(token, str) or not 0 < len(token) <= 512:
@@ -706,7 +734,11 @@ def build_dj_analysis(
     matched = _match_downbeats(beat_frames, raw_downbeat_frames, MODEL_FPS)
     regions = _regions(beat_frames, matched, beat_logits, MODEL_FPS)
     candidates = _novelty_candidates(regions, matched, energy, spectral_flux, MODEL_FPS)
-    vocal_risk = _vocal_risk_timeline(vocal_output, duration_seconds)
+    vocal_risk = _vocal_risk_timeline(
+        vocal_output,
+        duration_seconds,
+        calibration_artifact=vocal_calibration,
+    )
     payload = {
         "schema_version": SCHEMA_VERSION,
         "method": METHOD,
@@ -1191,6 +1223,7 @@ def analyze_dj_file(
     cancelled=None,
     progress=None,
     key_evidence=None,
+    vocal_calibration=None,
 ):
     deadline = time.monotonic() + max(1, min(JOB_DEADLINE_SECONDS, deadline_seconds))
     source_path = Path(path).resolve(strict=True)
@@ -1259,4 +1292,5 @@ def analyze_dj_file(
         source=source,
         key_evidence=key_evidence,
         vocal_output=vocal_output,
+        vocal_calibration=vocal_calibration,
     )
