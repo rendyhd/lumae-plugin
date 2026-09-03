@@ -171,6 +171,7 @@ def claim_dj_requests(
                OR (job.status='pending' AND job.updated_at < now()-interval '20 minutes')
                OR (job.status IN ('unsupported', 'failed', 'cancelled')
                    AND job.updated_at < now()-interval '6 hours')
+               OR job.status='ready'
             RETURNING job_token""",
             (catalog_id, track_id, revision, token, int(priority)),
         )
@@ -442,6 +443,18 @@ def dj_jobs_pending(db):
     cur.execute(
         f"SELECT EXISTS (SELECT 1 FROM {table('dj_analysis_jobs')} "
         "WHERE status='pending')"
+    )
+    row = cur.fetchone()
+    cur.close()
+    return bool(row and row[0])
+
+
+def interactive_dj_jobs_pending(db):
+    """Whether the private audition has an app-requested boundary waiting."""
+    cur = db.cursor()
+    cur.execute(
+        f"SELECT EXISTS (SELECT 1 FROM {table('dj_analysis_jobs')} "
+        "WHERE status='pending' AND priority>=10)"
     )
     row = cur.fetchone()
     cur.close()

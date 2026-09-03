@@ -21,11 +21,14 @@ from pathlib import Path
 
 import numpy as np
 
-from .vocal_calibration import calibrated_risk as apply_vocal_calibration
+from .vocal_calibration import (
+    calibrated_risk as apply_vocal_calibration,
+    qualification_tier as vocal_calibration_tier,
+)
 
 
 SCHEMA_VERSION = 2
-METHOD = "beat-this-1.1.0-yamnet-lite-1-lumae-dj-v2"
+METHOD = "beat-this-1.1.0-yamnet-lite-1-lumae-dj-v2.2"
 BEAT_THIS_VERSION = "1.1.0"
 MODEL_NAME = "final0"
 MODEL_URL = (
@@ -77,11 +80,33 @@ MODEL_BORDER_FRAMES = 6
 MODEL_STEP_FRAMES = MODEL_WINDOW_FRAMES - 2 * MODEL_BORDER_FRAMES
 MAX_SOURCE_SECONDS = 30 * 60
 JOB_DEADLINE_SECONDS = 15 * 60
-RSS_CAP_BYTES = 1 * 1024 * 1024 * 1024
+DEFAULT_RSS_CAP_BYTES = 1 * 1024 * 1024 * 1024
+MIN_RSS_CAP_BYTES = 512 * 1024 * 1024
+MAX_RSS_CAP_BYTES = 4 * 1024 * 1024 * 1024
+
+
+def configured_rss_cap_bytes(value=None):
+    """Return the bounded worker RSS ceiling; invalid overrides fail to default."""
+    raw = os.environ.get("LUMAE_DJ_RSS_CAP_BYTES", "") if value is None else value
+    if raw in (None, ""):
+        return DEFAULT_RSS_CAP_BYTES
+    try:
+        parsed = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return DEFAULT_RSS_CAP_BYTES
+    return max(MIN_RSS_CAP_BYTES, min(MAX_RSS_CAP_BYTES, parsed))
+
+
+RSS_CAP_BYTES = configured_rss_cap_bytes()
 MIN_REGION_BEATS = 32
 MAX_INTERVAL_CV = 0.06
 MAX_RAW_DOWNBEAT_ALIGNMENT_SECONDS = 0.05
-NOVELTY_Z_THRESHOLD = 2.5
+# Every eligible eight-bar downbeat is a phrase-aligned candidate. Novelty ranks
+# those boundaries and the app still requires >=1.25 for a drop-on-one; the
+# other archetypes retain their beat, vocal, tempo, content, and rendered-PCM
+# guards. Gating all cue families at 2.5 produced no cues on ordinary dance
+# tracks because a 17-boundary local neighborhood rarely reaches that z-score.
+NOVELTY_Z_THRESHOLD = 0.0
 MAX_ENTRY_CANDIDATES = 8
 MAX_EXIT_CANDIDATES = 8
 
@@ -455,7 +480,7 @@ def _novelty_candidates(regions, matched_downbeats, energy, spectral_flux, fps):
             if deviation > 0
             else 0.0
         )
-        if z_score > NOVELTY_Z_THRESHOLD:
+        if z_score >= NOVELTY_Z_THRESHOLD:
             accepted.append(
                 {
                     "time_ms": item["time_ms"],
@@ -578,6 +603,11 @@ def _vocal_risk_timeline(value, duration_seconds, calibration_artifact=None):
                 "artifact_digest": calibration_artifact["artifact_digest"],
                 "label_definition": calibration_artifact["label_definition"],
                 "holdout": calibration_artifact["holdout"],
+                "calibration_tier": vocal_calibration_tier(calibration_artifact),
+                "release_authorized": bool(
+                    vocal_calibration_tier(calibration_artifact) == "release"
+                    and calibration_artifact["authorization"]["cuts_authorized"]
+                ),
             }
         )
     return {

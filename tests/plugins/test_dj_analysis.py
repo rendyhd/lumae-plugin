@@ -474,7 +474,10 @@ def test_reviewed_held_out_calibration_publishes_bounded_vocal_risk():
     )
 
     risk = result["vocal_risk"]
-    assert [frame["calibrated_risk"] for frame in risk["frames"]] == [0.0, 1.0]
+    expected_low_risk = 0.25 / 100.5
+    assert [frame["calibrated_risk"] for frame in risk["frames"]] == pytest.approx(
+        [expected_low_risk, 1 - expected_low_risk], abs=1e-8
+    )
     assert risk["calibration"]["status"] == "ready"
     assert risk["calibration"]["cuts_authorized"] is True
     assert risk["calibration"]["artifact_digest"] == artifact["artifact_digest"]
@@ -630,6 +633,68 @@ class Database:
 
     def rollback(self):
         self.rollbacks += 1
+
+
+def test_worker_rss_cap_override_is_bounded_and_invalid_values_fail_to_default():
+    assert dj.configured_rss_cap_bytes(2 * 1024 * 1024 * 1024) == 2 * 1024 * 1024 * 1024
+    assert dj.configured_rss_cap_bytes(1) == dj.MIN_RSS_CAP_BYTES
+    assert dj.configured_rss_cap_bytes(8 * 1024 * 1024 * 1024) == dj.MAX_RSS_CAP_BYTES
+    assert dj.configured_rss_cap_bytes("invalid") == dj.DEFAULT_RSS_CAP_BYTES
+
+
+def test_structural_candidate_gate_keeps_a_clear_local_novelty_peak():
+    matched_downbeats = [
+        {"beat_index": index * 4, "snapped_frame": index * 10}
+        for index in range(57)
+    ]
+    energy = np.zeros(600, dtype=np.float64)
+    spectral_flux = np.zeros(600, dtype=np.float64)
+    spectral_flux[320] = 1.0
+    regions = [{"eligible": True, "start_beat_index": 0, "end_beat_index": 224}]
+
+    candidates = dj._novelty_candidates(
+        regions,
+        matched_downbeats,
+        energy,
+        spectral_flux,
+        fps=10,
+    )
+
+    assert candidates["entries"] == candidates["exits"]
+    assert candidates["entries"][0] == {
+        "time_ms": 32000,
+        "region_index": 0,
+        "novelty_z": pytest.approx(2.44948974),
+        "boundary": "eight_bar_downbeat",
+    }
+    assert len(candidates["entries"]) == 1
+
+    neutral = dj._novelty_candidates(
+        [{"eligible": True, "start_beat_index": 0, "end_beat_index": 32}],
+        matched_downbeats[:9],
+        energy,
+        spectral_flux * 0,
+        fps=10,
+    )
+    assert neutral["entries"] == [
+        {
+            "time_ms": 8000,
+            "region_index": 0,
+            "novelty_z": 0.0,
+            "boundary": "eight_bar_downbeat",
+        }
+    ]
+
+
+def test_ready_job_is_reclaimed_when_its_analysis_contract_is_stale(monkeypatch):
+    monkeypatch.setattr(store, "_current_sources", lambda *_args: [("track-a", "signature-a")])
+    db = Database(rows=[None, ("token",)])
+    accepted, ready = store.claim_dj_requests(
+        db, "catalog-a", ["track-a"], expected_vocal_calibration_cache_key="c" * 64
+    )
+    assert ready == []
+    assert [job["track_id"] for job in accepted] == ["track-a"]
+    assert "OR job.status='ready'" in db.cur.executed[-1][0]
 
 
 def test_store_migration_has_one_running_worker_and_durable_progress():

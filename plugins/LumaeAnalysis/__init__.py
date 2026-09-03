@@ -1,6 +1,7 @@
 import base64
 import json
 import os
+import re
 from datetime import datetime, timezone
 from html import escape
 
@@ -39,6 +40,7 @@ from .dj_analysis_store import (
     dj_backfill_candidates,
     dj_job_cancelled,
     dj_jobs_pending,
+    interactive_dj_jobs_pending,
     finish_dj_job,
     migrate_dj_analysis,
     publish_dj_analysis,
@@ -54,7 +56,9 @@ from .provision_dj_model import (
 )
 from .vocal_calibration import (
     METHOD as VOCAL_CALIBRATION_METHOD,
+    PRIVATE_AUDITION_TIER,
     VocalCalibrationError,
+    qualification_tier as vocal_calibration_tier,
     load_artifact as load_vocal_calibration_artifact,
 )
 from .core_compat import (
@@ -1719,12 +1723,16 @@ def _disabled_dj_capability():
         "available": False,
         "reference_host_qualified": False,
         "reason": "disabled",
+        "calibration_tier": "release",
+        "release_authorized": False,
         "vocal_calibration": {
             "method": VOCAL_CALIBRATION_METHOD,
             "status": "unconfigured",
             "artifact_digest": None,
             "cache_key": "uncalibrated-v1",
             "cuts_authorized": False,
+            "calibration_tier": "release",
+            "release_authorized": False,
         },
         "supported_analysis_versions": [DJ_SCHEMA_VERSION],
         "supported_plan_versions": [2],
@@ -1763,7 +1771,14 @@ def local_dj_worker_capability():
                 stats.append((path, info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns))
             except OSError:
                 stats.append((path, None))
-        cache_key = (enabled, acknowledged, dj_setup_state(), tuple(stats))
+        cache_key = (
+            enabled,
+            acknowledged,
+            dj_setup_state(),
+            PLUGIN_VERSION,
+            os.environ.get("LUMAE_DJ_PRIVATE_AUDITION", ""),
+            tuple(stats),
+        )
     else:
         cache_key = (enabled, False, "disabled", ())
     if _DJ_CAPABILITY_CACHE.get("key") == cache_key:
@@ -1779,6 +1794,17 @@ def local_dj_worker_capability():
         calibration = load_configured_vocal_calibration()
     except (OSError, ValueError, VocalCalibrationError):
         calibration_error = "vocal_calibration_invalid"
+    calibration_tier = vocal_calibration_tier(calibration or {})
+    cuts_authorized = bool(
+        calibration and calibration["authorization"]["cuts_authorized"]
+    )
+    release_authorized = bool(cuts_authorized and calibration_tier == "release")
+    private_audition_authorized = bool(
+        cuts_authorized
+        and calibration_tier == PRIVATE_AUDITION_TIER
+        and os.environ.get("LUMAE_DJ_PRIVATE_AUDITION") == "1"
+        and re.fullmatch(r"1\.2\.0-djtest\.[1-9][0-9]*", PLUGIN_VERSION)
+    )
     status["vocal_calibration"] = {
         "method": VOCAL_CALIBRATION_METHOD,
         "status": (
@@ -1792,14 +1818,17 @@ def local_dj_worker_capability():
         "cache_key": (
             calibration["artifact_digest"] if calibration is not None else "uncalibrated-v1"
         ),
-        "cuts_authorized": bool(
-            calibration and calibration["authorization"]["cuts_authorized"]
-        ),
+        "cuts_authorized": cuts_authorized,
+        "calibration_tier": calibration_tier,
+        "release_authorized": release_authorized,
     }
     if calibration_error:
         status["available"] = False
         status["reason"] = calibration_error
     worker_available = bool(status["available"]) if acknowledged else False
+    internal_test_eligible = bool(
+        worker_available and (release_authorized or private_audition_authorized)
+    )
     lifecycle = dj_setup_state() if enabled else "disabled"
     if worker_available:
         lifecycle = "ready"
@@ -1811,7 +1840,9 @@ def local_dj_worker_capability():
             "acknowledged": acknowledged,
             "lifecycle": lifecycle,
             "worker_available": worker_available,
-            "internal_test_eligible": worker_available,
+            "internal_test_eligible": internal_test_eligible,
+            "calibration_tier": calibration_tier,
+            "release_authorized": release_authorized,
             # The CPU reference-host and listening gates are evidence gates,
             # not administrator toggles. Keep playback unavailable until a
             # reviewed qualification artifact changes this shipped contract.
@@ -1821,6 +1852,10 @@ def local_dj_worker_capability():
                 if not enabled
                 else "acknowledgement_required"
                 if not acknowledged
+                else "private_audition_only"
+                if private_audition_authorized and worker_available
+                else "vocal_calibration_required"
+                if worker_available and not internal_test_eligible
                 else "reference_host_unqualified"
                 if worker_available
                 else status["reason"]
@@ -1879,7 +1914,14 @@ def dj_analysis_capability():
             # Private test eligibility never promotes the public capability.
             "available": False,
             "reason": (
-                "reference_host_unqualified"
+                status.get("reason")
+                or (
+                    "private_audition_only"
+                    if status.get("calibration_tier") == PRIVATE_AUDITION_TIER
+                    else "reference_host_unqualified"
+                )
+                if status.get("internal_test_eligible") is True
+                else "reference_host_unqualified"
                 if worker_available
                 else status.get("reason") or "worker_unavailable"
             ),
@@ -2972,6 +3014,17 @@ def _profile_work_pending(db=None):
         cur.close()
 
 
+def _dj_profile_gate_open(capability, db=None):
+    """Let reviewed private app requests pass unrelated background profile work."""
+    db = db or get_db()
+    if not _profile_work_pending(db):
+        return True
+    return bool(
+        capability.get("internal_test_eligible") is True
+        and interactive_dj_jobs_pending(db)
+    )
+
+
 def _enqueue_dj_worker():
     return enqueue_bounded(
         dj_analysis_task,
@@ -3211,7 +3264,7 @@ def dj_analysis_task():
     if not capability["worker_available"]:
         return {"status": "deferred", "reason": capability["reason"]}
     db = get_db()
-    if _profile_work_pending(db):
+    if not _dj_profile_gate_open(capability, db):
         return {"status": "deferred", "reason": "profile_work_pending"}
     job = claim_next_dj_job(db)
     if not job:
@@ -3293,7 +3346,7 @@ def dj_analysis_task():
 
     queued_next = False
     try:
-        if dj_jobs_pending(get_db()) and not _profile_work_pending(get_db()):
+        if dj_jobs_pending(get_db()) and _dj_profile_gate_open(capability, get_db()):
             _enqueue_dj_worker()
             queued_next = True
     except Exception:

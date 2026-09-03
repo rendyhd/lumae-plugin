@@ -85,7 +85,7 @@ not affect EdgeProfileV2, recommendation membership, normal sync, or SmoothFade.
 ## Vocal-risk calibration
 
 Structural cuts remain locked until an administrator supplies a reviewed
-`lumae-yamnet-vocal-risk-isotonic-v1` artifact through
+`lumae-yamnet-vocal-risk-isotonic-v2` artifact through
 `LUMAE_DJ_VOCAL_CALIBRATION`. Build it from JSONL labels with:
 
 ```bash
@@ -105,6 +105,30 @@ false negatives at the cut threshold. The artifact binds to the exact YAMNet
 and class-map hashes and has its own digest. Installing or replacing it changes
 the DJ analysis cache key, so uncalibrated or differently calibrated rows are
 recomputed. An invalid configured artifact makes the worker fail closed.
+
+For an isolated listening build, `--qualification-tier private-audition`
+accepts the smaller exploratory gate: at least 10 calibration tracks, 10
+disjoint holdout tracks, and five positive plus five negative reviewed frames
+in each split. The holdout metric limits do not change. This tier reports
+`release_authorized=false` and becomes internally eligible only when the worker
+runs a `1.2.0-djtest.N` package with `LUMAE_DJ_PRIVATE_AUDITION=1`.
+
+Create its disposable review pack from 20 locally acquired tracks and their
+uncalibrated `vocal_risk.frames` with:
+
+```bash
+python scripts/build_private_vocal_review_pack.py \
+  --input private-vocal-sources.jsonl \
+  --output-dir private-vocal-review
+```
+
+The input uses local paths only for bounded ffmpeg extraction; paths are not
+written to the pack. The page presents one high-evidence and one low-evidence
+six-second clip per track, hides the model score during review, and exports the
+existing label JSONL. If uncertain answers leave either class short, rerun with
+`--review-state review-state.json`; replacements are selected only from the
+same fixed tracks and split. Generated clips and review files are audition
+artifacts and must not be committed or treated as release evidence.
 
 ## Private prerelease packaging
 

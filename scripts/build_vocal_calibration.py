@@ -45,7 +45,15 @@ def read_rows(path):
     return rows
 
 
-def build(input_path, output_path, *, reviewed=False, authorize_cuts=False, acknowledgement=""):
+def build(
+    input_path,
+    output_path,
+    *,
+    reviewed=False,
+    authorize_cuts=False,
+    acknowledgement="",
+    qualification_tier=None,
+):
     if authorize_cuts and (
         not reviewed or acknowledgement != REVIEW_ACKNOWLEDGEMENT
     ):
@@ -57,6 +65,7 @@ def build(input_path, output_path, *, reviewed=False, authorize_cuts=False, ackn
         class_map_sha256=YAMNET_CLASS_MAP_SHA256,
         reviewed=reviewed,
         authorize_cuts=authorize_cuts,
+        qualification_tier_name=qualification_tier,
     )
     destination = Path(output_path).resolve()
     destination.parent.mkdir(parents=True, exist_ok=True)
@@ -73,6 +82,12 @@ def main(argv=None):
     parser.add_argument("--reviewed", action="store_true")
     parser.add_argument("--authorize-cuts", action="store_true")
     parser.add_argument("--acknowledgement", default="")
+    parser.add_argument(
+        "--qualification-tier",
+        choices=("release", "private-audition"),
+        default="release",
+        help="Private audition lowers corpus size only; it never authorizes release.",
+    )
     args = parser.parse_args(argv)
     artifact = build(
         args.input,
@@ -80,6 +95,7 @@ def main(argv=None):
         reviewed=args.reviewed,
         authorize_cuts=args.authorize_cuts,
         acknowledgement=args.acknowledgement,
+        qualification_tier=args.qualification_tier,
     )
     print(
         json.dumps(
@@ -87,6 +103,11 @@ def main(argv=None):
                 "output": str(Path(args.output).resolve()),
                 "artifact_digest": artifact["artifact_digest"],
                 "cuts_authorized": artifact["authorization"]["cuts_authorized"],
+                "calibration_tier": artifact.get("qualification_tier", "release"),
+                "release_authorized": (
+                    artifact.get("qualification_tier", "release") == "release"
+                    and artifact["authorization"]["cuts_authorized"]
+                ),
                 "holdout": artifact["holdout"],
             },
             sort_keys=True,

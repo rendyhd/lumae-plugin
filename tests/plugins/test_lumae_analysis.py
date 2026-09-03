@@ -294,9 +294,62 @@ def test_dj_capability_caches_verified_artifact_by_file_identity(monkeypatch, tm
     assert calls == [(str(model), str(yamnet_model), True)]
     assert first == second
     assert first["worker_available"] is True
+    assert first["internal_test_eligible"] is False
     assert first["available"] is False
-    assert first["reason"] == "reference_host_unqualified"
+    assert first["reason"] == "vocal_calibration_required"
     assert str(model) not in json.dumps(first)
+
+
+def test_private_audition_requires_prerelease_env_and_reviewed_artifact(monkeypatch, tmp_path):
+    mod = load_plugin()
+    model = tmp_path / "beat-this.ckpt"
+    yamnet_model = tmp_path / "yamnet.tflite"
+    model.write_bytes(b"model")
+    yamnet_model.write_bytes(b"yamnet")
+    monkeypatch.setattr(mod, "PLUGIN_VERSION", "1.2.0-djtest.14")
+    monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
+    monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
+    monkeypatch.setattr(mod, "dj_setup_state", lambda: "ready")
+    monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setenv("LUMAE_DJ_PRIVATE_AUDITION", "1")
+    monkeypatch.setattr(
+        mod,
+        "get_setting",
+        lambda key, default=None: (
+            str(model)
+            if key == "dj_model_path"
+            else str(yamnet_model)
+            if key == "dj_yamnet_model_path"
+            else default
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "load_configured_vocal_calibration",
+        lambda: {
+            "qualification_tier": "private-audition",
+            "artifact_digest": "c" * 64,
+            "authorization": {"reviewed": True, "cuts_authorized": True},
+        },
+    )
+    monkeypatch.setattr(
+        mod,
+        "dj_runtime_status",
+        lambda *_args, **_kwargs: {
+            "available": True,
+            "reason": None,
+            "models": {},
+        },
+    )
+    mod._DJ_CAPABILITY_CACHE.clear()
+
+    capability = mod.local_dj_worker_capability()
+
+    assert capability["worker_available"] is True
+    assert capability["internal_test_eligible"] is True
+    assert capability["calibration_tier"] == "private-audition"
+    assert capability["release_authorized"] is False
+    assert capability["reason"] == "private_audition_only"
 
 
 def test_dj_capability_fails_closed_for_configured_invalid_vocal_calibration(
@@ -706,6 +759,35 @@ def test_dj_worker_defers_before_claim_when_profile_work_is_pending(monkeypatch)
         "status": "deferred",
         "reason": "profile_work_pending",
     }
+
+
+def test_private_interactive_dj_job_can_pass_background_profile_gate(monkeypatch):
+    mod = load_plugin()
+    database = object()
+    capability = {
+        "worker_available": True,
+        "internal_test_eligible": True,
+        "reason": "private_audition_only",
+    }
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "prepare_dj_runtime", lambda: capability)
+    monkeypatch.setattr(mod, "get_db", lambda: database)
+    monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: True)
+    monkeypatch.setattr(mod, "interactive_dj_jobs_pending", lambda _db: True)
+    monkeypatch.setattr(mod, "claim_next_dj_job", lambda _db: None)
+
+    assert mod.dj_analysis_task() == {"status": "idle"}
+
+
+def test_release_dj_job_cannot_pass_background_profile_gate(monkeypatch):
+    mod = load_plugin()
+    database = object()
+    monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: True)
+    monkeypatch.setattr(mod, "interactive_dj_jobs_pending", lambda _db: True)
+
+    assert mod._dj_profile_gate_open(
+        {"internal_test_eligible": False}, database
+    ) is False
 
 
 def test_dj_worker_publishes_one_source_bound_job_and_cleans_temp(monkeypatch):

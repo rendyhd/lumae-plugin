@@ -14,13 +14,39 @@ from pathlib import Path
 
 
 SCHEMA_VERSION = 1
-METHOD = "lumae-yamnet-vocal-risk-isotonic-v1"
+METHOD = "lumae-yamnet-vocal-risk-isotonic-v2"
 LABEL_DEFINITION = "audible-vocal-conflict-v1"
-MAPPING = "right-continuous-isotonic-v1"
+MAPPING = "right-continuous-beta-quarter-isotonic-v2"
+BETA_PRIOR_ALPHA = 0.25
+BETA_PRIOR_BETA = 0.25
+REGULARIZATION = {
+    "kind": "symmetric-beta",
+    "alpha": BETA_PRIOR_ALPHA,
+    "beta": BETA_PRIOR_BETA,
+    "scope": "per-evidence-group",
+}
 MIN_CALIBRATION_TRACKS = 100
 MIN_HOLDOUT_TRACKS = 200
 MIN_POSITIVE_FRAMES_PER_SPLIT = 100
 MIN_NEGATIVE_FRAMES_PER_SPLIT = 100
+PRIVATE_AUDITION_TIER = "private-audition"
+RELEASE_TIER = "release"
+TIER_REQUIREMENTS = {
+    RELEASE_TIER: {
+        "calibration_tracks": MIN_CALIBRATION_TRACKS,
+        "holdout_tracks": MIN_HOLDOUT_TRACKS,
+        "positive_frames": MIN_POSITIVE_FRAMES_PER_SPLIT,
+        "negative_frames": MIN_NEGATIVE_FRAMES_PER_SPLIT,
+        "total_frames": 400,
+    },
+    PRIVATE_AUDITION_TIER: {
+        "calibration_tracks": 10,
+        "holdout_tracks": 10,
+        "positive_frames": 5,
+        "negative_frames": 5,
+        "total_frames": 40,
+    },
+}
 CUT_RISK_THRESHOLD = 0.25
 MAX_BRIER_SCORE = 0.18
 MAX_EXPECTED_CALIBRATION_ERROR = 0.08
@@ -62,6 +88,14 @@ def _integer(value, name, minimum=0):
     return value
 
 
+def qualification_tier(value):
+    """An absent tier preserves the original public-release contract."""
+    tier = value.get("qualification_tier", RELEASE_TIER)
+    if tier not in TIER_REQUIREMENTS:
+        raise VocalCalibrationError("unsupported calibration qualification tier")
+    return tier
+
+
 def validate_artifact(
     value,
     *,
@@ -74,12 +108,16 @@ def validate_artifact(
         raise VocalCalibrationError("unsupported calibration contract")
     if value.get("label_definition") != LABEL_DEFINITION or value.get("mapping") != MAPPING:
         raise VocalCalibrationError("unsupported calibration semantics")
+    if value.get("regularization") != REGULARIZATION:
+        raise VocalCalibrationError("unsupported calibration regularization")
     if value.get("yamnet_model_sha256") != yamnet_model_sha256:
         raise VocalCalibrationError("calibration YAMNet identity mismatch")
     if value.get("class_map_sha256") != class_map_sha256:
         raise VocalCalibrationError("calibration class-map identity mismatch")
     if value.get("artifact_digest") != artifact_digest(value):
         raise VocalCalibrationError("calibration artifact digest mismatch")
+    tier = qualification_tier(value)
+    requirements = TIER_REQUIREMENTS[tier]
 
     corpus = value.get("corpus")
     if not isinstance(corpus, dict):
@@ -87,20 +125,22 @@ def validate_artifact(
     calibration_tracks = _integer(
         corpus.get("calibration_track_count"),
         "calibration_track_count",
-        MIN_CALIBRATION_TRACKS,
+        requirements["calibration_tracks"],
     )
     holdout_tracks = _integer(
-        corpus.get("holdout_track_count"), "holdout_track_count", MIN_HOLDOUT_TRACKS
+        corpus.get("holdout_track_count"),
+        "holdout_track_count",
+        requirements["holdout_tracks"],
     )
     calibration_frames = _integer(corpus.get("calibration_frame_count"), "calibration_frame_count", 1)
     holdout_frames = _integer(corpus.get("holdout_frame_count"), "holdout_frame_count", 1)
-    for name in (
-        "calibration_positive_frames",
-        "calibration_negative_frames",
-        "holdout_positive_frames",
-        "holdout_negative_frames",
+    for name, minimum in (
+        ("calibration_positive_frames", requirements["positive_frames"]),
+        ("calibration_negative_frames", requirements["negative_frames"]),
+        ("holdout_positive_frames", requirements["positive_frames"]),
+        ("holdout_negative_frames", requirements["negative_frames"]),
     ):
-        _integer(corpus.get(name), name, MIN_POSITIVE_FRAMES_PER_SPLIT)
+        _integer(corpus.get(name), name, minimum)
     manifest_digest = corpus.get("manifest_sha256")
     if not isinstance(manifest_digest, str) or len(manifest_digest) != 64:
         raise VocalCalibrationError("invalid calibration manifest digest")
@@ -108,7 +148,11 @@ def validate_artifact(
         int(manifest_digest, 16)
     except ValueError as exc:
         raise VocalCalibrationError("invalid calibration manifest digest") from exc
-    if calibration_tracks + holdout_tracks < 300 or calibration_frames + holdout_frames < 400:
+    if (
+        calibration_tracks + holdout_tracks
+        < requirements["calibration_tracks"] + requirements["holdout_tracks"]
+        or calibration_frames + holdout_frames < requirements["total_frames"]
+    ):
         raise VocalCalibrationError("calibration corpus is incomplete")
 
     bins = value.get("bins")
@@ -224,8 +268,8 @@ def _fit_isotonic(rows):
         blocks.append(
             {
                 "max": item["score"],
-                "sum": item["sum"],
-                "count": item["count"],
+                "sum": item["sum"] + BETA_PRIOR_ALPHA,
+                "count": item["count"] + BETA_PRIOR_ALPHA + BETA_PRIOR_BETA,
             }
         )
         while len(blocks) >= 2:
@@ -285,7 +329,12 @@ def fit_artifact(
     class_map_sha256,
     reviewed=False,
     authorize_cuts=False,
+    qualification_tier_name=None,
 ):
+    tier = qualification_tier(
+        {} if qualification_tier_name is None else {"qualification_tier": qualification_tier_name}
+    )
+    requirements = TIER_REQUIREMENTS[tier]
     normalized = _normalize_rows(rows)
     calibration = [row for row in normalized if row["split"] == "calibration"]
     holdout = [row for row in normalized if row["split"] == "holdout"]
@@ -293,12 +342,18 @@ def fit_artifact(
     holdout_tracks = {row["track_id"] for row in holdout}
     if calibration_tracks & holdout_tracks:
         raise VocalCalibrationError("calibration and holdout tracks overlap")
-    if len(calibration_tracks) < MIN_CALIBRATION_TRACKS or len(holdout_tracks) < MIN_HOLDOUT_TRACKS:
+    if (
+        len(calibration_tracks) < requirements["calibration_tracks"]
+        or len(holdout_tracks) < requirements["holdout_tracks"]
+    ):
         raise VocalCalibrationError("calibration corpus does not meet the track-count gates")
     for split_name, split_rows in (("calibration", calibration), ("holdout", holdout)):
         positives = sum(row["vocal_conflict"] for row in split_rows)
         negatives = len(split_rows) - positives
-        if positives < MIN_POSITIVE_FRAMES_PER_SPLIT or negatives < MIN_NEGATIVE_FRAMES_PER_SPLIT:
+        if (
+            positives < requirements["positive_frames"]
+            or negatives < requirements["negative_frames"]
+        ):
             raise VocalCalibrationError(f"{split_name} split lacks positive or negative labels")
     bins = _fit_isotonic(calibration)
     measurements = _holdout_metrics(holdout, bins)
@@ -323,6 +378,7 @@ def fit_artifact(
         "method": METHOD,
         "label_definition": LABEL_DEFINITION,
         "mapping": MAPPING,
+        "regularization": REGULARIZATION,
         "yamnet_model_sha256": yamnet_model_sha256,
         "class_map_sha256": class_map_sha256,
         "corpus": corpus,
@@ -333,6 +389,8 @@ def fit_artifact(
             "cuts_authorized": bool(authorize_cuts and reviewed and metrics_pass),
         },
     }
+    if tier != RELEASE_TIER:
+        artifact["qualification_tier"] = tier
     artifact["artifact_digest"] = artifact_digest(artifact)
     return validate_artifact(
         artifact,
