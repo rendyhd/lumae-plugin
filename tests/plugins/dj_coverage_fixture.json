@@ -1,0 +1,47 @@
+{
+  "analyses": [
+    {
+      "schema_version": 2,
+      "track_id": "v2-a",
+      "regions": [{"eligible": true, "tempo_bpm": 120.0, "rejection_reasons": []}],
+      "candidates": {"entries": [{"time_ms": 1000}], "exits": [{"time_ms": 90000}]},
+      "vocal_risk": {"calibration": {"status": "ready", "cuts_authorized": true}}
+    },
+    {
+      "schema_version": 2,
+      "track_id": "v2-b",
+      "regions": [{"eligible": true, "tempo_bpm": 122.0, "rejection_reasons": []}],
+      "candidates": {"entries": [{"time_ms": 1000}], "exits": [{"time_ms": 90000}]},
+      "vocal_risk": {"calibration": {"status": "ready", "cuts_authorized": true}}
+    },
+    {
+      "schema_version": 3,
+      "track_id": "v3-a",
+      "edge_profile_ready": true,
+      "rhythm": {"regions": [{"confidence_tier": "medium", "normalized_tempo_bpm": 96.0, "rejection_reasons": ["unstable_tempo"]}]},
+      "cue_candidates": [{"role": "exit", "confidence_tier": "medium"}],
+      "vocal_risk": {"calibration": {"status": "ready", "cuts_authorized": true}}
+    },
+    {
+      "schema_version": 3,
+      "track_id": "v3-b",
+      "edge_profile_ready": true,
+      "rhythm": {"regions": [{"confidence_tier": "medium", "normalized_tempo_bpm": 132.0, "rejection_reasons": []}]},
+      "cue_candidates": [{"role": "entry", "confidence_tier": "medium"}],
+      "vocal_risk": {"calibration": {"status": "ready", "cuts_authorized": true}}
+    }
+  ],
+  "manifest": {
+    "pairs": [
+      {"from": "v2-a", "to": "v2-b"},
+      {"from": "v3-a", "to": "v3-b"},
+      {"from": "v3-b", "to": "v3-a"}
+    ],
+    "orders": [
+      {
+        "original": ["v3-b", "v2-a", "v3-a"],
+        "reordered": ["v3-b", "v3-a", "v2-a"]
+      }
+    ]
+  }
+}
