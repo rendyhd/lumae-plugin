@@ -72,6 +72,7 @@ jobs:
           tests/plugins/test_lumae_analysis.py
           tests/plugins/test_edge_profiles.py
           tests/plugins/test_dj_analysis.py
+          tests/plugins/test_dj_analysis_v3.py
           tests/plugins/test_lumae_analysis_provider_identity.py
           tests/plugins/test_collection_library_postgres_integration.py
           -q

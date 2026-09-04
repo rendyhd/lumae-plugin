@@ -49,6 +49,23 @@ from .dj_analysis_store import (
     update_dj_progress,
     write_dj_worker_capability,
 )
+from .dj_analysis_v3 import (
+    METHOD as DJ_V3_METHOD,
+    SCHEMA_VERSION as DJ_V3_SCHEMA_VERSION,
+    analyze_dj_file_v3,
+)
+from .dj_analysis_v3_store import (
+    claim_dj_v3_requests,
+    claim_next_dj_job_any,
+    dj_v3_job_cancelled,
+    dj_v3_jobs_pending,
+    finish_dj_v3_job,
+    migrate_dj_analysis_v3,
+    priority_dj_v3_jobs_pending,
+    publish_dj_v3_analysis,
+    read_dj_v3_analysis,
+    update_dj_v3_progress,
+)
 from .provision_dj_model import (
     ACKNOWLEDGEMENT as DJ_MODEL_ACKNOWLEDGEMENT,
     provision_stack as provision_dj_models,
@@ -1100,6 +1117,7 @@ def migrate(db):
     )
     migrate_edge_profiles(db)
     migrate_dj_analysis(db)
+    migrate_dj_analysis_v3(db)
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {table('profile_migrations')} (
@@ -1734,8 +1752,12 @@ def _disabled_dj_capability():
             "calibration_tier": "release",
             "release_authorized": False,
         },
-        "supported_analysis_versions": [DJ_SCHEMA_VERSION],
-        "supported_plan_versions": [2],
+        "supported_analysis_versions": [DJ_SCHEMA_VERSION, DJ_V3_SCHEMA_VERSION],
+        "supported_plan_versions": [2, 3],
+        "analysis_contracts": [
+            {"schema_version": DJ_SCHEMA_VERSION, "method": DJ_METHOD},
+            {"schema_version": DJ_V3_SCHEMA_VERSION, "method": DJ_V3_METHOD},
+        ],
     }
 
 
@@ -1788,6 +1810,12 @@ def local_dj_worker_capability():
         yamnet_path,
         verify_model=enabled,
     )
+    status["supported_analysis_versions"] = [DJ_SCHEMA_VERSION, DJ_V3_SCHEMA_VERSION]
+    status["supported_plan_versions"] = [2, 3]
+    status["analysis_contracts"] = [
+        {"schema_version": DJ_SCHEMA_VERSION, "method": DJ_METHOD},
+        {"schema_version": DJ_V3_SCHEMA_VERSION, "method": DJ_V3_METHOD},
+    ]
     calibration = None
     calibration_error = None
     try:
@@ -1872,6 +1900,7 @@ def attest_dj_worker_capability():
     """Persist the dedicated worker's path-free, version-bound result."""
     db = get_db()
     migrate_dj_analysis(db)
+    migrate_dj_analysis_v3(db)
     capability = local_dj_worker_capability()
     return write_dj_worker_capability(db, PLUGIN_VERSION, capability)
 
@@ -1962,7 +1991,15 @@ def sync_contract(compatibility):
             "dj_analysis": {
                 "schema_version": DJ_SCHEMA_VERSION,
                 "method": DJ_METHOD,
-                "semantic_contracts": ["lumae_dj_analysis_v1"],
+                "supported_schema_versions": [DJ_SCHEMA_VERSION, DJ_V3_SCHEMA_VERSION],
+                "contracts": [
+                    {"schema_version": DJ_SCHEMA_VERSION, "method": DJ_METHOD},
+                    {"schema_version": DJ_V3_SCHEMA_VERSION, "method": DJ_V3_METHOD},
+                ],
+                "semantic_contracts": [
+                    "lumae_dj_analysis_v1",
+                    "lumae_dj_analysis_v3",
+                ],
             },
             "relationships": {
                 "schema_version": RELATIONSHIP_SCHEMA_VERSION,
@@ -3021,7 +3058,10 @@ def _dj_profile_gate_open(capability, db=None):
         return True
     return bool(
         capability.get("internal_test_eligible") is True
-        and interactive_dj_jobs_pending(db)
+        and (
+            interactive_dj_jobs_pending(db)
+            or priority_dj_v3_jobs_pending(db)
+        )
     )
 
 
@@ -3173,6 +3213,105 @@ def _request_dj_jobs(source, ids, *, priority=0):
     }, 202
 
 
+def _request_dj_v3_jobs(source, ids, *, priority_tier):
+    capability = dj_analysis_capability()
+    if maintenance_paused():
+        return {
+            "capability": capability,
+            "accepted": [],
+            "promoted": [],
+            "already_ready": [],
+            "already_queued": [],
+            "deferred": True,
+            "reason": "maintenance_paused",
+        }, 503
+    if not capability["worker_available"]:
+        return {
+            "capability": capability,
+            "accepted": [],
+            "promoted": [],
+            "already_ready": [],
+            "already_queued": [],
+            "deferred": True,
+            "reason": capability["reason"],
+        }, 503
+    jobs, promoted, ready, queued = claim_dj_v3_requests(
+        get_db(),
+        source["catalog_instance_id"],
+        ids,
+        priority_tier=priority_tier,
+        expected_vocal_calibration_cache_key=(
+            capability.get("vocal_calibration", {}).get("cache_key")
+        ),
+    )
+    deferred = False
+    if jobs or promoted:
+        try:
+            _enqueue_dj_worker()
+        except Exception:
+            deferred = True
+            logger.exception("lumae_analysis could not queue the DJ V3 worker")
+    return {
+        "capability": capability,
+        "accepted": [job["track_id"] for job in jobs],
+        "promoted": promoted,
+        "already_ready": ready,
+        "already_queued": queued,
+        "priority_tier": priority_tier,
+        "deferred": deferred,
+    }, 202
+
+
+@bp.get("/api/dj/v3/analysis")
+def dj_v3_analysis_api():
+    try:
+        source = resolve_profile_source(
+            catalog_instance_id=request.args.get("catalog_instance_id"),
+            server_id=request.args.get("server_id"),
+        )
+        ids = _validate_dj_ids(parse_ids(request.args.get("ids", "")))
+        capability = dj_analysis_capability()
+        result = read_dj_v3_analysis(
+            get_db(),
+            source["catalog_instance_id"],
+            ids,
+            expected_vocal_calibration_cache_key=(
+                capability.get("vocal_calibration", {}).get("cache_key")
+            ),
+        )
+        return _private_json(
+            {
+                "schema_version": DJ_V3_SCHEMA_VERSION,
+                "method": DJ_V3_METHOD,
+                "catalog_instance_id": source["catalog_instance_id"],
+                "capability": capability,
+                **result,
+            }
+        )
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_dj_v3_request", str(exc), 400)
+
+
+@bp.post("/api/dj/v3/analysis/analyze")
+def dj_v3_analysis_request_api():
+    try:
+        body = _json_body(max_bytes=64_000)
+        source = resolve_profile_source(
+            catalog_instance_id=body.get("catalog_instance_id"),
+            server_id=body.get("server_id"),
+        )
+        ids = _validate_dj_ids(body.get("ids"))
+        priority_tier = body.get("priority")
+        if priority_tier not in ("boundary", "lookahead", "queue"):
+            raise ValueError("priority must be boundary, lookahead, or queue")
+        result, status = _request_dj_v3_jobs(
+            source, ids, priority_tier=priority_tier
+        )
+        return _private_json(result, status)
+    except (KeyError, ValueError, CatalogScanError) as exc:
+        return _catalog_error("invalid_dj_v3_request", str(exc), 400)
+
+
 @bp.get("/api/dj/analysis")
 def dj_analysis_api():
     try:
@@ -3265,7 +3404,7 @@ def dj_analysis_cancel_api():
 
 
 def dj_analysis_task():
-    """Process at most one durable job after all profile work has cleared."""
+    # Process one V2/V3 job through the globally ordered DJ worker.
     if maintenance_paused():
         return {"status": "deferred", "reason": "maintenance_paused"}
     capability = prepare_dj_runtime()
@@ -3274,12 +3413,22 @@ def dj_analysis_task():
     db = get_db()
     if not _dj_profile_gate_open(capability, db):
         return {"status": "deferred", "reason": "profile_work_pending"}
-    job = claim_next_dj_job(db)
+    job = claim_next_dj_job_any(db)
     if not job:
         return {"status": "idle"}
 
+    is_v3 = job["analysis_version"] == 3
+    cancel_check = dj_v3_job_cancelled if is_v3 else dj_job_cancelled
+    progress_update = update_dj_v3_progress if is_v3 else update_dj_progress
+    publish = publish_dj_v3_analysis if is_v3 else publish_dj_analysis
+    finish = finish_dj_v3_job if is_v3 else finish_dj_job
+    analyzer = analyze_dj_file_v3 if is_v3 else analyze_dj_file
     info = None
-    outcome = {"status": "failed", "track_id": job["track_id"]}
+    outcome = {
+        "status": "failed",
+        "track_id": job["track_id"],
+        "analysis_version": job["analysis_version"],
+    }
     try:
         source = resolve_profile_source(
             catalog_instance_id=job["catalog_instance_id"]
@@ -3294,25 +3443,24 @@ def dj_analysis_task():
             or opaque_revision(info.get("media_signature")) != job["media_revision"]
         ):
             raise DjAnalysisError("source_replaced")
-        payload = analyze_dj_file(
+        payload = analyzer(
             info["file_path"],
             catalog_instance_id=job["catalog_instance_id"],
             track_id=job["track_id"],
             media_revision=job["media_revision"],
             model_path=configured_dj_model_path(),
             yamnet_model_path=configured_yamnet_model_path(),
-            cancelled=lambda: dj_job_cancelled(get_db(), job),
-            progress=lambda frames: update_dj_progress(get_db(), job, frames),
+            cancelled=lambda: cancel_check(get_db(), job),
+            progress=lambda frames: progress_update(get_db(), job, frames),
             vocal_calibration=load_configured_vocal_calibration(),
         )
-        applied = publish_dj_analysis(
-            get_db(), job, payload, info["media_signature"]
-        )
+        applied = publish(get_db(), job, payload, info["media_signature"])
         if not applied:
-            finish_dj_job(get_db(), job, "failed", "source_replaced")
+            finish(get_db(), job, "failed", "source_replaced")
         outcome = {
             "status": "ready" if applied else "superseded",
             "track_id": job["track_id"],
+            "analysis_version": job["analysis_version"],
         }
     except DjAnalysisError as exc:
         rollback = getattr(get_db(), "rollback", None)
@@ -3335,17 +3483,23 @@ def dj_analysis_task():
             if exc.code in unsupported
             else "failed"
         )
-        finish_dj_job(get_db(), job, status, exc.code)
-        outcome = {"status": status, "track_id": job["track_id"], "reason": exc.code}
+        finish(get_db(), job, status, exc.code)
+        outcome = {
+            "status": status,
+            "track_id": job["track_id"],
+            "analysis_version": job["analysis_version"],
+            "reason": exc.code,
+        }
     except Exception:
         rollback = getattr(get_db(), "rollback", None)
         if callable(rollback):
             rollback()
-        finish_dj_job(get_db(), job, "failed", "internal_error")
+        finish(get_db(), job, "failed", "internal_error")
         logger.exception("lumae_analysis DJ worker failed")
         outcome = {
             "status": "failed",
             "track_id": job["track_id"],
+            "analysis_version": job["analysis_version"],
             "reason": "internal_error",
         }
     finally:
@@ -3354,7 +3508,10 @@ def dj_analysis_task():
 
     queued_next = False
     try:
-        if dj_jobs_pending(get_db()) and _dj_profile_gate_open(capability, get_db()):
+        if (
+            (dj_v3_jobs_pending(get_db()) or dj_jobs_pending(get_db()))
+            and _dj_profile_gate_open(capability, get_db())
+        ):
             _enqueue_dj_worker()
             queued_next = True
     except Exception:

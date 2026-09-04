@@ -97,8 +97,8 @@ def build_private_prerelease(
             "version": version,
             "min_core_version": public_metadata["versions"][0]["min_core_version"],
             "changelog": (
-                "Private opt-in DJ Analysis V2 test: checksum-pinned Beat This and "
-                "official YAMNet Lite, resumable model lifecycle, and source-bound analysis."
+                "Private opt-in DJ Analysis V3 test: localized rhythm and cue evidence, "
+                "checksum-pinned Beat This/YAMNet, and source-bound priority analysis."
             ),
             "imageUrl": "",
             "sourceUrl": f"{base_url}/{zip_name}",

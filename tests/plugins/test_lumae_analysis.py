@@ -438,6 +438,7 @@ def test_dj_worker_attestation_is_version_bound_and_dedicated(monkeypatch):
     monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "migrate_dj_analysis", lambda value: migrated.append(value))
+    monkeypatch.setattr(mod, "migrate_dj_analysis_v3", lambda value: migrated.append(value))
     monkeypatch.setattr(
         mod,
         "local_dj_worker_capability",
@@ -452,7 +453,7 @@ def test_dj_worker_attestation_is_version_bound_and_dedicated(monkeypatch):
     result = mod.attest_dj_worker_capability()
 
     assert result["reason"] == "disabled"
-    assert migrated == [db]
+    assert migrated == [db, db]
     assert written == [(db, mod.PLUGIN_VERSION, result)]
 
 
@@ -791,7 +792,7 @@ def test_dj_worker_defers_before_claim_when_profile_work_is_pending(monkeypatch)
     monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: True)
     monkeypatch.setattr(
         mod,
-        "claim_next_dj_job",
+        "claim_next_dj_job_any",
         lambda _db: pytest.fail("DJ job must not be claimed ahead of profile work"),
     )
 
@@ -814,7 +815,7 @@ def test_private_interactive_dj_job_can_pass_background_profile_gate(monkeypatch
     monkeypatch.setattr(mod, "get_db", lambda: database)
     monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: True)
     monkeypatch.setattr(mod, "interactive_dj_jobs_pending", lambda _db: True)
-    monkeypatch.setattr(mod, "claim_next_dj_job", lambda _db: None)
+    monkeypatch.setattr(mod, "claim_next_dj_job_any", lambda _db: None)
 
     assert mod.dj_analysis_task() == {"status": "idle"}
 
@@ -838,6 +839,7 @@ def test_dj_worker_publishes_one_source_bound_job_and_cleans_temp(monkeypatch):
         "track_id": "track-a",
         "media_revision": mod.opaque_revision("catalog-media:revision-a"),
         "job_token": "token-a",
+        "analysis_version": 2,
     }
     info = {
         "file_path": "/private/temp/track-a.flac",
@@ -855,7 +857,7 @@ def test_dj_worker_publishes_one_source_bound_job_and_cleans_temp(monkeypatch):
     )
     monkeypatch.setattr(mod, "get_db", lambda: database)
     monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: False)
-    monkeypatch.setattr(mod, "claim_next_dj_job", lambda _db: job)
+    monkeypatch.setattr(mod, "claim_next_dj_job_any", lambda _db: job)
     monkeypatch.setattr(
         mod,
         "resolve_profile_source",
@@ -875,11 +877,17 @@ def test_dj_worker_publishes_one_source_bound_job_and_cleans_temp(monkeypatch):
         ),
     )
     monkeypatch.setattr(mod, "dj_jobs_pending", lambda _db: False)
+    monkeypatch.setattr(mod, "dj_v3_jobs_pending", lambda _db: False)
     monkeypatch.setattr(mod, "remove_downloaded_file", removed.append)
 
     result = mod.dj_analysis_task()
 
-    assert result == {"status": "ready", "track_id": "track-a", "queued_next": False}
+    assert result == {
+        "status": "ready",
+        "track_id": "track-a",
+        "analysis_version": 2,
+        "queued_next": False,
+    }
     assert analyzed[0][0] == info["file_path"]
     assert analyzed[0][1]["media_revision"] == job["media_revision"]
     assert published == [(database, job, {"payload": True}, info["media_signature"])]
@@ -10569,3 +10577,105 @@ def test_enrichment_cleanup_bounds_relationship_history_to_two_snapshots():
         and "relationship_state" in sql
         for sql, params in db.cursor_obj.executed
     )
+
+
+
+def test_dj_v3_request_maps_server_controlled_priority_and_reports_promotion(monkeypatch):
+    mod = load_plugin()
+    database = object()
+    capability = {"worker_available": True, "reason": "private_audition_only"}
+    calls = []
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "dj_analysis_capability", lambda: capability)
+    monkeypatch.setattr(mod, "get_db", lambda: database)
+    monkeypatch.setattr(
+        mod,
+        "claim_dj_v3_requests",
+        lambda db, catalog_id, ids, **kwargs: calls.append(
+            (db, catalog_id, ids, kwargs)
+        )
+        or ([], ["track-a"], [], []),
+    )
+    monkeypatch.setattr(mod, "_enqueue_dj_worker", lambda: calls.append("enqueue"))
+
+    response = plugin_client(mod).post(
+        "/api/dj/v3/analysis/analyze",
+        json={
+            "catalog_instance_id": "catalog-a",
+            "ids": ["track-a"],
+            "priority": "boundary",
+        },
+    )
+
+    assert response.status_code == 202
+    assert response.get_json()["promoted"] == ["track-a"]
+    assert response.get_json()["priority_tier"] == "boundary"
+    assert calls[0][0:3] == (database, "catalog-a", ["track-a"])
+    assert calls[0][3]["priority_tier"] == "boundary"
+    assert calls[1] == "enqueue"
+
+
+def test_dj_v3_request_rejects_unknown_priority_before_creating_jobs(monkeypatch):
+    mod = load_plugin()
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+    monkeypatch.setattr(
+        mod,
+        "claim_dj_v3_requests",
+        lambda *_args, **_kwargs: pytest.fail("invalid priority must not create a job"),
+    )
+
+    response = plugin_client(mod).post(
+        "/api/dj/v3/analysis/analyze",
+        json={
+            "catalog_instance_id": "catalog-a",
+            "ids": ["track-a"],
+            "priority": "urgent",
+        },
+    )
+
+    assert response.status_code == 400
+    assert response.get_json()["error"] == "invalid_dj_v3_request"
+
+
+def test_dj_v3_read_is_additive_and_calibration_bound(monkeypatch):
+    mod = load_plugin()
+    database = object()
+    calls = []
+    capability = {
+        "worker_available": True,
+        "supported_analysis_versions": [2, 3],
+        "vocal_calibration": {"cache_key": "c" * 64},
+    }
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+    monkeypatch.setattr(mod, "get_db", lambda: database)
+    monkeypatch.setattr(mod, "dj_analysis_capability", lambda: capability)
+    monkeypatch.setattr(
+        mod,
+        "read_dj_v3_analysis",
+        lambda db, catalog_id, ids, **kwargs: calls.append(
+            (db, catalog_id, ids, kwargs)
+        )
+        or {"ready": [], "pending": [], "unsupported": [], "failed": [], "missing": ids},
+    )
+
+    response = plugin_client(mod).get(
+        "/api/dj/v3/analysis?catalog_instance_id=catalog-a&ids=track-a"
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["schema_version"] == 3
+    assert response.get_json()["method"] == mod.DJ_V3_METHOD
+    assert calls[0][3] == {"expected_vocal_calibration_cache_key": "c" * 64}

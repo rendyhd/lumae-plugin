@@ -81,6 +81,7 @@ def test_private_prerelease_builder_isolated_from_public_channel(tmp_path):
         runtime = archive.read("__init__.py").decode("utf-8")
     assert 'PLUGIN_VERSION = "1.2.0-djtest.7"' in runtime
     assert private_metadata["channel"] == "private-dj-test"
+    assert "DJ Analysis V3" in private_metadata["versions"][0]["changelog"]
     assert [entry["version"] for entry in private_metadata["versions"]] == [
         "1.2.0-djtest.7"
     ]
