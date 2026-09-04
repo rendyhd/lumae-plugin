@@ -28,7 +28,7 @@ from .vocal_calibration import (
 
 
 SCHEMA_VERSION = 2
-METHOD = "beat-this-1.1.0-yamnet-lite-1-lumae-dj-v2.2"
+METHOD = "beat-this-1.1.0-yamnet-lite-1-lumae-dj-v2.3"
 BEAT_THIS_VERSION = "1.1.0"
 MODEL_NAME = "final0"
 MODEL_URL = (

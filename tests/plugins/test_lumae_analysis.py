@@ -738,6 +738,46 @@ def test_dj_request_fails_closed_without_creating_jobs(monkeypatch):
     assert response.get_json()["reason"] == "disabled"
 
 
+def test_dj_read_uses_the_capability_calibration_identity(monkeypatch):
+    mod = load_plugin()
+    database = object()
+    calls = []
+    capability = {
+        "worker_available": True,
+        "vocal_calibration": {"cache_key": "c" * 64},
+    }
+    monkeypatch.setattr(
+        mod,
+        "resolve_profile_source",
+        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
+    )
+    monkeypatch.setattr(mod, "get_db", lambda: database)
+    monkeypatch.setattr(mod, "dj_analysis_capability", lambda: capability)
+    monkeypatch.setattr(
+        mod,
+        "read_dj_analysis",
+        lambda db, catalog_id, ids, **kwargs: calls.append(
+            (db, catalog_id, ids, kwargs)
+        )
+        or {"ready": [], "pending": [], "unsupported": [], "failed": [], "missing": ids},
+    )
+
+    response = plugin_client(mod).get(
+        "/api/dj/analysis?catalog_instance_id=catalog-a&ids=track-a"
+    )
+
+    assert response.status_code == 200
+    assert calls == [
+        (
+            database,
+            "catalog-a",
+            ["track-a"],
+            {"expected_vocal_calibration_cache_key": "c" * 64},
+        )
+    ]
+    assert response.get_json()["capability"] == capability
+
+
 def test_dj_worker_defers_before_claim_when_profile_work_is_pending(monkeypatch):
     mod = load_plugin()
     database = object()

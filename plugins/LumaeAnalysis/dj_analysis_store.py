@@ -144,13 +144,21 @@ def claim_dj_requests(
             if expected_vocal_calibration_cache_key is not None
             else ""
         )
-        parameters = [catalog_id, track_id, revision, signature, METHOD]
+        parameters = [
+            catalog_id,
+            track_id,
+            revision,
+            signature,
+            METHOD,
+            str(SCHEMA_VERSION),
+        ]
         if expected_vocal_calibration_cache_key is not None:
             parameters.append(str(expected_vocal_calibration_cache_key))
         cur.execute(
             f"""SELECT 1 FROM {table('dj_analyses')}
             WHERE catalog_instance_id=%s AND track_id=%s AND media_revision=%s
               AND media_signature=%s AND payload->>'method'=%s
+              AND payload->>'schema_version'=%s
               {calibration_clause} LIMIT 1""",
             tuple(parameters),
         )
@@ -354,8 +362,23 @@ def publish_dj_analysis(db, job, payload, media_signature):
     return True
 
 
-def read_dj_analysis(db, catalog_id, ids):
+def read_dj_analysis(
+    db,
+    catalog_id,
+    ids,
+    *,
+    expected_vocal_calibration_cache_key=None,
+):
     cur = db.cursor()
+    calibration_clause = (
+        "AND value.payload#>>'{vocal_risk,calibration,cache_key}'=%s"
+        if expected_vocal_calibration_cache_key is not None
+        else ""
+    )
+    parameters = [METHOD, str(SCHEMA_VERSION)]
+    if expected_vocal_calibration_cache_key is not None:
+        parameters.append(str(expected_vocal_calibration_cache_key))
+    parameters.extend([catalog_id, list(dict.fromkeys(ids))[:100]])
     cur.execute(
         f"""SELECT p.track_id, analysis.payload, job.status, job.error_code,
                    job.progress_frames
@@ -364,12 +387,15 @@ def read_dj_analysis(db, catalog_id, ids):
             SELECT payload FROM {table('dj_analyses')} value
             WHERE value.catalog_instance_id=p.catalog_instance_id
               AND value.track_id=p.track_id AND value.media_signature=p.media_signature
+              AND value.payload->>'method'=%s
+              AND value.payload->>'schema_version'=%s
+              {calibration_clause}
             ORDER BY value.updated_at DESC LIMIT 1
         ) analysis ON TRUE
         LEFT JOIN {table('dj_analysis_jobs')} job
           ON job.catalog_instance_id=p.catalog_instance_id AND job.track_id=p.track_id
         WHERE p.catalog_instance_id=%s AND p.track_id=ANY(%s) ORDER BY p.track_id""",
-        (catalog_id, list(dict.fromkeys(ids))[:100]),
+        tuple(parameters),
     )
     rows = cur.fetchall()
     cur.close()
@@ -408,7 +434,7 @@ def dj_backfill_candidates(
         if expected_vocal_calibration_cache_key is not None
         else ""
     )
-    parameters = [METHOD]
+    parameters = [METHOD, str(SCHEMA_VERSION)]
     if expected_vocal_calibration_cache_key is not None:
         parameters.append(str(expected_vocal_calibration_cache_key))
     parameters.extend([catalog_id, str(after), max(1, min(100, int(limit)))])
@@ -419,7 +445,9 @@ def dj_backfill_candidates(
             WHERE analysis.catalog_instance_id=p.catalog_instance_id
               AND analysis.track_id=p.track_id
               AND analysis.media_signature=p.media_signature
-              AND analysis.payload->>'method'=%s {calibration_clause} LIMIT 1
+              AND analysis.payload->>'method'=%s
+              AND analysis.payload->>'schema_version'=%s
+              {calibration_clause} LIMIT 1
         ) analysis ON TRUE
         LEFT JOIN {table('dj_analysis_jobs')} job
           ON job.catalog_instance_id=p.catalog_instance_id AND job.track_id=p.track_id

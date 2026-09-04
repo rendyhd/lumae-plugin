@@ -3181,13 +3181,21 @@ def dj_analysis_api():
             server_id=request.args.get("server_id"),
         )
         ids = _validate_dj_ids(parse_ids(request.args.get("ids", "")))
-        result = read_dj_analysis(get_db(), source["catalog_instance_id"], ids)
+        capability = dj_analysis_capability()
+        result = read_dj_analysis(
+            get_db(),
+            source["catalog_instance_id"],
+            ids,
+            expected_vocal_calibration_cache_key=(
+                capability.get("vocal_calibration", {}).get("cache_key")
+            ),
+        )
         return _private_json(
             {
                 "schema_version": DJ_SCHEMA_VERSION,
                 "method": DJ_METHOD,
                 "catalog_instance_id": source["catalog_instance_id"],
-                "capability": dj_analysis_capability(),
+                "capability": capability,
                 **result,
             }
         )

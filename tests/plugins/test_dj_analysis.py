@@ -694,6 +694,16 @@ def test_ready_job_is_reclaimed_when_its_analysis_contract_is_stale(monkeypatch)
     )
     assert ready == []
     assert [job["track_id"] for job in accepted] == ["track-a"]
+    analysis_sql, analysis_params = db.cur.executed[-2]
+    assert "payload->>'schema_version'=%s" in analysis_sql
+    assert analysis_params[:6] == (
+        "catalog-a",
+        "track-a",
+        edge.opaque_revision("signature-a"),
+        "signature-a",
+        dj.METHOD,
+        str(dj.SCHEMA_VERSION),
+    )
     assert "OR job.status='ready'" in db.cur.executed[-1][0]
 
 
@@ -719,7 +729,39 @@ def test_backfill_invalidates_analysis_when_vocal_calibration_changes():
 
     sql, params = db.cur.executed[-1]
     assert "analysis.payload#>>'{vocal_risk,calibration,cache_key}'=%s" in sql
-    assert params == (dj.METHOD, "c" * 64, "catalog-a", "", 100)
+    assert params == (
+        dj.METHOD,
+        str(dj.SCHEMA_VERSION),
+        "c" * 64,
+        "catalog-a",
+        "",
+        100,
+    )
+
+
+def test_read_hides_analysis_from_a_stale_contract_or_calibration():
+    db = Database(rows=[("track-a", None, "ready", None, 0)])
+
+    state = store.read_dj_analysis(
+        db,
+        "catalog-a",
+        ["track-a"],
+        expected_vocal_calibration_cache_key="c" * 64,
+    )
+
+    sql, params = db.cur.executed[-1]
+    assert "value.payload->>'method'=%s" in sql
+    assert "value.payload->>'schema_version'=%s" in sql
+    assert "value.payload#>>'{vocal_risk,calibration,cache_key}'=%s" in sql
+    assert params == (
+        dj.METHOD,
+        str(dj.SCHEMA_VERSION),
+        "c" * 64,
+        "catalog-a",
+        ["track-a"],
+    )
+    assert state["ready"] == []
+    assert state["missing"] == ["track-a"]
 
 
 def test_worker_capability_store_is_version_bound_and_path_free():
