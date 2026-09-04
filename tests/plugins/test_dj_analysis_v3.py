@@ -235,6 +235,13 @@ def test_v3_migration_is_additive_and_global_claim_checks_both_versions():
     claim_sql = "\n".join(statement for statement, _ in claim_cursor.statements)
     assert "dj_analysis_jobs_v3" in claim_sql
     assert "dj_analysis_jobs" in claim_sql
+    recovery_sql = [
+        statement
+        for statement, _params in claim_cursor.statements
+        if "error_code='worker_restarted'" in statement
+    ]
+    assert len(recovery_sql) == 2
+    assert all("WHERE status='running'" in statement for statement in recovery_sql)
     assert "priority DESC, requested_at" in claim_sql
 
 

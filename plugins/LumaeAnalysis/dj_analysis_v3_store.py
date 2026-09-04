@@ -167,6 +167,17 @@ def claim_next_dj_job_any(db):
     """Claim one V2/V3 job by priority and request time under one DB election."""
     cur = db.cursor()
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (DJ_CLAIM_LOCK_ID,))
+    # The dedicated lumae-dj queue is globally serialized. A running row seen
+    # when a new queue task starts belongs to a worker process that exited
+    # before it could publish or fail the job. Reclaim it immediately so a
+    # supervisor recycle cannot strand every later request behind a 20-minute
+    # migration timeout.
+    for jobs_table in (table("dj_analysis_jobs_v3"), table("dj_analysis_jobs")):
+        cur.execute(
+            f"""UPDATE {jobs_table} SET status='pending', started_at=NULL,
+                completed_at=NULL, error_code='worker_restarted', updated_at=now()
+            WHERE status='running'"""
+        )
     cur.execute(
         f"""SELECT analysis_version, catalog_instance_id, track_id
         FROM (
