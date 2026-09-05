@@ -1,0 +1,24 @@
+{
+  "relationship_inputs": {
+    "kind": "synthetic-relationship-input-conversion",
+    "tracks": 100000,
+    "initial_rss_bytes": 100921344,
+    "buffered_rows_rss_bytes": 287985664,
+    "final_rss_bytes": 363905024,
+    "peak_rss_bytes": 363905024,
+    "conversion_seconds": 0.375,
+    "total_seconds": 0.6879999999946449,
+    "limits": "Excludes PostgreSQL server, provider acquisition, entity construction and candidate scoring."
+  },
+  "decoder_polling": {
+    "per-frame": {
+      "database_callback_count": 1419,
+      "elapsed_seconds": 0.125
+    },
+    "throttled": {
+      "database_callback_count": 1,
+      "elapsed_seconds": 0.0779999999795109
+    },
+    "scope": "Real PyAV decode of a 60-second WAV; model inference stubbed; no database latency or real inference throughput measured."
+  }
+}

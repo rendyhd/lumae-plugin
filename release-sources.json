@@ -1,0 +1,13 @@
+{
+  "plugins": {
+    "LumaeAnalysis": {
+      "mode": "pinned-artifact",
+      "version": "1.1.8",
+      "checksum": "6a0196e20d33f8be21b9551c02a009e2"
+    },
+    "FederatedAlbums": {
+      "mode": "private",
+      "reason": "Requires a host with scoped plugin bearer authentication; source is under qualification."
+    }
+  }
+}

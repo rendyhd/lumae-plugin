@@ -4,6 +4,7 @@ import argparse
 import hashlib
 import os
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -42,7 +43,15 @@ def _verified_download(
     expected_sha256,
     verifier,
     opener,
+    cancelled=None,
+    deadline=None,
 ):
+    def check():
+        if cancelled and cancelled():
+            raise DjAnalysisError("cancelled")
+        if deadline is not None and time.monotonic() >= deadline:
+            raise DjAnalysisError("deadline_exceeded")
+    check()
     target = Path(output).expanduser().resolve()
     try:
         verifier(target)
@@ -67,6 +76,7 @@ def _verified_download(
     if offset:
         with open(partial, "rb") as existing:
             while True:
+                check()
                 chunk = existing.read(1024 * 1024)
                 if not chunk:
                     break
@@ -76,6 +86,7 @@ def _verified_download(
     try:
         with response, open(partial, mode) as sink:
             while True:
+                check()
                 chunk = response.read(1024 * 1024)
                 if not chunk:
                     break
@@ -88,6 +99,7 @@ def _verified_download(
             os.fsync(sink.fileno())
         if total != expected_bytes or digest.hexdigest() != expected_sha256:
             raise ValueError("model does not match pinned size and SHA-256")
+        check()
         os.replace(partial, target)
         verifier(target)
         return target
@@ -98,7 +110,7 @@ def _verified_download(
         raise
 
 
-def provision(output, *, opener=urllib.request.urlopen):
+def provision(output, *, opener=urllib.request.urlopen, cancelled=None, deadline=None):
     """Backward-compatible Beat This provision entry point."""
     return _verified_download(
         MODEL_URL,
@@ -106,25 +118,26 @@ def provision(output, *, opener=urllib.request.urlopen):
         expected_bytes=MODEL_BYTES,
         expected_sha256=MODEL_SHA256,
         verifier=verify_model_artifact,
-        opener=opener,
+        opener=opener, cancelled=cancelled, deadline=deadline,
     )
 
 
-def provision_yamnet(output, *, opener=urllib.request.urlopen):
+def provision_yamnet(output, *, opener=urllib.request.urlopen, cancelled=None, deadline=None):
     return _verified_download(
         YAMNET_MODEL_URL,
         output,
         expected_bytes=YAMNET_MODEL_BYTES,
         expected_sha256=YAMNET_MODEL_SHA256,
         verifier=verify_yamnet_model_artifact,
-        opener=opener,
+        opener=opener, cancelled=cancelled, deadline=deadline,
     )
 
 
-def provision_stack(beat_this_output, yamnet_output, *, opener=urllib.request.urlopen):
+def provision_stack(beat_this_output, yamnet_output, *, opener=urllib.request.urlopen, cancelled=None, deadline_seconds=1800):
+    deadline = time.monotonic() + max(1, min(1800, deadline_seconds))
     return {
-        "beat_this": provision(beat_this_output, opener=opener),
-        "yamnet": provision_yamnet(yamnet_output, opener=opener),
+        "beat_this": provision(beat_this_output, opener=opener, cancelled=cancelled, deadline=deadline),
+        "yamnet": provision_yamnet(yamnet_output, opener=opener, cancelled=cancelled, deadline=deadline),
     }
 
 

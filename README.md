@@ -1,10 +1,12 @@
 # Lumae AudioMuse-AI Plugin Catalog
 
-This repository publishes the Lumae Analysis plugin for **AudioMuse-AI**.
+This repository publishes Lumae plugins for **AudioMuse-AI**.
 
 The catalog is exposed through `manifest.json`. AudioMuse-AI reads that catalog, follows the Lumae `pluginUrl`, downloads the versioned code-only zip from `dist/lumae_analysis/`, and verifies the published checksum.
 
-## Plugin
+## Plugins
+
+### Lumae Analysis
 
 Lumae Analysis precomputes loudness and MixRamp profiles server-side so Lumae can use volume normalization and SmoothFade without doing that work on the phone.
 
@@ -87,11 +89,27 @@ rows. PostgreSQL no longer receives a row-lock request for the nullable side of
 the optional analysis-state join, so refresh retries can publish normally while
 the previous complete generation remains available.
 
+### Friend Album Discovery (private development)
+
+This source is excluded from the public catalogue until its required scoped
+plugin-bearer host extension is available and qualified. Connection operations
+are owner-scoped, and friend sync runs as bounded background work.
+
+Friend Album Discovery connects authenticated AudioMuse-AI instances using
+revocable, read-only pairing tokens. It recommends three albums a listener
+does not own from Lumae's native Sonic Fingerprint and adds friend results to
+sonically similar album searches.
+
+The catalogue contains album metadata and versioned Album Dynamics averages,
+not audio, filenames, listening history, track IDs, or individual track
+embeddings. Artwork is fetched only through a size-limited authenticated proxy.
+
 ## Layout
 
 * `manifest.json` - the AudioMuse plugin catalog.
 * `plugins/LumaeAnalysis/plugin.json` - the plugin metadata and release list.
 * `plugins/LumaeAnalysis/*.py` - the plugin code.
+* `plugins/FederatedAlbums/*.py` - the friend-album plugin code.
 * `dist/lumae_analysis/` - published Lumae release zip files.
 * `tests/plugins/test_lumae_analysis.py` - local regression tests.
 
@@ -101,7 +119,7 @@ The latest AudioMuse plugin documentation is here:
 
 https://github.com/NeptuneHub/AudioMuse-AI/blob/main/docs/PLUGIN.md
 
-The release zip must contain code only: `__init__.py` and helper files, with no `plugin.json` inside the zip. The GitHub workflow rebuilds the zip, fills the release `sourceUrl` and `checksum`, and regenerates `manifest.json`.
+The release zip contains code only, with no `plugin.json`. `release-sources.json` explicitly selects a pinned immutable archive, a new source release, or private development for each plugin. The public workflow currently verifies and reuses Lumae Analysis 1.1.8; private DJ changes never rebuild that archive. A new public release requires both a new metadata version and an explicit source-release policy.
 
 Run the local regression suite with:
 
@@ -110,8 +128,13 @@ python -m pip install -r requirements-dev.txt
 python -m pytest tests/plugins -q
 ```
 
-Pull requests run the same tests. The release builder rejects source changes
-that would alter an already checksummed version; add a new version entry instead.
+CI discovers the complete suite and runs PostgreSQL integration tests. Locally, set
+`LUMAE_POSTGRES_TEST_DSN` to a disposable database to enable those tests.
+Run `python scripts/build_catalog.py --check` to verify the public release policy.
+
+The [private DJ architecture, host contract and qualification guide](runtime/README.md)
+documents the dedicated worker requirements, V2/V3 lifecycle, bounded response
+pages, model removal, optional retention and reproducible performance tools.
 
 ## License
 

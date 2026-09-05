@@ -1,0 +1,56 @@
+{
+  "sourceKey": "source",
+  "expectedOrder": ["wide", "near", "far", "compact"],
+  "albums": [
+    {
+      "key": "source",
+      "album": "Source",
+      "artist": "Artist A",
+      "tracks": [
+        {"embedding": [1.0, 0.0], "energy": 0.25, "mood": [0.8, 0.2], "order": 0},
+        {"embedding": [0.0, 1.0], "energy": 0.55, "mood": [0.5, 0.5], "order": 1},
+        {"embedding": [-1.0, 0.0], "energy": 0.8, "mood": [0.2, 0.8], "order": 2}
+      ]
+    },
+    {
+      "key": "wide",
+      "album": "Wide Match",
+      "artist": "Artist B",
+      "tracks": [
+        {"embedding": [1.0, 0.0], "energy": 0.25, "mood": [0.8, 0.2], "order": 0},
+        {"embedding": [0.0, 1.0], "energy": 0.55, "mood": [0.5, 0.5], "order": 1},
+        {"embedding": [-1.0, 0.0], "energy": 0.8, "mood": [0.2, 0.8], "order": 2}
+      ]
+    },
+    {
+      "key": "near",
+      "album": "Near Arc",
+      "artist": "Artist C",
+      "tracks": [
+        {"embedding": [0.15, 0.95], "energy": 0.3, "mood": [0.7, 0.3], "order": 0},
+        {"embedding": [0.0, 1.0], "energy": 0.55, "mood": [0.5, 0.5], "order": 1},
+        {"embedding": [-0.15, 0.95], "energy": 0.75, "mood": [0.3, 0.7], "order": 2}
+      ]
+    },
+    {
+      "key": "compact",
+      "album": "Compact",
+      "artist": "Artist D",
+      "tracks": [
+        {"embedding": [1.0, 0.0], "energy": 0.4, "mood": [0.9, 0.1], "order": 0},
+        {"embedding": [0.99, 0.02], "energy": 0.5, "mood": [0.8, 0.2], "order": 1},
+        {"embedding": [0.98, 0.03], "energy": 0.6, "mood": [0.7, 0.3], "order": 2}
+      ]
+    },
+    {
+      "key": "far",
+      "album": "Far Side",
+      "artist": "Artist E",
+      "tracks": [
+        {"embedding": [0.0, -1.0], "energy": 0.1, "mood": [0.0, 1.0], "order": 0},
+        {"embedding": [-0.2, -0.8], "energy": 0.2, "mood": [0.1, 0.9], "order": 1}
+      ]
+    }
+  ]
+}
+

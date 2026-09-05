@@ -42,7 +42,7 @@ def _build_code_zip(source: Path, output: Path, version: str) -> None:
         for path, archive_name in members:
             payload = path.read_bytes()
             if archive_name == "__init__.py":
-                source_text = payload.decode("utf-8")
+                source_text = payload.decode("utf-8").replace("\r\n", "\n")
                 patched, replacements = RUNTIME_VERSION_RE.subn(
                     f'PLUGIN_VERSION = "{version}"', source_text, count=1
                 )

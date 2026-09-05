@@ -1,0 +1,36 @@
+{
+  "analysis": {
+    "edge_ready": 81,
+    "entry_ready": 101,
+    "exit_ready": 104,
+    "rhythm_ready": 104,
+    "total": 107,
+    "unsupported": 0,
+    "v2": 0,
+    "v3": 107,
+    "vocal_ready": 107
+  },
+  "ordering": {
+    "comparisons": 1,
+    "improved": 1,
+    "regressed": 0,
+    "total_improvement": 4.2,
+    "unchanged": 0
+  },
+  "pairs": {
+    "rejections": {},
+    "tempo_compatible": 46,
+    "tiers": {
+      "edge-fx": 0,
+      "one-sided": 8,
+      "phrase-sync": 46,
+      "smoothfade": 0,
+      "tempo-independent": 52
+    },
+    "total": 106
+  },
+  "region_rejections": {
+    "localized_meter_unavailable": 408,
+    "unstable_tempo": 318
+  }
+}

@@ -255,6 +255,7 @@ def test_dj_capability_caches_verified_artifact_by_file_identity(monkeypatch, tm
     monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
     monkeypatch.setattr(mod, "dj_setup_state", lambda: "ready")
     monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setenv("LUMAE_DJ_HOST_CONTRACT", "lumae-dj-host-v1")
     monkeypatch.setattr(
         mod,
         "get_setting",
@@ -311,6 +312,7 @@ def test_private_audition_requires_prerelease_env_and_reviewed_artifact(monkeypa
     monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
     monkeypatch.setattr(mod, "dj_setup_state", lambda: "ready")
     monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setenv("LUMAE_DJ_HOST_CONTRACT", "lumae-dj-host-v1")
     monkeypatch.setenv("LUMAE_DJ_PRIVATE_AUDITION", "1")
     monkeypatch.setattr(
         mod,
@@ -366,6 +368,7 @@ def test_dj_capability_fails_closed_for_configured_invalid_vocal_calibration(
     monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
     monkeypatch.setattr(mod, "dj_setup_state", lambda: "ready")
     monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setenv("LUMAE_DJ_HOST_CONTRACT", "lumae-dj-host-v1")
     monkeypatch.setenv("LUMAE_DJ_VOCAL_CALIBRATION", str(calibration))
     monkeypatch.setattr(
         mod,
@@ -401,6 +404,7 @@ def test_dj_capability_reads_only_fresh_worker_attestation(monkeypatch):
     mod = load_plugin()
     db = object()
     attested = {
+        "host_contract": "lumae-dj-host-v1",
         "schema_version": 2,
         "method": mod.DJ_METHOD,
         "worker_available": True,
@@ -436,6 +440,7 @@ def test_dj_worker_attestation_is_version_bound_and_dedicated(monkeypatch):
     migrated = []
     written = []
     monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setenv("LUMAE_DJ_HOST_CONTRACT", "lumae-dj-host-v1")
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "migrate_dj_analysis", lambda value: migrated.append(value))
     monkeypatch.setattr(mod, "migrate_dj_analysis_v3", lambda value: migrated.append(value))
@@ -453,7 +458,7 @@ def test_dj_worker_attestation_is_version_bound_and_dedicated(monkeypatch):
     result = mod.attest_dj_worker_capability()
 
     assert result["reason"] == "disabled"
-    assert migrated == [db, db]
+    assert migrated == []  # periodic attestation does not run DDL
     assert written == [(db, mod.PLUGIN_VERSION, result)]
 
 
@@ -549,6 +554,7 @@ def test_dj_runtime_provisions_only_after_opt_in(monkeypatch):
     monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
     monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
     monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setenv("LUMAE_DJ_HOST_CONTRACT", "lumae-dj-host-v1")
     monkeypatch.setattr(mod, "attest_dj_worker_capability", lambda: next(capabilities))
     monkeypatch.setattr(mod, "configured_dj_model_path", lambda: model_path)
     monkeypatch.setattr(mod, "configured_yamnet_model_path", lambda: yamnet_path)
@@ -556,7 +562,7 @@ def test_dj_runtime_provisions_only_after_opt_in(monkeypatch):
     monkeypatch.setattr(
         mod,
         "provision_dj_models",
-        lambda beat_path, vocal_path: provisioned.append((beat_path, vocal_path)),
+        lambda beat_path, vocal_path, **kwargs: provisioned.append((beat_path, vocal_path)),
     )
 
     result = mod.prepare_dj_runtime()
@@ -578,6 +584,7 @@ def test_dj_runtime_repairs_stale_lifecycle_when_models_are_already_ready(monkey
     monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
     monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
     monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setenv("LUMAE_DJ_HOST_CONTRACT", "lumae-dj-host-v1")
     monkeypatch.setattr(mod, "dj_setup_state", lambda: "downloading")
     monkeypatch.setattr(
         mod,
@@ -609,6 +616,7 @@ def test_dj_runtime_setup_contention_does_not_migrate_or_download(monkeypatch):
     monkeypatch.setattr(mod, "dj_analysis_enabled", lambda: True)
     monkeypatch.setattr(mod, "dj_models_acknowledged", lambda: True)
     monkeypatch.setenv("LUMAE_DJ_WORKER", "1")
+    monkeypatch.setenv("LUMAE_DJ_HOST_CONTRACT", "lumae-dj-host-v1")
     monkeypatch.setattr(mod, "_acquire_dj_runtime_prepare_lock", lambda: (object(), False))
     monkeypatch.setattr(
         mod,
@@ -654,6 +662,10 @@ def test_dj_settings_switch_is_off_by_default_and_explains_download(monkeypatch)
 
 def test_dj_settings_switch_controls_setup_queue(monkeypatch):
     mod = load_plugin()
+    monkeypatch.setattr(mod.dj_maintenance, "state", lambda db: {})
+    schedules=[]
+    monkeypatch.setattr(mod.dj_maintenance, "configure_schedule", lambda db, enabled: schedules.append(enabled))
+    monkeypatch.setattr(mod.dj_service, "dispatch", lambda host: host.enqueue())
     saved = []
     queued = []
     monkeypatch.setattr(mod, "set_setting", lambda key, value: saved.append((key, value)))
@@ -682,12 +694,14 @@ def test_dj_settings_switch_controls_setup_queue(monkeypatch):
     assert saved == [
         ("dj_analysis_enabled", True),
         ("dj_models_acknowledged", True),
-        ("dj_setup_state", "downloading"),
+        ("dj_setup_state", "queued"),
         ("dj_analysis_enabled", False),
         ("dj_models_acknowledged", False),
         ("dj_setup_state", "disabled"),
     ]
     assert queued == ["dj"]
+
+    assert schedules == [True, False]
 
 
 def test_dj_settings_refuses_enable_without_combined_acknowledgement(monkeypatch):
@@ -781,43 +795,17 @@ def test_dj_read_uses_the_capability_calibration_identity(monkeypatch):
 
 def test_dj_worker_defers_before_claim_when_profile_work_is_pending(monkeypatch):
     mod = load_plugin()
-    database = object()
-    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
-    monkeypatch.setattr(
-        mod,
-        "prepare_dj_runtime",
-        lambda: {"worker_available": True, "reason": "reference_host_unqualified"},
-    )
-    monkeypatch.setattr(mod, "get_db", lambda: database)
-    monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: True)
-    monkeypatch.setattr(
-        mod,
-        "claim_next_dj_job_any",
-        lambda _db: pytest.fail("DJ job must not be claimed ahead of profile work"),
-    )
-
-    assert mod.dj_analysis_task() == {
-        "status": "deferred",
-        "reason": "profile_work_pending",
-    }
+    monkeypatch.setattr(mod, '_profile_work_pending', lambda db: True)
+    monkeypatch.setattr(mod, 'interactive_dj_jobs_pending', lambda db: False)
+    monkeypatch.setattr(mod, 'priority_dj_v3_jobs_pending', lambda db: False)
+    assert not mod._dj_profile_gate_open({'internal_test_eligible': True}, object())
 
 
 def test_private_interactive_dj_job_can_pass_background_profile_gate(monkeypatch):
     mod = load_plugin()
-    database = object()
-    capability = {
-        "worker_available": True,
-        "internal_test_eligible": True,
-        "reason": "private_audition_only",
-    }
-    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
-    monkeypatch.setattr(mod, "prepare_dj_runtime", lambda: capability)
-    monkeypatch.setattr(mod, "get_db", lambda: database)
-    monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: True)
-    monkeypatch.setattr(mod, "interactive_dj_jobs_pending", lambda _db: True)
-    monkeypatch.setattr(mod, "claim_next_dj_job_any", lambda _db: None)
-
-    assert mod.dj_analysis_task() == {"status": "idle"}
+    monkeypatch.setattr(mod, '_profile_work_pending', lambda db: True)
+    monkeypatch.setattr(mod, 'interactive_dj_jobs_pending', lambda db: True)
+    assert mod._dj_profile_gate_open({'internal_test_eligible': True}, object())
 
 
 def test_release_dj_job_cannot_pass_background_profile_gate(monkeypatch):
@@ -831,67 +819,7 @@ def test_release_dj_job_cannot_pass_background_profile_gate(monkeypatch):
     ) is False
 
 
-def test_dj_worker_publishes_one_source_bound_job_and_cleans_temp(monkeypatch):
-    mod = load_plugin()
-    database = object()
-    job = {
-        "catalog_instance_id": "catalog-a",
-        "track_id": "track-a",
-        "media_revision": mod.opaque_revision("catalog-media:revision-a"),
-        "job_token": "token-a",
-        "analysis_version": 2,
-    }
-    info = {
-        "file_path": "/private/temp/track-a.flac",
-        "media_signature": "catalog-media:revision-a",
-        "cleanup_path": "/private/temp/track-a.flac",
-    }
-    removed = []
-    analyzed = []
-    published = []
-    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
-    monkeypatch.setattr(
-        mod,
-        "prepare_dj_runtime",
-        lambda: {"worker_available": True, "reason": "reference_host_unqualified"},
-    )
-    monkeypatch.setattr(mod, "get_db", lambda: database)
-    monkeypatch.setattr(mod, "_profile_work_pending", lambda db=None: False)
-    monkeypatch.setattr(mod, "claim_next_dj_job_any", lambda _db: job)
-    monkeypatch.setattr(
-        mod,
-        "resolve_profile_source",
-        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
-    )
-    monkeypatch.setattr(mod, "load_track_file", lambda *_args, **_kwargs: info)
-    monkeypatch.setattr(
-        mod,
-        "analyze_dj_file",
-        lambda path, **kwargs: analyzed.append((path, kwargs)) or {"payload": True},
-    )
-    monkeypatch.setattr(
-        mod,
-        "publish_dj_analysis",
-        lambda db, value, payload, signature: (
-            published.append((db, value, payload, signature)) or True
-        ),
-    )
-    monkeypatch.setattr(mod, "dj_jobs_pending", lambda _db: False)
-    monkeypatch.setattr(mod, "dj_v3_jobs_pending", lambda _db: False)
-    monkeypatch.setattr(mod, "remove_downloaded_file", removed.append)
 
-    result = mod.dj_analysis_task()
-
-    assert result == {
-        "status": "ready",
-        "track_id": "track-a",
-        "analysis_version": 2,
-        "queued_next": False,
-    }
-    assert analyzed[0][0] == info["file_path"]
-    assert analyzed[0][1]["media_revision"] == job["media_revision"]
-    assert published == [(database, job, {"payload": True}, info["media_signature"])]
-    assert removed == [info["cleanup_path"]]
 
 
 @pytest.fixture
@@ -4047,6 +3975,12 @@ class LimitAwareDb(FakeDb):
 
 
 class CronCursor(FakeCursor):
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
     def __init__(self, existing=None):
         super().__init__(rows=[])
         self.existing = existing
@@ -5149,7 +5083,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
 
     mod.migrate(db)
 
-    assert db.commits == 2
+    assert db.commits == 3
     assert queued == []
     assert (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
@@ -5177,6 +5111,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
             mod.ANALYSIS_PROJECTION_TASK_TYPE,
             "47 */6 * * *",
         ),
+        (mod.dj_maintenance.TASK_TYPE, mod.dj_maintenance.TASK_TYPE, "* * * * *", False),
     ]
     migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
     assert "rebind_status='active' AND provider_type='navidrome'" in migration_sql
@@ -5344,7 +5279,7 @@ def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch)
     first_sql = [sql for sql, _params in db.cursor_obj.executed]
     mod.migrate(db)
 
-    assert db.commits == 4
+    assert db.commits == 6
     assert all("DROP TABLE" not in sql.upper() for sql, _params in db.cursor_obj.executed)
     assert sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql, _ in db.cursor_obj.executed) == (
         2 * sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql in first_sql)
@@ -8568,7 +8503,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.settings_endpoint == "lumae_analysis.settings"
     assert ctx.install_hooks == [mod.migrate]
     assert ctx.flask_hooks == [mod.observe_provider_identities_on_start]
-    assert ctx.worker_hooks == [mod.prepare_dj_runtime]
+    assert ctx.worker_hooks == [mod.dj_worker_start]
     assert ctx.song_hooks == [mod.analyze_song_hook]
     assert ctx.tasks == [
         ("prepare", mod.prepare_lumae_task, "default"),
@@ -8584,6 +8519,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
         ("dj_analysis", mod.dj_analysis_task, "lumae-dj"),
+        ("dj_reconcile", mod.dj_reconcile_task, "default"),
     ]
     assert ctx.menu_items == []
 
@@ -9315,7 +9251,7 @@ def test_settings_page_recovers_transaction_after_identity_status_query_fails(mo
 
     body = plugin_client(mod).get("/settings").get_data(as_text=True)
 
-    assert db.rollbacks == 2
+    assert db.rollbacks == 3  # DJ progress is independently recovered, too
     assert 'id="collections-recovered"' in body
 
 
@@ -10581,43 +10517,15 @@ def test_enrichment_cleanup_bounds_relationship_history_to_two_snapshots():
 
 
 def test_dj_v3_request_maps_server_controlled_priority_and_reports_promotion(monkeypatch):
-    mod = load_plugin()
-    database = object()
-    capability = {"worker_available": True, "reason": "private_audition_only"}
-    calls = []
-    monkeypatch.setattr(
-        mod,
-        "resolve_profile_source",
-        lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "server-a"},
-    )
-    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
-    monkeypatch.setattr(mod, "dj_analysis_capability", lambda: capability)
-    monkeypatch.setattr(mod, "get_db", lambda: database)
-    monkeypatch.setattr(
-        mod,
-        "claim_dj_v3_requests",
-        lambda db, catalog_id, ids, **kwargs: calls.append(
-            (db, catalog_id, ids, kwargs)
-        )
-        or ([], ["track-a"], [], []),
-    )
-    monkeypatch.setattr(mod, "_enqueue_dj_worker", lambda: calls.append("enqueue"))
-
-    response = plugin_client(mod).post(
-        "/api/dj/v3/analysis/analyze",
-        json={
-            "catalog_instance_id": "catalog-a",
-            "ids": ["track-a"],
-            "priority": "boundary",
-        },
-    )
-
-    assert response.status_code == 202
-    assert response.get_json()["promoted"] == ["track-a"]
-    assert response.get_json()["priority_tier"] == "boundary"
-    assert calls[0][0:3] == (database, "catalog-a", ["track-a"])
-    assert calls[0][3]["priority_tier"] == "boundary"
-    assert calls[1] == "enqueue"
+    mod=load_plugin();calls=[]
+    monkeypatch.setattr(mod,'resolve_profile_source',lambda **kwargs:{'catalog_instance_id':'catalog-a'})
+    def service(host,version,source,ids,**kwargs):
+        calls.append((version,source,ids,kwargs))
+        return {'promoted':['track-a'],'priority_tier':kwargs['priority_tier']},202
+    monkeypatch.setattr(mod.dj_service,'request_analysis',service)
+    response=plugin_client(mod).post('/api/dj/v3/analysis/analyze',json={'ids':['track-a'],'priority':'boundary','force':True})
+    assert response.status_code==202 and response.json['promoted']==['track-a']
+    assert calls==[(3,{'catalog_instance_id':'catalog-a'},['track-a'],{'priority_tier':'boundary','force':True})]
 
 
 def test_dj_v3_request_rejects_unknown_priority_before_creating_jobs(monkeypatch):

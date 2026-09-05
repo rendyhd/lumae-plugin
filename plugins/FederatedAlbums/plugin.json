@@ -1,0 +1,34 @@
+{
+  "id": "federated_albums",
+  "name": "Friend Album Discovery",
+  "author": "Lumae",
+  "description": "Find albums you do not own and sonically similar albums across authenticated AudioMuse-AI friends.",
+  "requirements": [],
+  "capabilities": {
+    "federated_album_discovery": {
+      "schema_version": 1,
+      "fingerprint_method": "lumae_album_dynamics_v1",
+      "embedding_family": "musicnn-200",
+      "features": [
+        "album_recommendations",
+        "similar_albums",
+        "friend_catalog",
+        "artwork_proxy"
+      ]
+    }
+  },
+  "versions": [
+    {
+      "version": "0.1.0",
+      "min_core_version": "2.6.3",
+      "changelog": "Initial authenticated friend-album catalogue, Sonic Fingerprint recommendations, similar-album search, web UI, and Lumae API.",
+      "imageUrl": "",
+      "sourceUrl": "",
+      "checksum": ""
+    }
+  ],
+  "channel": "private-development",
+  "required_host_capabilities": [
+    "scoped-plugin-bearer-auth-v1"
+  ]
+}

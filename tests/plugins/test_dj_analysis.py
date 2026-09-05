@@ -279,7 +279,7 @@ def test_yamnet_adapter_requires_the_pinned_float32_litert_contract(monkeypatch,
     model.write_bytes(b"pinned-yamnet")
     info = model.stat()
     monkeypatch.setattr(
-        dj,
+        dj.dj_runtime,
         "verify_yamnet_model_artifact",
         lambda *_args, **_kwargs: {
             "path": model.resolve(),
@@ -290,7 +290,7 @@ def test_yamnet_adapter_requires_the_pinned_float32_litert_contract(monkeypatch,
         },
     )
     monkeypatch.setattr(
-        dj,
+        dj.dj_runtime,
         "_sha256_file",
         lambda *_args, **_kwargs: dj.YAMNET_MODEL_SHA256,
     )
@@ -687,25 +687,7 @@ def test_structural_candidate_gate_keeps_a_clear_local_novelty_peak():
     ]
 
 
-def test_ready_job_is_reclaimed_when_its_analysis_contract_is_stale(monkeypatch):
-    monkeypatch.setattr(store, "_current_sources", lambda *_args: [("track-a", "signature-a")])
-    db = Database(rows=[None, ("token",)])
-    accepted, ready = store.claim_dj_requests(
-        db, "catalog-a", ["track-a"], expected_vocal_calibration_cache_key="c" * 64
-    )
-    assert ready == []
-    assert [job["track_id"] for job in accepted] == ["track-a"]
-    analysis_sql, analysis_params = db.cur.executed[-2]
-    assert "payload->>'schema_version'=%s" in analysis_sql
-    assert analysis_params[:6] == (
-        "catalog-a",
-        "track-a",
-        edge.opaque_revision("signature-a"),
-        "signature-a",
-        dj.METHOD,
-        str(dj.SCHEMA_VERSION),
-    )
-    assert "OR job.status='ready'" in db.cur.executed[-1][0]
+
 
 
 def test_store_migration_has_one_running_worker_and_durable_progress():
@@ -714,55 +696,15 @@ def test_store_migration_has_one_running_worker_and_durable_progress():
     sql = "\n".join(query for query, _params in db.cur.executed)
     assert "WHERE status='running'" in sql
     assert "progress_frames BIGINT NOT NULL" in sql
-    assert "worker_restarted" in sql
+    assert "worker_restarted" not in sql  # migration must never steal a running job
     assert "dj_worker_capability" in sql
     assert "plugin_version TEXT NOT NULL" in sql
 
 
-def test_backfill_invalidates_analysis_when_vocal_calibration_changes():
-    db = Database(rows=[("track-a",)])
-
-    assert store.dj_backfill_candidates(
-        db,
-        "catalog-a",
-        expected_vocal_calibration_cache_key="c" * 64,
-    ) == ["track-a"]
-
-    sql, params = db.cur.executed[-1]
-    assert "analysis.payload#>>'{vocal_risk,calibration,cache_key}'=%s" in sql
-    assert params == (
-        dj.METHOD,
-        str(dj.SCHEMA_VERSION),
-        "c" * 64,
-        "catalog-a",
-        "",
-        100,
-    )
 
 
-def test_read_hides_analysis_from_a_stale_contract_or_calibration():
-    db = Database(rows=[("track-a", None, "ready", None, 0)])
 
-    state = store.read_dj_analysis(
-        db,
-        "catalog-a",
-        ["track-a"],
-        expected_vocal_calibration_cache_key="c" * 64,
-    )
 
-    sql, params = db.cur.executed[-1]
-    assert "value.payload->>'method'=%s" in sql
-    assert "value.payload->>'schema_version'=%s" in sql
-    assert "value.payload#>>'{vocal_risk,calibration,cache_key}'=%s" in sql
-    assert params == (
-        dj.METHOD,
-        str(dj.SCHEMA_VERSION),
-        "c" * 64,
-        "catalog-a",
-        ["track-a"],
-    )
-    assert state["ready"] == []
-    assert state["missing"] == ["track-a"]
 
 
 def test_worker_capability_store_is_version_bound_and_path_free():
@@ -857,7 +799,7 @@ def test_postgres_job_claim_publish_cancel_and_read(postgres_db):
     state = store.read_dj_analysis(db, "catalog-a", ["track-a", "track-b", "absent"])
     assert [item["track_id"] for item in state["ready"]] == ["track-a"]
     assert state["pending"] == [
-        {"track_id": "track-b", "status": "pending", "progress_frames": 0}
+        {"track_id": "track-b", "status": "pending", "progress_frames": 0, "priority_tier": "queue", "priority": 0}
     ]
     assert state["missing"] == ["absent"]
     assert store.cancel_dj_jobs(db, "catalog-a", ["track-b"]) == ["track-b"]

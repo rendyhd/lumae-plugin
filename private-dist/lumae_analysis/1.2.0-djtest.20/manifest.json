@@ -1,0 +1,12 @@
+{
+  "channel": "private-dj-test",
+  "plugins": [
+    {
+      "id": "lumae_analysis",
+      "name": "Lumae Analysis",
+      "author": "Lumae",
+      "description": "Mirrors supported Navidrome catalogues and prepares Lumae volume, SmoothFade, album-similarity, and artist-similarity data away from the phone.",
+      "pluginUrl": "http://192.168.1.172:8765/lumae_analysis/1.2.0-djtest.20/plugin.json"
+    }
+  ]
+}

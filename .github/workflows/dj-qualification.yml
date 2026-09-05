@@ -1,0 +1,23 @@
+name: Optional DJ runtime qualification
+on:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  measure:
+    runs-on: [self-hosted, linux, lumae-dj-qualification]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Measure the administrator-provided local corpus
+        run: >-
+          python scripts/qualify_dj_runtime.py
+          --corpus /srv/lumae-qualification/corpus.json
+          --beat-this /srv/lumae-qualification/final0.ckpt
+          --yamnet /srv/lumae-qualification/yamnet.tflite
+          --output qualification-report.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: dj-runtime-measurement
+          path: qualification-report.json

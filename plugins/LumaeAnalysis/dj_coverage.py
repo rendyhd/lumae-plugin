@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections import Counter
+import math
 from dataclasses import dataclass
 from typing import Iterable
 
@@ -26,6 +27,7 @@ class TrackEvidence:
     vocal_ready: bool
     edge_ready: bool
     rejection_reasons: tuple[str, ...]
+    cues: tuple[tuple[str, float | None, str], ...] = ()
 
 
 def _dict(value):
@@ -37,7 +39,11 @@ def _list(value):
 
 
 def _finite(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(value)
+    )
 
 
 def _tempo_compatible(left, right):
@@ -49,7 +55,84 @@ def _tempo_compatible(left, right):
 
 def _vocal_ready(payload):
     calibration = _dict(_dict(payload.get("vocal_risk")).get("calibration"))
-    return calibration.get("status") == "ready" and calibration.get("cuts_authorized") is True
+    return (
+        calibration.get("status") == "ready"
+        and calibration.get("cuts_authorized") is True
+    )
+
+
+def _qualified_cues(payload):
+    if not _vocal_ready(payload):
+        return ()
+    result = []
+    if payload.get("schema_version") == 3:
+        for cue in _list(payload.get("cue_candidates")):
+            cue = _dict(cue)
+            role = cue.get("role")
+            if (
+                role not in _HASHABLE_ROLES
+                or cue.get("speech_safe") is not True
+                or cue.get("confidence_tier") not in ("high", "medium")
+            ):
+                continue
+            if role == "loop" and cue.get("loop_verified") is not True:
+                continue
+            section = (
+                "complete_section_after"
+                if role in ("entry", "drop")
+                else "complete_section_before"
+            )
+            if cue.get(section) is not True:
+                continue
+            tempo = cue.get("local_tempo_bpm")
+            result.append(
+                (
+                    role,
+                    float(tempo) if _finite(tempo) and tempo > 0 else None,
+                    cue["confidence_tier"],
+                )
+            )
+    else:
+        regions = _list(payload.get("regions"))
+        frames = [
+            _dict(row) for row in _list(_dict(payload.get("vocal_risk")).get("frames"))
+        ]
+        for field, role in (("entries", "entry"), ("exits", "exit")):
+            for cue in _list(_dict(payload.get("candidates")).get(field)):
+                cue = _dict(cue)
+                index = cue.get("region_index")
+                position = cue.get("time_ms")
+                if (
+                    not isinstance(index, int)
+                    or isinstance(index, bool)
+                    or not 0 <= index < len(regions)
+                    or not _finite(position)
+                ):
+                    continue
+                region = _dict(regions[index])
+                tempo = region.get("tempo_bpm")
+                if (
+                    region.get("eligible") is not True
+                    or not _finite(tempo)
+                    or not region.get("start_ms", 0)
+                    <= position
+                    <= region.get("end_ms", -1)
+                ):
+                    continue
+                nearby = [
+                    frame
+                    for frame in frames
+                    if _finite(frame.get("position_ms"))
+                    and abs(frame["position_ms"] - position) <= 750
+                ]
+                if not nearby:
+                    continue
+                risk = min(
+                    nearby, key=lambda frame: abs(frame["position_ms"] - position)
+                ).get("calibrated_risk")
+                if _finite(risk) and 0 <= risk < 0.25:
+                    result.append((role, float(tempo), "high"))
+    return tuple(result)
 
 
 def _v2_evidence(payload, track_id):
@@ -69,7 +152,9 @@ def _v2_evidence(payload, track_id):
         roles.add("exit")
     reasons = []
     for region in regions:
-        reasons.extend(str(reason) for reason in _list(_dict(region).get("rejection_reasons")))
+        reasons.extend(
+            str(reason) for reason in _list(_dict(region).get("rejection_reasons"))
+        )
     return TrackEvidence(
         track_id=track_id,
         version=2,
@@ -79,6 +164,7 @@ def _v2_evidence(payload, track_id):
         vocal_ready=_vocal_ready(payload),
         edge_ready=payload.get("edge_profile_ready") is True,
         rejection_reasons=tuple(reasons),
+        cues=_qualified_cues(payload),
     )
 
 
@@ -112,6 +198,7 @@ def _v3_evidence(payload, track_id):
         vocal_ready=_vocal_ready(payload),
         edge_ready=payload.get("edge_profile_ready") is True,
         rejection_reasons=tuple(reasons),
+        cues=_qualified_cues(payload),
     )
 
 
@@ -144,48 +231,45 @@ def track_evidence(payload):
 
 
 def _has_outgoing(evidence, roles):
-    return bool(evidence.roles.intersection(roles))
+    return any(role in roles for role, tempo, tier in evidence.cues)
 
 
 def _has_incoming(evidence, roles):
-    return bool(evidence.roles.intersection(roles))
+    return any(role in roles for role, tempo, tier in evidence.cues)
 
 
 def classify_pair(outgoing, incoming):
     if outgoing.version not in (2, 3) or incoming.version not in (2, 3):
         return "smoothfade", "unsupported-analysis-version", False
-
-    outgoing_high = _has_outgoing(outgoing, {"exit", "loop", "cut", "breakdown"})
-    incoming_high = _has_incoming(incoming, {"entry", "drop"})
+    left = [
+        cue for cue in outgoing.cues if cue[0] in {"exit", "loop", "cut", "breakdown"}
+    ]
+    right = [cue for cue in incoming.cues if cue[0] in {"entry", "drop"}]
     compatible = any(
-        _tempo_compatible(left, right)
-        for left in outgoing.high_tempos
-        for right in incoming.high_tempos
+        a[2] == "high" and b[2] == "high" and _tempo_compatible(a[1], b[1])
+        for a in left
+        for b in right
     )
-    if outgoing_high and incoming_high and compatible and outgoing.vocal_ready and incoming.vocal_ready:
-        return "phrase-sync", None, compatible
-
-    if outgoing.version == 3 and incoming.version == 3 and outgoing.vocal_ready and incoming.vocal_ready:
-        if _has_outgoing(outgoing, {"exit", "cut", "breakdown"}) and _has_incoming(
-            incoming, {"entry", "drop"}
-        ):
-            return "tempo-independent", None, compatible
-        rhythmic_out = bool(outgoing.high_tempos or outgoing.medium_tempos) and outgoing_high
-        rhythmic_in = bool(incoming.high_tempos or incoming.medium_tempos) and incoming_high
-        if rhythmic_out != rhythmic_in:
-            return "one-sided", None, compatible
+    if compatible:
+        return "phrase-sync", None, True
+    if (
+        outgoing.version == 3
+        and incoming.version == 3
+        and outgoing.vocal_ready
+        and incoming.vocal_ready
+    ):
+        if left and right:
+            return "tempo-independent", None, False
+        if bool(left) != bool(right):
+            return "one-sided", None, False
         if outgoing.edge_ready and incoming.edge_ready:
-            return "edge-fx", None, compatible
-
-    if not outgoing.vocal_ready or not incoming.vocal_ready:
-        reason = "vocal-calibration-unavailable"
-    elif not outgoing_high or not incoming_high:
-        reason = "no-qualified-cues"
-    elif not compatible:
-        reason = "tempo-out-of-range"
-    else:
-        reason = "no-qualified-tier"
-    return "smoothfade", reason, compatible
+            return "edge-fx", None, False
+    reason = (
+        "vocal-calibration-unavailable"
+        if not outgoing.vocal_ready or not incoming.vocal_ready
+        else "no-qualified-cues" if not left or not right else "tempo-out-of-range"
+    )
+    return "smoothfade", reason, False
 
 
 def _unique_evidence(payloads):
@@ -205,11 +289,20 @@ def _pairs(evidence, manifest):
             item = _dict(pair)
             left = evidence.get(item.get("from"))
             right = evidence.get(item.get("to"))
-            if left is not None and right is not None and left.track_id != right.track_id:
+            if (
+                left is not None
+                and right is not None
+                and left.track_id != right.track_id
+            ):
                 output.append((left, right))
         return output
     values = list(evidence.values())
-    return [(left, right) for left in values for right in values if left.track_id != right.track_id]
+    return [
+        (left, right)
+        for left in values
+        for right in values
+        if left.track_id != right.track_id
+    ]
 
 
 def _order_cost(order, evidence):
@@ -237,12 +330,19 @@ def evaluate_coverage(payloads: Iterable[dict], manifest=None):
             rejections[reason] += 1
 
     versions = Counter(item.version for item in evidence.values())
-    region_ready = sum(bool(item.high_tempos or item.medium_tempos) for item in evidence.values())
-    entry_ready = sum(_has_incoming(item, {"entry", "drop"}) for item in evidence.values())
+    region_ready = sum(
+        bool(item.high_tempos or item.medium_tempos) for item in evidence.values()
+    )
+    entry_ready = sum(
+        _has_incoming(item, {"entry", "drop"}) for item in evidence.values()
+    )
     exit_ready = sum(
-        _has_outgoing(item, {"exit", "loop", "cut", "breakdown"}) for item in evidence.values()
+        _has_outgoing(item, {"exit", "loop", "cut", "breakdown"})
+        for item in evidence.values()
     )
     report = {
+        "evaluation": "cue-eligibility-estimate-v2",
+        "playback_qualification": False,
         "analysis": {
             "total": len(evidence),
             "v2": versions[2],
@@ -265,7 +365,9 @@ def evaluate_coverage(payloads: Iterable[dict], manifest=None):
         "region_rejections": dict(
             sorted(
                 Counter(
-                    reason for item in evidence.values() for reason in item.rejection_reasons
+                    reason
+                    for item in evidence.values()
+                    for reason in item.rejection_reasons
                 ).items()
             )
         ),

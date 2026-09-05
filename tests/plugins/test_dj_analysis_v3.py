@@ -172,7 +172,7 @@ def test_speech_safe_cut_requires_160ms_minimum_and_80ms_guards():
 
 def test_runtime_capability_advertises_v2_and_v3(monkeypatch):
     monkeypatch.setattr(
-        v2,
+        v3.runtime,
         "runtime_status",
         lambda *_args, **_kwargs: {
             "schema_version": 2,
@@ -216,6 +216,9 @@ class RecordingDb:
     def cursor(self):
         return self._cursor
 
+    def rollback(self):
+        pass
+
     def commit(self):
         self.commits += 1
 
@@ -230,7 +233,7 @@ def test_v3_migration_is_additive_and_global_claim_checks_both_versions():
     assert "dj_analysis_jobs_v3" in sql
     assert "CREATE TABLE IF NOT EXISTS plugin_lumae_analysis__dj_analyses (" not in sql
 
-    claim_cursor = RecordingCursor(fetchone_values=[None])
+    claim_cursor = RecordingCursor(fetchone_values=[(True,), None, (True,)])
     store.claim_next_dj_job_any(RecordingDb(claim_cursor))
     claim_sql = "\n".join(statement for statement, _ in claim_cursor.statements)
     assert "dj_analysis_jobs_v3" in claim_sql
@@ -248,7 +251,7 @@ def test_v3_migration_is_additive_and_global_claim_checks_both_versions():
 def test_pending_queue_job_is_promoted_without_replacement():
     revision = store.opaque_revision("media-signature")
     cursor = RecordingCursor(
-        fetchone_values=[None, (revision, "pending", 10)],
+        fetchone_values=[None, (revision, "pending", 10, store.jobs.producer_key(3), True, 0)],
         fetchall_values=[[('track-a', "media-signature")]],
     )
     db = RecordingDb(cursor)
