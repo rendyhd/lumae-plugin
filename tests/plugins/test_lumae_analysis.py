@@ -212,6 +212,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "scope": "shared",
             },
             "catalog_mirror": mod.catalog_capability(),
+            "credits": mod.credits_service.capability(),
             "edge_profiles": {
                 "schema_version": 2,
                 "method": mod.EDGE_METHOD,
@@ -8510,6 +8511,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("profile_backfill", mod.profile_backfill_task, "default"),
         ("dj_analysis", mod.dj_analysis_task, "lumae-dj"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
+        ("credits", mod.credits_service.run_one, "default"),
         ("relationship_preparation", mod.relationship_preparation_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
     ]

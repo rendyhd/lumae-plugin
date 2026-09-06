@@ -357,6 +357,7 @@ def _artist_rows(row, fallback_name=None, default_role="artist"):
                 "position": position,
                 "identity_provenance": provenance,
                 "role": _text(_value(item, "Role", "role")) or default_role,
+                "external_ids": _external_ids(item, "artist"),
             }
         )
     return result
@@ -461,7 +462,7 @@ def _replay_gain_payload(row):
     }
 
 
-def _external_ids(row):
+def _external_ids(row, entity_kind=None):
     result = dict(_safe_payload(_value(row, "ProviderIds", "providerIds", default={})) or {})
     for key, names in {
         "musicbrainz": ("musicBrainzId", "MusicBrainzId"),
@@ -470,6 +471,23 @@ def _external_ids(row):
         found = _text(_value(row, *names))
         if found:
             result.setdefault(key, found)
+    # Keep identifiers typed. Generic legacy IDs remain separate until verified
+    # against the corresponding MusicBrainz entity endpoint by credits enrichment.
+    aliases = {
+        "musicbrainz_artist_id": ("musicBrainzArtistId", "MusicBrainzArtist", "musicBrainzArtistIds"),
+        "musicbrainz_release_id": ("musicBrainzAlbumId", "MusicBrainzAlbum", "musicBrainzReleaseId"),
+        "musicbrainz_release_group_id": ("musicBrainzReleaseGroupId", "MusicBrainzReleaseGroup"),
+        "musicbrainz_recording_id": ("musicBrainzRecordingId", "MusicBrainzTrack"),
+        "musicbrainz_release_track_id": ("musicBrainzTrackId", "musicBrainzReleaseTrackId"),
+    }
+    for key, names in aliases.items():
+        value = _value(row, key, *names)
+        if value is None:
+            value = _value(result, key, *names)
+        if value:
+            result[key] = _safe_payload(value)
+    if entity_kind and result.get("musicbrainz"):
+        result["musicbrainz_legacy_entity_context"] = entity_kind
     return result
 
 
@@ -543,7 +561,7 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             "content_kind": _content_kind(raw),
             "year": _integer(_value(raw, "year", "ProductionYear")),
             "genres": _string_list(_value(raw, "genre", "Genres", "genres", default=[])),
-            "provider_ids": _external_ids(raw),
+            "provider_ids": _external_ids(raw, "album"),
         }
         payload = _safe_payload(raw)
         albums_by_id[album_id] = {
@@ -618,7 +636,7 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             "album": album_name,
             "year": _integer(_value(raw, "year", "ProductionYear")),
             "genres": _string_list(_value(raw, "genre", "Genres", "genres", default=[])),
-            "external_ids": _external_ids(raw),
+            "external_ids": _external_ids(raw, "track"),
             "disc_title": _text(_value(raw, "discTitle", "DiscTitle")),
             "track_total": _integer(_value(raw, "trackTotal", "TrackTotal")),
             "disc_total": _integer(_value(raw, "discTotal", "DiscTotal")),
@@ -784,6 +802,7 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         metadata = {
             "name": artist["name"],
             "identity_provenance": artist["identity_provenance"],
+            "external_ids": artist.get("external_ids") or {},
         }
         library_ids = sorted(artist_libraries.get(artist["artist_id"], set()))
         payload = {**metadata, "_lumae": {"library_ids": library_ids}}

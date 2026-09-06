@@ -1,0 +1,70 @@
+{
+  "schema_version": 1,
+  "catalog_instance_id": "catalog-fixture-a",
+  "capability": {
+    "schema_version": 1,
+    "matching_version": 1,
+    "provider": "musicbrainz",
+    "supported": true,
+    "automatic_display_qualified": false
+  },
+  "records": [
+    {
+      "schema_version": 1,
+      "catalog_instance_id": "catalog-fixture-a",
+      "album_id": "album-a",
+      "input_fingerprint": "fixture-identity-a",
+      "match_status": "recordings_only",
+      "computed_at": "2026-09-06T00:00:00Z",
+      "release_mbid": null,
+      "release_group_mbid": null,
+      "matching": {
+        "matching_version": 1,
+        "method": "corroborated_recordings",
+        "edition_candidates": 2,
+        "candidate_set_complete": true
+      },
+      "subjects": [
+        {
+          "subject_type": "album",
+          "subject_id": "album-a",
+          "credits": []
+        },
+        {
+          "subject_type": "track",
+          "subject_id": "track-a",
+          "credits": [
+            {
+              "id": "fixture-credit-a",
+              "person_mbid": "00000000-0000-0000-0000-000000000041",
+              "person_name": "Fixture Person",
+              "role": "performer",
+              "relationship_type": "instrument",
+              "relationship_type_id": "00000000-0000-0000-0000-000000000050",
+              "instruments": [
+                "guitar"
+              ],
+              "attribute_ids": {},
+              "scope": "recording",
+              "source": "musicbrainz",
+              "source_entity_type": "recording",
+              "source_entity_id": "00000000-0000-0000-0000-000000000100",
+              "source_url": "https://musicbrainz.org/recording/00000000-0000-0000-0000-000000000100",
+              "matching": {
+                "matching_version": 1,
+                "method": "corroborated_recordings"
+              }
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "deletion": {
+    "seq": 2,
+    "album_id": "album-a",
+    "operation": "delete",
+    "record": null
+  },
+  "note": "Synthetic cross-language contract fixture. Not a representative matching audit."
+}

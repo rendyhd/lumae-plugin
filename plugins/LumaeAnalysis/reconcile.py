@@ -31,6 +31,8 @@ def _work_table(name):
 
 def migrate_reconcile(db):
     """Create additive operational state without changing app-facing schemas."""
+    from .credits_store import migrate as migrate_credits
+    migrate_credits(db)
     cur = db.cursor()
     for name in ("analysis_runs", "preparation_state", "profile_backfill_state", "relationship_state"):
         cur.execute(
@@ -217,6 +219,11 @@ def _work_summary(cur):
               FROM {_work_table('profile_backfill_state')}
              WHERE status IN ('queued', 'failed')
                 OR (status='running' AND updated_at < now() - interval '30 minutes')
+            UNION ALL
+            SELECT CASE WHEN not_before>now() THEN 'retry' ELSE 'ready' END,
+                   attempts,not_before
+              FROM {_work_table('credits_jobs')}
+             WHERE status IN('pending','failed') OR (status='running' AND lease_until<now())
         ), totals AS (
             SELECT count(*) FILTER (WHERE kind='ready') AS ready_count,
                    count(*) FILTER (WHERE kind='waiting') AS waiting_count
@@ -493,6 +500,9 @@ def read_reconcile_status(db):
               UNION ALL
               SELECT 'volume and ramps' FROM {_work_table('profile_backfill_state')}
                WHERE status IN ('queued','failed','running')
+              UNION ALL
+              SELECT 'MusicBrainz credits' FROM {_work_table('credits_jobs')}
+               WHERE status IN ('pending','failed','running')
           ) work
          GROUP BY action ORDER BY action
         """

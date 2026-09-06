@@ -24,6 +24,7 @@ from .edge_profile_store import (
     publish_edge_profile, edge_backfill_candidates,
 )
 from . import dj_service, dj_maintenance, dj_jobs, optional_storage, dj_capabilities
+from . import credits_service, credits_store
 from .dj_analysis import (
     JOB_DEADLINE_SECONDS as DJ_JOB_TIMEOUT_SECONDS,
     METHOD as DJ_METHOD,
@@ -260,6 +261,7 @@ COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
 
 bp = Blueprint("lumae_analysis", __name__)
 register_collection_routes(bp)
+credits_service.register_routes(bp)
 
 
 def enqueue_bounded(func, *args, queue="default", timeout=None, **kwargs):
@@ -785,6 +787,15 @@ def _run_reconcile_action(
         raise
 
 
+def _safe_credits_reconcile(db, server_id, before_background):
+    try:
+        return credits_service.reconcile(db, server_id, before_background=before_background)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis credits reconciliation unavailable")
+        return None
+
+
 def catalog_reconcile_task():
     """Execute at most one durable action for the active source, then retune cadence."""
     db = get_db()
@@ -844,6 +855,10 @@ def catalog_reconcile_task():
                 "result": result,
             }
 
+        credits_result = _safe_credits_reconcile(db, server_id, before_background=True)
+        if credits_result:
+            return {"status": "processed", "action": "credits", "result": credits_result}
+
         relationship = next_relationship_run(db=db, server_id=server_id)
         if relationship:
             result = _run_reconcile_action(
@@ -871,6 +886,10 @@ def catalog_reconcile_task():
                 *profile[:2],
             )
             return {"status": "processed", "action": "profile_backfill", "result": result}
+
+        credits_result = _safe_credits_reconcile(db, server_id, before_background=False)
+        if credits_result:
+            return {"status": "processed", "action": "credits", "result": credits_result}
 
         return {
             "status": "current",
@@ -1272,6 +1291,7 @@ def migrate(db):
     )
     cur.close()
     migrate_enrichment(db)
+    credits_store.migrate(db)
     prune_catalog_storage(db)
     compact_enrichment_storage(db)
     migrate_collections(db)
@@ -1820,6 +1840,7 @@ def sync_contract(compatibility):
                     "lumae_dj_analysis_v3",
                 ],
             },
+            "credits": credits_service.capability(),
             "relationships": {
                 "schema_version": RELATIONSHIP_SCHEMA_VERSION,
                 "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
@@ -1872,6 +1893,7 @@ def health():
                     "scope": current_collection_scope()["mode"],
                 },
                 "catalog_mirror": catalog_capability(),
+                "credits": credits_service.capability(),
             },
             "status": "ok" if compatibility.supported else compatibility.status,
         }
@@ -6327,6 +6349,7 @@ def register(ctx):
     ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
     ctx.add_task("dj_analysis", dj_analysis_task, queue=DJ_TASK_QUEUE)
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
+    ctx.add_task("credits", credits_service.run_one, queue="default")
     ctx.add_task(
         "relationship_preparation", relationship_preparation_task, queue="default"
     )
