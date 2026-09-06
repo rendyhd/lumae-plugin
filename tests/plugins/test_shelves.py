@@ -123,3 +123,46 @@ def test_disabled_and_malformed_session_fail_closed(shelves, monkeypatch):
     manager = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
     monkeypatch.setattr(manager, "collections_enabled", lambda: False)
     assert shelves.get("/api/shelves/changes?catalog_id=catalog-a").status_code == 404
+
+def test_concurrent_devices_collapse_duplicate_adds_and_receipts(shelves, lumae_postgres_db, monkeypatch):
+    import os
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    import psycopg2
+    mod = shelf_module()
+    with lumae_postgres_db.cursor() as cur:
+        cur.execute("SELECT current_schema()")
+        schema = cur.fetchone()[0]
+    local = threading.local()
+    monkeypatch.setattr(mod, "get_db", lambda: getattr(local, "db", lumae_postgres_db))
+
+    def send(identifier):
+        with psycopg2.connect(os.environ["LUMAE_POSTGRES_TEST_DSN"]) as db:
+            local.db = db
+            with db.cursor() as cur:
+                cur.execute(f'SET search_path TO "{schema}", public')
+            client = shelves.application.test_client()
+            response = post(client, add(identifier, "same-album"))
+            assert response.status_code == 200
+            return response.get_json()["records"][0]["value"]["id"]
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        ids = list(pool.map(send, ["device-a", "device-b"]))
+    assert len(set(ids)) == 1
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        repeated = list(pool.map(send, ["device-a", "device-a"]))
+    assert repeated == [ids[0], ids[0]]
+    assert len(records(shelves)) == 1
+
+
+def test_rekey_publishes_only_the_matching_catalogue(shelves, lumae_postgres_db):
+    mod = shelf_module()
+    post(shelves, add("a", "old-id"))
+    post(shelves, add("b", "old-id"), catalog="catalog-b")
+    before = shelves.get("/api/shelves/changes?catalog_id=catalog-a").get_json()["cursor"]
+    with lumae_postgres_db.cursor() as cur:
+        mod.rekey_shelves(cur, "catalog-a", {"old-id": "new-id"})
+    lumae_postgres_db.commit()
+    changed = shelves.get(f"/api/shelves/changes?catalog_id=catalog-a&cursor={before}").get_json()["records"]
+    assert changed[0]["value"]["entityId"] == "new-id"
+    assert records(shelves, catalog="catalog-b")[0]["value"]["entityId"] == "old-id"
