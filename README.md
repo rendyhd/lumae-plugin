@@ -139,3 +139,13 @@ pages, model removal, optional retention and reproducible performance tools.
 ## License
 
 This repository is licensed under the AGPLv3 license. See `LICENSE`.
+
+## Personal Shelves (API version 1)
+
+The existing Collections setting also enables Personal Shelves synchronization. Health advertises `capabilities.shelves` with `enabled`, `schema_version: 1`, and scope metadata. Management stays in the Lumae mobile app.
+
+Under the Lumae API prefix, `GET /shelves/snapshot` and `GET /shelves/changes` accept `catalog_id`, `cursor`, and `limit` (maximum 500 records per transport page). `POST /shelves/mutations?catalog_id=...` accepts an idempotency ID plus an add, remove, restore, order, or evidence operation. Orders carry a base revision; conflicts return HTTP 409 with the synchronized arrangement for mobile review. Evidence ingestion accepts batches of up to 500 facts. These transport sizes do not limit shelf capacity.
+
+Records and mutation receipts are partitioned by authenticated principal and catalogue identity. Signed-in users have personal shelves; bearer-token users share the installation scope, matching Collections. Membership periods retain deletion tombstones, simultaneous duplicate additions converge, and provider identity rekeys update only the matching catalogue. Search evidence contains selected entity IDs rather than raw queries. Rating changes/removals, active-view cooldowns, and occurrence-identified qualified listening synchronize idempotently. Mobile keeps recommendation batches and scroll positions local.
+
+Shelf storage is additive and independent of the provider catalogue cache. An ordinary refresh does not erase curated membership or durable listening. Disabled or older plugins leave mobile shelves usable offline with pending changes retained. The browser shelf manager, publication, and deployment are outside this implementation.
