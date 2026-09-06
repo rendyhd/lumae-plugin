@@ -1068,7 +1068,7 @@ def render_collections_settings_panel():
     return f"""
       <section class="lumae-panel" aria-label="Living Collections">
         <h3>Living Collections</h3>
-        <p class="lumae-help">Manage mixed album-and-track collections in AudioMuse and sync them with Lumae. Turning this off hides the manager and API without deleting anything.</p>
+        <p class="lumae-help">Manage mixed album-and-track collections in AudioMuse and synchronize collections and Personal Shelves with Lumae, including shelf arrangement, recommendation evidence, and listening insights. Shelf management is in the mobile app. Turning this off hides the manager and sync APIs without deleting anything.</p>
         <form class="lumae-form" method="post">
           <label class="lumae-toggle">
             <input type="checkbox" name="collection_manager_enabled" {checked}>

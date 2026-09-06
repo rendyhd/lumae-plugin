@@ -205,6 +205,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
         "schema_version": 1,
         "analyzer_version": 1,
         "capabilities": {
+            "shelves": {"schema_version": 1, "enabled": False, "scope": "shared"},
             "collections": {
                 "schema_version": 1,
                 "backup_version": 1,

@@ -335,6 +335,9 @@ def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings):
     _update_by_mapping(cur, "collection_items", "provider_album_id", albums)
     _update_by_mapping(cur, "collection_items", "cover_item_id", combined)
 
+    from .shelves import rekey_shelves
+    rekey_shelves(cur, catalog_instance_id, exact)
+
     json_tables = (
         ("collection_changes", ("seq",), "payload"),
         ("collection_mutations", ("principal", "idempotency_key"), "response_payload"),

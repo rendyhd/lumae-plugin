@@ -25,6 +25,7 @@ from .edge_profile_store import (
 )
 from . import dj_service, dj_maintenance, dj_jobs, optional_storage, dj_capabilities
 from . import credits_service, credits_store
+from .shelves import SHELVES_SCHEMA_VERSION, migrate_shelves, register_shelf_routes
 from .dj_analysis import (
     JOB_DEADLINE_SECONDS as DJ_JOB_TIMEOUT_SECONDS,
     METHOD as DJ_METHOD,
@@ -261,6 +262,7 @@ COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
 
 bp = Blueprint("lumae_analysis", __name__)
 register_collection_routes(bp)
+register_shelf_routes(bp)
 credits_service.register_routes(bp)
 
 
@@ -1295,6 +1297,7 @@ def migrate(db):
     prune_catalog_storage(db)
     compact_enrichment_storage(db)
     migrate_collections(db)
+    migrate_shelves(db)
     ensure_catalog_refresh_schedule(db)
     ensure_catalog_reconcile_schedule(db)
     ensure_provider_identity_recheck_schedule(db)
@@ -1886,6 +1889,11 @@ def health():
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
                 "dj_analysis": dj_analysis_capability(),
+                "shelves": {
+                    "schema_version": SHELVES_SCHEMA_VERSION,
+                    "enabled": collections_enabled(),
+                    "scope": current_collection_scope()["mode"],
+                },
                 "collections": {
                     "schema_version": COLLECTIONS_SCHEMA_VERSION,
                     "backup_version": COLLECTIONS_BACKUP_VERSION,
