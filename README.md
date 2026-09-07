@@ -24,6 +24,18 @@ The plugin provides:
 * server-owned album and artist relationship generations using Lumae's native scoring model, published as resumable snapshots and deltas;
 * nonblocking enrichment: a complete provider catalogue is app-ready while waveform and relationship backlogs continue.
 
+### Personal Shelves, credits, and recovery in 1.2.0
+
+This release adds Personal Shelves synchronization and insights, MusicBrainz
+credits enrichment, resumable album/artist relationship builds, source-bound
+edge profiles, and opt-in DJ analysis with interrupted-work recovery and bounded
+queue deferral. It includes the Navidrome identity guard from 1.1.9.
+
+DJ analysis remains disabled by default and requires a compatible dedicated
+worker; publishing this plugin does not install or enable that worker. Credits
+matching remains subject to its configured audit gate. Friend Album Discovery
+remains excluded from the public catalogue.
+
 ### Resource safety in 1.0.1
 
 Waveform analysis now decodes and filters audio incrementally. Its working
@@ -42,6 +54,13 @@ Administrators can pause Lumae background maintenance from the plugin settings
 page. Pausing stops new catalogue, projection, waveform, and relationship work;
 it does not delete or hide already published catalogue, profile, collection, or
 relationship data.
+
+### Provider-identity reconciliation fix in 1.1.9
+
+Trusted pre-canonical Navidrome releases now publish ordinary track removals and
+music-library scope changes through the normal catalogue diff. Exact identity
+inspection remains fail-closed for pending, uncertain, or blocked canonical-ID
+transitions.
 
 ### Adaptive reconciliation in 1.1.8
 
@@ -119,7 +138,7 @@ The latest AudioMuse plugin documentation is here:
 
 https://github.com/NeptuneHub/AudioMuse-AI/blob/main/docs/PLUGIN.md
 
-The release zip contains code only, with no `plugin.json`. `release-sources.json` explicitly selects a pinned immutable archive, a new source release, or private development for each plugin. The public workflow currently verifies and reuses Lumae Analysis 1.1.8; private DJ changes never rebuild that archive. A new public release requires both a new metadata version and an explicit source-release policy.
+The release zip contains code only, with no `plugin.json`. `release-sources.json` explicitly selects a pinned immutable archive, a new source release, or private development for each plugin. The public workflow verifies and reuses the immutable Lumae Analysis 1.2.0 archive; subsequent development never rebuilds that archive. A new public release requires both a new metadata version and an explicit source-release policy.
 
 Run the local regression suite with:
 

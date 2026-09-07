@@ -1,6 +1,6 @@
 # Private DJ host contract and qualification
 
-DJ source development is separate from the immutable public Lumae Analysis 1.1.8 release. Build a new `1.2.0-djtest.N` with `scripts/build_private_dj_prerelease.py`; do not republish an earlier private version or overwrite the public archive. `release-sources.json` selects the public source explicitly. The public builder verifies the pinned archive and excludes private plugins.
+Further DJ source development is separate from the immutable public Lumae Analysis 1.2.0 release. Build a new `1.2.0-djtest.N` with `scripts/build_private_dj_prerelease.py`; do not republish an earlier private version or overwrite the public archive. `release-sources.json` selects the public source explicitly. The public builder verifies the pinned archive and excludes private plugins.
 
 ## Host contract
 

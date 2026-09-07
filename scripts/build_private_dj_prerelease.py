@@ -72,7 +72,7 @@ def build_private_prerelease(
     if not public_metadata_path.is_file():
         raise FileNotFoundError(public_metadata_path)
     public_metadata = json.loads(public_metadata_path.read_text(encoding="utf-8"))
-    if public_metadata["versions"][0]["version"] != "1.1.8":
+    if public_metadata["versions"][0]["version"] != "1.2.0":
         raise ValueError("public latest changed; review private prerelease isolation")
 
     destination = output_root.resolve() / public_metadata["id"] / version

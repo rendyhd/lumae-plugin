@@ -25,7 +25,7 @@ def code_zip(source, output):
         for path in sorted(source.rglob("*")):
             if (
                 not path.is_file()
-                or "__pycache__" in path.parts
+                or {"__pycache__", ".pytest_cache", ".ruff_cache"}.intersection(path.parts)
                 or path.suffix == ".pyc"
             ):
                 continue

@@ -1,8 +1,13 @@
 # Catalogue sync operations
 
-Lumae Analysis 1.1.8 publishes catalogue schema 3. Schema 3 is additive to the
+Lumae Analysis 1.1.9 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
+
+Version 1.1.9 treats the provider-version observation as the identity-inspection
+admission gate. Trusted pre-canonical Navidrome releases publish ordinary track
+removals and library-scope changes through the normal catalogue diff, while
+pending, uncertain, or blocked identity transitions remain fail-closed.
 
 Version 1.1.8 makes the durable catalogue watchdog adaptive. Runnable work uses
 minute cadence, an active AudioMuse parent is checked every five minutes,
