@@ -800,6 +800,7 @@ def test_dj_worker_defers_before_claim_when_profile_work_is_pending(monkeypatch)
     monkeypatch.setattr(mod, '_profile_work_pending', lambda db: True)
     monkeypatch.setattr(mod, 'interactive_dj_jobs_pending', lambda db: False)
     monkeypatch.setattr(mod, 'priority_dj_v3_jobs_pending', lambda db: False)
+    monkeypatch.setattr(mod, 'aged_dj_v3_jobs_pending', lambda db: False)
     assert not mod._dj_profile_gate_open({'internal_test_eligible': True}, object())
 
 
@@ -10439,3 +10440,28 @@ def test_dj_v3_read_is_additive_and_calibration_bound(monkeypatch):
     assert response.get_json()["schema_version"] == 3
     assert response.get_json()["method"] == mod.DJ_V3_METHOD
     assert calls[0][3] == {"expected_vocal_calibration_cache_key": "c" * 64}
+
+
+@pytest.mark.parametrize("aged", [False, True])
+def test_private_dj_queue_has_bounded_profile_deferral(monkeypatch, aged):
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "_profile_work_pending", lambda db: True)
+    monkeypatch.setattr(mod, "interactive_dj_jobs_pending", lambda db: False)
+    monkeypatch.setattr(mod, "priority_dj_v3_jobs_pending", lambda db: False)
+    monkeypatch.setattr(mod, "aged_dj_v3_jobs_pending", lambda db: aged)
+    assert mod._dj_profile_gate_open({"enabled": True, "internal_test_eligible": True}, object()) is aged
+    assert mod._dj_profile_gate_open({"enabled": True, "internal_test_eligible": False}, object()) is aged
+    assert not mod._dj_profile_gate_open({"enabled": False, "internal_test_eligible": False}, object())
+
+
+def test_dj_age_gate_uses_parameterized_job_age():
+    from unittest.mock import MagicMock
+    mod = load_plugin()
+    db = MagicMock()
+    db.cursor.return_value.fetchone.return_value = (True,)
+    assert mod.aged_dj_v3_jobs_pending(db)
+    query, params = db.cursor.return_value.execute.call_args.args
+    assert "requested_at <= now()" in query
+    assert "next_retry_at <= now()" in query
+    assert params == (300,)
+    db.cursor.return_value.close.assert_called_once()

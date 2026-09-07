@@ -65,6 +65,7 @@ from .dj_analysis_v3_store import (
     finish_dj_v3_job,
     migrate_dj_analysis_v3,
     priority_dj_v3_jobs_pending,
+    aged_dj_v3_jobs_pending,
     publish_dj_v3_analysis,
     read_dj_v3_analysis,
     update_dj_v3_progress,
@@ -2908,9 +2909,15 @@ def _profile_work_pending(db=None):
 
 
 def _dj_profile_gate_open(capability, db=None):
-    """Let reviewed private app requests pass unrelated background profile work."""
+    """Prioritize imminent private DJ work; bound enabled queue deferral to five minutes.
+
+    The dedicated DJ worker still runs one bounded job at a time and retains
+    its CPU/RSS limits. Background edge backlog cannot starve it indefinitely.
+    """
     db = db or get_db()
     if not _profile_work_pending(db):
+        return True
+    if capability.get("enabled") is True and aged_dj_v3_jobs_pending(db):
         return True
     return bool(
         capability.get("internal_test_eligible") is True

@@ -87,3 +87,8 @@ def dj_v3_jobs_pending(db):
 
 def priority_dj_v3_jobs_pending(db):
     return jobs.jobs_pending(db, 3, minimum_priority=50)
+
+
+def aged_dj_v3_jobs_pending(db):
+    """Bound DJ queue starvation behind unrelated profile work to five minutes."""
+    return jobs.jobs_pending(db, 3, minimum_age_seconds=300)

@@ -550,15 +550,22 @@ def publish(db, job, payload, media_signature, metrics=None):
         _finish_ownership(db, job)
 
 
-def jobs_pending(db, version, minimum_priority=None):
+def jobs_pending(db, version, minimum_priority=None, minimum_age_seconds=None):
     spec = contract(version)
     cur = db.cursor()
     try:
         priority = "" if minimum_priority is None else " AND priority >= %s"
+        age = (
+            "" if minimum_age_seconds is None
+            else " AND requested_at <= now() - (%s * interval '1 second')"
+        )
+        params = (() if minimum_priority is None else (minimum_priority,)) + (
+            () if minimum_age_seconds is None else (minimum_age_seconds,)
+        )
         cur.execute(
             f"""SELECT EXISTS (SELECT 1 FROM {spec.jobs} WHERE
-            (status IN ('pending','running') OR (status='failed' AND next_retry_at <= now() AND attempts < 5)){priority})""",
-            () if minimum_priority is None else (minimum_priority,),
+            (status IN ('pending','running') OR (status='failed' AND next_retry_at <= now() AND attempts < 5)){priority}{age})""",
+            params,
         )
         row = cur.fetchone()
         return bool(row and row[0])
