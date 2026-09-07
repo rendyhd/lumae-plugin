@@ -212,7 +212,7 @@ def _work_summary(cur):
                    retry_count, next_retry_at
               FROM {_work_table('relationship_state')}
              WHERE status IN ('queued', 'failed', 'waiting_for_index')
-                OR (status='running' AND updated_at < now() - interval '2 hours')
+                OR (status='running' AND updated_at < now() - interval '2 minutes')
             UNION ALL
             SELECT CASE WHEN next_retry_at > now() THEN 'retry' ELSE 'ready' END,
                    retry_count, next_retry_at

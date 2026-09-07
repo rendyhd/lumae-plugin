@@ -255,6 +255,9 @@ def migrate_enrichment(db):
     for statement in statements:
         cur.execute(statement)
 
+    from .relationship_build import migrate_relationship_builds
+    migrate_relationship_builds(cur)
+
     cur.execute(f"SELECT catalog_instance_id FROM {t('catalog_sources')}")
     source_ids = [str(row[0]) for row in cur.fetchall()]
     for catalog_instance_id in source_ids:
@@ -1222,14 +1225,16 @@ def _load_relationship_inputs(cur, source):
     analysis_generation = int(source["analysis"]["generation"])
     cur.execute(
         f"""
+        WITH artist_covers AS MATERIALIZED (
+            SELECT lower(name) AS artist_key, MIN(cover_art_id) AS cover_art_id
+              FROM {t("catalog_artists")}
+             WHERE catalog_instance_id=%s AND published_generation=%s
+             GROUP BY lower(name)
+        )
         SELECT tr.track_id, tr.album_id, al.name, al.album_artist_display,
                tr.artist_display, tr.disc_number, tr.track_number, tr.cover_art_id,
                tr.payload,
-               (SELECT MIN(ar.cover_art_id)
-                  FROM {t("catalog_artists")} ar
-                 WHERE ar.catalog_instance_id=tr.catalog_instance_id
-                   AND ar.published_generation=tr.published_generation
-                   AND lower(ar.name)=lower(COALESCE(al.album_artist_display, tr.artist_display))),
+               ac.cover_art_id,
                ai.scalar_payload,
                ai.musicnn_vector, ai.musicnn_dimensions
           FROM {t("catalog_tracks")} tr
@@ -1246,13 +1251,16 @@ def _load_relationship_inputs(cur, source):
             ON al.catalog_instance_id=tr.catalog_instance_id
            AND al.published_generation=tr.published_generation
            AND al.album_id=tr.album_id
+          LEFT JOIN artist_covers ac
+            ON ac.artist_key=lower(COALESCE(al.album_artist_display, tr.artist_display))
          WHERE tr.catalog_instance_id=%s AND tr.published_generation=%s
            AND tr.available=TRUE AND tr.analysis_eligible=TRUE
          ORDER BY lower(COALESCE(al.album_artist_display, tr.artist_display)),
                   lower(COALESCE(al.name, '')), COALESCE(tr.disc_number, 0),
                   COALESCE(tr.track_number, 9999), tr.track_id
         """,
-        (analysis_generation, catalog_instance_id, catalog_generation),
+        (catalog_instance_id, catalog_generation,
+         analysis_generation, catalog_instance_id, catalog_generation),
     )
     rows = cur.fetchall()
     tracks = []
@@ -1285,7 +1293,8 @@ def _load_relationship_inputs(cur, source):
     return tracks
 
 
-def _build_entities(tracks):
+def _iter_relationship_entities(tracks, completed=()):
+    """Yield fingerprints in stable order, skipping durable checkpoints."""
     album_groups = {}
     artist_groups = {}
     for track in tracks:
@@ -1294,27 +1303,29 @@ def _build_entities(tracks):
         if track["album"]:
             album_key = f"{artist_key}::{track['album'].lower()}"
             album_groups.setdefault(album_key, []).append(track)
-    albums = []
     for key, rows in sorted(album_groups.items()):
-        albums.append(
-            {
+        if ("album", key) not in completed:
+            yield "album", {
                 "key": key,
                 "album": rows[0]["album"],
                 "artist": rows[0]["artist"],
                 "cover": rows[0]["track_cover"] or min(row["id"] for row in rows),
                 "fingerprint": _album_fingerprint(key, rows),
             }
-        )
-    artists = []
     for key, rows in sorted(artist_groups.items()):
-        artists.append(
-            {
+        if ("artist", key) not in completed:
+            yield "artist", {
                 "key": key,
                 "artist": rows[0]["artist"],
                 "cover": rows[0]["artist_cover"] or min(row["id"] for row in rows),
                 "fingerprint": _artist_fingerprint(key, rows),
             }
-        )
+
+
+def _build_entities(tracks):
+    albums, artists = [], []
+    for entity_type, entity in _iter_relationship_entities(tracks):
+        (albums if entity_type == "album" else artists).append(entity)
     return albums, artists
 
 
@@ -1408,7 +1419,9 @@ def relationship_status(db, catalog_instance_id):
                source_catalog_generation, source_analysis_generation,
                result_generation, epoch, head_seq, floor_seq, status,
                album_count, artist_count, started_at, completed_at,
-               last_error, updated_at
+               last_error, updated_at,
+               (SELECT progress FROM {t('relationship_builds')} b
+                 WHERE b.catalog_instance_id={t('relationship_state')}.catalog_instance_id)
           FROM {t("relationship_state")} WHERE catalog_instance_id=%s
         """,
         (catalog_instance_id,),
@@ -1438,6 +1451,7 @@ def relationship_status(db, catalog_instance_id):
         "completed_at": _iso(row[12]) if row[12] else None,
         "last_error": str(row[13]) if row[13] else None,
         "updated_at": _iso(row[14]) if row[14] else None,
+        "build_progress": (_json(row[15], {}) or {}) if len(row) > 15 else {},
     }
 
 
@@ -1463,270 +1477,16 @@ def claim_relationship_preparation(db, catalog_instance_id):
     return claimed
 
 
-def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None, progress=None):
-    """Build one bounded, atomically published relationship generation."""
-    db = db or get_db()
-    candidate_lookup = candidate_lookup or _ivf_candidate_track_ids
-    sources = resolve_catalog_source(db, catalog_instance_id=catalog_instance_id)
-    if len(sources) != 1:
-        raise ValueError("An explicit catalogue source is required")
-    source = sources[0]
-    if source["catalog"]["status"] != "complete" or source["analysis"]["status"] != "complete":
-        raise CatalogScanError("Catalogue and sonic analysis must be published first")
-    if callable(progress):
-        progress("building album and artist relationships")
-    cur = db.cursor()
-    cur.execute(
-        f"""
-        UPDATE {t("relationship_state")}
-           SET status='running', started_at=COALESCE(started_at, now()),
-               last_error=NULL, updated_at=now()
-         WHERE catalog_instance_id=%s
-        """,
-        (catalog_instance_id,),
+def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None, progress=None,
+                          *, batch_size=128, time_budget_seconds=20):
+    """Advance a durable build; only complete generations become visible."""
+    from .relationship_build import run_relationship_build
+    return run_relationship_build(
+        catalog_instance_id, db=db or get_db(),
+        candidate_lookup=candidate_lookup or _ivf_candidate_track_ids,
+        progress=progress, batch_size=batch_size,
+        time_budget_seconds=time_budget_seconds,
     )
-    db.commit()
-    try:
-        tracks = _load_relationship_inputs(cur, source)
-        albums, artists = _build_entities(tracks)
-        albums_by_key = {row["key"]: row for row in albums}
-        artists_by_key = {row["key"]: row for row in artists}
-        track_to_album = {
-            row["id"]: f"{row['artist'].lower()}::{row['album'].lower()}"
-            for row in tracks
-            if row.get("album")
-        }
-        track_to_artist = {row["id"]: row["artist"].lower() for row in tracks}
-
-        cur.execute(
-            f"SELECT result_generation, epoch, head_seq FROM {t('relationship_state')} "
-            "WHERE catalog_instance_id=%s FOR UPDATE",
-            (catalog_instance_id,),
-        )
-        state = cur.fetchone()
-        if state is None:
-            raise CatalogScanError("Relationship state is missing")
-        generation = int(state[0]) + 1
-        epoch = str(state[1])
-        next_seq = int(state[2])
-        cur.execute(
-            f"SELECT entity_type, entity_id, result_fp FROM {t('relationship_results')} "
-            "WHERE catalog_instance_id=%s",
-            (catalog_instance_id,),
-        )
-        old = {(str(row[0]), str(row[1])): str(row[2]) for row in cur.fetchall()}
-        current = set()
-        changed = 0
-
-        def publish(entity_type, entity, candidates):
-            nonlocal changed, next_seq
-            entity_id = entity["key"]
-            if entity_type == "album":
-                payload = {
-                    "entity_type": "album",
-                    "entity_id": entity_id,
-                    "album": entity["album"],
-                    "artist": entity["artist"],
-                    "coverItemId": entity["cover"],
-                    "candidates": _rank_albums(entity, candidates),
-                    "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
-                }
-            else:
-                payload = {
-                    "entity_type": "artist",
-                    "entity_id": entity_id,
-                    "artist": entity["artist"],
-                    "coverItemId": entity["cover"],
-                    "candidates": _rank_artists(entity, candidates),
-                    "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
-                }
-            current.add((entity_type, entity_id))
-            result_fp = _fingerprint(payload)
-            cur.execute(
-                f"""
-                INSERT INTO {t("relationship_results")}
-                    (catalog_instance_id, entity_type, entity_id, result_generation,
-                     result_fp, payload, computed_at)
-                VALUES (%s, %s, %s, %s, %s, %s::jsonb, now())
-                ON CONFLICT (catalog_instance_id, entity_type, entity_id) DO UPDATE SET
-                    result_generation=EXCLUDED.result_generation,
-                    result_fp=EXCLUDED.result_fp,
-                    payload=EXCLUDED.payload,
-                    computed_at=EXCLUDED.computed_at
-                """,
-                (
-                    catalog_instance_id,
-                    entity_type,
-                    entity_id,
-                    generation,
-                    result_fp,
-                    canonical_json(payload),
-                ),
-            )
-            if old.get((entity_type, entity_id)) == result_fp:
-                return
-            next_seq += 1
-            changed += 1
-            cur.execute(
-                f"""
-                INSERT INTO {t("relationship_changes")}
-                    (catalog_instance_id, epoch, seq, generation, entity_type,
-                     entity_id, operation, payload)
-                VALUES (%s, %s, %s, %s, %s, %s, 'upsert', %s::jsonb)
-                """,
-                (
-                    catalog_instance_id,
-                    epoch,
-                    next_seq,
-                    generation,
-                    entity_type,
-                    entity_id,
-                    canonical_json(payload),
-                ),
-            )
-
-        for album in albums:
-            candidates = _relationship_candidates(
-                album,
-                "album",
-                albums_by_key,
-                track_to_album,
-                candidate_lookup,
-            )
-            publish("album", album, candidates)
-        for artist in artists:
-            candidates = _relationship_candidates(
-                artist,
-                "artist",
-                artists_by_key,
-                track_to_artist,
-                candidate_lookup,
-            )
-            publish("artist", artist, candidates)
-
-        latest_sources = resolve_catalog_source(
-            db, catalog_instance_id=catalog_instance_id
-        )
-        if len(latest_sources) != 1:
-            raise CatalogScanError("Catalogue identity changed during relationship preparation")
-        latest = latest_sources[0]
-        if (
-            int(latest["catalog"]["generation"])
-            != int(source["catalog"]["generation"])
-            or int(latest["analysis"]["generation"])
-            != int(source["analysis"]["generation"])
-        ):
-            raise CatalogScanError(
-                "Catalogue or analysis generation changed during relationship preparation"
-            )
-
-        for entity_type, entity_id in sorted(set(old) - current):
-            next_seq += 1
-            changed += 1
-            cur.execute(
-                f"""
-                INSERT INTO {t("relationship_changes")}
-                    (catalog_instance_id, epoch, seq, generation, entity_type,
-                     entity_id, operation)
-                VALUES (%s, %s, %s, %s, %s, %s, 'delete')
-                """,
-                (
-                    catalog_instance_id,
-                    epoch,
-                    next_seq,
-                    generation,
-                    entity_type,
-                    entity_id,
-                ),
-            )
-            cur.execute(
-                f"DELETE FROM {t('relationship_results')} "
-                "WHERE catalog_instance_id=%s AND entity_type=%s AND entity_id=%s",
-                (catalog_instance_id, entity_type, entity_id),
-            )
-        cur.execute(
-            f"""
-            UPDATE {t("relationship_state")}
-               SET relationship_schema_version=%s, algorithm_version=%s,
-                   source_catalog_generation=%s, source_analysis_generation=%s,
-                   result_generation=%s, head_seq=%s, status='complete',
-                   album_count=%s, artist_count=%s, completed_at=now(),
-                   last_error=NULL, updated_at=now()
-             WHERE catalog_instance_id=%s
-            """,
-            (
-                RELATIONSHIP_SCHEMA_VERSION,
-                RELATIONSHIP_ALGORITHM_VERSION,
-                int(source["catalog"]["generation"]),
-                int(source["analysis"]["generation"]),
-                generation,
-                next_seq,
-                len(albums),
-                len(artists),
-                catalog_instance_id,
-            ),
-        )
-        compact_change_journal(
-            cur,
-            catalog_instance_id=catalog_instance_id,
-            state_table="relationship_state",
-            changes_table="relationship_changes",
-            epoch_column="epoch",
-            floor_column="floor_seq",
-            epoch=epoch,
-            head_seq=next_seq,
-            retention_limit=change_journal_retention_limit(
-                len(albums) + len(artists)
-            ),
-        )
-        db.commit()
-        if callable(progress):
-            progress("published relationship generation")
-        return {
-            "catalog_instance_id": catalog_instance_id,
-            "status": "complete",
-            "generation": generation,
-            "album_count": len(albums),
-            "artist_count": len(artists),
-            "track_count": len(tracks),
-            "changes": changed,
-            "cursor": opaque_cursor(catalog_instance_id, epoch, next_seq),
-        }
-    except RelationshipIndexUnavailable as exc:
-        db.rollback()
-        waiting_cur = db.cursor()
-        waiting_cur.execute(
-            f"""
-            UPDATE {t("relationship_state")}
-               SET status='waiting_for_index', last_error=%s,
-                   completed_at=NULL, updated_at=now()
-             WHERE catalog_instance_id=%s
-            """,
-            (str(exc)[:2000], catalog_instance_id),
-        )
-        db.commit()
-        waiting_cur.close()
-        return {
-            "catalog_instance_id": catalog_instance_id,
-            "status": "waiting_for_index",
-            "reason": str(exc),
-        }
-    except Exception as exc:
-        db.rollback()
-        failure_cur = db.cursor()
-        failure_cur.execute(
-            f"""
-            UPDATE {t("relationship_state")}
-               SET status='failed', last_error=%s, completed_at=now(), updated_at=now()
-             WHERE catalog_instance_id=%s
-            """,
-            (str(exc)[:2000], catalog_instance_id),
-        )
-        db.commit()
-        failure_cur.close()
-        raise
-    finally:
-        cur.close()
 
 
 def relationship_bootstrap_page(

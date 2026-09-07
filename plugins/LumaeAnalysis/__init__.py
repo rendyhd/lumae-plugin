@@ -594,7 +594,7 @@ def next_relationship_run(db=None, server_id=None):
                 OR (r.status IN ('failed', 'waiting_for_index')
                     AND (r.next_retry_at IS NULL OR r.next_retry_at <= now()))
                 OR (r.status='running' AND r.updated_at
-                    < now() - interval '{PREPARATION_STALE_HOURS} hours'))
+                    < now() - interval '2 minutes'))
            AND (%s IS NULL OR s.current_core_server_id=%s)
          ORDER BY r.updated_at, r.catalog_instance_id
          LIMIT 1
@@ -733,6 +733,13 @@ def _run_reconcile_action(
             except Exception:
                 _rollback_if_possible(db)
                 logger.exception("lumae_analysis could not record deferred reconcile work")
+            return result
+        if action == "relationships" and result_status == "queued":
+            # A committed checkpoint is continuation work, not a failed build
+            # or a published generation. Keep minute cadence without backoff.
+            update_work_retry(db, action, catalog_instance_id, failed=False)
+            finish_event(db, event_id, "deferred", phase="relationship build checkpointed",
+                         summary=_reconcile_result_summary(result))
             return result
         if result_status in ("failed", "failure", "error"):
             raise RuntimeError(str((result or {}).get("error") or result_status))
@@ -4390,59 +4397,16 @@ def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=No
     return analyze_tracks_task(ids)
 
 
-def claim_relationship_preparation_run(catalog_instance_id, db=None):
-    """Claim one queued or interrupted relationship build."""
-    db = db or get_db()
-    cur = db.cursor()
-    cur.execute(
-        f"""
-        UPDATE {table('relationship_state')}
-           SET status='running', last_error=NULL,
-               started_at=COALESCE(started_at, now()), next_retry_at=NULL, updated_at=now()
-         WHERE catalog_instance_id=%s
-           AND (status='queued'
-                OR (status IN ('failed', 'waiting_for_index')
-                    AND (next_retry_at IS NULL OR next_retry_at <= now()))
-                OR (status='running' AND updated_at
-                    < now() - interval '{PREPARATION_STALE_HOURS} hours'))
-        RETURNING catalog_instance_id
-        """,
-        (catalog_instance_id,),
-    )
-    claimed = cur.fetchone() is not None
-    db.commit()
-    cur.close()
-    return claimed
-
-
 def relationship_preparation_task(server_id, catalog_instance_id):
     if maintenance_paused():
         return {"status": "paused", "reason": "maintenance_paused"}
-    if not claim_relationship_preparation_run(catalog_instance_id):
-        return {"status": "coalesced", "reason": "already_running"}
-    try:
-        _safe_progress("loading relationship inputs")
-        source = resolve_profile_source(
-            catalog_instance_id=catalog_instance_id,
-            server_id=server_id,
-        )
-        if source["catalog_instance_id"] != catalog_instance_id:
-            raise CatalogScanError("Catalogue identity changed before relationship preparation")
-        return prepare_relationships(catalog_instance_id, progress=_safe_progress)
-    except Exception as exc:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            f"""
-            UPDATE {table('relationship_state')}
-               SET status='failed', last_error=%s, completed_at=now(), updated_at=now()
-             WHERE catalog_instance_id=%s
-            """,
-            (str(exc)[:2000], catalog_instance_id),
-        )
-        db.commit()
-        cur.close()
-        raise
+    source = resolve_profile_source(
+        catalog_instance_id=catalog_instance_id, server_id=server_id,
+    )
+    if source["catalog_instance_id"] != catalog_instance_id:
+        raise CatalogScanError("Catalogue identity changed before relationship preparation")
+    # The builder owns a session advisory lock across its checkpoint commits.
+    return prepare_relationships(catalog_instance_id, progress=_safe_progress)
 
 
 def start_relationship_preparation(
@@ -5154,6 +5118,25 @@ def render_relationship_status_panel():
         active_work = active_work or active
         albums = int(state.get("album_count") or 0)
         artists = int(state.get("artist_count") or 0)
+        build_progress = state.get("build_progress") or {}
+        build_counts = build_progress.get("counts") or {}
+        progress_html = ""
+        if active and build_counts:
+            if int(build_counts.get("fingerprints_done") or 0) < (
+                int(build_counts.get("albums") or 0) + int(build_counts.get("artists") or 0)
+            ):
+                progress_text = (
+                    f"Preparing library signatures: {int(build_counts.get('fingerprints_done') or 0):,} / "
+                    f"{int(build_counts.get('albums') or 0) + int(build_counts.get('artists') or 0):,}"
+                )
+            else:
+                progress_text = (
+                    f"Album similarities: {int(build_counts.get('albums_done') or 0):,} / "
+                    f"{int(build_counts.get('albums') or 0):,}. "
+                    f"Artist similarities: {int(build_counts.get('artists_done') or 0):,} / "
+                    f"{int(build_counts.get('artists') or 0):,}."
+                )
+            progress_html = f'<p class="lumae-help" role="status">{escape(progress_text)}</p>'
         if current:
             status_label = "Ready"
             status_class = "lumae-source-state-ready"
@@ -5216,6 +5199,7 @@ def render_relationship_status_panel():
                 <span class="lumae-source-state {status_class}">{status_label}</span>
               </header>
               {summary}
+              {progress_html}
               <details>
                 <summary>Technical details</summary>
                 <div class="lumae-technical-details">
