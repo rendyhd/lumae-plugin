@@ -10,10 +10,6 @@ from plugin.api import table
 TABLES = (
     "edge_profiles",
     "edge_profile_jobs",
-    "dj_analyses",
-    "dj_analysis_jobs",
-    "dj_analyses_v3",
-    "dj_analysis_jobs_v3",
 )
 
 

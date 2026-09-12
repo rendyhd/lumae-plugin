@@ -40,11 +40,7 @@ def playback_pending(db):
     result = bool(cur.fetchone()[0])
     cur.close()
     db.commit()
-    if result:
-        return True
-    from .dj_analysis_store import interactive_dj_jobs_pending
-    from .dj_analysis_v3_store import priority_dj_v3_jobs_pending
-    return bool(interactive_dj_jobs_pending(db) or priority_dj_v3_jobs_pending(db))
+    return result
 
 
 def run_one(catalog_id, *, db=None, client_factory=Client, critical=playback_pending):

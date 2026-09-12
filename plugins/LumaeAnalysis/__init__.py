@@ -23,65 +23,9 @@ from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
     publish_edge_profile, edge_backfill_candidates,
 )
-from . import dj_service, dj_maintenance, dj_jobs, optional_storage, dj_capabilities
+from . import optional_storage
 from . import credits_service, credits_store
 from .shelves import SHELVES_SCHEMA_VERSION, migrate_shelves, register_shelf_routes
-from .dj_analysis import (
-    JOB_DEADLINE_SECONDS as DJ_JOB_TIMEOUT_SECONDS,
-    METHOD as DJ_METHOD,
-    SCHEMA_VERSION as DJ_SCHEMA_VERSION,
-    YAMNET_CLASS_MAP_SHA256 as DJ_YAMNET_CLASS_MAP_SHA256,
-    YAMNET_MODEL_SHA256 as DJ_YAMNET_MODEL_SHA256,
-    DjAnalysisError,
-    analyze_dj_file,
-    runtime_status as dj_runtime_status,
-)
-from .dj_analysis_store import (
-    cancel_dj_jobs,
-    claim_dj_requests,
-    claim_next_dj_job,
-    dj_backfill_candidates,
-    dj_job_cancelled,
-    dj_jobs_pending,
-    interactive_dj_jobs_pending,
-    finish_dj_job,
-    migrate_dj_analysis,
-    publish_dj_analysis,
-    read_dj_worker_capability,
-    read_dj_analysis,
-    update_dj_progress,
-    write_dj_worker_capability,
-)
-from .dj_analysis_v3 import (
-    METHOD as DJ_V3_METHOD,
-    SCHEMA_VERSION as DJ_V3_SCHEMA_VERSION,
-    analyze_dj_file_v3,
-)
-from .dj_analysis_v3_store import (
-    claim_dj_v3_requests,
-    claim_next_dj_job_any,
-    dj_v3_job_cancelled,
-    dj_v3_jobs_pending,
-    finish_dj_v3_job,
-    migrate_dj_analysis_v3,
-    priority_dj_v3_jobs_pending,
-    aged_dj_v3_jobs_pending,
-    publish_dj_v3_analysis,
-    read_dj_v3_analysis,
-    update_dj_v3_progress,
-)
-from .provision_dj_model import (
-    ACKNOWLEDGEMENT as DJ_MODEL_ACKNOWLEDGEMENT,
-    provision_stack as provision_dj_models,
-    remove_stack as remove_dj_models,
-)
-from .vocal_calibration import (
-    METHOD as VOCAL_CALIBRATION_METHOD,
-    PRIVATE_AUDITION_TIER,
-    VocalCalibrationError,
-    qualification_tier as vocal_calibration_tier,
-    load_artifact as load_vocal_calibration_artifact,
-)
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -251,11 +195,6 @@ ANALYSIS_RUN_SETTLE_GRACE_MINUTES = 2
 ANALYSIS_RUN_STALE_MINUTES = 30
 PROFILE_JOB_TIMEOUT_SECONDS = 20 * 60
 PROFILE_BACKFILL_JOB_TIMEOUT_SECONDS = 30 * 60
-MAX_DJ_ANALYSIS_IDS = 100
-DEFAULT_DJ_MODEL_PATH = "/var/lib/audiomuse/lumae-models/beat-this-final0.ckpt"
-DEFAULT_YAMNET_MODEL_PATH = "/var/lib/audiomuse/lumae-models/yamnet-classification-tflite-1.tflite"
-DJ_TASK_QUEUE = "lumae-dj"
-_DJ_CAPABILITY_CACHE = {}
 CATALOG_JOB_TIMEOUT_SECONDS = 90 * 60
 RELATIONSHIP_JOB_TIMEOUT_SECONDS = 60 * 60
 COLLECTIONS_MENU_LABEL = "Living Collections"
@@ -1102,6 +1041,23 @@ def observe_provider_identities_on_start():
     # state. Startup never reaches into queue internals or creates root work.
 
 
+def _drop_dj_tables(db):
+    with db.cursor() as cur:
+        for name in (
+            "dj_worker_capability",
+            "dj_analyses",
+            "dj_analysis_jobs",
+            "dj_analyses_v3",
+            "dj_analysis_jobs_v3",
+            "dj_control",
+        ):
+            cur.execute(f"DROP TABLE IF EXISTS {table(name)} CASCADE")
+        try:
+            cur.execute("DELETE FROM cron WHERE task_type LIKE 'plugin.lumae_analysis.dj%'")
+        except Exception:
+            pass
+
+
 def migrate(db):
     cur = db.cursor()
     cur.execute(
@@ -1154,9 +1110,7 @@ def migrate(db):
         f"ON {source_profiles_table()} (catalog_instance_id, status)"
     )
     migrate_edge_profiles(db)
-    migrate_dj_analysis(db)
-    migrate_dj_analysis_v3(db)
-    dj_maintenance.migrate(db)
+    _drop_dj_tables(db)
     optional_storage.migrate(db)
     cur.execute(
         f"""
@@ -1312,9 +1266,6 @@ def migrate(db):
     ensure_analysis_projection_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
-    migrate_dj_opt_in()
-    removal = dj_maintenance.state(db)
-    dj_maintenance.configure_schedule(db, dj_analysis_enabled() or removal.get("status") in ("pending", "running"))
     # Installation is schema work, not a reason to rebuild the full analysis
     # and relationship projections. Only a missing/stale catalogue publication
     # is admitted here; ordinary analysis hooks and explicit prepare requests
@@ -1717,98 +1668,6 @@ def catalog_capability():
     }
 
 
-def dj_analysis_enabled():
-    value = get_setting("dj_analysis_enabled", False)
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
-
-
-def configured_dj_model_path():
-    value = get_setting("dj_model_path", DEFAULT_DJ_MODEL_PATH)
-    return str(value or DEFAULT_DJ_MODEL_PATH).strip()
-
-
-def configured_yamnet_model_path():
-    value = get_setting("dj_yamnet_model_path", DEFAULT_YAMNET_MODEL_PATH)
-    return str(value or DEFAULT_YAMNET_MODEL_PATH).strip()
-
-
-def dj_models_acknowledged():
-    value = get_setting("dj_models_acknowledged", False)
-    if isinstance(value, str):
-        return value.strip().lower() in ("1", "true", "yes", "on")
-    return bool(value)
-
-
-def dj_setup_state():
-    value = str(get_setting("dj_setup_state", "disabled") or "disabled")
-    return value if value in ("disabled", "queued", "downloading", "initializing", "ready", "error") else "error"
-
-
-def configured_vocal_calibration_path():
-    """Optional, administrator-provided held-out calibration artifact."""
-    return str(os.environ.get("LUMAE_DJ_VOCAL_CALIBRATION", "") or "").strip()
-
-
-def load_configured_vocal_calibration():
-    return load_vocal_calibration_artifact(
-        configured_vocal_calibration_path(),
-        yamnet_model_sha256=DJ_YAMNET_MODEL_SHA256,
-        class_map_sha256=DJ_YAMNET_CLASS_MAP_SHA256,
-    )
-
-
-def migrate_dj_opt_in():
-    """Require the new combined two-model consent after older DJ test builds."""
-    enabled = dj_analysis_enabled()
-    acknowledged = dj_models_acknowledged()
-    if enabled and not acknowledged:
-        # The previous one-model switch is not consent to download YAMNet or to
-        # run DJ Analysis V2. Fail closed and require the new combined switch.
-        set_setting("dj_analysis_enabled", False)
-        enabled = False
-    if not enabled:
-        set_setting("dj_setup_state", "disabled")
-    _DJ_CAPABILITY_CACHE.clear()
-
-
-def _dj_capability_host():
-    return dj_capabilities.CapabilityHost(
-        enabled=dj_analysis_enabled,
-        acknowledged=dj_models_acknowledged,
-        setup_state=dj_setup_state,
-        model_path=configured_dj_model_path,
-        yamnet_path=configured_yamnet_model_path,
-        calibration_path=configured_vocal_calibration_path,
-        load_calibration=load_configured_vocal_calibration,
-        runtime_status=dj_runtime_status,
-        plugin_version=PLUGIN_VERSION,
-        cache=_DJ_CAPABILITY_CACHE,
-        get_db=get_db,
-        reader=read_dj_worker_capability,
-        writer=write_dj_worker_capability,
-        logger=logger,
-        probe=local_dj_worker_capability,
-    )
-
-
-def _disabled_dj_capability():
-    return dj_capabilities.disabled()
-
-
-def local_dj_worker_capability():
-    return dj_capabilities.local_status(_dj_capability_host())
-
-
-def attest_dj_worker_capability():
-    return dj_capabilities.attest(_dj_capability_host())
-
-
-def dj_analysis_capability():
-    return dj_capabilities.read_status(_dj_capability_host())
-
-
 def sync_contract(compatibility):
     """Describe breaking schemas and semantic formats independently of core version."""
     return {
@@ -1837,19 +1696,6 @@ def sync_contract(compatibility):
                 "schema_version": SCHEMA_VERSION,
                 "analyzer_version": ANALYZER_VERSION,
                 "semantic_contracts": ["lumae_playback_profile_v1"],
-            },
-            "dj_analysis": {
-                "schema_version": DJ_SCHEMA_VERSION,
-                "method": DJ_METHOD,
-                "supported_schema_versions": [DJ_SCHEMA_VERSION, DJ_V3_SCHEMA_VERSION],
-                "contracts": [
-                    {"schema_version": DJ_SCHEMA_VERSION, "method": DJ_METHOD},
-                    {"schema_version": DJ_V3_SCHEMA_VERSION, "method": DJ_V3_METHOD},
-                ],
-                "semantic_contracts": [
-                    "lumae_dj_analysis_v1",
-                    "lumae_dj_analysis_v3",
-                ],
             },
             "credits": credits_service.capability(),
             "relationships": {
@@ -1896,7 +1742,6 @@ def health():
             "capabilities": {
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
-                "dj_analysis": dj_analysis_capability(),
                 "shelves": {
                     "schema_version": SHELVES_SCHEMA_VERSION,
                     "enabled": collections_enabled(),
@@ -2861,383 +2706,6 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id):
             if info:
                 remove_downloaded_file(info.get("cleanup_path"))
     return outcomes
-
-
-def _validate_dj_ids(value):
-    if not isinstance(value, list) or len(value) > MAX_DJ_ANALYSIS_IDS:
-        raise ValueError("ids must contain at most 100 track IDs")
-    ids = []
-    seen = set()
-    for track_id in value:
-        if (
-            not isinstance(track_id, str)
-            or not track_id
-            or len(track_id) > 512
-        ):
-            raise ValueError("ids must contain at most 100 track IDs")
-        if track_id not in seen:
-            ids.append(track_id)
-            seen.add(track_id)
-    return ids
-
-
-def _profile_work_pending(db=None):
-    """Fail closed so CPU DJ work never jumps ahead of playback preparation."""
-    db = db or get_db()
-    cur = db.cursor()
-    try:
-        cur.execute(
-            f"""SELECT (
-                EXISTS (SELECT 1 FROM {source_profiles_table()}
-                        WHERE status IN ('pending', 'pending_interactive'))
-                OR EXISTS (SELECT 1 FROM {table('edge_profile_jobs')}
-                           WHERE status IN ('pending', 'running'))
-                OR EXISTS (SELECT 1 FROM {profile_backfill_state_table()}
-                           WHERE status IN ('queued', 'running'))
-            )"""
-        )
-        row = cur.fetchone()
-        return not row or bool(row[0])
-    except Exception:
-        rollback = getattr(db, "rollback", None)
-        if callable(rollback):
-            rollback()
-        logger.exception("lumae_analysis could not verify DJ worker priority")
-        return True
-    finally:
-        cur.close()
-
-
-def _dj_profile_gate_open(capability, db=None):
-    """Prioritize imminent private DJ work; bound enabled queue deferral to five minutes.
-
-    The dedicated DJ worker still runs one bounded job at a time and retains
-    its CPU/RSS limits. Background edge backlog cannot starve it indefinitely.
-    """
-    db = db or get_db()
-    if not _profile_work_pending(db):
-        return True
-    if capability.get("enabled") is True and aged_dj_v3_jobs_pending(db):
-        return True
-    return bool(
-        capability.get("internal_test_eligible") is True
-        and (
-            interactive_dj_jobs_pending(db)
-            or priority_dj_v3_jobs_pending(db)
-        )
-    )
-
-
-def _enqueue_dj_worker():
-    status = read_dj_worker_capability(get_db(), PLUGIN_VERSION) or {}
-    if status.get("host_contract") != dj_maintenance.HOST_CONTRACT:
-        raise RuntimeError("DJ host has not attested the dedicated queue contract")
-    return enqueue_bounded(dj_analysis_task, queue=DJ_TASK_QUEUE,
-                           timeout=DJ_JOB_TIMEOUT_SECONDS)
-
-
-DJ_RUNTIME_PREPARE_LOCK_ID = dj_maintenance.RUNTIME_PREPARE_LOCK_ID
-
-
-def _acquire_dj_runtime_prepare_lock():
-    """Elect one setup hook across the worker processes sharing PostgreSQL."""
-    db = get_db()
-    if db is None:
-        # Isolated unit tests do not install the AudioMuse database adapter.
-        return None, True
-    cur = db.cursor()
-    try:
-        cur.execute("SELECT pg_try_advisory_lock(%s)", (DJ_RUNTIME_PREPARE_LOCK_ID,))
-        row = cur.fetchone()
-        db.commit()
-        return db, bool(row and row[0])
-    except Exception:
-        rollback = getattr(db, "rollback", None)
-        if callable(rollback):
-            rollback()
-        logger.exception("lumae_analysis could not acquire the DJ setup lock")
-        return db, False
-    finally:
-        cur.close()
-
-
-def _release_dj_runtime_prepare_lock(db, acquired):
-    if db is None or not acquired:
-        return
-    cur = db.cursor()
-    try:
-        cur.execute("SELECT pg_advisory_unlock(%s)", (DJ_RUNTIME_PREPARE_LOCK_ID,))
-        commit = getattr(db, "commit", None)
-        if callable(commit):
-            commit()
-    except Exception:
-        rollback = getattr(db, "rollback", None)
-        if callable(rollback):
-            rollback()
-        logger.exception("lumae_analysis could not release the DJ setup lock")
-    finally:
-        cur.close()
-
-
-def prepare_dj_runtime():
-    """Provision both pinned models only on the opted-in dedicated worker."""
-    if not dj_analysis_enabled() or os.environ.get("LUMAE_DJ_WORKER") != "1":
-        return local_dj_worker_capability()
-    if os.environ.get("LUMAE_DJ_HOST_CONTRACT") != dj_maintenance.HOST_CONTRACT:
-        return attest_dj_worker_capability()
-    lock_db, lock_acquired = _acquire_dj_runtime_prepare_lock()
-    if not lock_acquired:
-        capability = local_dj_worker_capability()
-        if not capability.get("worker_available"):
-            capability["reason"] = "setup_in_progress"
-        return capability
-    try:
-        if not dj_models_acknowledged():
-            set_setting("dj_setup_state", "error")
-            _DJ_CAPABILITY_CACHE.clear()
-            return attest_dj_worker_capability()
-        capability = attest_dj_worker_capability()
-        if capability["worker_available"]:
-            if dj_setup_state() != "ready":
-                set_setting("dj_setup_state", "ready")
-                _DJ_CAPABILITY_CACHE.clear()
-            capability["lifecycle"] = "ready"
-            return capability
-        if capability.get("runtime_mismatches"):
-            return capability
-        try:
-            set_setting("dj_setup_state", "downloading")
-            _DJ_CAPABILITY_CACHE.clear()
-            provision_dj_models(
-                configured_dj_model_path(),
-                configured_yamnet_model_path(),
-                cancelled=lambda: not dj_analysis_enabled(),
-            )
-            if not dj_analysis_enabled():
-                return attest_dj_worker_capability()
-            set_setting("dj_setup_state", "initializing")
-            _DJ_CAPABILITY_CACHE.clear()
-            capability = attest_dj_worker_capability()
-            set_setting(
-                "dj_setup_state",
-                "ready" if capability["worker_available"] else "error",
-            )
-            capability["lifecycle"] = (
-                "ready" if capability["worker_available"] else "error"
-            )
-        except Exception:
-            if not dj_analysis_enabled():
-                set_setting("dj_setup_state", "disabled")
-                _DJ_CAPABILITY_CACHE.clear()
-                return attest_dj_worker_capability()
-            set_setting("dj_setup_state", "error")
-            logger.exception("lumae_analysis could not provision the optional DJ model")
-            capability["worker_available"] = False
-            capability["internal_test_eligible"] = False
-            capability["available"] = False
-            capability["reason"] = "model_download_failed"
-            return write_dj_worker_capability(get_db(), PLUGIN_VERSION, capability)
-        _DJ_CAPABILITY_CACHE.clear()
-        return capability
-    finally:
-        _release_dj_runtime_prepare_lock(lock_db, lock_acquired)
-
-
-def _request_dj_jobs(source, ids, *, priority=0, force=False):
-    return dj_service.request_analysis(_dj_host(), 2, source, ids,
-                                       priority=priority, force=force)
-
-
-def _request_dj_v3_jobs(source, ids, *, priority_tier, force=False):
-    return dj_service.request_analysis(_dj_host(), 3, source, ids,
-                                       priority_tier=priority_tier, force=force)
-
-
-@bp.get("/api/dj/v3/analysis")
-def dj_v3_analysis_api():
-    try:
-        source = resolve_profile_source(
-            catalog_instance_id=request.args.get("catalog_instance_id"),
-            server_id=request.args.get("server_id"),
-        )
-        ids = _validate_dj_ids(parse_ids(request.args.get("ids", "")))
-        capability = dj_analysis_capability()
-        result = read_dj_v3_analysis(
-            get_db(),
-            source["catalog_instance_id"],
-            ids,
-            expected_vocal_calibration_cache_key=(
-                capability.get("vocal_calibration", {}).get("cache_key")
-            ),
-        )
-        return _private_json(
-            {
-                "schema_version": DJ_V3_SCHEMA_VERSION,
-                "method": DJ_V3_METHOD,
-                "catalog_instance_id": source["catalog_instance_id"],
-                "capability": capability,
-                **result,
-            }
-        )
-    except (KeyError, ValueError, CatalogScanError) as exc:
-        return _catalog_error("invalid_dj_v3_request", str(exc), 400)
-
-
-@bp.post("/api/dj/v3/analysis/analyze")
-def dj_v3_analysis_request_api():
-    try:
-        body = _json_body(max_bytes=64_000)
-        source = resolve_profile_source(
-            catalog_instance_id=body.get("catalog_instance_id"),
-            server_id=body.get("server_id"),
-        )
-        ids = _validate_dj_ids(body.get("ids"))
-        priority_tier = body.get("priority")
-        if priority_tier not in ("boundary", "lookahead", "queue"):
-            raise ValueError("priority must be boundary, lookahead, or queue")
-        result, status = _request_dj_v3_jobs(
-            source, ids, priority_tier=priority_tier, force=_dj_force(body)
-        )
-        return _private_json(result, status)
-    except (KeyError, ValueError, CatalogScanError) as exc:
-        return _catalog_error("invalid_dj_v3_request", str(exc), 400)
-
-
-@bp.get("/api/dj/analysis")
-def dj_analysis_api():
-    try:
-        source = resolve_profile_source(
-            catalog_instance_id=request.args.get("catalog_instance_id"),
-            server_id=request.args.get("server_id"),
-        )
-        ids = _validate_dj_ids(parse_ids(request.args.get("ids", "")))
-        capability = dj_analysis_capability()
-        result = read_dj_analysis(
-            get_db(),
-            source["catalog_instance_id"],
-            ids,
-            expected_vocal_calibration_cache_key=(
-                capability.get("vocal_calibration", {}).get("cache_key")
-            ),
-        )
-        return _private_json(
-            {
-                "schema_version": DJ_SCHEMA_VERSION,
-                "method": DJ_METHOD,
-                "catalog_instance_id": source["catalog_instance_id"],
-                "capability": capability,
-                **result,
-            }
-        )
-    except (KeyError, ValueError, CatalogScanError) as exc:
-        return _catalog_error("invalid_dj_request", str(exc), 400)
-
-
-@bp.post("/api/dj/analysis/analyze")
-def dj_analysis_request_api():
-    try:
-        body = _json_body(max_bytes=64_000)
-        source = resolve_profile_source(
-            catalog_instance_id=body.get("catalog_instance_id"),
-            server_id=body.get("server_id"),
-        )
-        ids = _validate_dj_ids(body.get("ids"))
-        result, status = _request_dj_jobs(source, ids, priority=10, force=_dj_force(body))
-        return _private_json(result, status)
-    except (KeyError, ValueError, CatalogScanError) as exc:
-        return _catalog_error("invalid_dj_request", str(exc), 400)
-
-
-@bp.post("/api/dj/analysis/backfill")
-def dj_analysis_backfill_api():
-    try:
-        body = _json_body(max_bytes=16_000)
-        source = resolve_profile_source(
-            catalog_instance_id=body.get("catalog_instance_id"),
-            server_id=body.get("server_id"),
-        )
-        after = body.get("after", "")
-        limit = body.get("limit", 100)
-        if not isinstance(after, str) or len(after) > 512:
-            raise ValueError("invalid backfill cursor")
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
-            raise ValueError("limit must be an integer from 1 to 100")
-        capability = dj_analysis_capability()
-        ids = dj_backfill_candidates(
-            get_db(),
-            source["catalog_instance_id"],
-            after,
-            limit,
-            expected_vocal_calibration_cache_key=(
-                capability.get("vocal_calibration", {}).get("cache_key")
-            ),
-        )
-        result, status = _request_dj_jobs(source, ids)
-        result["next_after"] = ids[-1] if ids else None
-        return _private_json(result, status)
-    except (KeyError, ValueError, CatalogScanError) as exc:
-        return _catalog_error("invalid_dj_request", str(exc), 400)
-
-
-def _dj_force(body):
-    force = body.get("force", False)
-    if not isinstance(force, bool):
-        raise ValueError("force must be a boolean")
-    return force
-
-
-@bp.post("/api/dj/v3/analysis/cancel")
-def dj_v3_analysis_cancel_api():
-    try:
-        body = _json_body(max_bytes=64_000)
-        source = resolve_profile_source(catalog_instance_id=body.get("catalog_instance_id"),
-                                        server_id=body.get("server_id"))
-        ids = _validate_dj_ids(body.get("ids"))
-        cancelled = dj_jobs.cancel_jobs(get_db(), 3, source["catalog_instance_id"], ids)
-        return _private_json({"schema_version": 3, "cancelled": cancelled})
-    except (KeyError, ValueError, CatalogScanError) as exc:
-        return _catalog_error("invalid_dj_v3_request", str(exc), 400)
-
-
-@bp.post("/api/dj/analysis/cancel")
-def dj_analysis_cancel_api():
-    try:
-        body = _json_body(max_bytes=64_000)
-        source = resolve_profile_source(
-            catalog_instance_id=body.get("catalog_instance_id"),
-            server_id=body.get("server_id"),
-        )
-        ids = _validate_dj_ids(body.get("ids"))
-        cancelled = cancel_dj_jobs(get_db(), source["catalog_instance_id"], ids)
-        return _private_json({"cancelled": cancelled})
-    except (KeyError, ValueError, CatalogScanError) as exc:
-        return _catalog_error("invalid_dj_request", str(exc), 400)
-
-
-def _dj_host():
-    return dj_service.WorkerHost(
-        get_db=get_db, paused=maintenance_paused, capability=dj_analysis_capability,
-        prepare=prepare_dj_runtime, gate_open=_dj_profile_gate_open,
-        resolve_source=resolve_profile_source, load_track=load_track_file,
-        remove_download=remove_downloaded_file, model_path=configured_dj_model_path,
-        yamnet_path=configured_yamnet_model_path, calibration=load_configured_vocal_calibration,
-        enqueue=_enqueue_dj_worker, enabled=dj_analysis_enabled, remove_models=remove_dj_models,
-        setup_lock=_acquire_dj_runtime_prepare_lock, release_setup_lock=_release_dj_runtime_prepare_lock,
-        logger=logger)
-
-
-def dj_analysis_task():
-    return dj_service.run_worker(_dj_host())
-
-
-def dj_reconcile_task():
-    return dj_service.reconcile(_dj_host())
-
-
-def dj_worker_start():
-    if os.environ.get("LUMAE_DJ_WORKER") == "1":
-        attest_dj_worker_capability()
-        return dj_analysis_task()
 
 
 def analyze_one_track(track_id, catalog_instance_id=None, server_id=None):
@@ -5680,21 +5148,6 @@ def render_reconcile_status_panel():
     """
 
 
-def render_dj_analysis_panel():
-    from .dj_ui import render_panel
-    counts = {}; removal = {}
-    try:
-        db = get_db()
-        if db is not None:
-            counts = dj_jobs.status_counts(db)
-            removal = dj_maintenance.state(db)
-    except Exception:
-        _rollback_if_possible(get_db())
-        logger.exception("Could not read DJ progress")
-    return render_panel(dj_analysis_enabled(), dj_models_acknowledged(),
-                        dj_analysis_capability(), counts, removal, DJ_MODEL_ACKNOWLEDGEMENT)
-
-
 def render_settings_status_panels(batch_size):
     readiness_html = render_v3_readiness_panel()
     relationships_html = render_relationship_status_panel()
@@ -5706,7 +5159,6 @@ def render_settings_status_panels(batch_size):
         "waveform": waveform_html,
         "reconcile": render_reconcile_status_panel(),
         "identity": render_provider_identity_panel(),
-        "dj": render_dj_analysis_panel(),
     }
 
 
@@ -6164,7 +5616,6 @@ def render_settings(message=None, error=None):
           {panels['identity']}
           {panels['readiness']}
           {panels['waveform']}
-          {panels['dj']}
           {panels['relationships']}
           {render_collections_settings_panel()}
         </section>
@@ -6195,42 +5646,6 @@ def settings():
                 set_setting("collection_manager_enabled", enabled)
                 sync_collections_menu(enabled)
                 message = f"Living Collections {'enabled' if enabled else 'disabled'}."
-            elif action == "save_dj_analysis":
-                enabled = request.form.get("dj_analysis_enabled") == "on"
-                acknowledged = request.form.get("dj_models_acknowledged") == "on"
-                if enabled and not acknowledged:
-                    raise ValueError(
-                        "Review and accept the Beat This and YAMNet/AudioSet caveats before enabling DJ analysis."
-                    )
-                set_setting("dj_analysis_enabled", enabled)
-                set_setting("dj_models_acknowledged", acknowledged)
-                set_setting("dj_setup_state", "queued" if enabled else "disabled")
-                dj_maintenance.configure_schedule(get_db(), enabled or dj_maintenance.state(get_db()).get("status") in ("pending", "running"))
-                _DJ_CAPABILITY_CACHE.clear()
-                if enabled:
-                    try:
-                        dj_service.dispatch(_dj_host())
-                    except Exception:
-                        logger.exception("DJ setup is durable; reconciliation will retry dispatch")
-                    message = (
-                        "DJ Mode enabled. The DJ worker will download and verify the optional "
-                        "Beat This and YAMNet models."
-                    )
-                else:
-                    message = "DJ analysis disabled. No DJ model will be loaded or downloaded."
-            elif action == "remove_dj_models":
-                set_setting("dj_analysis_enabled", False)
-                set_setting("dj_setup_state", "disabled")
-                dj_maintenance.request_removal(get_db())
-                try:
-                    dj_service.dispatch(_dj_host())
-                except Exception:
-                    logger.exception("DJ model removal is pending on the dedicated worker")
-                _DJ_CAPABILITY_CACHE.clear()
-                message = (
-                    "DJ analysis disabled. Model removal is queued on the dedicated worker; "
-                    "its completion is shown in DJ status."
-                )
             elif action in ("ack_v3_readiness", "clear_v3_readiness"):
                 message = (
                     "Manual AudioMuse verification is no longer required. "
@@ -6342,11 +5757,9 @@ def register(ctx):
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
     ctx.on_install(migrate)
     ctx.on_flask_start(observe_provider_identities_on_start)
-    ctx.on_worker_start(dj_worker_start)
     ctx.on_song_analyzed(analyze_song_hook)
     ctx.add_task("prepare", prepare_lumae_task, queue="default")
     ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
-    ctx.add_task("dj_analysis", dj_analysis_task, queue=DJ_TASK_QUEUE)
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_task("credits", credits_service.run_one, queue="default")
     ctx.add_task(
@@ -6359,5 +5772,3 @@ def register(ctx):
         "provider_identity_recheck", provider_identity_recheck_task, queue="default"
     )
     ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")
-    ctx.add_cron_task("dj_analysis", dj_analysis_task, queue=DJ_TASK_QUEUE)
-    ctx.add_cron_task("dj_reconcile", dj_reconcile_task, queue="default")

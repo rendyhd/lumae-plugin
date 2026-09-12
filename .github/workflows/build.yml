@@ -64,7 +64,6 @@ jobs:
           cache-dependency-path: |
             requirements-dev.txt
             requirements-edge.txt
-            requirements-dj.txt
 
       - name: Install test dependencies
         run: python -m pip install -r requirements-dev.txt -r requirements-edge.txt
