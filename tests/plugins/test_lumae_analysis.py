@@ -9870,3 +9870,58 @@ def test_enrichment_cleanup_bounds_relationship_history_to_two_snapshots():
         and "relationship_state" in sql
         for sql, params in db.cursor_obj.executed
     )
+
+
+@pytest.mark.parametrize("legacy_install", [False, True])
+def test_retired_dj_migration_preserves_supported_data(lumae_postgres_db, legacy_install):
+    mod = load_plugin()
+    db = lumae_postgres_db
+    retired = ("dj_worker_capability", "dj_analyses", "dj_analysis_jobs",
+               "dj_analyses_v3", "dj_analysis_jobs_v3", "dj_control")
+    kept = ("profiles", "source_profiles", "edge_profiles", "catalog_sources")
+    unrelated = ("plugin.lumae_analysis.catalog_refresh",
+                 "plugin.lumae_analysis.dj_future", "plugin.lumaeXanalysis.dj_analysis")
+    with db.cursor() as cur:
+        cur.execute("CREATE TABLE cron (task_type TEXT PRIMARY KEY)")
+        for task in (*unrelated, "plugin.lumae_analysis.dj_analysis",
+                     "plugin.lumae_analysis.dj_reconcile"):
+            cur.execute("INSERT INTO cron VALUES (%s)", (task,))
+        for name in (*kept, *(retired if legacy_install else ())):
+            cur.execute(f"CREATE TABLE {mod.table(name)} (value TEXT)")
+            cur.execute(f"INSERT INTO {mod.table(name)} VALUES ('preserved')")
+    db.commit()
+    mod._drop_dj_tables(db)
+    db.commit()
+    mod._drop_dj_tables(db)
+    db.commit()
+    with db.cursor() as cur:
+        for name in retired:
+            cur.execute("SELECT to_regclass(%s)", (mod.table(name),))
+            assert cur.fetchone()[0] is None
+        for name in kept:
+            cur.execute(f"SELECT value FROM {mod.table(name)}")
+            assert cur.fetchall() == [("preserved",)]
+        cur.execute("SELECT task_type FROM cron ORDER BY task_type")
+        assert {row[0] for row in cur.fetchall()} == set(unrelated)
+
+
+def test_retired_dj_migration_does_not_hide_database_errors(monkeypatch):
+    from unittest.mock import MagicMock
+    mod = load_plugin()
+    db = MagicMock()
+    cursor = db.cursor.return_value.__enter__.return_value
+    def execute(sql, *args):
+        if sql.startswith("DELETE FROM cron"):
+            raise RuntimeError("scheduler unavailable")
+    cursor.execute.side_effect = execute
+    with pytest.raises(RuntimeError, match="scheduler unavailable"):
+        mod._drop_dj_tables(db)
+
+
+def test_retired_dj_routes_are_absent():
+    mod = load_plugin()
+    app = Flask(__name__)
+    app.register_blueprint(mod.bp)
+    assert not any("/dj/" in rule.rule for rule in app.url_map.iter_rules())
+    manifest = json.loads(pathlib.Path("plugins/LumaeAnalysis/plugin.json").read_text())
+    assert not any("dj" in key.lower() for key in manifest["capabilities"])

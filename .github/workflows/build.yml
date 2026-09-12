@@ -11,7 +11,6 @@ on:
       - 'runtime/**'
       - 'requirements-dev.txt'
       - 'requirements-edge.txt'
-      - 'requirements-dj.txt'
       - '.github/workflows/build.yml'
   pull_request:
     paths:
@@ -22,7 +21,6 @@ on:
       - 'runtime/**'
       - 'requirements-dev.txt'
       - 'requirements-edge.txt'
-      - 'requirements-dj.txt'
       - '.github/workflows/build.yml'
   workflow_dispatch:
 

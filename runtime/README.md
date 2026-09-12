@@ -1,57 +1,36 @@
-# Private DJ host contract and qualification
+# Lumae plugin runtime and upgrades
 
-Further DJ source development is separate from the immutable public Lumae Analysis 1.2.0 release. Build a new `1.2.0-djtest.N` with `scripts/build_private_dj_prerelease.py`; do not republish an earlier private version or overwrite the public archive. `release-sources.json` selects the public source explicitly. The public builder verifies the pinned archive and excludes private plugins.
+Radio DJ has been retired. Current source provides catalog, profile, SmoothFade,
+relationship, and collection services without DJ workers or model dependencies.
 
-## Host contract
+## Upgrading a DJ-enabled private installation
 
-The dedicated worker must attest `lumae-dj-host-v1`. This declaration means the host provides all of these behaviors:
+Stop and drain the old dedicated DJ workers before upgrading all plugin processes.
+The install migration removes the six legacy DJ tables and the two DJ cron
+registrations. Catalog data, loudness and edge profiles, collections, and unrelated
+scheduled tasks are preserved. Run the migration again safely after an interrupted
+installation. Do not run old DJ worker code against the upgraded database.
 
-- `plugin.api.enqueue(..., queue="lumae-dj")` actually routes to the dedicated DJ queue.
-- DJ task execution and worker hooks have the correct plugin/database context and a stable PostgreSQL session for each job. Transaction-pooling proxies are unsuitable for the execution lock.
-- Only the dedicated model host sets `LUMAE_DJ_WORKER=1` and `LUMAE_DJ_HOST_CONTRACT=lumae-dj-host-v1`.
-- The host calls `attest_dj_worker_capability()` periodically, including while DJ mode is disabled. The existing private DJ test image's two-minute attestation loop meets this requirement; attestations expire after ten minutes.
-- The host has the pinned CPU dependencies from `requirements-dj.txt`, local model storage, and an appropriate process/container resource limit. Optional packages are not installed from a playback request.
+Old model files are not removed by a database migration. After retiring the old
+workers, an administrator can remove their dedicated model cache using the host's
+normal storage management. Do not remove shared audio or provider data.
 
-The inspected `lumae/audiomuse-ai:3.3.1-dj-v2-test.9` image supplies custom DJ routing and attestation. Its dedicated worker needs the additional contract environment variable for this source revision. Setting that variable on a stock image does not add the missing routing implementation. Configure the custom core consistently on the web and worker sides.
+## Releases and validation
 
-Stop/drain existing DJ workers before installing this revision, then update all DJ workers together. Older plugin code predates the session-lock protocol and must not participate in the same durable queue during rollout. Installation is additive; it preserves V2 and V3 tables. Methods change to `...v2.4` and `...v3.1`, so old annotations become stale and can be requested again.
+`release-sources.json` selects the public release explicitly. Published archives
+are immutable: prepare a new version to ship source changes and never overwrite
+1.2.0. Historical private archives are retained as upgrade references; they are
+not current runtime instructions. No deployment is performed by local tests.
 
-Enabling DJ Mode installs/enables a one-minute reconciliation schedule on the ordinary queue. Dispatch is coalesced for two minutes and waits for live analysis/setup ownership. Gated work, failed enqueue attempts, abandoned running work, and missing setup all receive another wake-up. Disabled mode stops analysis dispatch; a pending model-removal command keeps reconciliation enabled until its worker result is available.
-
-A PostgreSQL session lock covers acquisition, inference, projection and publication. Claiming abandoned work issues a new token. Cancellation, source identity and token checks fence publication; cancellation is polled at most twice per second during compute, with forced checks between stages and before publication. Model removal waits for analysis ownership and the setup lock, then deletes artifacts on the worker host.
-
-The analysis deadline is cooperative and includes elapsed source acquisition when allocating the remaining inference budget. It cannot interrupt a blocked provider call or native inference call. Model downloads have a separate bounded deadline and socket timeout. Host process supervision supplies any required hard end-to-end job limit; the plugin does not claim that AudioMuse enforces its ignored queue timeout argument.
-
-## Client semantics
-
-V2 and V3 keep separate API/storage contracts. Both use the shared job repository and immutable raw evidence. If both versions are pending for the same current source/calibration, the worker performs inference once and builds both projections. Per-job model construction and two bounded decoder passes remain; changing those requires measurements on the target host.
-
-- V3 cancellation: `POST /api/dj/v3/analysis/cancel`, with the same source and `ids` fields as analysis requests.
-- Both analyze routes accept an optional boolean `force`. Unsupported and cancelled results stay cached for the same source/producer; explicit force or a changed source/method/calibration permits a new attempt. Transient failures use 1/5/15/60-minute delays and stop automatic retries after five attempts.
-- Analysis reads budget JSON payload transfer to 2 MiB per response. Consume `next_ids` until empty. An individual oversized analysis returns `analysis_response_too_large`; envelope/status fields add a small amount of overhead.
-- Exact source start and EOF remain in `natural_boundaries`. `suggested_audible_boundaries` are estimates with `trim_authorized=false`.
-- Scalar energy seam evidence creates loop candidates with `loop_verified=false`. Precise playback representation verification and public playback qualification remain false.
-- Coverage reports use candidate-level tempo, section and speech evidence and identify themselves as eligibility estimates. They are not a rendered-transition or listening qualification.
-- Optional edge/DJ data receives a 30-day grace period after absence is first observed in a published catalogue. Refresh maintenance processes at most 1,000 rows per table per pass, preserves active jobs, and clears orphan markers for returning tracks.
-
-## Runtime measurements
-
-The normal CI workflow discovers every test under `tests/plugins` and uses PostgreSQL 17. Model inference is a separate manual workflow, `Optional DJ runtime qualification`, on an administrator-provided runner labelled `lumae-dj-qualification`.
-
-Install the exact CPU runtime on that runner and supply verified local model files and a consented corpus. No model or audio downloads occur in the qualification script. The corpus format is:
-
-```json
-{"cases": [{"path": "audio/speech.flac"}, {"path": "audio/long-track.flac"}]}
-```
-
-Paths are relative to the corpus file or absolute. Include speech, singing, instrumental music, quiet/flat passages, irregular rhythm, short sources, long tracks and the codecs/representations used by the player.
+The normal CI workflow discovers `tests/plugins` and runs PostgreSQL integration
+checks. Set `LUMAE_POSTGRES_TEST_DSN` to a disposable database for local integration
+checks. Ordinary tests must not connect to a production database.
 
 ```sh
-python scripts/qualify_dj_runtime.py --corpus /srv/lumae-qualification/corpus.json --beat-this /srv/lumae-qualification/final0.ckpt --yamnet /srv/lumae-qualification/yamnet.tflite --output qualification-report.json
+python -m pytest tests/plugins -q
+python scripts/build_catalog.py --check
 python scripts/benchmark_relationship_inputs.py --tracks 100000 --output relationship-memory.json
 ```
-
-Each audio case runs in a fresh process with a hard timeout and sampled peak RSS, builds both projections, and reports stage timings and payload sizes. Reports omit audio paths/titles and never authorize playback. Calibration approval, rendered PCM seam checks, listening evaluation and actual player/decoder alignment require separate evidence.
 
 ## Friend Album Discovery
 

@@ -1052,10 +1052,12 @@ def _drop_dj_tables(db):
             "dj_control",
         ):
             cur.execute(f"DROP TABLE IF EXISTS {table(name)} CASCADE")
-        try:
-            cur.execute("DELETE FROM cron WHERE task_type LIKE 'plugin.lumae_analysis.dj%'")
-        except Exception:
-            pass
+        # Match only the retired registrations; LIKE treats underscores as wildcards.
+        # Let failures abort the migration transaction instead of hiding them.
+        cur.execute(
+            "DELETE FROM cron WHERE task_type IN (%s, %s)",
+            ("plugin.lumae_analysis.dj_analysis", "plugin.lumae_analysis.dj_reconcile"),
+        )
 
 
 def migrate(db):
