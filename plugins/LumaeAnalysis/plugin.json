@@ -90,6 +90,14 @@
   },
   "versions": [
     {
+      "version": "1.2.1",
+      "min_core_version": "3.2.0",
+      "changelog": "Remove retired Radio DJ analysis, routes, worker registrations, and dependencies. Clean up legacy DJ tables and schedules on upgrade while preserving catalog, loudness, SmoothFade edge profiles, collections, credits, and relationship data. Stop old dedicated DJ workers before upgrading.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.2.1.zip",
+      "checksum": "d519b34d4b57e2600fb71fc2c32f3cbb"
+    },
+    {
       "version": "1.2.0",
       "min_core_version": "3.2.0",
       "changelog": "Add Personal Shelves synchronization and insights, MusicBrainz credits enrichment, resumable relationship builds, source-bound edge profiles, and opt-in DJ analysis with bounded queue deferral and interrupted-work recovery. Preserve the Navidrome identity guard from 1.1.9. DJ analysis requires a compatible dedicated worker and remains disabled by default.",
