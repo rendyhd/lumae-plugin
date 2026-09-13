@@ -52,10 +52,11 @@ def has_credit_relationships(entity):
 
 
 class Client:
-    def __init__(self, db, allowed=lambda: True, http=None, sleep=time.sleep):
+    def __init__(self, db, allowed=lambda: True, http=None, sleep=time.sleep, reserve_request=None):
         self.db, self.allowed = db, allowed
         self.http, self.sleep = http or requests.Session(), sleep
         self.requests = 0
+        self.reserve_request = reserve_request
 
     def get(self, entity, entity_id=None, **params):
         visited = set()
@@ -110,6 +111,8 @@ class Client:
                 raise MusicBrainzDeferred("Credits work paused or superseded", 60)
             cur.execute(f"UPDATE {table('credits_http_control')} SET next_request_at=clock_timestamp()+interval '1 second' WHERE singleton=1")
             self.db.commit()
+            if self.reserve_request is not None:
+                self.reserve_request()
             self.requests += 1
             try:
                 response = self.http.get(BASE_URL + path, params=params,

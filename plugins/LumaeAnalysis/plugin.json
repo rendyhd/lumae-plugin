@@ -86,9 +86,42 @@
         "provider_identity_rekey_v1",
         "bounded_storage_retention"
       ]
+    },
+    "personal_discovery": {
+      "schema_version": 1,
+      "features": [
+        "principal_scope",
+        "catalogue_independent",
+        "field_conflicts",
+        "tombstones",
+        "epoch_bootstrap",
+        "canonical_save_aliases",
+        "introduction_provenance"
+      ]
+    },
+    "music_metadata": {
+      "schema_version": 1,
+      "provider": "musicbrainz",
+      "daily_request_limit": 80,
+      "features": [
+        "external_entities",
+        "leased_jobs",
+        "cancel",
+        "typed_verification",
+        "shared_http_cache",
+        "playback_priority"
+      ]
     }
   },
   "versions": [
+    {
+      "version": "1.2.2",
+      "min_core_version": "3.2.0",
+      "changelog": "Add catalogue-independent personal discovery sync with field conflicts, tombstones and epoch recovery. Add external MusicBrainz entity jobs with playback priority, cancellation and a persistent 80-request daily allowance per account. Existing shelf and credits APIs remain compatible.",
+      "imageUrl": "",
+      "checksum": "72ec8ca31184e26c847445d694420132",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.2.2.zip"
+    },
     {
       "version": "1.2.1",
       "min_core_version": "3.2.0",

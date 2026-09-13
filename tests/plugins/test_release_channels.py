@@ -122,20 +122,22 @@ def test_new_source_release_keeps_previous_archive_immutable(release_root):
     assert old.read_bytes() == previous_bytes
 
 
-def test_current_removal_candidate_contains_supported_source_only():
+def test_current_release_contains_supported_source_only():
     import zipfile
 
     metadata = json.loads((ROOT / "plugins/LumaeAnalysis/plugin.json").read_text())
     latest = metadata["versions"][0]
-    assert latest["version"] == "1.2.1"
-    archive = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.1.zip"
+    assert latest["version"] == "1.2.2"
+    archive = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.2.zip"
     assert hashlib.md5(archive.read_bytes()).hexdigest() == latest["checksum"]
     with zipfile.ZipFile(archive) as package:
         names = package.namelist()
         assert not any(Path(name).name.startswith(("dj_", "provision_dj")) for name in names)
         assert "edge_profiles.py" in names
+        assert "personal_discovery.py" in names
+        assert "music_metadata.py" in names
         assert package.read("__init__.py") == (ROOT / "plugins/LumaeAnalysis/__init__.py").read_bytes()
-        assert b"PLUGIN_VERSION = \"1.2.1\"" in package.read("__init__.py")
+        assert b"PLUGIN_VERSION = \"1.2.2\"" in package.read("__init__.py")
         assert b"def _drop_dj_tables" in package.read("__init__.py")
     previous = next(item for item in metadata["versions"] if item["version"] == "1.2.0")
     assert hashlib.md5((ROOT / "dist/lumae_analysis/lumae_analysis_1.2.0.zip").read_bytes()).hexdigest() == previous["checksum"]

@@ -24,6 +24,23 @@ The plugin provides:
 * server-owned album and artist relationship generations using Lumae's native scoring model, published as resumable snapshots and deltas;
 * nonblocking enrichment: a complete provider catalogue is app-ready while waveform and relationship backlogs continue.
 
+### Discovery support in 1.2.2
+
+Adds catalogue-independent Want Shelf, memory, feedback, Rest and introduction
+provenance synchronization, plus background MusicBrainz checks for external
+artists, release groups, editions and recordings. Existing shelf v1 and credits
+APIs remain unchanged. This is server support; the corresponding mobile data
+and recommendation features must also be implemented in the app.
+
+Enable **the collection manager** in Lumae Analysis settings to enable personal
+discovery sync. Sign in with the same AudioMuse account on each device. An
+installation token uses shared storage for everyone using that token.
+MusicBrainz checking requires no account/key and pauses with background
+maintenance or pending playback work. Last.fm/AI keys belong in the mobile app.
+
+See [Discovery API and operations](docs/discovery-api-v1.md) for contracts,
+recovery, limits, test commands and release qualification.
+
 ### Personal Shelves, credits, and recovery in 1.2.0
 
 This release adds Personal Shelves synchronization and insights, MusicBrainz

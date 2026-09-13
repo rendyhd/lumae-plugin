@@ -104,7 +104,7 @@ def test_plugin_manifest_has_lumae_identity():
     assert manifest["id"] == "lumae_analysis"
     assert manifest["name"] == "Lumae Analysis"
     assert manifest["requirements"] == []
-    assert manifest["versions"][0]["version"] == "1.2.1"
+    assert manifest["versions"][0]["version"] == "1.2.2"
     assert manifest["versions"][0]["min_core_version"] == "3.2.0"
     assert manifest["capabilities"]["lumae_analysis_profiles"] == {
         "schema_version": 1,
@@ -197,7 +197,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": "1.2.1",
+        "plugin_version": "1.2.2",
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -205,6 +205,8 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
         "schema_version": 1,
         "analyzer_version": 1,
         "capabilities": {
+            "personal_discovery": {"schema_version": 1, "enabled": False, "scope": "shared"},
+            "music_metadata": {"schema_version": 1, "enabled": True, "provider": "musicbrainz", "daily_request_limit": 80},
             "shelves": {"schema_version": 1, "enabled": False, "scope": "shared"},
             "collections": {
                 "schema_version": 1,
@@ -534,7 +536,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == "1.2.1"
+    assert body["plugin_version"] == "1.2.2"
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -4343,6 +4345,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
     ) in db.cursor_obj.executed
     cron_inserts = [params for sql, params in db.cursor_obj.executed if "INSERT INTO cron" in sql]
     assert cron_inserts == [
+        ("Lumae album metadata", "plugin.lumae_analysis.music_metadata", "* * * * *"),
         (
             mod.CATALOG_REFRESH_TASK_TYPE,
             mod.CATALOG_REFRESH_TASK_TYPE,
@@ -7765,6 +7768,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
     ]
     assert ctx.cron_tasks == [
+        ("music_metadata", mod.music_metadata.run_one, "default"),
         ("catalog_reconcile", mod.catalog_reconcile_task, "default"),
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),

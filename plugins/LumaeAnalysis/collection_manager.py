@@ -1068,7 +1068,7 @@ def render_collections_settings_panel():
     return f"""
       <section class="lumae-panel" aria-label="Living Collections">
         <h3>Living Collections</h3>
-        <p class="lumae-help">Manage mixed album-and-track collections in AudioMuse and synchronize collections and Personal Shelves with Lumae, including shelf arrangement, recommendation evidence, and listening insights. Shelf management is in the mobile app. Turning this off hides the manager and sync APIs without deleting anything.</p>
+        <p class="lumae-help">Manage mixed album-and-track collections in AudioMuse and synchronize collections and Personal Shelves with Lumae, including shelf arrangement, recommendation evidence, and listening insights. Shelf management is in the mobile app. This also enables Want Shelf, musical memories, feedback and Rest sync in compatible Lumae apps. Use the same account on each device; server-token users share one shelf. Turning this off hides the manager and sync APIs without deleting anything.</p>
         <form class="lumae-form" method="post">
           <label class="lumae-toggle">
             <input type="checkbox" name="collection_manager_enabled" {checked}>
@@ -1079,6 +1079,7 @@ def render_collections_settings_panel():
             {location}
           </div>
         </form>
+        <p class="lumae-help">Album metadata: MusicBrainz lookups need no account or API key. External album checking runs in the background, pauses for playback work and respects Pause background maintenance. Each account gets up to 80 uncached requests per UTC day. Last.fm and AI keys are configured only in the Lumae app.</p>
       </section>
     """
 

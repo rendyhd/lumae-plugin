@@ -24,7 +24,7 @@ from .edge_profile_store import (
     publish_edge_profile, edge_backfill_candidates,
 )
 from . import optional_storage
-from . import credits_service, credits_store
+from . import credits_service, credits_store, personal_discovery, music_metadata
 from .shelves import SHELVES_SCHEMA_VERSION, migrate_shelves, register_shelf_routes
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
@@ -111,7 +111,7 @@ from .reconcile import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.2.1"
+PLUGIN_VERSION = "1.2.2"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -203,6 +203,8 @@ COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
 bp = Blueprint("lumae_analysis", __name__)
 register_collection_routes(bp)
 register_shelf_routes(bp)
+personal_discovery.register_routes(bp)
+music_metadata.register_routes(bp)
 credits_service.register_routes(bp)
 
 
@@ -1262,6 +1264,9 @@ def migrate(db):
     compact_enrichment_storage(db)
     migrate_collections(db)
     migrate_shelves(db)
+    personal_discovery.migrate(db)
+    music_metadata.migrate(db)
+    music_metadata.ensure_schedule(db)
     ensure_catalog_refresh_schedule(db)
     ensure_catalog_reconcile_schedule(db)
     ensure_provider_identity_recheck_schedule(db)
@@ -1744,6 +1749,8 @@ def health():
             "capabilities": {
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
+                "personal_discovery": {"schema_version": 1, "enabled": collections_enabled(), "scope": current_collection_scope()["mode"]},
+                "music_metadata": {"schema_version": 1, "enabled": not maintenance_paused(), "provider": "musicbrainz", "daily_request_limit": 80},
                 "shelves": {
                     "schema_version": SHELVES_SCHEMA_VERSION,
                     "enabled": collections_enabled(),
@@ -5764,6 +5771,7 @@ def register(ctx):
     ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_task("credits", credits_service.run_one, queue="default")
+    ctx.add_cron_task("music_metadata", music_metadata.run_one, queue="default")
     ctx.add_task(
         "relationship_preparation", relationship_preparation_task, queue="default"
     )
