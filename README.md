@@ -185,3 +185,7 @@ Under the Lumae API prefix, `GET /shelves/snapshot` and `GET /shelves/changes` a
 Records and mutation receipts are partitioned by authenticated principal and catalogue identity. Signed-in users have personal shelves; bearer-token users share the installation scope, matching Collections. Membership periods retain deletion tombstones, simultaneous duplicate additions converge, and provider identity rekeys update only the matching catalogue. Search evidence contains selected entity IDs rather than raw queries. Rating changes/removals, active-view cooldowns, and occurrence-identified qualified listening synchronize idempotently. Mobile keeps recommendation batches and scroll positions local.
 
 Shelf storage is additive and independent of the provider catalogue cache. An ordinary refresh does not erase curated membership or durable listening. Disabled or older plugins leave mobile shelves usable offline with pending changes retained. The browser shelf manager, publication, and deployment are outside this implementation.
+
+### Discovery qualification update (1.2.3)
+
+Album memories now retain their artist context. Explicit enjoyment is independent of recognition; “new to me” and “enjoyed” can both be true. Health advertises `album_memory_context` and `enjoyment_feedback`; older mobile clients and existing schema-v1 records remain compatible. Release 1.2.2 remains immutable.

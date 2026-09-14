@@ -147,3 +147,7 @@ only the plugin does not finish the pending mobile Want Shelf/prediction work.
 - Existing release archives and private test builds were preserved.
 - MusicBrainz HTTP behavior was tested with controlled responses; this is not a
   live recommendation-quality benchmark.
+
+## Additive capabilities in 1.2.3
+
+`personal_discovery.features` includes `album_memory_context` and `enjoyment_feedback`. Album memory entities accept an optional bounded `artist` string. Feedback affection accepts `enjoyed` independently of `recognition` (including `new_to_me`). Clients retain these edits locally with an update message when the capability is absent.

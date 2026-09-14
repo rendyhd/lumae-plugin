@@ -266,3 +266,16 @@ def test_metadata_yields_to_playback_and_shared_principal_is_distinct(api):
     shared = client.get('/api/personal_discovery/bootstrap', headers={'Test-Auth': 'bearer'}).get_json()
     assert personal['epoch'] != shared['epoch']
     assert client.get('/api/personal_discovery/changes', query_string={'epoch': personal['epoch'], 'cursor': 999}).status_code == 410
+
+
+def test_album_memory_context_and_enjoyment_are_independent_of_recognition(api):
+    client, _, _, _ = api
+    epoch = initial(client)['epoch']
+    memory = mutation(epoch, kind='memory', fields={'entity': {'kind':'album','name':'The Young and the Hopeless','artist':'Good Charlotte'}, 'text':'School days','includeInRecommendations':True})
+    assert post(client,memory).status_code == 200
+    feedback = mutation(epoch,kind='feedback',fields={'entity':{'kind':'album','id':uid()},'recognition':'new_to_me','affection':'enjoyed'})
+    saved=post(client,feedback)
+    assert saved.status_code == 200
+    assert saved.get_json()['record']['fields']['recognition'] == 'new_to_me'
+    invalid=mutation(epoch,kind='memory',fields={'entity':{'kind':'album','name':'Album','artist':{'apiKey':'no'}}})
+    assert post(client,invalid).status_code == 400

@@ -80,7 +80,7 @@ def validate(body):
         raise ValueError("Invalid aliases")
     if "recognition" in fields and fields["recognition"] not in ("remembered", "new_to_me", "unknown", None):
         raise ValueError("Invalid recognition")
-    if "affection" in fields and fields["affection"] not in ("old_favourite", "not_for_me", "neutral", "unknown", None):
+    if "affection" in fields and fields["affection"] not in ("old_favourite", "enjoyed", "not_for_me", "neutral", "unknown", None):
         raise ValueError("Invalid affection")
     if "intent" in fields and fields["intent"] not in (None, "discovery", "comfort", "unclassified"):
         raise ValueError("Invalid saving intent")
@@ -88,8 +88,10 @@ def validate(body):
         raise ValueError("Invalid memory consent")
     if "entity" in fields:
         entity = fields["entity"]
-        if not isinstance(entity, dict) or set(entity) - {"kind", "id", "catalogId", "mbid", "name"}:
+        if not isinstance(entity, dict) or set(entity) - {"kind", "id", "catalogId", "mbid", "name", "artist"}:
             raise ValueError("Invalid entity reference")
+        if "artist" in entity and (not isinstance(entity["artist"], str) or not 0 < len(entity["artist"]) <= 500):
+            raise ValueError("Invalid memory artist")
         if entity.get("kind") == "recording":
             identifier(entity.get("mbid"))
         elif entity.get("kind") == "track":

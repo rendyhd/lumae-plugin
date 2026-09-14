@@ -90,13 +90,8 @@
     "personal_discovery": {
       "schema_version": 1,
       "features": [
-        "principal_scope",
-        "catalogue_independent",
-        "field_conflicts",
-        "tombstones",
-        "epoch_bootstrap",
-        "canonical_save_aliases",
-        "introduction_provenance"
+        "album_memory_context",
+        "enjoyment_feedback"
       ]
     },
     "music_metadata": {
@@ -114,6 +109,14 @@
     }
   },
   "versions": [
+    {
+      "version": "1.2.3",
+      "min_core_version": "3.2.0",
+      "changelog": "Complete personal discovery feedback: sync album-specific memories with artist context and explicit enjoyment independently of nostalgia recognition. Advertise both capabilities for safe upgrades from 1.2.2.",
+      "imageUrl": "",
+      "checksum": "bbd4851056e30e2561c887b86085a910",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.2.3.zip"
+    },
     {
       "version": "1.2.2",
       "min_core_version": "3.2.0",
