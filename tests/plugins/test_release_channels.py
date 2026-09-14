@@ -141,3 +141,15 @@ def test_current_release_contains_supported_source_only():
         assert b"def _drop_dj_tables" in package.read("__init__.py")
     previous = next(item for item in metadata["versions"] if item["version"] == "1.2.0")
     assert hashlib.md5((ROOT / "dist/lumae_analysis/lumae_analysis_1.2.0.zip").read_bytes()).hexdigest() == previous["checksum"]
+
+
+@pytest.mark.parametrize("platform", ["win32", "linux"])
+def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, platform):
+    import zipfile
+
+    # ZipInfo otherwise records the host platform in every central directory entry.
+    monkeypatch.setattr(zipfile.sys, "platform", platform)
+    candidate = tmp_path / "release.zip"
+    builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
+    published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.3.zip"
+    assert candidate.read_bytes() == published.read_bytes()

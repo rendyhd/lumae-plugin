@@ -33,6 +33,8 @@ def code_zip(source, output):
             if name == "plugin.json":
                 continue
             info = zipfile.ZipInfo(name, (1980, 1, 1, 0, 0, 0))
+            # Match existing releases regardless of the build host's platform.
+            info.create_system = 0
             info.compress_type = zipfile.ZIP_DEFLATED
             info.external_attr = 0o644 << 16
             archive.writestr(info, path.read_bytes())
