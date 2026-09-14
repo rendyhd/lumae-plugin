@@ -148,8 +148,37 @@ def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, pl
     import zipfile
 
     # ZipInfo otherwise records the host platform in every central directory entry.
-    monkeypatch.setattr(zipfile.sys, "platform", platform)
+    from types import SimpleNamespace
+
+    monkeypatch.setattr(zipfile, "sys", SimpleNamespace(platform=platform))
     candidate = tmp_path / "release.zip"
     builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
     published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.3.zip"
-    assert candidate.read_bytes() == published.read_bytes()
+    assert builder.same_zip_contents(candidate, published)
+    builder.build_catalog(ROOT, repository="rendyhd/lumae-plugin", check=True)
+
+
+def test_source_validation_preserves_archive_with_different_compression(release_root):
+    import zipfile
+
+    metadata_path = release_root / "plugins/LumaeAnalysis/plugin.json"
+    metadata = json.loads(metadata_path.read_text())
+    archive = release_root / "dist/lumae_analysis/lumae_analysis_1.1.8.zip"
+    source = release_root / "plugins/LumaeAnalysis/__init__.py"
+    with zipfile.ZipFile(archive, "w", zipfile.ZIP_STORED) as package:
+        package.writestr("__init__.py", source.read_bytes())
+    original = archive.read_bytes()
+    declared = hashlib.md5(original).hexdigest()
+    metadata["versions"][0]["checksum"] = declared
+    metadata_path.write_text(json.dumps(metadata))
+    policy_path = release_root / "release-sources.json"
+    policy = json.loads(policy_path.read_text())
+    policy["plugins"]["LumaeAnalysis"]["mode"] = "source"
+    policy_path.write_text(json.dumps(policy))
+
+    builder.build_catalog(release_root, repository="owner/repo")
+    assert hashlib.md5(archive.read_bytes()).hexdigest() == declared
+    assert json.loads(metadata_path.read_text())["versions"][0]["checksum"] == declared
+    source.write_bytes(b"changed source")
+    with pytest.raises(ValueError, match="immutable"):
+        builder.build_catalog(release_root, repository="owner/repo")

@@ -40,6 +40,15 @@ def code_zip(source, output):
             archive.writestr(info, path.read_bytes())
 
 
+def same_zip_contents(first, second):
+    # Compression libraries may produce different bytes for identical source.
+    with zipfile.ZipFile(first) as left, zipfile.ZipFile(second) as right:
+        return (
+            sorted(left.namelist()) == sorted(right.namelist())
+            and all(left.read(name) == right.read(name) for name in left.namelist())
+        )
+
+
 def build_catalog(root, *, repository, branch="main", check=False):
     root = Path(root).resolve()
     policy = json.loads((root / "release-sources.json").read_text(encoding="utf-8"))
@@ -84,7 +93,7 @@ def build_catalog(root, *, repository, branch="main", check=False):
                 if declared and (
                     not artifact.is_file()
                     or checksum(artifact) != declared
-                    or actual != declared
+                    or not same_zip_contents(artifact, candidate)
                 ):
                     raise ValueError(
                         f"{folder}: published versions are immutable; select a new version"
@@ -95,7 +104,7 @@ def build_catalog(root, *, repository, branch="main", check=False):
                             "Unchecksummed release would replace an existing archive"
                         )
                     writes.append((artifact, candidate.read_bytes()))
-                latest["checksum"] = actual
+                latest["checksum"] = declared or actual
             latest["sourceUrl"] = f'{raw}/dist/{meta["id"]}/{artifact.name}'
             writes.append((metadata_path, (json.dumps(meta, indent=2) + "\n").encode()))
             catalog.append(
