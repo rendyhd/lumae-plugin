@@ -105,10 +105,19 @@
         "typed_verification",
         "shared_http_cache",
         "playback_priority"
-      ]
+      ],
+      "recording_membership": true
     }
   },
   "versions": [
+    {
+      "version": "1.2.4",
+      "min_core_version": "3.2.0",
+      "changelog": "Verify release type and complete single/EP recording membership for duplicate-safe Lumae recommendations.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.2.4.zip",
+      "checksum": "fbfa792371554bde7723d30d1234b36d"
+    },
     {
       "version": "1.2.3",
       "min_core_version": "3.2.0",

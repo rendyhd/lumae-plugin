@@ -279,3 +279,29 @@ def test_album_memory_context_and_enjoyment_are_independent_of_recognition(api):
     assert saved.get_json()['record']['fields']['recognition'] == 'new_to_me'
     invalid=mutation(epoch,kind='memory',fields={'entity':{'kind':'album','name':'Album','artist':{'apiKey':'no'}}})
     assert post(client,invalid).status_code == 400
+
+
+def test_single_membership_checks_complete_edition_and_keeps_recording_identity():
+    load_plugin()
+    meta = importlib.import_module('plugins.LumaeAnalysis.music_metadata')
+    group, release_id, recording_id = uid(), uid(), uid()
+    class FakeClient:
+        def get(self, kind, entity_id=None, **params):
+            if entity_id is None:
+                return {"release-count": 1, "releases": [{"id": release_id, "status": "Official", "date": "2002"}]}
+            return {"id": release_id, "release-group": {"id": group},
+                    "artist-credit": [{"name": "Simple Plan"}],
+                    "media": [{"track-count": 1, "tracks": [{"recording": {"id": recording_id, "title": "Song", "length": 180000}}]}]}
+    result = meta.membership({"id": group, "primary-type": "Single"}, FakeClient())
+    assert result['trackListComplete'] is True
+    assert result['releaseId'] == release_id
+    assert result['recordings'] == [{"id": recording_id, "title": "Song", "artist": "Simple Plan", "durationMs": 180000}]
+
+
+def test_membership_withholds_truncated_editions():
+    load_plugin()
+    meta = importlib.import_module('plugins.LumaeAnalysis.music_metadata')
+    class FakeClient:
+        def get(self, *args, **kwargs):
+            return {"release-count": 101, "releases": []}
+    assert meta.membership({"id": uid(), "primary-type": "EP"}, FakeClient())['trackListComplete'] is False

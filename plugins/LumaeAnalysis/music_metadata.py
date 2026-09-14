@@ -101,6 +101,46 @@ def artist_name(entity):
     return "".join((a.get("name") or (a.get("artist") or {}).get("name", "")) + a.get("joinphrase", "") for a in entity.get("artist-credit", []) if isinstance(a, dict))
 
 
+def membership(details, client):
+    """Resolve a deterministic official edition, never guess tracks from a release title."""
+    fields = {"releaseType": details.get("primary-type"), "trackListComplete": False}
+    if normalized(fields["releaseType"]) not in {"single", "ep"}:
+        return fields
+    editions = client.get("release", **{"release-group": details["id"], "limit": 100, "offset": 0})
+    rows = editions.get("releases") or []
+    if int(editions.get("release-count", len(rows))) > 100:
+        return fields
+    official = [r for r in rows if r.get("status") == "Official" and r.get("id")]
+    if not official:
+        return fields
+    chosen = sorted(official, key=lambda r: (r.get("date") or "9999", r["id"]))[0]
+    release = client.get("release", identifier(chosen["id"]), inc="artist-credits+recordings+release-groups")
+    if (release.get("release-group") or {}).get("id") != details["id"]:
+        return fields
+    media = release.get("media") or []
+    complete = bool(media)
+    recordings = []
+    for medium in media:
+        tracks = medium.get("tracks") or []
+        complete = complete and medium.get("track-count") == len(tracks) and bool(tracks)
+        for track in tracks:
+            recording = track.get("recording") or {}
+            title = recording.get("title") or track.get("title")
+            artist = artist_name(recording) or artist_name(track) or artist_name(release)
+            if not recording.get("id") or not title or not artist:
+                complete = False
+                continue
+            row = {"id": identifier(recording["id"]), "title": title, "artist": artist}
+            if recording.get("disambiguation"):
+                row["version"] = recording["disambiguation"]
+            if recording.get("length") or track.get("length"):
+                row["durationMs"] = recording.get("length") or track["length"]
+            recordings.append(row)
+    fields.update(releaseId=identifier(release["id"]), recordings=recordings[:1000],
+                  trackListComplete=bool(complete and recordings and len(recordings) <= 1000))
+    return fields
+
+
 def resolve(entity, client):
     kind, mbid = entity["kind"], entity.get("mbid")
     evidence = "typed_identifier"
@@ -131,6 +171,8 @@ def resolve(entity, client):
     for source, target in (("first-release-date", "firstReleaseDate"), ("date", "editionDate"), ("country", "country")):
         if details.get(source):
             fields[target] = details[source]
+    if kind == "release-group":
+        fields.update(membership(details, client))
     return {"status": "verified", "kind": kind, "verifiedFields": fields, "evidence": evidence,
             "source": f"https://musicbrainz.org/{kind}/{fields['id']}",
             "recognition": "unknown", "relatedEntities": "not_resolved"}

@@ -111,7 +111,7 @@ from .reconcile import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.2.3"
+PLUGIN_VERSION = "1.2.4"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -1750,7 +1750,7 @@ def health():
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
                 "personal_discovery": {"schema_version": 1, "enabled": collections_enabled(), "scope": current_collection_scope()["mode"], "features": ["album_memory_context", "enjoyment_feedback"]},
-                "music_metadata": {"schema_version": 1, "enabled": not maintenance_paused(), "provider": "musicbrainz", "daily_request_limit": 80},
+                "music_metadata": {"schema_version": 1, "enabled": not maintenance_paused(), "provider": "musicbrainz", "daily_request_limit": 80, "recording_membership": True},
                 "shelves": {
                     "schema_version": SHELVES_SCHEMA_VERSION,
                     "enabled": collections_enabled(),
