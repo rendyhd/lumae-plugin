@@ -1897,6 +1897,7 @@ def catalog_health():
                 if not transition["catalog_sync_allowed"] and server.get("v3_readiness"):
                     readiness = dict(server["v3_readiness"])
                     readiness["ready"] = False
+                    readiness["fully_verified"] = False
                     readiness["analysis_sync_allowed"] = False
                     readiness["blockers"] = list(
                         dict.fromkeys([*(readiness.get("blockers") or []), TRANSITION_BLOCKER])

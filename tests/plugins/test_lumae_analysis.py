@@ -603,6 +603,7 @@ def test_catalog_health_denies_both_streams_while_provider_identity_is_pending(m
     assert server["catalog_sync_allowed"] is False
     assert server["analysis_sync_allowed"] is False
     assert server["v3_readiness"]["ready"] is False
+    assert server["v3_readiness"]["fully_verified"] is False
     assert server["v3_readiness"]["admission"]["catalog"] == {
         "admitted": False,
         "status": "denied",
