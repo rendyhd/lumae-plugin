@@ -111,6 +111,14 @@
   },
   "versions": [
     {
+      "version": "1.2.5",
+      "min_core_version": "3.2.0",
+      "changelog": "Set fully_verified to False when transition blocks catalog sync to preserve progressive readiness contract.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.2.5.zip",
+      "checksum": "0db09b2f7f7ee7e453a89d51d5c9969f"
+    },
+    {
       "version": "1.2.4",
       "min_core_version": "3.2.0",
       "changelog": "Verify release type and complete single/EP recording membership for duplicate-safe Lumae recommendations.",

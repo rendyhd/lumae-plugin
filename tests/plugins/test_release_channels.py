@@ -127,8 +127,8 @@ def test_current_release_contains_supported_source_only():
 
     metadata = json.loads((ROOT / "plugins/LumaeAnalysis/plugin.json").read_text())
     latest = metadata["versions"][0]
-    assert latest["version"] == "1.2.4"
-    archive = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.4.zip"
+    assert latest["version"] == "1.2.5"
+    archive = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
     assert hashlib.md5(archive.read_bytes()).hexdigest() == latest["checksum"]
     with zipfile.ZipFile(archive) as package:
         names = package.namelist()
@@ -137,10 +137,10 @@ def test_current_release_contains_supported_source_only():
         assert "personal_discovery.py" in names
         assert "music_metadata.py" in names
         assert package.read("__init__.py") == (ROOT / "plugins/LumaeAnalysis/__init__.py").read_bytes()
-        assert b"PLUGIN_VERSION = \"1.2.4\"" in package.read("__init__.py")
+        assert b"PLUGIN_VERSION = \"1.2.5\"" in package.read("__init__.py")
         assert b"def _drop_dj_tables" in package.read("__init__.py")
-    previous = next(item for item in metadata["versions"] if item["version"] == "1.2.0")
-    assert hashlib.md5((ROOT / "dist/lumae_analysis/lumae_analysis_1.2.0.zip").read_bytes()).hexdigest() == previous["checksum"]
+    previous = next(item for item in metadata["versions"] if item["version"] == "1.2.4")
+    assert hashlib.md5((ROOT / "dist/lumae_analysis/lumae_analysis_1.2.4.zip").read_bytes()).hexdigest() == previous["checksum"]
 
 
 @pytest.mark.parametrize("platform", ["win32", "linux"])
@@ -153,7 +153,7 @@ def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, pl
     monkeypatch.setattr(zipfile, "sys", SimpleNamespace(platform=platform))
     candidate = tmp_path / "release.zip"
     builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
-    published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.4.zip"
+    published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
     assert builder.same_zip_contents(candidate, published)
     builder.build_catalog(ROOT, repository="rendyhd/lumae-plugin", check=True)
 
