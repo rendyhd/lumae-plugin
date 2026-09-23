@@ -242,6 +242,7 @@ def migrate_enrichment(db):
             token_hash TEXT NOT NULL UNIQUE,
             signing_secret TEXT NOT NULL,
             principal TEXT NOT NULL,
+            principal_contract_version INTEGER NOT NULL DEFAULT 2,
             catalog_instance_id TEXT NOT NULL,
             core_server_id TEXT NOT NULL,
             catalog_epoch TEXT NOT NULL,
@@ -254,6 +255,18 @@ def migrate_enrichment(db):
             expires_at TIMESTAMPTZ NOT NULL,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
+        """,
+        f"""
+        ALTER TABLE {t('profile_bootstrap_sessions')}
+        ADD COLUMN IF NOT EXISTS principal_contract_version INTEGER NOT NULL DEFAULT 1
+        """,
+        f"""
+        DELETE FROM {t('profile_bootstrap_sessions')}
+        WHERE principal_contract_version <> 2 OR principal LIKE 'user:%'
+        """,
+        f"""
+        ALTER TABLE {t('profile_bootstrap_sessions')}
+        ALTER COLUMN principal_contract_version SET DEFAULT 2
         """,
         f"""
         CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_principal_idx')}

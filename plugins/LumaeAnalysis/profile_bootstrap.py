@@ -14,9 +14,9 @@ import uuid
 from contextlib import contextmanager
 
 import psycopg2
-from psycopg2 import sql
 from psycopg2.extras import Json, execute_values
 
+import plugin.api as host_api
 from plugin.api import table
 
 from .catalog import opaque_cursor
@@ -120,37 +120,37 @@ def _require_request(body, *, creating=False):
         invalid()
 
 
-@contextmanager
-def _connection(host_db, *, repeatable=False, creator=False):
-    """Clone credentials and schema, but own every transaction and rollback."""
+def principal_binding(principal):
+    """Encode the host's durable account identity without a username fallback."""
+    if (getattr(principal, "kind", None) != "account"
+            or not isinstance(getattr(principal, "subject", None), str)
+            or not isinstance(getattr(principal, "authorization_generation", None), str)):
+        raise BootstrapError("authentication_required", 401)
     try:
-        # The host may set a request-local search_path. Reading it does not
-        # commit, roll back, or alter the host connection's transaction.
-        with host_db.cursor() as cur:
-            cur.execute("SELECT current_schema()")
-            schema = cur.fetchone()[0]
-        parameters = host_db.get_dsn_parameters()
-        # psycopg2 redacts passwords from .dsn and get_dsn_parameters().
-        if host_db.info.password:
-            parameters["password"] = host_db.info.password
-        # A configured zero or absent timeout must not hang an HTTP worker.
-        parameters["connect_timeout"] = 5
-        db = psycopg2.connect(**parameters)
+        subject = str(uuid.UUID(principal.subject))
+        generation = str(uuid.UUID(principal.authorization_generation))
+    except (ValueError, AttributeError):
+        raise BootstrapError("authentication_required", 401) from None
+    return json.dumps({"kind": principal.kind, "subject": subject,
+                       "authorization_generation": generation},
+                      sort_keys=True, separators=(",", ":"))
+
+
+@contextmanager
+def _connection(*, repeatable=False, creator=False):
+    """Use one host-owned backend; never touch the request connection."""
+    try:
+        db = host_api.open_db_connection(
+            isolation="repeatable_read" if repeatable else "read_committed",
+            connect_timeout=5, statement_timeout_ms=20_000,
+            lock_timeout_ms=5_000)
         try:
-            with db.cursor() as cur:
-                cur.execute(sql.SQL("SET search_path TO {}, public").format(sql.Identifier(schema)))
-            db.commit()
             if creator:
-                db.autocommit = True
                 with db.cursor() as cur:
-                    cur.execute("SET statement_timeout = '20s'")
                     cur.execute("SELECT pg_advisory_lock(110094, 10)")
-                db.autocommit = False
-            with db.cursor() as cur:
-                cur.execute("BEGIN ISOLATION LEVEL " +
-                            ("REPEATABLE READ" if repeatable else "READ COMMITTED"))
-                cur.execute("SET LOCAL statement_timeout = '20s'")
-                cur.execute("SET LOCAL lock_timeout = '5s'")
+                # End the acquisition transaction before the MVCC snapshot;
+                # the session advisory lock stays on this backend until close.
+                db.commit()
             yield db
             db.commit()
         except Exception:
@@ -160,7 +160,7 @@ def _connection(host_db, *, repeatable=False, creator=False):
             db.close()
     except BootstrapError:
         raise
-    except (psycopg2.Error, AttributeError, TypeError) as exc:
+    except (psycopg2.Error, AttributeError, TypeError, OSError, ValueError) as exc:
         raise BootstrapError("bootstrap_unavailable", 503) from exc
 
 
@@ -216,13 +216,13 @@ def _metadata(session):
             "total_profiles": session[11], "expires_at": _iso(session[12])}
 
 
-def create_session(host_db, body, principal):
+def create_session(body, principal):
     size = _require_request(body, creating=True)
     token = secrets.token_hex(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
     session_id = str(uuid.uuid4())
     secret = secrets.token_hex(32)
-    with _connection(host_db, repeatable=True, creator=True) as db:
+    with _connection(repeatable=True, creator=True) as db:
         with db.cursor() as cur:
             # Session advisory lock was acquired before the RR snapshot.
             cur.execute(f"DELETE FROM {_table('profile_bootstrap_sessions')} WHERE expires_at<=now()")
@@ -286,9 +286,9 @@ def create_session(host_db, body, principal):
                                              None, None, size), "snapshot", 0)}
 
 
-def snapshot_page(host_db, body, principal):
+def snapshot_page(body, principal):
     _require_request(body)
-    with _connection(host_db) as db:
+    with _connection() as db:
         with db.cursor() as cur:
             session, _ = _session(cur, body, principal, lock=True)
             ordinal = _ordinal(session, "snapshot", body.get("page_token"))
@@ -308,9 +308,9 @@ def snapshot_page(host_db, body, principal):
                     "has_more": more}
 
 
-def catchup_page(host_db, body, principal):
+def catchup_page(body, principal):
     _require_request(body)
-    with _connection(host_db) as db:
+    with _connection() as db:
         with db.cursor() as cur:
             session, state = _session(cur, body, principal, lock=True)
             ordinal = _ordinal(session, "catchup", body.get("page_token"))
@@ -377,9 +377,9 @@ def catchup_page(host_db, body, principal):
                     "has_more": more}
 
 
-def release_session(host_db, body, principal):
+def release_session(body, principal):
     _require_request(body)
-    with _connection(host_db) as db:
+    with _connection() as db:
         with db.cursor() as cur:
             token_hash = hashlib.sha256(body["session_token"].encode()).hexdigest()
             cur.execute(f"SELECT principal, catalog_instance_id FROM {_table('profile_bootstrap_sessions')} "

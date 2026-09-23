@@ -8,6 +8,7 @@ from html import escape
 from flask import Blueprint, Response, g, jsonify, request, url_for
 
 from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
+import plugin.api as host_api
 
 from .loudness import (
     ProfileAnalysisTimeout,
@@ -2590,15 +2591,23 @@ def profile_changes_api():
 
 
 def _profile_bootstrap_v2(operation):
-    principal = getattr(g, "auth_user", None)
-    if not principal:
+    resolver = getattr(host_api, "get_principal", None)
+    opener = getattr(host_api, "open_db_connection", None)
+    if not callable(resolver) or not callable(opener):
+        return _catalog_error("bootstrap_unavailable", "host_api_unavailable", 503)
+    try:
+        principal = resolver()
+        binding = profile_bootstrap.principal_binding(principal)
+    except profile_bootstrap.BootstrapError:
         return _catalog_error("authentication_required", "Authentication required.", 401)
+    except Exception:
+        return _catalog_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
     try:
         body = _json_body(max_bytes=16_384)
     except ValueError:
         return _catalog_error("invalid_profile_bootstrap", "Invalid bootstrap request.", 400)
     try:
-        result = operation(get_db(), body, f"user:{principal}")
+        result = operation(body, binding)
         return _private_json(result)
     except profile_bootstrap.BootstrapError as exc:
         return _catalog_error(exc.code, exc.code, exc.status)
