@@ -1,0 +1,20 @@
+
+> lumae@1.0.0 test
+> jest --runInBand src/services/__tests__/pluginEnrichmentSync.test.ts src/services/__tests__/providerIdentityPreflight.test.ts src/services/sync/__tests__/providerIdentityCoordinatorGuard.test.ts src/services/__tests__/catalogDiagnostics.test.ts src/services/sync/__tests__/syncDiagnostics.test.ts src/services/__tests__/lumaeAnalysisProfiles.test.ts src/store/__tests__/mixrampProfileDb.test.ts src/services/__tests__/pluginAnalysisResume.test.ts
+
+(node:64508) ExperimentalWarning: SQLite is an experimental feature and might change at any time
+(Use `node --trace-warnings ...` to show where the warning was created)
+PASS src/services/__tests__/pluginAnalysisResume.test.ts
+PASS src/services/__tests__/providerIdentityPreflight.test.ts
+PASS src/services/__tests__/lumaeAnalysisProfiles.test.ts
+PASS src/store/__tests__/mixrampProfileDb.test.ts
+PASS src/services/sync/__tests__/syncDiagnostics.test.ts
+PASS src/services/__tests__/pluginEnrichmentSync.test.ts
+PASS src/services/__tests__/catalogDiagnostics.test.ts
+PASS src/services/sync/__tests__/providerIdentityCoordinatorGuard.test.ts
+
+Test Suites: 8 passed, 8 total
+Tests:       107 passed, 107 total
+Snapshots:   0 total
+Time:        4.884 s
+Ran all test suites matching /src\\services\\__tests__\\pluginEnrichmentSync.test.ts|src\\services\\__tests__\\providerIdentityPreflight.test.ts|src\\services\\sync\\__tests__\\providerIdentityCoordinatorGuard.test.ts|src\\services\\__tests__\\catalogDiagnostics.test.ts|src\\services\\sync\\__tests__\\syncDiagnostics.test.ts|src\\services\\__tests__\\lumaeAnalysisProfiles.test.ts|src\\store\\__tests__\\mixrampProfileDb.test.ts|src\\services\\__tests__\\pluginAnalysisResume.test.ts/i.

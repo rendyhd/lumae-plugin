@@ -1,2 +1,4 @@
 docs/remediation/evidence/*.log -whitespace
 docs/remediation/evidence/phase0-client/*.log -whitespace
+# Historical Markdown uses intentional two-space line breaks.
+docs/remediation/LUMAE_ASTRA_MASTER_ORCHESTRATION.md -whitespace

@@ -1,0 +1,26 @@
+{
+  "success": true,
+  "passedSuites": 900,
+  "pendingSuites": 1,
+  "failedSuites": 0,
+  "passedTests": 8767,
+  "pendingTests": 3,
+  "failedTests": 0,
+  "skipped": [
+    {
+      "file": "C:\\Users\\rendy\\vscode\\Auralscape\\plugins\\__tests__\\backgroundDownloadSession.runtime.test.js",
+      "test": "routes downloader completion exclusively, and forwards unrelated/nil-bundle sessions to Expo",
+      "status": "pending"
+    },
+    {
+      "file": "C:\\Users\\rendy\\vscode\\Auralscape\\plugins\\__tests__\\iosInputDiagnosticsPolicy.test.js",
+      "test": "iOS input diagnostics build policy preprocesses native and RN gates for off/on/undefined",
+      "status": "pending"
+    },
+    {
+      "file": "C:\\Users\\rendy\\vscode\\Auralscape\\scripts\\__tests__\\verify-ios-smoothfade.test.js",
+      "test": "verify-ios-smoothfade release readiness contract parses every native XCTest source with the Apple Swift compiler",
+      "status": "pending"
+    }
+  ]
+}

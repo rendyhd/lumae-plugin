@@ -1,0 +1,13 @@
+ M src/components/LyricsView.tsx
+ M src/components/__tests__/LyricsView.test.tsx
+ M src/components/nowplaying/LyricsOverlay.tsx
+ M src/components/nowplaying/__tests__/LyricsOverlay.test.tsx
+ M src/lib/__tests__/compactViewport.test.ts
+ M src/lib/compactViewport.ts
+ M src/screens/NowPlayingScreen.tsx
+ M src/screens/__tests__/NowPlayingScreen.test.tsx
+ M src/services/remote/__tests__/rendererUrls.test.ts
+?? DESIGN.md
+?? docs/research/2026-09-22-issue-11-foldable-player-plan.md
+?? docs/testing/issue-11-foldable-now-playing.md
+?? docs/testing/phase-2.4a-personal-discovery-credential-sanitization.md

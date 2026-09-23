@@ -1,0 +1,33 @@
+Phase 0A Auralscape environment inventory
+Recorded: 2026-09-22 (Europe/Amsterdam)
+
+Repository: C:\Users\rendy\vscode\Auralscape
+HEAD: 6501c83da0691e42c304961d580ece22debd76cb
+Branch: main
+Worktree at audit start: dirty (38 porcelain entries, including pre-existing
+now-playing/navigation/settings work and untracked design/testing files).
+
+Runtime tools observed:
+- Node v24.12.0
+- npm 11.6.2
+- Expo CLI 57.0.16
+- Java/JDK: unavailable on PATH
+- Maestro: unavailable on PATH
+- xcodebuild/Xcode: unavailable on this Windows host
+
+Connected devices (read-only adb devices):
+- adb-59201FDCH00111-SciMKL._adb-tls-connect._tcp, state=device
+
+No device-mutating command, build, installation, data inspection, production
+database access, browser-session test, or production network access was run.
+
+Test evidence:
+- focused-jest.log: command completed; 8 suites / 107 tests passed / 0 skipped
+  reported / 0 snapshots.
+- full-jest.log: serial full-suite attempt did not produce a Jest completion
+  summary in the available command window. It is incomplete evidence, not a
+  pass or failure count.
+
+## Full Jest result (post-audit evidence correction)
+
+The full Jest run against `1f5467bc5415725e3c5ef6ff1b84f5f4da0664a6` completed successfully: `npm.cmd test -- --runInBand --json --outputFile <evidence path>` exited 0 in 251.756 s. Jest reported 900 passed and 1 skipped suites (901 total), 8,767 passed and 3 skipped tests (8,770 total), and 0 snapshots. The skipped suite was `plugins/__tests__/backgroundDownloadSession.runtime.test.js`; its three tests require runtime downloader-session behavior. See `evidence/phase0-client/full-jest-current.log` and `full-jest-current.json`.
