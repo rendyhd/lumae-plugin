@@ -86,6 +86,7 @@ from .provider_identity_guard import (
 )
 from .provider_identity_rekey import read_transition_manifest, refresh_audiomuse_health
 from .profile_publication import admit_attempts, complete_attempt, migrate_attempts, release_attempts
+from . import profile_bootstrap
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -2586,6 +2587,43 @@ def profile_changes_api():
         )
     except (CatalogScanError, ValueError) as exc:
         return _catalog_error("invalid_cursor", str(exc), 400)
+
+
+def _profile_bootstrap_v2(operation):
+    principal = getattr(g, "auth_user", None)
+    if not principal:
+        return _catalog_error("authentication_required", "Authentication required.", 401)
+    try:
+        body = _json_body(max_bytes=16_384)
+    except ValueError:
+        return _catalog_error("invalid_profile_bootstrap", "Invalid bootstrap request.", 400)
+    try:
+        result = operation(get_db(), body, f"user:{principal}")
+        return _private_json(result)
+    except profile_bootstrap.BootstrapError as exc:
+        return _catalog_error(exc.code, exc.code, exc.status)
+    except Exception:
+        return _catalog_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
+
+
+@bp.post("/api/profiles/bootstrap/sessions")
+def profile_bootstrap_sessions_api():
+    return _profile_bootstrap_v2(profile_bootstrap.create_session)
+
+
+@bp.post("/api/profiles/bootstrap/sessions/page")
+def profile_bootstrap_sessions_page_api():
+    return _profile_bootstrap_v2(profile_bootstrap.snapshot_page)
+
+
+@bp.post("/api/profiles/bootstrap/sessions/catchup")
+def profile_bootstrap_sessions_catchup_api():
+    return _profile_bootstrap_v2(profile_bootstrap.catchup_page)
+
+
+@bp.post("/api/profiles/bootstrap/sessions/release")
+def profile_bootstrap_sessions_release_api():
+    return _profile_bootstrap_v2(profile_bootstrap.release_session)
 
 
 @bp.post("/api/catalog/relationships/prepare")

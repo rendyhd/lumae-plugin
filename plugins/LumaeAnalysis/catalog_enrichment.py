@@ -237,6 +237,49 @@ def migrate_enrichment(db):
         )
         """,
         f"""
+        CREATE TABLE IF NOT EXISTS {t("profile_bootstrap_sessions")} (
+            session_id UUID PRIMARY KEY,
+            token_hash TEXT NOT NULL UNIQUE,
+            signing_secret TEXT NOT NULL,
+            principal TEXT NOT NULL,
+            catalog_instance_id TEXT NOT NULL,
+            core_server_id TEXT NOT NULL,
+            catalog_epoch TEXT NOT NULL,
+            profile_epoch TEXT NOT NULL,
+            schema_version INTEGER NOT NULL,
+            page_size INTEGER NOT NULL,
+            snapshot_seq BIGINT NOT NULL,
+            head_seq BIGINT,
+            snapshot_count INTEGER NOT NULL,
+            expires_at TIMESTAMPTZ NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_principal_idx')}
+        ON {t('profile_bootstrap_sessions')} (principal, expires_at)
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {t('profile_bootstrap_snapshot')} (
+            session_id UUID NOT NULL REFERENCES {t('profile_bootstrap_sessions')}(session_id)
+                ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            payload JSONB NOT NULL,
+            PRIMARY KEY (session_id, ordinal)
+        )
+        """,
+        f"""
+        CREATE TABLE IF NOT EXISTS {t('profile_bootstrap_catchup')} (
+            session_id UUID NOT NULL REFERENCES {t('profile_bootstrap_sessions')}(session_id)
+                ON DELETE CASCADE,
+            ordinal INTEGER NOT NULL,
+            seq BIGINT NOT NULL,
+            payload JSONB NOT NULL,
+            PRIMARY KEY (session_id, ordinal),
+            UNIQUE (session_id, seq)
+        )
+        """,
+        f"""
         CREATE INDEX IF NOT EXISTS {t("profile_changes_track_idx")}
         ON {t("profile_changes")} (catalog_instance_id, track_id)
         """,
