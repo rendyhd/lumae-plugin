@@ -2010,6 +2010,13 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 catalog_instance_id,
             ),
         )
+        # The catalog state row is still locked. Withdraw public profiles for
+        # known new media revisions and deleted occurrences in this publication.
+        from .profile_publication import invalidate_catalog_changes
+        invalidate_catalog_changes(
+            cur, catalog_instance_id, generation, ordered_changes,
+            full_reconcile=fingerprint_rebase,
+        )
         progress = {
             "input_counts": counts,
             "change_counts": change_counts,

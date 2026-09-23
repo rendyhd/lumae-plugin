@@ -1,0 +1,81 @@
+Command: C:\Users\rendy\vscode\lumae-plugin\.pytest-tmp\settings-env\Scripts\python.exe -m pytest tests/plugins -q -r s --basetemp .pytest-tmp/task1b-resume-pg -p no:cacheprovider
+LUMAE_POSTGRES_TEST_DSN: disposable localhost PostgreSQL 17
+
+........................................................................ [ 14%]
+........................................................................ [ 29%]
+........................................................................ [ 44%]
+........................................................................ [ 59%]
+........................................................................ [ 74%]
+........................................................................ [ 89%]
+........................................FFF.........                     [100%]
+================================== FAILURES ===================================
+_____________ test_current_release_contains_supported_source_only _____________
+
+    def test_current_release_contains_supported_source_only():
+        import zipfile
+    
+        metadata = json.loads((ROOT / "plugins/LumaeAnalysis/plugin.json").read_text())
+        latest = metadata["versions"][0]
+        assert latest["version"] == "1.2.5"
+        archive = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+        assert hashlib.md5(archive.read_bytes()).hexdigest() == latest["checksum"]
+        with zipfile.ZipFile(archive) as package:
+            names = package.namelist()
+            assert not any(Path(name).name.startswith(("dj_", "provision_dj")) for name in names)
+            assert "edge_profiles.py" in names
+            assert "personal_discovery.py" in names
+            assert "music_metadata.py" in names
+>           assert package.read("__init__.py") == (ROOT / "plugins/LumaeAnalysis/__init__.py").read_bytes()
+E           assert b'import base...default")\r\n' == b'import base...default")\r\n'
+E             
+E             At index 2333 diff: b'\r' != b','
+E             Use -v to get more diff
+
+tests\plugins\test_release_channels.py:139: AssertionError
+__________ test_release_archive_is_identical_across_platforms[win32] __________
+
+tmp_path = WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1b-resume-pg/test_release_archive_is_identi0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000280FFCA2960>
+platform = 'win32'
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, platform):
+        import zipfile
+    
+        # ZipInfo otherwise records the host platform in every central directory entry.
+        from types import SimpleNamespace
+    
+        monkeypatch.setattr(zipfile, "sys", SimpleNamespace(platform=platform))
+        candidate = tmp_path / "release.zip"
+        builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
+        published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+>       assert builder.same_zip_contents(candidate, published)
+E       AssertionError: assert False
+E        +  where False = <function same_zip_contents at 0x0000028080E72F20>(WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1b-resume-pg/test_release_archive_is_identi0/release.zip'), WindowsPath('C:/Users/rendy/vscode/lumae-plugin/dist/lumae_analysis/lumae_analysis_1.2.5.zip'))
+E        +    where <function same_zip_contents at 0x0000028080E72F20> = builder.same_zip_contents
+
+tests\plugins\test_release_channels.py:157: AssertionError
+__________ test_release_archive_is_identical_across_platforms[linux] __________
+
+tmp_path = WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1b-resume-pg/test_release_archive_is_identi1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x00000280FFD44860>
+platform = 'linux'
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, platform):
+        import zipfile
+    
+        # ZipInfo otherwise records the host platform in every central directory entry.
+        from types import SimpleNamespace
+    
+        monkeypatch.setattr(zipfile, "sys", SimpleNamespace(platform=platform))
+        candidate = tmp_path / "release.zip"
+        builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
+        published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+>       assert builder.same_zip_contents(candidate, published)
+E       AssertionError: assert False
+E        +  where False = <function same_zip_contents at 0x0000028080E72F20>(WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1b-resume-pg/test_release_archive_is_identi1/release.zip'), WindowsPath('C:/Users/rendy/vscode/lumae-plugin/dist/lumae_analysis/lumae_analysis_1.2.5.zip'))
+E        +    where <function same_zip_contents at 0x0000028080E72F20> = builder.same_zip_contents
+
+tests\plugins\test_release_channels.py:157: AssertionError
+3 failed, 481 passed in 39.34s

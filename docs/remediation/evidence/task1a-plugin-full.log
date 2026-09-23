@@ -1,0 +1,154 @@
+Command: C:\Users\rendy\vscode\lumae-plugin\.pytest-tmp\settings-env\Scripts\python.exe -m pytest tests/plugins -q -r s --basetemp .pytest-tmp/task1a-resume-pg -p no:cacheprovider
+LUMAE_POSTGRES_TEST_DSN: disposable localhost PostgreSQL 17
+
+........................................................................ [ 15%]
+........................................................................ [ 31%]
+......................F................................................. [ 47%]
+........................................................................ [ 62%]
+........................................................................ [ 78%]
+........................................................................ [ 94%]
+...............FFF.........                                              [100%]
+================================== FAILURES ===================================
+_____ test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item ______
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000020A432DB2F0>
+tmp_path = WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1a-resume-pg/test_analyze_song_hook_uses_an0')
+
+    def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypatch, tmp_path):
+        mod = load_plugin()
+        audio = tmp_path / "analysis-hook.flac"
+        audio.write_bytes(b"hook audio")
+        db = FakeDb(rows=[])
+        monkeypatch.setattr(mod, "get_db", lambda: db)
+        monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+        monkeypatch.setattr(
+            mod,
+            "source_profiles_table",
+            lambda: "plugin_lumae_analysis__source_profiles",
+        )
+        monkeypatch.setattr(
+            mod,
+            "resolve_profile_source",
+            lambda **_kwargs: {"catalog_instance_id": "catalog-a", "server_id": "legacy-default"},
+        )
+    
+        class Result:
+            sample_rate = 44100
+            duration_ms = 2500
+            ref_lufs = -15.5
+            start_ramp_blob = b"\x01\x02\x03"
+            end_ramp_blob = b"\x04\x05\x06"
+    
+        seen = {}
+    
+        def fake_analyze_file(path):
+            seen["path"] = path
+            return Result()
+    
+        monkeypatch.setattr(mod, "analyze_file", fake_analyze_file)
+        monkeypatch.setattr(
+            mod,
+            "enqueue",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                AssertionError("per-song hooks must not enqueue full projections")
+            ),
+        )
+        monkeypatch.setattr(
+            mod,
+            "record_analysis_run",
+            lambda server_id, catalog_instance_id, run_id: seen.update(
+                {
+                    "run": (server_id, catalog_instance_id, run_id),
+                }
+            ),
+        )
+    
+        result = mod.analyze_song_hook(
+            {
+                "item_id": "track-a",
+                "run_id": "analysis-run-a",
+                "audio_path": str(audio),
+                "metadata": {"file_path": "/metadata/path.flac"},
+                "media_item": {"Id": "raw-track", "FilePath": "/music/raw-song.flac"},
+            }
+        )
+    
+>       assert result == {"track_id": "track-a", "status": "ready"}
+E       AssertionError: assert {'track_id': ...us': 'failed'} == {'track_id': ...tus': 'ready'}
+E         
+E         Omitting 1 identical items, use -vv to show
+E         Differing items:
+E         {'status': 'failed'} != {'status': 'ready'}
+E         Use -v to get more diff
+
+tests\plugins\test_lumae_analysis.py:2444: AssertionError
+_____________ test_current_release_contains_supported_source_only _____________
+
+    def test_current_release_contains_supported_source_only():
+        import zipfile
+    
+        metadata = json.loads((ROOT / "plugins/LumaeAnalysis/plugin.json").read_text())
+        latest = metadata["versions"][0]
+        assert latest["version"] == "1.2.5"
+        archive = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+        assert hashlib.md5(archive.read_bytes()).hexdigest() == latest["checksum"]
+        with zipfile.ZipFile(archive) as package:
+            names = package.namelist()
+            assert not any(Path(name).name.startswith(("dj_", "provision_dj")) for name in names)
+            assert "edge_profiles.py" in names
+            assert "personal_discovery.py" in names
+            assert "music_metadata.py" in names
+>           assert package.read("__init__.py") == (ROOT / "plugins/LumaeAnalysis/__init__.py").read_bytes()
+E           assert b'import base...default")\r\n' == b'import base...default")\r\n'
+E             
+E             At index 2333 diff: b'\r' != b','
+E             Use -v to get more diff
+
+tests\plugins\test_release_channels.py:139: AssertionError
+__________ test_release_archive_is_identical_across_platforms[win32] __________
+
+tmp_path = WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1a-resume-pg/test_release_archive_is_identi0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000020A1315BE00>
+platform = 'win32'
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, platform):
+        import zipfile
+    
+        # ZipInfo otherwise records the host platform in every central directory entry.
+        from types import SimpleNamespace
+    
+        monkeypatch.setattr(zipfile, "sys", SimpleNamespace(platform=platform))
+        candidate = tmp_path / "release.zip"
+        builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
+        published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+>       assert builder.same_zip_contents(candidate, published)
+E       AssertionError: assert False
+E        +  where False = <function same_zip_contents at 0x0000020A441B02C0>(WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1a-resume-pg/test_release_archive_is_identi0/release.zip'), WindowsPath('C:/Users/rendy/vscode/lumae-plugin/dist/lumae_analysis/lumae_analysis_1.2.5.zip'))
+E        +    where <function same_zip_contents at 0x0000020A441B02C0> = builder.same_zip_contents
+
+tests\plugins\test_release_channels.py:157: AssertionError
+__________ test_release_archive_is_identical_across_platforms[linux] __________
+
+tmp_path = WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1a-resume-pg/test_release_archive_is_identi1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x0000020A432FE1B0>
+platform = 'linux'
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, platform):
+        import zipfile
+    
+        # ZipInfo otherwise records the host platform in every central directory entry.
+        from types import SimpleNamespace
+    
+        monkeypatch.setattr(zipfile, "sys", SimpleNamespace(platform=platform))
+        candidate = tmp_path / "release.zip"
+        builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
+        published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+>       assert builder.same_zip_contents(candidate, published)
+E       AssertionError: assert False
+E        +  where False = <function same_zip_contents at 0x0000020A441B02C0>(WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1a-resume-pg/test_release_archive_is_identi1/release.zip'), WindowsPath('C:/Users/rendy/vscode/lumae-plugin/dist/lumae_analysis/lumae_analysis_1.2.5.zip'))
+E        +    where <function same_zip_contents at 0x0000020A441B02C0> = builder.same_zip_contents
+
+tests\plugins\test_release_channels.py:157: AssertionError
+4 failed, 455 passed in 31.91s

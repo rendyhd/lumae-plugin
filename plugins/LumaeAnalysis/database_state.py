@@ -7,49 +7,143 @@ metadata, exposes credentials, or mutates database state.
 
 from datetime import datetime, timezone
 from html import escape
+import re
+from time import monotonic
 
 from plugin.api import table
+
+_OPERATION_BY_SECTION = {
+    "sonic links": "sonic_links_summary",
+    "analysis items": "analysis_items_summary",
+    "analysis groups": "analysis_groups_summary",
+    "waveform profiles": "waveform_profiles_summary",
+    "preparation workflow": "preparation_workflow_summary",
+    "profile backfill workflow": "profile_backfill_workflow_summary",
+    "analysis run workflow": "analysis_runs_summary",
+    "catalogue journal": "catalogue_journal_summary",
+    "analysis journal": "analysis_journal_summary",
+    "bootstrap leases": "bootstrap_leases_summary",
+    "AudioMuse core": "audiomuse_core_summary",
+}
+_SQLSTATE_RE = re.compile(r"[0-9A-Z]{5}")
+_MAX_DIAGNOSTIC_OPERATIONS = 16
+_MAX_DB_CALL_TIME_MS = 3_600_000
 
 
 def _iso_now():
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
+def _safe_sqlstate(exc):
+    value = str(getattr(exc, "pgcode", None) or getattr(exc, "sqlstate", None) or "").upper()
+    return value if _SQLSTATE_RE.fullmatch(value) else None
+
+
+def _error_metadata(exc):
+    sqlstate = _safe_sqlstate(exc)
+    if isinstance(exc, TimeoutError) or sqlstate == "57014":
+        error_class = "timeout"
+    elif sqlstate and sqlstate.startswith("08"):
+        error_class = "connection"
+    elif sqlstate and sqlstate.startswith("40"):
+        error_class = "transaction"
+    else:
+        error_class = "database_error"
+    return {"error_class": error_class, **({"sqlstate": sqlstate} if sqlstate else {})}
+
+
+def _record_diagnostic(diagnostics, section, started_at, error=None):
+    if len(diagnostics) < _MAX_DIAGNOSTIC_OPERATIONS:
+        elapsed_ms = max(0, min(int(round((monotonic() - started_at) * 1000)), _MAX_DB_CALL_TIME_MS))
+        diagnostics.append({
+            "operation": _OPERATION_BY_SECTION[section],
+            "server_db_execute_fetch_ms": elapsed_ms,
+            "status": "error" if error else "ok",
+            **(_error_metadata(error) if error else {}),
+        })
+
+
 def _error(errors, section, exc):
-    errors.append({"section": section, "message": str(exc)[:500]})
+    errors.append({
+        "section": section,
+        "operation": _OPERATION_BY_SECTION[section],
+        "message": "Database diagnostic query failed.",
+        **_error_metadata(exc),
+    })
 
 
-def _fetchone(db, sql, params, errors, section, default):
-    cur = db.cursor()
+def safe_snapshot_error(exc):
+    return {
+        "section": "database snapshot",
+        "operation": "database_snapshot",
+        "message": "Database diagnostic snapshot failed.",
+        **_error_metadata(exc),
+    }
+
+
+def _cursor_or_error(db, errors, section):
     try:
-        cur.execute(sql, params)
-        return cur.fetchone() or default
+        return db.cursor()
     except Exception as exc:
         _error(errors, section, exc)
+        return None
+
+
+def _cleanup_query(db, cur, errors, section, failed):
+    if failed:
         rollback = getattr(db, "rollback", None)
         if callable(rollback):
-            rollback()
+            try:
+                rollback()
+            except Exception as exc:
+                _error(errors, section, exc)
+    try:
+        cur.close()
+    except Exception as exc:
+        _error(errors, section, exc)
+
+
+def _fetchone(db, sql, params, errors, diagnostics, section, default):
+    cur = _cursor_or_error(db, errors, section)
+    if cur is None:
+        return default
+    started_at = monotonic()
+    failed = False
+    try:
+        cur.execute(sql, params)
+        result = cur.fetchone() or default
+        _record_diagnostic(diagnostics, section, started_at)
+        return result
+    except Exception as exc:
+        failed = True
+        _error(errors, section, exc)
+        _record_diagnostic(diagnostics, section, started_at, exc)
         return default
     finally:
-        cur.close()
+        _cleanup_query(db, cur, errors, section, failed)
 
 
-def _fetchall(db, sql, params, errors, section):
-    cur = db.cursor()
+def _fetchall(db, sql, params, errors, diagnostics, section):
+    cur = _cursor_or_error(db, errors, section)
+    if cur is None:
+        return []
+    started_at = monotonic()
+    failed = False
     try:
         cur.execute(sql, params)
-        return cur.fetchall()
+        result = cur.fetchall()
+        _record_diagnostic(diagnostics, section, started_at)
+        return result
     except Exception as exc:
+        failed = True
         _error(errors, section, exc)
-        rollback = getattr(db, "rollback", None)
-        if callable(rollback):
-            rollback()
+        _record_diagnostic(diagnostics, section, started_at, exc)
         return []
     finally:
-        cur.close()
+        _cleanup_query(db, cur, errors, section, failed)
 
 
-def _link_state(db, source, errors):
+def _link_state(db, source, errors, diagnostics):
     row = _fetchone(
         db,
         f"""
@@ -78,6 +172,7 @@ def _link_state(db, source, errors):
             source.get("analysis", {}).get("generation", 0),
         ),
         errors,
+        diagnostics,
         "sonic links",
         (0,) * 8,
     )
@@ -94,7 +189,7 @@ def _link_state(db, source, errors):
     return {key: int(value or 0) for key, value in zip(keys, row)}
 
 
-def _analysis_item_state(db, source, errors):
+def _analysis_item_state(db, source, errors, diagnostics):
     row = _fetchone(
         db,
         f"""
@@ -109,6 +204,7 @@ def _analysis_item_state(db, source, errors):
             source.get("analysis", {}).get("generation", 0),
         ),
         errors,
+        diagnostics,
         "analysis items",
         (0, 0, 0),
     )
@@ -119,7 +215,7 @@ def _analysis_item_state(db, source, errors):
     }
 
 
-def _group_state(db, source, errors):
+def _group_state(db, source, errors, diagnostics):
     row = _fetchone(
         db,
         f"""
@@ -139,6 +235,7 @@ def _group_state(db, source, errors):
             source.get("analysis", {}).get("generation", 0),
         ),
         errors,
+        diagnostics,
         "analysis groups",
         (0, 0, 0),
     )
@@ -149,7 +246,7 @@ def _group_state(db, source, errors):
     }
 
 
-def _profile_state(db, source, errors):
+def _profile_state(db, source, errors, diagnostics):
     row = _fetchone(
         db,
         f"""
@@ -176,6 +273,7 @@ def _profile_state(db, source, errors):
             source.get("catalog", {}).get("generation", 0),
         ),
         errors,
+        diagnostics,
         "waveform profiles",
         (0,) * 7,
     )
@@ -191,7 +289,7 @@ def _profile_state(db, source, errors):
     return {key: int(value or 0) for key, value in zip(keys, row)}
 
 
-def _workflow_state(db, source, errors):
+def _workflow_state(db, source, errors, diagnostics):
     catalog_instance_id = source["catalog_instance_id"]
     preparation = _fetchone(
         db,
@@ -203,6 +301,7 @@ def _workflow_state(db, source, errors):
         """,
         (catalog_instance_id,),
         errors,
+        diagnostics,
         "preparation workflow",
         None,
     )
@@ -216,6 +315,7 @@ def _workflow_state(db, source, errors):
         """,
         (catalog_instance_id,),
         errors,
+        diagnostics,
         "profile backfill workflow",
         None,
     )
@@ -230,6 +330,7 @@ def _workflow_state(db, source, errors):
         """,
         (catalog_instance_id,),
         errors,
+        diagnostics,
         "analysis run workflow",
     )
     return {
@@ -271,7 +372,7 @@ def _workflow_state(db, source, errors):
     }
 
 
-def _journal_state(db, source, errors):
+def _journal_state(db, source, errors, diagnostics):
     catalog = source.get("catalog") or {}
     analysis = source.get("analysis") or {}
     catalog_rows = _fetchone(
@@ -283,6 +384,7 @@ def _journal_state(db, source, errors):
         """,
         (source["catalog_instance_id"], catalog.get("epoch", "")),
         errors,
+        diagnostics,
         "catalogue journal",
         (0,),
     )
@@ -295,6 +397,7 @@ def _journal_state(db, source, errors):
         """,
         (source["catalog_instance_id"], analysis.get("epoch", "")),
         errors,
+        diagnostics,
         "analysis journal",
         (0,),
     )
@@ -310,6 +413,7 @@ def _journal_state(db, source, errors):
         """,
         (source["catalog_instance_id"],),
         errors,
+        diagnostics,
         "bootstrap leases",
         (0, 0),
     )
@@ -333,7 +437,8 @@ def _journal_state(db, source, errors):
     }
 
 
-def _core_state(db, compatibility, source, errors):
+def _core_state(db, compatibility, source, errors, diagnostics=None):
+    diagnostics = diagnostics if diagnostics is not None else []
     if compatibility.adapter == "v3_registry":
         row = _fetchone(
             db,
@@ -363,6 +468,7 @@ def _core_state(db, compatibility, source, errors):
             """,
             (source.get("server_id"),),
             errors,
+            diagnostics,
             "AudioMuse core",
             (0,) * 6,
         )
@@ -396,6 +502,7 @@ def _core_state(db, compatibility, source, errors):
         """,
         (),
         errors,
+        diagnostics,
         "AudioMuse core",
         (0, 0, 0),
     )
@@ -434,13 +541,14 @@ def collect_database_state(db, compatibility, sources, readiness_by_source=None)
 
     for source in sources:
         source_errors = []
-        links = _link_state(db, source, source_errors)
-        items = _analysis_item_state(db, source, source_errors)
-        groups = _group_state(db, source, source_errors)
-        profiles = _profile_state(db, source, source_errors)
-        workflow = _workflow_state(db, source, source_errors)
-        journals = _journal_state(db, source, source_errors)
-        core = _core_state(db, compatibility, source, source_errors)
+        source_diagnostics = []
+        links = _link_state(db, source, source_errors, source_diagnostics)
+        items = _analysis_item_state(db, source, source_errors, source_diagnostics)
+        groups = _group_state(db, source, source_errors, source_diagnostics)
+        profiles = _profile_state(db, source, source_errors, source_diagnostics)
+        workflow = _workflow_state(db, source, source_errors, source_diagnostics)
+        journals = _journal_state(db, source, source_errors, source_diagnostics)
+        core = _core_state(db, compatibility, source, source_errors, source_diagnostics)
         readiness = readiness_by_source.get(source["catalog_instance_id"]) or {}
         snapshot["sources"].append(
             {
@@ -461,6 +569,7 @@ def collect_database_state(db, compatibility, sources, readiness_by_source=None)
                 "journals": journals,
                 "core": core,
                 "readiness": readiness,
+                "diagnostics": {"scope": "server_db_execute_fetch", "unit": "milliseconds", "operations": source_diagnostics},
                 "errors": source_errors,
             }
         )
@@ -516,11 +625,37 @@ def _meter(label, numerator, denominator):
 def _error_list(errors):
     if not errors:
         return '<p class="db-muted">No recorded errors in this snapshot.</p>'
-    return "<ul class=\"db-errors\">" + "".join(
-        f"<li><strong>{escape(str(row.get('section') or 'Unknown'))}:</strong> "
-        f"{escape(str(row.get('message') or 'Unknown error'))}</li>"
-        for row in errors
-    ) + "</ul>"
+    rows = []
+    for row in errors:
+        metadata = " · ".join(
+            str(row[key]) for key in ("operation", "error_class", "sqlstate")
+            if row.get(key)
+        )
+        detail = f" <small>({escape(metadata)})</small>" if metadata else ""
+        rows.append(
+            f"<li><strong>{escape(str(row.get('section') or 'Unknown'))}:</strong> "
+            f"{escape(str(row.get('message') or 'Unknown error'))}{detail}</li>"
+        )
+    return '<ul class="db-errors">' + "".join(rows) + "</ul>"
+
+
+def _operation_list(diagnostics):
+    operations = (diagnostics or {}).get("operations") or []
+    if not operations:
+        return '<p class="db-muted">No server database query timings recorded.</p>'
+    rows = []
+    for row in operations[:_MAX_DIAGNOSTIC_OPERATIONS]:
+        operation = escape(str(row.get("operation") or "unknown"))
+        duration = escape(str(row.get("server_db_execute_fetch_ms", "unknown")))
+        status = escape(str(row.get("status") or "unknown"))
+        metadata = " · ".join(
+            str(row[key]) for key in ("error_class", "sqlstate") if row.get(key)
+        )
+        detail = f" · {escape(metadata)}" if metadata else ""
+        rows.append(
+            f"<li><span>{operation}</span><strong>{duration} ms · {status}{detail}</strong></li>"
+        )
+    return '<ul class="db-workflows">' + "".join(rows) + "</ul>"
 
 
 def _coverage_list(coverage):
@@ -787,6 +922,12 @@ def _source_html(source):
             <div><span class="db-kicker">Actionable diagnostics</span><h3>Errors</h3></div>
           </div>
           {_error_list(errors)}
+          <details>
+            <summary>Server database query timings (execute + fetch)</summary>
+            <p class="db-muted">Measured on this server for each aggregate query. Excludes
+              network, client processing, and database connection setup.</p>
+            {_operation_list(source.get("diagnostics"))}
+          </details>
         </section>
       </article>
     """
@@ -858,11 +999,15 @@ def render_database_state(snapshot):
         """
         <section class="db-alert" role="alert">
           <strong>Some diagnostic queries were unavailable.</strong>
-          <span>The rest of the snapshot is still valid. See each source's Errors section.</span>
+          <span>Review the Errors section for the affected operation.</span>
         </section>
         """
         if snapshot_errors
         else ""
+    )
+    global_errors_html = (
+        f'<section class="db-section"><h3>Snapshot errors</h3>{_error_list(snapshot_errors)}</section>'
+        if snapshot_errors and not sources else ""
     )
     return f"""
       <style>
@@ -959,6 +1104,7 @@ def render_database_state(snapshot):
         </header>
         {readiness_notice}
         {partial_notice}
+        {global_errors_html}
         <section class="db-summary" aria-label="Database summary">
           {_metric("Sources", _number(len(sources)))}
           {_metric("App-ready sources", f"{ready_sources} / {len(sources)}", "ready" if ready_sources == len(sources) and sources else "danger")}

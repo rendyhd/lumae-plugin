@@ -51,8 +51,8 @@ def claim_edge_jobs(db, catalog_id, ids):
     """Bounded request; ready/current rows are retained and failed upgrades back off."""
     cur = db.cursor()
     cur.execute(f"""SELECT p.track_id, p.media_signature, edge.payload
-        FROM {table('source_profiles')} p {edge_join()}
-        WHERE p.catalog_instance_id=%s AND p.track_id=ANY(%s) AND p.status='ready'
+        FROM {table('published_source_profiles')} p {edge_join()}
+        WHERE p.catalog_instance_id=%s AND p.track_id=ANY(%s)
         ORDER BY p.track_id""", (catalog_id, list(dict.fromkeys(ids))[:100]))
     rows = cur.fetchall()
     accepted, ready = [], []
@@ -105,9 +105,35 @@ def publish_edge_profile(db, catalog_id, job, payload, signature):
             opaque_revision(signature) != job['media_revision'] or profile_digest(payload) != payload.get('profile_digest')):
         raise ValueError('edge publication identity/digest mismatch')
     cur = db.cursor()
+    cur.execute(
+        f"""SELECT c.published_generation
+              FROM {table('catalog_state')} c
+              JOIN {table('catalog_sources')} s USING (catalog_instance_id)
+             WHERE c.catalog_instance_id=%s AND s.rebind_status='active'
+             FOR UPDATE OF c""",
+        (catalog_id,),
+    )
+    state = cur.fetchone()
+    if state is None:
+        db.rollback()
+        cur.close()
+        return False
+    cur.execute(
+        f"""SELECT media_fp FROM {table('catalog_tracks')}
+             WHERE catalog_instance_id=%s AND published_generation=%s
+               AND track_id=%s AND available=TRUE""",
+        (catalog_id, state[0], job['track_id']),
+    )
+    media = cur.fetchone()
+    if not media or not media[0] or signature not in (
+        str(media[0]), f"catalog-media:{media[0]}"
+    ):
+        db.rollback()
+        cur.close()
+        return False
     cur.execute(f"""SELECT track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
-                analyzer_ver, analyzed_at, media_signature FROM {table('source_profiles')}
-        WHERE catalog_instance_id=%s AND track_id=%s AND status='ready' FOR UPDATE""",
+                analyzer_ver, analyzed_at, media_signature FROM {table('published_source_profiles')}
+        WHERE catalog_instance_id=%s AND track_id=%s FOR UPDATE""",
                 (catalog_id, job['track_id']))
     legacy = cur.fetchone()
     cur.execute(f"""SELECT job_token FROM {table('edge_profile_jobs')}
@@ -139,7 +165,7 @@ def edge_backfill_candidates(db, catalog_id, after='', limit=100):
     cur = db.cursor()
     cur.execute(f"""SELECT p.track_id FROM {table('source_profiles')} p {edge_join()}
         LEFT JOIN {table('edge_profile_jobs')} j ON j.catalog_instance_id=p.catalog_instance_id AND j.track_id=p.track_id
-        WHERE p.catalog_instance_id=%s AND p.status='ready' AND p.media_signature IS NOT NULL
+        WHERE p.catalog_instance_id=%s AND p.media_signature IS NOT NULL
           AND p.track_id>%s AND edge.payload IS NULL
           AND (j.track_id IS NULL OR j.updated_at < now()-interval '6 hours')
         ORDER BY p.track_id LIMIT %s""", (catalog_id, after, max(1, min(100, int(limit)))))

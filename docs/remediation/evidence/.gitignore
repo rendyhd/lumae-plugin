@@ -1,0 +1,3 @@
+# Verbose local evidence is retained on disk; compact summaries are tracked.
+phase0-client/full-jest*.json
+phase0-client/full-jest*.log

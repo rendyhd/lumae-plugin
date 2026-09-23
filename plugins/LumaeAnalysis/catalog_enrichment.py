@@ -126,24 +126,61 @@ def _stream_state(cur, table_name, catalog_instance_id):
     return epoch, 0, 0
 
 
+def _profile_stream_state(cur, catalog_instance_id, *, for_update=False):
+    """Get the source profile frontier, locking it for publisher mutation."""
+    if not for_update:
+        cur.execute(
+            f"SELECT epoch, head_seq, floor_seq FROM {t('profile_stream_state')} "
+            "WHERE catalog_instance_id=%s",
+            (catalog_instance_id,),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            return str(row[0]), int(row[1]), int(row[2])
+    cur.execute(
+        f"INSERT INTO {t('profile_stream_state')} "
+        "(catalog_instance_id, epoch, head_seq, floor_seq, updated_at) "
+        "VALUES (%s, %s, 0, 0, now()) "
+        "ON CONFLICT (catalog_instance_id) DO NOTHING",
+        (catalog_instance_id, str(uuid.uuid4())),
+    )
+    cur.execute(
+        f"SELECT epoch, head_seq, floor_seq FROM {t('profile_stream_state')} "
+        "WHERE catalog_instance_id=%s" + (" FOR UPDATE" if for_update else ""),
+        (catalog_instance_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise RuntimeError("Profile stream state disappeared during initialization")
+    return str(row[0]), int(row[1]), int(row[2])
+
+
 def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
     """Bound profile and relationship journals during upgrades and maintenance."""
     cur = cursor or db.cursor()
     cur.execute(
         f"""
-        SELECT p.catalog_instance_id, p.epoch, p.head_seq,
-               (SELECT COUNT(*) FROM {t('source_profiles')} AS profile
-                 WHERE profile.catalog_instance_id=p.catalog_instance_id),
+        SELECT p.catalog_instance_id,
                r.epoch, r.head_seq, r.album_count, r.artist_count
           FROM {t('profile_stream_state')} AS p
           LEFT JOIN {t('relationship_state')} AS r USING (catalog_instance_id)
          WHERE %s IS NULL OR p.catalog_instance_id=%s
+         ORDER BY p.catalog_instance_id
         """,
         (catalog_instance_id, catalog_instance_id),
     )
     rows = cur.fetchall()
     for row in rows:
         source_id = str(row[0])
+        epoch, head_seq, _floor_seq = _profile_stream_state(
+            cur, source_id, for_update=True
+        )
+        cur.execute(
+            f"SELECT COUNT(*) FROM {t('source_profiles')} "
+            "WHERE catalog_instance_id=%s",
+            (source_id,),
+        )
+        profile_count = int(cur.fetchone()[0])
         compact_change_journal(
             cur,
             catalog_instance_id=source_id,
@@ -151,11 +188,11 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
             changes_table="profile_changes",
             epoch_column="epoch",
             floor_column="floor_seq",
-            epoch=row[1],
-            head_seq=row[2],
-            retention_limit=change_journal_retention_limit(row[3]),
+            epoch=epoch,
+            head_seq=head_seq,
+            retention_limit=change_journal_retention_limit(profile_count),
         )
-        if row[4] is not None:
+        if row[1] is not None:
             compact_change_journal(
                 cur,
                 catalog_instance_id=source_id,
@@ -163,10 +200,10 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
                 changes_table="relationship_changes",
                 epoch_column="epoch",
                 floor_column="floor_seq",
-                epoch=row[4],
-                head_seq=row[5],
+                epoch=row[1],
+                head_seq=row[2],
                 retention_limit=change_journal_retention_limit(
-                    int(row[6] or 0) + int(row[7] or 0)
+                    int(row[3] or 0) + int(row[4] or 0)
                 ),
             )
     if cursor is None:
@@ -258,10 +295,10 @@ def migrate_enrichment(db):
     from .relationship_build import migrate_relationship_builds
     migrate_relationship_builds(cur)
 
-    cur.execute(f"SELECT catalog_instance_id FROM {t('catalog_sources')}")
+    cur.execute(f"SELECT catalog_instance_id FROM {t('catalog_sources')} ORDER BY catalog_instance_id")
     source_ids = [str(row[0]) for row in cur.fetchall()]
     for catalog_instance_id in source_ids:
-        _stream_state(cur, "profile_stream_state", catalog_instance_id)
+        _profile_stream_state(cur, catalog_instance_id, for_update=True)
         cur.execute(
             f"""
             INSERT INTO {t("relationship_state")}
@@ -348,8 +385,8 @@ def serialize_profile(
 
 def record_profile_change(cur, catalog_instance_id, track_id, status, payload=None):
     """Append a profile upsert/delete in the same transaction as its profile."""
-    epoch, head_seq, _floor_seq = _stream_state(
-        cur, "profile_stream_state", catalog_instance_id
+    epoch, head_seq, _floor_seq = _profile_stream_state(
+        cur, catalog_instance_id, for_update=True
     )
     seq = head_seq + 1
     operation = "upsert" if status == "ready" and payload is not None else "delete"
@@ -370,9 +407,13 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
     )
     cur.execute(
         f"UPDATE {t('profile_stream_state')} "
-        "SET head_seq=%s, updated_at=now() WHERE catalog_instance_id=%s",
-        (seq, catalog_instance_id),
+        "SET head_seq=%s, updated_at=now() "
+        "WHERE catalog_instance_id=%s AND epoch=%s AND head_seq=%s "
+        "RETURNING head_seq",
+        (seq, catalog_instance_id, epoch, head_seq),
     )
+    if cur.fetchone() is None:
+        raise RuntimeError("Profile stream head changed during publication")
     compact_change_journal(
         cur,
         catalog_instance_id=catalog_instance_id,
@@ -392,8 +433,8 @@ def _profile_rows(cur, catalog_instance_id, after_track_id, limit):
         f"""
         SELECT p.track_id, p.sample_rate, p.duration_ms, p.ref_lufs, p.start_ramp, p.end_ramp,
                p.analyzer_ver, p.analyzed_at, p.media_signature, edge.payload
-          FROM {t("source_profiles")} p {edge_join()}
-         WHERE p.catalog_instance_id=%s AND p.status='ready' AND p.track_id > %s
+          FROM {t("published_source_profiles")} p {edge_join()}
+         WHERE p.catalog_instance_id=%s AND p.track_id > %s
          ORDER BY p.track_id LIMIT %s
         """,
         (catalog_instance_id, after_track_id or "", limit),
@@ -428,8 +469,8 @@ def profile_bootstrap_page(db, catalog_instance_id, page_token=None, limit=250):
     catalog_instance_id = sources[0]["catalog_instance_id"]
     limit = max(1, min(int(limit), 500))
     cur = db.cursor()
-    epoch, head_seq, _floor_seq = _stream_state(
-        cur, "profile_stream_state", catalog_instance_id
+    epoch, head_seq, _floor_seq = _profile_stream_state(
+        cur, catalog_instance_id
     )
     token = _decode_page_token(page_token) if page_token else None
     if token:
@@ -472,9 +513,7 @@ def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250):
     if len(sources) != 1 or sources[0]["catalog_instance_id"] != cursor["catalog_instance_id"]:
         raise ValueError("Cursor belongs to another profile source")
     cur = db.cursor()
-    epoch, head_seq, floor_seq = _stream_state(
-        cur, "profile_stream_state", expected_id
-    )
+    epoch, head_seq, floor_seq = _profile_stream_state(cur, expected_id)
     if cursor["epoch"] != epoch or cursor["seq"] < floor_seq:
         cur.close()
         raise KeyError("bootstrap_required")

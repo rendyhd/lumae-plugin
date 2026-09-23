@@ -73,7 +73,7 @@ from .catalog_enrichment import (
 )
 from .catalog_readiness import CONTRACT_REVISION, v3_release_readiness
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
-from .database_state import collect_database_state, render_database_state
+from .database_state import collect_database_state, render_database_state, safe_snapshot_error
 from .settings_ui import SETTINGS_STATUS_SCRIPT
 from .provider_identity_guard import (
     TRANSITION_BLOCKER,
@@ -85,6 +85,7 @@ from .provider_identity_guard import (
     require_projection_reconcile,
 )
 from .provider_identity_rekey import read_transition_manifest, refresh_audiomuse_health
+from .profile_publication import admit_attempts, complete_attempt, migrate_attempts, release_attempts
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
     COLLECTIONS_SCHEMA_VERSION,
@@ -433,6 +434,36 @@ def _resolve_task_server_id(adapter, server_id):
     return None
 
 
+def wake_profile_backfill_after_catalog_refresh(result, db=None):
+    """Keep one exact-source repair wake even if a batch is finishing."""
+    source = result["catalog_instance_id"]
+    server_id = result["server_id"]
+    db = db or get_db()
+    force_now = bool(result.get("changes") or
+                     result.get("change_reason") == "fingerprint_schema_rebase")
+    with db.cursor() as cur:
+        cur.execute(
+            f"""UPDATE {profile_backfill_state_table()}
+                   SET refresh_wake_pending=CASE WHEN %s THEN TRUE
+                                                 ELSE refresh_wake_pending END,
+                       next_retry_at=CASE WHEN %s AND status='queued' THEN NULL
+                                          ELSE next_retry_at END,
+                       updated_at=now()
+                 WHERE catalog_instance_id=%s AND status IN ('queued', 'running')
+                 RETURNING catalog_instance_id""",
+            (force_now, force_now, source),
+        )
+        active = cur.fetchone() is not None
+    if active:
+        arm_reconcile(db, "catalog_profile_repair")
+        db.commit()
+        return True
+    db.commit()
+    return start_profile_backfill(
+        catalog_instance_id=source, server_id=server_id, enqueue_job=False,
+    )
+
+
 def catalog_refresh_task(server_id=None):
     if maintenance_paused():
         return {"status": "paused", "reason": "maintenance_paused"}
@@ -441,6 +472,18 @@ def catalog_refresh_task(server_id=None):
     if not resolved_server_id:
         return {"status": "skipped", "reason": "source_rebind_required"}
     result = refresh_catalog(server_id=resolved_server_id)
+    try:
+        source = result["catalog_instance_id"]
+        changed = bool(result.get("changes") or
+                       result.get("change_reason") == "fingerprint_schema_rebase")
+        if (changed or
+                find_backfill_ids(1, catalog_instance_id=source,
+                                  server_id=result["server_id"]) or
+                next_profile_retry_at(source)):
+            wake_profile_backfill_after_catalog_refresh(result)
+    except Exception:
+        _rollback_if_possible(get_db())
+        logger.exception("Could not arm source profile repair after catalogue publication")
     try:
         db = get_db()
         optional_storage.prune(db)
@@ -555,7 +598,7 @@ def next_profile_backfill_run(db=None, server_id=None):
         f"""
         SELECT server_id, catalog_instance_id, retry_count
           FROM {profile_backfill_state_table()}
-         WHERE (status='queued'
+         WHERE ((status='queued' AND (next_retry_at IS NULL OR next_retry_at <= now()))
             OR (status='failed' AND (next_retry_at IS NULL OR next_retry_at <= now()))
             OR (status='running' AND updated_at
                 < now() - interval '{BACKFILL_STALE_MINUTES} minutes'))
@@ -1113,6 +1156,7 @@ def migrate(db):
         f"CREATE INDEX IF NOT EXISTS {table('source_profiles_status_idx')} "
         f"ON {source_profiles_table()} (catalog_instance_id, status)"
     )
+    migrate_attempts(cur)
     migrate_edge_profiles(db)
     _drop_dj_tables(db)
     optional_storage.migrate(db)
@@ -1154,6 +1198,50 @@ def migrate(db):
                p.profile_schema_ver, p.media_signature, p.analyzed_at,
                p.status, p.last_error
           FROM migration CROSS JOIN default_source d CROSS JOIN {profiles_table()} p
+        ON CONFLICT (catalog_instance_id, track_id) DO NOTHING
+        """
+    )
+    # Published validity is independent of the current analysis attempt. This
+    # additive table is seeded once; runtime routing is introduced separately.
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {table('published_source_profiles')} (
+            catalog_instance_id TEXT NOT NULL REFERENCES {table('catalog_sources')}(catalog_instance_id)
+                ON DELETE CASCADE,
+            track_id TEXT NOT NULL,
+            sample_rate INTEGER NOT NULL,
+            duration_ms INTEGER NOT NULL,
+            ref_lufs REAL NOT NULL,
+            start_ramp BYTEA NOT NULL,
+            end_ramp BYTEA NOT NULL,
+            analyzer_ver INTEGER NOT NULL,
+            profile_schema_ver INTEGER NOT NULL,
+            media_signature TEXT,
+            analyzed_at TIMESTAMP NOT NULL,
+            PRIMARY KEY (catalog_instance_id, track_id)
+        )
+        """
+    )
+    # Use a distinct durable marker, even when there are no ready rows.
+    # The marker and copy share one SQL statement and the migration transaction:
+    # a later default-source change or deleted publication cannot trigger a copy.
+    cur.execute(
+        f"""
+        WITH migration AS (
+            INSERT INTO {table('profile_migrations')} (name)
+            VALUES ('published_source_profiles_seed_v1')
+            ON CONFLICT (name) DO NOTHING
+            RETURNING name
+        )
+        INSERT INTO {table('published_source_profiles')}
+            (catalog_instance_id, track_id, sample_rate, duration_ms, ref_lufs,
+             start_ramp, end_ramp, analyzer_ver, profile_schema_ver,
+             media_signature, analyzed_at)
+        SELECT p.catalog_instance_id, p.track_id, p.sample_rate, p.duration_ms,
+               p.ref_lufs, p.start_ramp, p.end_ramp, p.analyzer_ver,
+               p.profile_schema_ver, p.media_signature, p.analyzed_at
+          FROM migration CROSS JOIN {source_profiles_table()} p
+         WHERE p.status='ready'
         ON CONFLICT (catalog_instance_id, track_id) DO NOTHING
         """
     )
@@ -1203,6 +1291,10 @@ def migrate(db):
             updated_at TIMESTAMP NOT NULL DEFAULT now()
         )
         """
+    )
+    cur.execute(
+        f"ALTER TABLE {profile_backfill_state_table()} "
+        "ADD COLUMN IF NOT EXISTS refresh_wake_pending BOOLEAN NOT NULL DEFAULT FALSE"
     )
     cur.execute(
         f"""
@@ -1329,6 +1421,25 @@ def fetch_profile_rows(ids, catalog_instance_id=None):
     return rows
 
 
+def fetch_published_profile_rows(ids, catalog_instance_id):
+    if not ids:
+        return []
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""SELECT p.track_id, p.sample_rate, p.duration_ms, p.ref_lufs,
+                  p.start_ramp, p.end_ramp, p.analyzer_ver, p.analyzed_at,
+                  p.media_signature, edge.payload AS edge_profile
+             FROM {table('published_source_profiles')} p {edge_join()}
+            WHERE p.catalog_instance_id=%s AND p.track_id=ANY(%s)""",
+        (catalog_instance_id, ids),
+    )
+    columns = [desc[0] for desc in cur.description]
+    rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+    cur.close()
+    return rows
+
+
 def _bytes(value):
     if value is None:
         return b""
@@ -1342,7 +1453,7 @@ def _bytes(value):
 def serialize_ready_profile(row):
     return serialize_profile(
         row["track_id"], row["sample_rate"], row["duration_ms"], row["ref_lufs"],
-        row["start_ramp"], row["end_ramp"], row["analyzer_ver"], str(row["analyzed_at"]),
+        row["start_ramp"], row["end_ramp"], row["analyzer_ver"], row["analyzed_at"],
         row.get("media_signature"), edge_profile=row.get("edge_profile"),
     )
 
@@ -1357,7 +1468,16 @@ def split_analyze_ids(ids, catalog_instance_id=None):
         row = by_id.get(track_id)
         status = row.get("status") if row else None
         if status == "ready":
-            already_ready.append(track_id)
+            current_signature = (
+                catalog_media_signature(
+                    track_id, catalog_instance_id=catalog_instance_id
+                )
+                if catalog_instance_id else None
+            )
+            if current_signature and row.get("media_signature") != current_signature:
+                accepted.append(track_id)
+            else:
+                already_ready.append(track_id)
         elif is_pending_profile_status(status):
             already_pending.append(track_id)
         else:
@@ -1369,73 +1489,106 @@ def is_pending_profile_status(status):
     return str(status or "") in ("pending", "pending_interactive")
 
 
+def arm_profile_claim_recovery(catalog_instance_id, db=None, commit=True):
+    """Keep a durable wake for an abandoned token, including hook-only work."""
+    db = db or get_db()
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""INSERT INTO {profile_backfill_state_table()}
+                    (catalog_instance_id, server_id, status, next_retry_at)
+                   SELECT s.catalog_instance_id, s.current_core_server_id,
+                          'queued', now() + interval '{PREPARATION_STALE_HOURS} hours'
+                     FROM {table('catalog_sources')} s
+                    WHERE s.catalog_instance_id=%s AND s.rebind_status='active'
+                   ON CONFLICT (catalog_instance_id) DO UPDATE SET
+                       status=CASE WHEN {profile_backfill_state_table()}.status='running'
+                                   THEN 'running' ELSE 'queued' END,
+                       next_retry_at=CASE
+                           WHEN {profile_backfill_state_table()}.status='running'
+                               THEN {profile_backfill_state_table()}.next_retry_at
+                           WHEN {profile_backfill_state_table()}.status='queued'
+                                AND {profile_backfill_state_table()}.next_retry_at IS NULL
+                               THEN NULL
+                           ELSE LEAST(
+                               COALESCE({profile_backfill_state_table()}.next_retry_at,
+                                        EXCLUDED.next_retry_at),
+                               EXCLUDED.next_retry_at)
+                           END,
+                       refresh_wake_pending=CASE
+                           WHEN {profile_backfill_state_table()}.status='running'
+                               THEN TRUE
+                           ELSE {profile_backfill_state_table()}.refresh_wake_pending END,
+                       updated_at=now()
+                   RETURNING catalog_instance_id""",
+            (catalog_instance_id,),
+        )
+        armed = cur.fetchone() is not None
+        if armed:
+            arm_reconcile(db, "profile_claim_recovery")
+        if commit:
+            db.commit()
+        return armed
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        cur.close()
+
+
 def mark_pending(ids, catalog_instance_id=None, priority="background"):
     if not ids:
-        return
+        return {}
+    if catalog_instance_id:
+        db = get_db()
+        return admit_attempts(
+            db, catalog_instance_id, ids, priority=priority,
+            analyzer_version=ANALYZER_VERSION, schema_version=SCHEMA_VERSION,
+            recovery_arm=arm_profile_claim_recovery,
+        )
     pending_status = "pending_interactive" if priority == "interactive" else "pending"
     db = get_db()
     cur = db.cursor()
-    if catalog_instance_id:
-        cur.execute(
-            f"""
-            INSERT INTO {source_profiles_table()}
-                (catalog_instance_id, track_id, sample_rate, duration_ms, ref_lufs,
-                 start_ramp, end_ramp, analyzer_ver, profile_schema_ver,
-                 analyzed_at, status, last_error)
-            SELECT %s, unnest(%s::text[]), 0, 0, 0, decode('', 'hex'), decode('', 'hex'),
-                   %s, %s, now(), %s, NULL
-            ON CONFLICT (catalog_instance_id, track_id) DO UPDATE SET
-                analyzed_at = EXCLUDED.analyzed_at,
-                status = EXCLUDED.status,
-                last_error = NULL
-            """,
-            (catalog_instance_id, ids, ANALYZER_VERSION, SCHEMA_VERSION, pending_status),
-        )
-    else:
-        cur.execute(
-            f"""
-            INSERT INTO {profiles_table()}
-                (track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
-                 analyzer_ver, profile_schema_ver, analyzed_at, status, last_error)
-            SELECT unnest(%s::text[]), 0, 0, 0, decode('', 'hex'), decode('', 'hex'), %s, %s, now(), %s, NULL
-            ON CONFLICT (track_id) DO UPDATE SET
-                analyzed_at = EXCLUDED.analyzed_at,
-                status = EXCLUDED.status,
-                last_error = NULL
-            """,
-            (ids, ANALYZER_VERSION, SCHEMA_VERSION, pending_status),
-        )
+    cur.execute(
+        f"""
+        INSERT INTO {profiles_table()}
+            (track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
+             analyzer_ver, profile_schema_ver, analyzed_at, status, last_error)
+        SELECT unnest(%s::text[]), 0, 0, 0, decode('', 'hex'), decode('', 'hex'),
+               %s, %s, now(), %s, NULL
+        ON CONFLICT (track_id) DO UPDATE SET
+            analyzed_at = EXCLUDED.analyzed_at,
+            status = EXCLUDED.status,
+            last_error = NULL
+        """,
+        (ids, ANALYZER_VERSION, SCHEMA_VERSION, pending_status),
+    )
     db.commit()
     cur.close()
+    return {}
 
-
-def release_pending(ids, catalog_instance_id=None, reason="Profile job could not be queued"):
+def release_pending(ids, catalog_instance_id=None,
+                    reason="Profile job could not be queued", tokens=None):
     if not ids:
         return
+    if catalog_instance_id:
+        return release_attempts(
+            get_db(), catalog_instance_id,
+            {track_id: tokens[track_id] for track_id in ids if tokens and track_id in tokens},
+            reason,
+        )
     db = get_db()
     cur = db.cursor()
-    if catalog_instance_id:
-        cur.execute(
-            f"""
-            UPDATE {source_profiles_table()}
-               SET status='stale', last_error=%s, analyzed_at=now()
-             WHERE catalog_instance_id=%s AND track_id=ANY(%s)
-               AND status IN ('pending', 'pending_interactive')
-            """,
-            (str(reason)[:2000], catalog_instance_id, ids),
-        )
-    else:
-        cur.execute(
-            f"""
-            UPDATE {profiles_table()}
-               SET status='stale', last_error=%s, analyzed_at=now()
-             WHERE track_id=ANY(%s) AND status IN ('pending', 'pending_interactive')
-            """,
-            (str(reason)[:2000], ids),
-        )
+    cur.execute(
+        f"""
+        UPDATE {profiles_table()}
+           SET status='stale', last_error=%s, analyzed_at=now()
+         WHERE track_id=ANY(%s) AND status IN ('pending', 'pending_interactive')
+        """,
+        (str(reason)[:2000], ids),
+    )
     db.commit()
     cur.close()
-
 
 def enqueue_profile_analysis(
     ids,
@@ -1445,38 +1598,31 @@ def enqueue_profile_analysis(
     priority="background",
 ):
     queue_name = "high" if priority == "interactive" else "default"
-    if catalog_instance_id:
-        mark_pending(ids, catalog_instance_id=catalog_instance_id, priority=priority)
-    else:
-        mark_pending(ids, priority=priority)
+    tokens = mark_pending(
+        ids, catalog_instance_id=catalog_instance_id, priority=priority
+    )
+    if catalog_instance_id and not tokens:
+        return None
+    admitted_ids = [track_id for track_id in ids if not catalog_instance_id or track_id in tokens]
     try:
-        if catalog_instance_id:
-            return enqueue_bounded(
-                analyze_tracks_task,
-                ids,
-                catalog_instance_id,
-                server_id,
-                priority,
-                queue=queue_name,
-                timeout=PROFILE_JOB_TIMEOUT_SECONDS,
-            )
         return enqueue_bounded(
             analyze_tracks_task,
-            ids,
-            None,
-            None,
+            admitted_ids,
+            catalog_instance_id,
+            server_id,
             priority,
+            tokens if catalog_instance_id else None,
             queue=queue_name,
             timeout=PROFILE_JOB_TIMEOUT_SECONDS,
         )
     except Exception as exc:
         release_pending(
-            ids,
+            admitted_ids,
             catalog_instance_id=catalog_instance_id,
             reason=f"Profile job could not be queued: {exc}",
+            tokens=tokens,
         )
         raise
-
 
 def load_track_file(track_id, catalog_instance_id=None, server_id=None):
     db = get_db()
@@ -1564,103 +1710,42 @@ def upsert_profile(
     last_error=None,
     media_sig=None,
     catalog_instance_id=None,
+    attempt_token=None,
+    failure_code=None,
 ):
+    if catalog_instance_id:
+        return complete_attempt(
+            get_db(), catalog_instance_id, track_id, attempt_token,
+            result, status, last_error, media_sig, ANALYZER_VERSION, SCHEMA_VERSION,
+            failure_code=failure_code,
+        )
+    # The pre-source compatibility table has no public profile stream.
     db = get_db()
     cur = db.cursor()
-    previous = None
-    if catalog_instance_id:
-        cur.execute(
-            f"""
-            SELECT sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
-                   analyzer_ver, media_signature, status
-              FROM {source_profiles_table()}
-             WHERE catalog_instance_id=%s AND track_id=%s
-            """,
-            (catalog_instance_id, track_id),
-        )
-        previous = cur.fetchone()
-    values = (
-        track_id,
-        int(getattr(result, "sample_rate", 0)),
-        int(getattr(result, "duration_ms", 0)),
-        float(getattr(result, "ref_lufs", 0.0)),
-        getattr(result, "start_ramp_blob", b""),
-        getattr(result, "end_ramp_blob", b""),
-        ANALYZER_VERSION,
-        SCHEMA_VERSION,
-        media_sig,
-        utc_now_iso(),
-        status,
-        last_error,
-    )
-    conflict_target = "track_id"
-    target_table = profiles_table()
-    columns = "track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp"
-    placeholders = "%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s"
-    if catalog_instance_id:
-        target_table = source_profiles_table()
-        conflict_target = "catalog_instance_id, track_id"
-        columns = "catalog_instance_id, " + columns
-        placeholders = "%s, " + placeholders
-        values = (catalog_instance_id,) + values
     cur.execute(
         f"""
-        INSERT INTO {target_table}
-            ({columns}, analyzer_ver, profile_schema_ver, media_signature,
-             analyzed_at, status, last_error)
-        VALUES ({placeholders})
-        ON CONFLICT ({conflict_target}) DO UPDATE SET
-            sample_rate = EXCLUDED.sample_rate,
-            duration_ms = EXCLUDED.duration_ms,
-            ref_lufs = EXCLUDED.ref_lufs,
-            start_ramp = EXCLUDED.start_ramp,
-            end_ramp = EXCLUDED.end_ramp,
-            analyzer_ver = EXCLUDED.analyzer_ver,
-            profile_schema_ver = EXCLUDED.profile_schema_ver,
-            media_signature = EXCLUDED.media_signature,
-            analyzed_at = EXCLUDED.analyzed_at,
-            status = EXCLUDED.status,
-            last_error = EXCLUDED.last_error
+        INSERT INTO {profiles_table()}
+            (track_id, sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
+             analyzer_ver, profile_schema_ver, media_signature, analyzed_at, status, last_error)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, now(), %s, %s)
+        ON CONFLICT (track_id) DO UPDATE SET
+            sample_rate=EXCLUDED.sample_rate, duration_ms=EXCLUDED.duration_ms,
+            ref_lufs=EXCLUDED.ref_lufs, start_ramp=EXCLUDED.start_ramp,
+            end_ramp=EXCLUDED.end_ramp, analyzer_ver=EXCLUDED.analyzer_ver,
+            profile_schema_ver=EXCLUDED.profile_schema_ver,
+            media_signature=EXCLUDED.media_signature, analyzed_at=EXCLUDED.analyzed_at,
+            status=EXCLUDED.status, last_error=EXCLUDED.last_error
         """,
-        values,
+        (track_id, int(getattr(result, "sample_rate", 0)),
+         int(getattr(result, "duration_ms", 0)),
+         float(getattr(result, "ref_lufs", 0.0)),
+         getattr(result, "start_ramp_blob", b""),
+         getattr(result, "end_ramp_blob", b""),
+         ANALYZER_VERSION, SCHEMA_VERSION, media_sig, status, last_error),
     )
-    if catalog_instance_id:
-        public_payload = None
-        if status == "ready":
-            public_payload = serialize_profile(
-                track_id,
-                int(getattr(result, "sample_rate", 0)),
-                int(getattr(result, "duration_ms", 0)),
-                float(getattr(result, "ref_lufs", 0.0)),
-                getattr(result, "start_ramp_blob", b""),
-                getattr(result, "end_ramp_blob", b""),
-                ANALYZER_VERSION,
-                values[-3],
-                media_sig,
-            )
-        ready_unchanged = (
-            status == "ready"
-            and previous is not None
-            and previous[7] == "ready"
-            and int(previous[0]) == int(getattr(result, "sample_rate", 0))
-            and int(previous[1]) == int(getattr(result, "duration_ms", 0))
-            and float(previous[2]) == float(getattr(result, "ref_lufs", 0.0))
-            and _bytes(previous[3]) == getattr(result, "start_ramp_blob", b"")
-            and _bytes(previous[4]) == getattr(result, "end_ramp_blob", b"")
-            and int(previous[5]) == ANALYZER_VERSION
-            and previous[6] == media_sig
-        )
-        removing_ready = previous is not None and previous[7] == "ready" and status != "ready"
-        if not ready_unchanged and (status == "ready" or removing_ready):
-            record_profile_change(
-                cur,
-                catalog_instance_id,
-                track_id,
-                status,
-                public_payload,
-            )
     db.commit()
     cur.close()
+    return True
 
 
 def catalog_capability():
@@ -2419,22 +2504,30 @@ def profiles():
     except (KeyError, ValueError, CatalogScanError) as exc:
         return _catalog_error("source_required", str(exc), 409)
     ids = parse_ids(request.args.get("ids", ""))
-    rows = fetch_profile_rows(ids, catalog_instance_id=source["catalog_instance_id"])
-    by_id = {row["track_id"]: row for row in rows}
+    source_id = source["catalog_instance_id"]
+    published = {
+        row["track_id"]: row
+        for row in fetch_published_profile_rows(ids, source_id)
+    }
+    attempts = {
+        row["track_id"]: row
+        for row in fetch_profile_rows(ids, catalog_instance_id=source_id)
+    }
     ready = []
     failed = []
     missing = []
     for track_id in ids:
-        row = by_id.get(track_id)
-        if row is None:
-            missing.append(track_id)
-        elif row["status"] == "ready":
+        row = published.get(track_id)
+        if row is not None:
             try:
                 ready.append(serialize_ready_profile(row))
             except Exception as exc:
                 failed.append({"track_id": track_id, "reason": str(exc)})
-        elif row["status"] in ("failed", "skipped_no_file"):
-            failed.append({"track_id": track_id, "reason": row.get("last_error") or "failed"})
+        elif attempts.get(track_id, {}).get("status") in ("failed", "skipped_no_file"):
+            failed.append({
+                "track_id": track_id,
+                "reason": attempts[track_id].get("last_error") or "failed",
+            })
         else:
             missing.append(track_id)
     return jsonify(
@@ -2718,84 +2811,51 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id):
     return outcomes
 
 
-def analyze_one_track(track_id, catalog_instance_id=None, server_id=None):
+def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
+                      attempt_token=None):
     if maintenance_paused():
         release_pending(
-            [track_id],
-            catalog_instance_id=catalog_instance_id,
+            [track_id], catalog_instance_id=catalog_instance_id,
             reason="Lumae background maintenance is paused",
+            tokens={track_id: attempt_token} if attempt_token else None,
         )
         return {"track_id": track_id, "status": "skipped_maintenance_paused"}
+    if catalog_instance_id and not attempt_token:
+        return {"track_id": track_id, "status": "superseded"}
+
+    def complete(result, status, error=None, media_sig=None, failure_code=None):
+        applied = upsert_profile(
+            track_id, result, status, error, media_sig,
+            catalog_instance_id=catalog_instance_id,
+            attempt_token=attempt_token,
+            **({"failure_code": failure_code} if failure_code else {}),
+        )
+        return {"track_id": track_id, "status": status if applied else "superseded"}
+
     try:
         info = load_track_file(
-            track_id,
-            catalog_instance_id=catalog_instance_id,
-            server_id=server_id,
+            track_id, catalog_instance_id=catalog_instance_id, server_id=server_id,
         )
     except MediaDownloadError as exc:
-        upsert_profile(
-            track_id,
-            object(),
-            "failed",
-            str(exc),
-            None,
-            catalog_instance_id=catalog_instance_id,
-        )
-        return {"track_id": track_id, "status": "failed"}
+        return complete(object(), "failed", str(exc), failure_code="download_unavailable")
     if info is None:
-        upsert_profile(
-            track_id,
-            object(),
-            "skipped_no_file",
-            "missing file path",
-            None,
-            catalog_instance_id=catalog_instance_id,
-        )
-        return {"track_id": track_id, "status": "skipped_no_file"}
+        return complete(object(), "skipped_no_file", "missing file path", failure_code="media_unavailable")
     try:
         result = analyze_file(info["file_path"])
-        upsert_profile(
-            track_id,
-            result,
-            "ready",
-            None,
-            info["media_signature"],
-            catalog_instance_id=catalog_instance_id,
-        )
-        _schedule_edge_upgrade(track_id, catalog_instance_id, server_id)
-        return {"track_id": track_id, "status": "ready"}
+        outcome = complete(result, "ready", media_sig=info["media_signature"])
+        if outcome["status"] == "ready":
+            _schedule_edge_upgrade(track_id, catalog_instance_id, server_id)
+        return outcome
     except SilentAudioError as exc:
-        upsert_profile(
-            track_id,
-            object(),
-            "failed",
-            str(exc),
-            info["media_signature"],
-            catalog_instance_id=catalog_instance_id,
-        )
-        return {"track_id": track_id, "status": "failed"}
+        return complete(object(), "failed", str(exc), info["media_signature"], "silent_audio")
     except (ProfileAnalysisTimeout, ProfileResourceLimitError) as exc:
         logger.warning("lumae_analysis bounded profile rejection for %s: %s", track_id, exc)
-        upsert_profile(
-            track_id,
-            object(),
-            "failed",
-            str(exc),
-            info["media_signature"],
-            catalog_instance_id=catalog_instance_id,
-        )
-        return {"track_id": track_id, "status": "failed"}
+        code = "analysis_timeout" if isinstance(exc, ProfileAnalysisTimeout) else "resource_limit"
+        return complete(object(), "failed", str(exc), info["media_signature"], code)
     except Exception as exc:
         logger.exception("lumae_analysis failed for %s", track_id)
-        upsert_profile(
-            track_id,
-            object(),
-            "failed",
-            str(exc),
-            info["media_signature"],
-            catalog_instance_id=catalog_instance_id,
-        )
-        return {"track_id": track_id, "status": "failed"}
+        code = "unsupported_media" if isinstance(exc, (ValueError, EOFError)) or type(exc).__name__ == "InvalidDataError" else "analysis_error"
+        return complete(object(), "failed", str(exc), info["media_signature"], code)
     finally:
         remove_downloaded_file(info.get("cleanup_path"))
 
@@ -2827,7 +2887,7 @@ def hook_media_signature(song, audio_path):
     return f"analysis-hook|{track_id}|{source_path}|{audio_sig}"
 
 
-def catalog_media_signature(track_id, server_id=None):
+def catalog_media_signature(track_id, server_id=None, catalog_instance_id=None):
     db = get_db()
     cur = db.cursor()
     cur.execute(
@@ -2838,11 +2898,12 @@ def catalog_media_signature(track_id, server_id=None):
           JOIN {table('catalog_tracks')} t
             ON t.catalog_instance_id=s.catalog_instance_id
            AND t.published_generation=c.published_generation
-         WHERE t.track_id=%s AND t.available=TRUE
+         WHERE t.track_id=%s AND t.available=TRUE AND s.rebind_status='active'
            AND (%s IS NULL OR s.current_core_server_id=%s)
+           AND (%s IS NULL OR s.catalog_instance_id=%s)
          ORDER BY s.is_default DESC LIMIT 1
         """,
-        (track_id, server_id, server_id),
+        (track_id, server_id, server_id, catalog_instance_id, catalog_instance_id),
     )
     row = cur.fetchone()
     cur.close()
@@ -3066,10 +3127,7 @@ def analyze_song_hook(song):
     except Exception:
         logger.exception("lumae_analysis could not resolve the analysis source")
     if catalog_instance_id and maintenance_paused():
-        return {
-            "track_id": hook_track_id(song),
-            "status": "skipped_maintenance_paused",
-        }
+        return {"track_id": hook_track_id(song), "status": "skipped_maintenance_paused"}
     if catalog_instance_id:
         run_id = str((event or {}).get("run_id") or "").strip()
         if run_id:
@@ -3083,72 +3141,47 @@ def analyze_song_hook(song):
         else:
             logger.warning("lumae_analysis analysis hook did not include run_id")
     track_id = hook_track_id(song)
-    audio_path = (song or {}).get("audio_path")
     if not track_id:
         logger.warning("lumae_analysis song hook skipped payload without item_id")
         return {"track_id": "", "status": "skipped_no_file"}
     if not catalog_instance_id:
         logger.warning("lumae_analysis song hook skipped %s without an exact source", track_id)
         return {"track_id": track_id, "status": "skipped_source_unresolved"}
-    if maintenance_paused():
-        return {"track_id": track_id, "status": "skipped_maintenance_paused"}
-    if not audio_path or not os.path.exists(audio_path):
-        upsert_profile(
-            track_id,
-            object(),
-            "skipped_no_file",
-            "missing analysis audio path",
-            None,
-            catalog_instance_id=catalog_instance_id,
-        )
-        return {"track_id": track_id, "status": "skipped_no_file"}
-    media_sig = catalog_media_signature(track_id, source_server_id) or hook_media_signature(
-        song, audio_path
+    tokens = mark_pending([track_id], catalog_instance_id, priority="interactive")
+    token = tokens.get(track_id)
+    if not token:
+        return {"track_id": track_id, "status": "skipped_source_unresolved"}
+    audio_path = (song or {}).get("audio_path")
+    media_sig = catalog_media_signature(
+        track_id, source_server_id, catalog_instance_id=catalog_instance_id
     )
+
+    def complete(result, status, error=None, failure_code=None):
+        applied = upsert_profile(
+            track_id, result, status, error, media_sig,
+            catalog_instance_id=catalog_instance_id, attempt_token=token,
+            **({"failure_code": failure_code} if failure_code else {}),
+        )
+        return {"track_id": track_id, "status": status if applied else "superseded"}
+
+    if not audio_path or not os.path.exists(audio_path):
+        return complete(object(), "skipped_no_file", "missing analysis audio path", "media_unavailable")
     try:
         result = analyze_file(audio_path)
-        upsert_profile(
-            track_id,
-            result,
-            "ready",
-            None,
-            media_sig,
-            catalog_instance_id=catalog_instance_id,
-        )
-        _schedule_edge_upgrade(track_id, catalog_instance_id, source_server_id)
-        return {"track_id": track_id, "status": "ready"}
+        outcome = complete(result, "ready")
+        if outcome["status"] == "ready":
+            _schedule_edge_upgrade(track_id, catalog_instance_id, source_server_id)
+        return outcome
     except SilentAudioError as exc:
-        upsert_profile(
-            track_id,
-            object(),
-            "failed",
-            str(exc),
-            media_sig,
-            catalog_instance_id=catalog_instance_id,
-        )
-        return {"track_id": track_id, "status": "failed"}
+        return complete(object(), "failed", str(exc), "silent_audio")
     except (ProfileAnalysisTimeout, ProfileResourceLimitError) as exc:
         logger.warning("lumae_analysis bounded profile rejection for %s: %s", track_id, exc)
-        upsert_profile(
-            track_id,
-            object(),
-            "failed",
-            str(exc),
-            media_sig,
-            catalog_instance_id=catalog_instance_id,
-        )
-        return {"track_id": track_id, "status": "failed"}
+        code = "analysis_timeout" if isinstance(exc, ProfileAnalysisTimeout) else "resource_limit"
+        return complete(object(), "failed", str(exc), code)
     except Exception as exc:
         logger.exception("lumae_analysis hook failed for %s", track_id)
-        upsert_profile(
-            track_id,
-            object(),
-            "failed",
-            str(exc),
-            media_sig,
-            catalog_instance_id=catalog_instance_id,
-        )
-        return {"track_id": track_id, "status": "failed"}
+        code = "unsupported_media" if isinstance(exc, (ValueError, EOFError)) or type(exc).__name__ == "InvalidDataError" else "analysis_error"
+        return complete(object(), "failed", str(exc), code)
 
 
 def profile_task_disposition(track_id, catalog_instance_id=None, server_id=None, priority="background"):
@@ -3160,7 +3193,9 @@ def profile_task_disposition(track_id, catalog_instance_id=None, server_id=None,
         return "promoted"
     if row.get("status") != "ready" or int(row.get("analyzer_ver") or 0) < ANALYZER_VERSION:
         return "analyze"
-    expected_signature = catalog_media_signature(track_id, server_id)
+    expected_signature = catalog_media_signature(
+        track_id, server_id, catalog_instance_id=catalog_instance_id
+    )
     stored_signature = row.get("media_signature")
     if expected_signature and stored_signature != expected_signature:
         return "analyze"
@@ -3172,6 +3207,7 @@ def analyze_tracks_task(
     catalog_instance_id=None,
     server_id=None,
     priority="background",
+    attempt_tokens=None,
 ):
     ids = parse_ids(",".join(ids or []))
     if maintenance_paused():
@@ -3179,6 +3215,7 @@ def analyze_tracks_task(
             ids,
             catalog_instance_id=catalog_instance_id,
             reason="Lumae background maintenance is paused",
+            tokens=attempt_tokens,
         )
         return {
             "attempted": 0,
@@ -3190,6 +3227,14 @@ def analyze_tracks_task(
             "deferred": len(ids),
             "paused": True,
         }
+    if catalog_instance_id and not attempt_tokens:
+        # Persisted jobs from before token admission cannot publish or release.
+        return {
+            "attempted": 0, "ready": 0, "already_ready": 0,
+            "promoted": 0, "failed": 0, "skipped": len(ids),
+            "deferred": len(ids), "superseded": len(ids),
+        }
+
     if priority == "background" and len(ids) > MAX_BACKFILL_BATCH_SIZE:
         # Drain 0.8.0's already-persisted 250-track RQ jobs quickly after an
         # upgrade. Their rows become retryable and one bounded chain owns the
@@ -3198,6 +3243,7 @@ def analyze_tracks_task(
             ids,
             catalog_instance_id=catalog_instance_id,
             reason="Migrated to bounded 0.8.1 background enrichment",
+            tokens=attempt_tokens,
         )
         if catalog_instance_id or server_id:
             try:
@@ -3229,12 +3275,16 @@ def analyze_tracks_task(
                 remaining,
                 catalog_instance_id=catalog_instance_id,
                 reason="Lumae background maintenance was paused during the batch",
+                tokens=attempt_tokens,
             )
             results.extend(
                 {"track_id": item_id, "status": "skipped_maintenance_paused"}
                 for item_id in remaining
             )
             break
+        if catalog_instance_id and track_id not in attempt_tokens:
+            results.append({"track_id": track_id, "status": "superseded"})
+            continue
         disposition = profile_task_disposition(
             track_id,
             catalog_instance_id=catalog_instance_id,
@@ -3250,6 +3300,7 @@ def analyze_tracks_task(
                 track_id,
                 catalog_instance_id=catalog_instance_id,
                 server_id=server_id,
+                attempt_token=attempt_tokens.get(track_id) if catalog_instance_id else None,
             )
         )
         _safe_progress("analyzing volume and ramps", current=index + 1, total=len(ids))
@@ -3277,6 +3328,8 @@ def is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
     current_sig = (
         file_path if str(file_path or "").startswith("catalog-media:") else media_signature(file_path)
     )
+    if status == "deferred_no_media_revision":
+        return bool(current_sig and current_sig != "catalog-media:")
     if status == "skipped_no_file":
         return bool(current_sig or media_server_download_available())
     if analyzer_ver is None:
@@ -3285,7 +3338,7 @@ def is_backfill_candidate(file_path, stored_sig, analyzer_ver, status):
         return True
     if status == "stale":
         return True
-    if status == "ready" and current_sig and stored_sig and current_sig != stored_sig:
+    if status == "ready" and current_sig and current_sig != "catalog-media:" and current_sig != stored_sig:
         return True
     return False
 
@@ -3360,14 +3413,45 @@ def fetch_backfill_rows(
     # ProviderCatalogBridge. This must remain retryable even when a v3 registry
     # source has no matching legacy global MEDIASERVER_* configuration.
     retry_skipped = True
-    params.extend(
-        (
-            ANALYZER_VERSION,
-            bool(include_failed),
-            retry_skipped,
-            max(1, int(limit)),
-        )
+    stale_clause = (
+        """(p.status='stale' AND (
+                    p.retry_category IS NULL
+                    OR (p.retry_category='queue_unavailable'
+                        AND p.retry_count < 3 AND p.retry_after <= now())
+                    OR (NULLIF(t.media_fp, '') IS NOT NULL
+                        AND p.retry_media_signature IS NOT NULL
+                        AND p.retry_media_signature IS DISTINCT FROM
+                            ('catalog-media:' || t.media_fp))
+                ))"""
+        if catalog_instance_id else "p.status='stale'"
     )
+    retry_clause = (
+        """OR (p.status IN ('failed', 'skipped_no_file')
+                AND (
+                    (NULLIF(t.media_fp, '') IS NOT NULL
+                     AND p.retry_media_signature IS NOT NULL
+                     AND p.retry_media_signature IS DISTINCT FROM
+                         ('catalog-media:' || t.media_fp))
+                    OR (p.retry_analyzer_ver IS NOT NULL
+                        AND p.retry_analyzer_ver < %s)
+                    OR (p.retry_profile_schema_ver IS NOT NULL
+                        AND p.retry_profile_schema_ver < %s)
+                    OR (p.retry_category IS NULL AND p.retry_count=0)
+                    OR (p.retry_category IN
+                            ('download_unavailable', 'media_unavailable',
+                             'analysis_timeout', 'analysis_error',
+                             'queue_unavailable')
+                        AND p.retry_count < %s AND p.retry_after <= now())
+                ))"""
+        if catalog_instance_id else
+        "OR (%s AND p.status='failed') OR (%s AND p.status='skipped_no_file')"
+    )
+    params.append(ANALYZER_VERSION)
+    if catalog_instance_id:
+        params.extend((ANALYZER_VERSION, SCHEMA_VERSION, 3))
+    else:
+        params.extend((bool(include_failed), retry_skipped))
+    params.append(max(1, int(limit)))
     cur.execute(
         f"""
         WITH source AS (
@@ -3388,19 +3472,26 @@ def fetch_backfill_rows(
           LEFT JOIN {profile_table} p ON p.track_id=t.track_id
                {profile_source_join}
          WHERE t.available=TRUE AND t.analysis_eligible=TRUE
-           AND COALESCE(p.status, '') NOT IN ('pending', 'pending_interactive')
+           AND (
+                COALESCE(p.status, '') NOT IN
+                    ('pending', 'pending_interactive', 'deferred_no_media_revision')
+                OR (p.status='deferred_no_media_revision'
+                    AND NULLIF(t.media_fp, '') IS NOT NULL)
+           )
            AND (
                 p.track_id IS NULL
                 OR p.analyzer_ver IS NULL
                 OR p.analyzer_ver < %s
-                OR p.status='stale'
+                OR {stale_clause}
+                OR (p.status='deferred_no_media_revision'
+                    AND NULLIF(t.media_fp, '') IS NOT NULL)
                 OR (
                     p.status='ready'
+                    AND NULLIF(t.media_fp, '') IS NOT NULL
                     AND p.media_signature IS DISTINCT FROM
                         ('catalog-media:' || COALESCE(t.media_fp, ''))
                 )
-                OR (%s AND p.status='failed')
-                OR (%s AND p.status='skipped_no_file')
+                {retry_clause}
            )
          ORDER BY t.track_id
          LIMIT %s
@@ -3427,8 +3518,12 @@ def find_backfill_ids(
         include_failed=include_failed,
     )
     for item_id, file_path, stored_sig, analyzer_ver, status in rows:
-        if (include_failed and status == "failed") or is_backfill_candidate(
-            file_path, stored_sig, analyzer_ver, status
+        if (
+            (catalog_instance_id and status in ("failed", "skipped_no_file"))
+            or (include_failed and status == "failed")
+            or is_backfill_candidate(
+                file_path, stored_sig, analyzer_ver, status
+            )
         ):
             ids.append(str(item_id))
             if len(ids) >= batch_limit:
@@ -3626,7 +3721,7 @@ def claim_profile_backfill_batch(catalog_instance_id, db=None):
         UPDATE {profile_backfill_state_table()}
            SET status='running', last_error=NULL, next_retry_at=NULL, updated_at=now()
          WHERE catalog_instance_id=%s
-           AND (status='queued'
+           AND ((status='queued' AND (next_retry_at IS NULL OR next_retry_at <= now()))
                 OR (status='failed' AND (next_retry_at IS NULL OR next_retry_at <= now()))
                 OR (status='running' AND updated_at
                     < now() - interval '{BACKFILL_STALE_MINUTES} minutes'))
@@ -3670,6 +3765,7 @@ def update_profile_backfill_state(
     queued_profiles=0,
     last_error=None,
     completed=False,
+    next_retry_at=None,
     db=None,
 ):
     db = db or get_db()
@@ -3678,17 +3774,23 @@ def update_profile_backfill_state(
         f"""
         INSERT INTO {profile_backfill_state_table()}
             (catalog_instance_id, server_id, status, processed_profiles,
-             queued_profiles, last_error, started_at, completed_at, updated_at)
+             queued_profiles, last_error, started_at, completed_at,
+             next_retry_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, now(),
-                CASE WHEN %s THEN now() ELSE NULL END, now())
+                CASE WHEN %s THEN now() ELSE NULL END, %s, now())
         ON CONFLICT (catalog_instance_id) DO UPDATE SET
             server_id=EXCLUDED.server_id,
-            status=EXCLUDED.status,
+            status=CASE WHEN EXCLUDED.status='complete'
+                              AND {profile_backfill_state_table()}.refresh_wake_pending
+                        THEN 'queued' ELSE EXCLUDED.status END,
+            refresh_wake_pending=FALSE,
             processed_profiles={profile_backfill_state_table()}.processed_profiles
                 + EXCLUDED.processed_profiles,
             queued_profiles=EXCLUDED.queued_profiles,
             last_error=EXCLUDED.last_error,
             completed_at=EXCLUDED.completed_at,
+            next_retry_at=CASE WHEN {profile_backfill_state_table()}.refresh_wake_pending
+                                  THEN NULL ELSE EXCLUDED.next_retry_at END,
             updated_at=now()
         """,
         (
@@ -3699,6 +3801,7 @@ def update_profile_backfill_state(
             int(queued_profiles or 0),
             str(last_error)[:2000] if last_error else None,
             bool(completed),
+            next_retry_at,
         ),
     )
     db.commit()
@@ -3758,6 +3861,42 @@ def start_profile_backfill(catalog_instance_id=None, server_id=None, enqueue_job
     }
 
 
+def next_profile_retry_at(catalog_instance_id, db=None):
+    """Earliest finite due retry for one exact source; no work is queued early."""
+    db = db or get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            f"""SELECT MIN(CASE
+                       WHEN p.status IN ('pending', 'pending_interactive')
+                           THEN p.analyzed_at + interval '1 hour'
+                       ELSE p.retry_after END)
+                  FROM {source_profiles_table()} p
+                  JOIN {table('catalog_sources')} s
+                    ON s.catalog_instance_id=p.catalog_instance_id
+                  JOIN {table('catalog_state')} c
+                    ON c.catalog_instance_id=p.catalog_instance_id
+                  JOIN {table('catalog_tracks')} t
+                    ON t.catalog_instance_id=p.catalog_instance_id
+                   AND t.published_generation=c.published_generation
+                   AND t.track_id=p.track_id
+                 WHERE p.catalog_instance_id=%s
+                   AND s.rebind_status='active'
+                   AND t.available=TRUE
+                   AND t.analysis_eligible=TRUE
+                   AND (
+                       p.status IN ('pending', 'pending_interactive')
+                       OR (p.status IN ('failed', 'skipped_no_file', 'stale')
+                           AND p.retry_category IN ('download_unavailable',
+                               'media_unavailable', 'analysis_timeout',
+                               'analysis_error', 'queue_unavailable')
+                           AND p.retry_count < 3 AND p.retry_after IS NOT NULL)
+                   )""",
+            (catalog_instance_id,),
+        )
+        row = cur.fetchone()
+    return row[0] if row else None
+
+
 def profile_backfill_task(server_id, catalog_instance_id):
     """Process one small batch; the watchdog resumes a queued next batch."""
     if maintenance_paused():
@@ -3775,6 +3914,7 @@ def profile_backfill_task(server_id, catalog_instance_id):
             "queued_next": False,
         }
     claimed_ids = []
+    claim_tokens = {}
     try:
         _safe_progress("selecting volume and ramp batch")
         resolve_profile_source(
@@ -3789,20 +3929,25 @@ def profile_backfill_task(server_id, catalog_instance_id):
             include_failed=False,
         )
         if not ids:
+            next_retry = next_profile_retry_at(catalog_instance_id)
             update_profile_backfill_state(
-                catalog_instance_id,
-                server_id,
-                "complete",
-                completed=True,
+                catalog_instance_id, server_id,
+                "queued" if next_retry else "complete",
+                next_retry_at=next_retry, completed=not bool(next_retry),
             )
-            return {"status": "complete", "processed": 0, "queued_next": False}
+            return {"status": "waiting_retry" if next_retry else "complete",
+                    "processed": 0, "queued_next": False}
         claimed_ids = ids
-        mark_pending(ids, catalog_instance_id=catalog_instance_id, priority="background")
+        claim_tokens = mark_pending(
+            ids, catalog_instance_id=catalog_instance_id, priority="background"
+        )
+        ids = [track_id for track_id in ids if track_id in claim_tokens]
         result = analyze_tracks_task(
             ids,
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
             priority="background",
+            attempt_tokens=claim_tokens,
         )
         next_ids = find_backfill_ids(
             1,
@@ -3811,14 +3956,15 @@ def profile_backfill_task(server_id, catalog_instance_id):
             include_failed=False,
         )
         if not next_ids:
+            next_retry = next_profile_retry_at(catalog_instance_id)
             update_profile_backfill_state(
-                catalog_instance_id,
-                server_id,
-                "complete",
-                processed_increment=len(ids),
-                completed=True,
+                catalog_instance_id, server_id,
+                "queued" if next_retry else "complete",
+                processed_increment=len(ids), next_retry_at=next_retry,
+                completed=not bool(next_retry),
             )
-            return {"status": "complete", "processed": len(ids), "queued_next": False, **result}
+            return {"status": "waiting_retry" if next_retry else "complete",
+                    "processed": len(ids), "queued_next": False, **result}
         update_profile_backfill_state(
             catalog_instance_id,
             server_id,
@@ -3840,6 +3986,7 @@ def profile_backfill_task(server_id, catalog_instance_id):
                     claimed_ids,
                     catalog_instance_id=catalog_instance_id,
                     reason=f"Background enrichment batch failed: {exc}",
+                    tokens=claim_tokens,
                 )
             except Exception:
                 logger.exception("lumae_analysis could not release a failed background batch")
@@ -3864,20 +4011,29 @@ def queue_whole_library(catalog_instance_id=None, server_id=None, include_failed
 
 def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=None):
     requested_limit = limit or configured_backfill_limit()
+    source = (
+        resolve_profile_source(
+            catalog_instance_id=catalog_instance_id, server_id=server_id,
+        )["catalog_instance_id"]
+        if catalog_instance_id or server_id else None
+    )
     ids = (
         find_backfill_ids(
             requested_limit,
-            catalog_instance_id=catalog_instance_id,
+            catalog_instance_id=source,
             server_id=server_id,
         )
-        if catalog_instance_id or server_id
+        if source
         else find_backfill_ids(requested_limit)
     )
-    if catalog_instance_id or server_id:
+    if source:
+        tokens = mark_pending(ids, catalog_instance_id=source, priority="background")
+        admitted = [track_id for track_id in ids if track_id in tokens]
         return analyze_tracks_task(
-            ids,
-            catalog_instance_id=catalog_instance_id,
+            admitted,
+            catalog_instance_id=source,
             server_id=server_id,
+            attempt_tokens=tokens,
         )
     return analyze_tracks_task(ids)
 
@@ -4109,8 +4265,15 @@ def recover_stale_pending_profiles(catalog_instance_id, db=None):
     cur.execute(
         f"""
         UPDATE {source_profiles_table()}
-           SET status='stale', last_error='Recovered an interrupted preparation job'
-         WHERE catalog_instance_id=%s AND status='pending'
+           SET status='stale', last_error='queue_unavailable',
+               attempt_token=NULL, retry_category='queue_unavailable',
+               retry_count=retry_count+1,
+               retry_after=CASE WHEN retry_count+1 < 3
+                   THEN now() + interval '60 seconds' ELSE NULL END,
+               retry_media_signature=attempt_media_signature,
+               retry_analyzer_ver=attempt_analyzer_ver,
+               retry_profile_schema_ver=attempt_profile_schema_ver
+         WHERE catalog_instance_id=%s AND status IN ('pending', 'pending_interactive')
            AND analyzed_at < now() - interval '{PREPARATION_STALE_HOURS} hours'
         """,
         (catalog_instance_id,),
@@ -5741,18 +5904,13 @@ def database_state_page():
             readiness_by_source=readiness_by_source,
         )
     except Exception as exc:
-        logger.exception("lumae_analysis could not collect database state")
+        logger.warning("lumae_analysis could not collect database state")
         snapshot = {
             "captured_at": utc_now_iso(),
             "status": "unavailable",
             "core": compatibility.as_dict(),
             "sources": [],
-            "errors": [
-                {
-                    "section": "database snapshot",
-                    "message": str(exc)[:500],
-                }
-            ],
+            "errors": [safe_snapshot_error(exc)],
         }
     return render_page(
         render_database_state(snapshot),

@@ -7,7 +7,7 @@ import uuid
 from datetime import date, datetime, timezone
 from functools import wraps
 
-from flask import Response, abort, g, jsonify, request
+from flask import Response, abort, current_app, g, jsonify, request
 
 from plugin.api import get_db, get_setting, render_page, table
 
@@ -22,6 +22,12 @@ MAX_BACKUP_COLLECTIONS = 2_000
 MAX_BACKUP_ITEMS_PER_COLLECTION = 50_000
 MAX_BACKUP_ITEMS = 100_000
 GLOBAL_PRINCIPAL = "__global__"
+FINGERPRINT_VERSION = 1
+FEED_PROTOCOL_VERSION = 1
+
+
+class FeedProtocolUnavailable(RuntimeError):
+    """The committed collection feed frontier is absent or incompatible."""
 
 
 def collections_table():
@@ -38,6 +44,10 @@ def collection_changes_table():
 
 def collection_mutations_table():
     return table("collection_mutations")
+
+
+def collection_feed_state_table():
+    return table("collection_feed_state")
 
 
 def collections_enabled():
@@ -132,6 +142,41 @@ def migrate_collections(db):
         )
         """
     )
+    # Bound the seed without changing timeouts for the host's later migrations.
+    # The change-table lock itself lasts through the host's outer commit.
+    cur.execute("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")
+    prior_timeouts = cur.fetchone()
+    cur.execute("SET LOCAL lock_timeout = '5s'")
+    cur.execute("SET LOCAL statement_timeout = '30s'")
+    cur.execute(f"LOCK TABLE {collection_changes_table()} IN ACCESS EXCLUSIVE MODE")
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {collection_feed_state_table()} (
+            singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+            protocol_version INTEGER NOT NULL,
+            epoch UUID NOT NULL,
+            head_seq BIGINT NOT NULL CHECK (head_seq >= 0)
+        )
+        """
+    )
+    cur.execute(
+        f"INSERT INTO {collection_feed_state_table()} "
+        f"(singleton, protocol_version, epoch, head_seq) "
+        f"SELECT 1, %s, gen_random_uuid(), COALESCE(MAX(seq), 0) "
+        f"FROM {collection_changes_table()} ON CONFLICT (singleton) DO NOTHING",
+        (FEED_PROTOCOL_VERSION,),
+    )
+    cur.execute(
+        f"SELECT protocol_version FROM {collection_feed_state_table()} WHERE singleton = 1"
+    )
+    state = cur.fetchone()
+    if state is None or state[0] != FEED_PROTOCOL_VERSION:
+        raise FeedProtocolUnavailable("unknown collection feed protocol")
+    cur.execute(
+        "SELECT set_config('lock_timeout', %s, true), "
+        "set_config('statement_timeout', %s, true)",
+        prior_timeouts,
+    )
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {collection_mutations_table()} (
@@ -139,11 +184,27 @@ def migrate_collections(db):
             idempotency_key TEXT NOT NULL,
             response_payload JSONB NOT NULL,
             status_code INTEGER NOT NULL,
+            request_fingerprint TEXT,
+            fingerprint_version INTEGER,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
             PRIMARY KEY (principal, idempotency_key)
         )
         """
     )
+    cur.execute(f"ALTER TABLE {collection_mutations_table()} ADD COLUMN IF NOT EXISTS request_fingerprint TEXT")
+    cur.execute(f"ALTER TABLE {collection_mutations_table()} ADD COLUMN IF NOT EXISTS fingerprint_version INTEGER")
+    cur.execute(
+        "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = %s::regclass",
+        ("lumae_collection_mutation_fingerprint_pair", collection_mutations_table()),
+    )
+    if cur.fetchone() is None:
+        cur.execute(
+            f"ALTER TABLE {collection_mutations_table()} "
+            "ADD CONSTRAINT lumae_collection_mutation_fingerprint_pair "
+            "CHECK ((request_fingerprint IS NULL AND fingerprint_version IS NULL) OR "
+            "(request_fingerprint IS NOT NULL AND fingerprint_version IS NOT NULL "
+            "AND fingerprint_version > 0))"
+        )
     cur.execute(
         f"CREATE INDEX IF NOT EXISTS lumae_collections_changed_idx "
         f"ON {collection_changes_table()} (principal, seq)"
@@ -377,75 +438,67 @@ def _normalize_backup_document(document):
     return normalized
 
 
-def _restore_principal_collections(principal, collections):
-    """Add backup contents as new collections; never overwrite live records."""
-    db = get_db()
-    cur = db.cursor()
+def _restore_principal_collections(cur, principal, collections):
+    """Add backup contents as new collections in the caller's transaction."""
     restored = []
     item_count = 0
-    try:
-        for source in collections:
-            collection_id = str(uuid.uuid4())
+    staged_changes = []
+    for source in collections:
+        collection_id = str(uuid.uuid4())
+        cur.execute(
+            f"INSERT INTO {collections_table()} (principal, id, name, description) "
+            "VALUES (%s, %s, %s, %s)",
+            (principal, collection_id, source["name"], source["description"]),
+        )
+        for item in source["items"]:
+            _upsert_item(cur, principal, collection_id, item)
+        if source["items"]:
             cur.execute(
-                f"""
-                INSERT INTO {collections_table()} (principal, id, name, description)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (principal, collection_id, source["name"], source["description"]),
+                f"UPDATE {collections_table()} SET revision = 2, updated_at = now() "
+                "WHERE principal = %s AND id = %s",
+                (principal, collection_id),
             )
-            for item in source["items"]:
-                _upsert_item(cur, principal, collection_id, item)
-            if source["items"]:
-                cur.execute(
-                    f"UPDATE {collections_table()} SET revision = 2, updated_at = now() "
-                    "WHERE principal = %s AND id = %s",
-                    (principal, collection_id),
-                )
-            collection = _fetch_collection(cur, principal, collection_id)
-            _record_change(
-                cur,
-                principal,
-                collection_id,
-                "collection",
-                collection_id,
-                "upsert",
-                collection,
-            )
-            for item in source["items"]:
-                _record_change(
-                    cur,
-                    principal,
-                    collection_id,
-                    "item",
-                    item["id"],
-                    "upsert",
+        collection = _fetch_collection(cur, principal, collection_id)
+        staged_changes.append(
+            (principal, collection_id, "collection", collection_id, "upsert", collection)
+        )
+        for item in source["items"]:
+            staged_changes.append(
+                (
+                    principal, collection_id, "item", item["id"], "upsert",
                     {
                         **item,
                         "collection_revision": collection["revision"],
                         "collection_updated_at": collection["updated_at"],
                     },
                 )
-            item_count += len(source["items"])
-            restored.append(collection)
-        cur.close()
-        db.commit()
-    except Exception:
-        cur.close()
-        rollback = getattr(db, "rollback", None)
-        if rollback:
-            rollback()
-        raise
+            )
+        item_count += len(source["items"])
+        restored.append(collection)
+    # Keep event emission after every parent and item write for LUM-004's lock order.
+    for change in staged_changes:
+        _record_change(cur, *change)
     return {"collections": restored, "collection_count": len(restored), "item_count": item_count}
 
 
 def _record_change(cur, principal, collection_id, entity_kind, entity_id, operation, payload):
+    # The UPDATE locks the singleton until the outer mutation transaction commits.
+    # All callers have finished parent/item writes before reaching this point.
+    cur.execute(
+        f"UPDATE {collection_feed_state_table()} SET head_seq = head_seq + 1 "
+        "WHERE singleton = 1 AND protocol_version = %s RETURNING head_seq",
+        (FEED_PROTOCOL_VERSION,),
+    )
+    allocated = cur.fetchone()
+    if allocated is None:
+        raise FeedProtocolUnavailable("collection feed frontier unavailable")
     cur.execute(
         f"""
         INSERT INTO {collection_changes_table()}
-            (principal, collection_id, entity_kind, entity_id, operation, payload)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            (seq, principal, collection_id, entity_kind, entity_id, operation, payload)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
         """,
-        (principal, collection_id, entity_kind, entity_id, operation, json.dumps(payload)),
+        (allocated[0], principal, collection_id, entity_kind, entity_id, operation, json.dumps(payload)),
     )
 
 
@@ -463,39 +516,96 @@ def _error(message, status, **extra):
     return {"error": message, **extra}, status
 
 
+def _request_fingerprint():
+    body = request.get_json(silent=True)
+    canonical = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    if_match = request.headers.get("If-Match")
+    fields = (
+        request.method.upper().encode("utf-8"),
+        request.path.encode("utf-8"),
+        canonical,
+        b"absent" if if_match is None else b"present:" + if_match.strip().encode("utf-8"),
+    )
+    framed = b"".join(len(field).to_bytes(8, "big") + field for field in fields)
+    return hashlib.sha256(framed).hexdigest()
+
+
+def _lock_collection(cur, principal, collection_id, include_deleted=False):
+    # Lock the plain row first: the aggregate collection query cannot use FOR UPDATE.
+    cur.execute(
+        f"SELECT deleted_at FROM {collections_table()} "
+        "WHERE principal = %s AND id = %s FOR UPDATE",
+        (principal, collection_id),
+    )
+    locked = cur.fetchone()
+    if locked is None or (locked[0] is not None and not include_deleted):
+        return None
+    return _fetch_collection(cur, principal, collection_id, include_deleted=include_deleted)
+
+
 def _mutation_response(handler):
     principal = current_principal()
     key = (request.headers.get("Idempotency-Key") or "").strip()[:200]
-    if key:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            f"SELECT response_payload::text, status_code FROM {collection_mutations_table()} "
-            "WHERE principal = %s AND idempotency_key = %s",
-            (principal, key),
-        )
-        saved = cur.fetchone()
-        cur.close()
-        if saved:
-            return jsonify(json.loads(saved[0])), saved[1]
-    payload, status = handler(principal)
-    # Cache only applied mutations. A 409 must be retryable with the same key
-    # after the client explicitly rebases or chooses a conflict winner.
-    if key and 200 <= status < 300:
-        db = get_db()
-        cur = db.cursor()
-        cur.execute(
-            f"""
-            INSERT INTO {collection_mutations_table()}
-                (principal, idempotency_key, response_payload, status_code)
-            VALUES (%s, %s, %s::jsonb, %s)
-            ON CONFLICT (principal, idempotency_key) DO NOTHING
-            """,
-            (principal, key, json.dumps(payload), status),
-        )
-        cur.close()
+    fingerprint = _request_fingerprint()
+    db = get_db()
+    cur = db.cursor()
+    try:
+        # The host may have queried settings on this request-scoped connection.
+        # SHOW is valid after that read; SET TRANSACTION would be rejected then.
+        # Row-lock waiters must see the holder's committed revision.
+        cur.execute("SHOW transaction_isolation")
+        isolation = cur.fetchone()[0].lower()
+        if isolation != "read committed" or getattr(db, "autocommit", False):
+            db.rollback()
+            return jsonify({"error": "unsupported_transaction_isolation"}), 503
+        if key:
+            identity = json.dumps((1, principal, key), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+            lock_id = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+            cur.execute(
+                f"SELECT response_payload::text, status_code, request_fingerprint, fingerprint_version "
+                f"FROM {collection_mutations_table()} "
+                "WHERE principal = %s AND idempotency_key = %s",
+                (principal, key),
+            )
+            saved = cur.fetchone()
+            if saved:
+                payload_text, status, saved_digest, saved_version = saved
+                if saved_digest is None and saved_version is None:
+                    current_app.logger.warning("Replaying legacy unbound collection receipt")
+                    headers = {"Idempotency-Replayed": "true", "Idempotency-Fingerprint": "legacy-unbound"}
+                elif saved_version != FINGERPRINT_VERSION or saved_digest != fingerprint:
+                    db.rollback()
+                    return jsonify({"error": "idempotency_key_conflict"}), 409
+                else:
+                    headers = {"Idempotency-Replayed": "true"}
+                db.rollback()
+                return jsonify(json.loads(payload_text)), status, headers
+        payload, status = handler(cur, principal)
+        if not 200 <= status < 300:
+            db.rollback()
+            return jsonify(payload), status
+        if key:
+            cur.execute(
+                f"INSERT INTO {collection_mutations_table()} "
+                "(principal, idempotency_key, response_payload, status_code, "
+                "request_fingerprint, fingerprint_version) "
+                "VALUES (%s, %s, %s::jsonb, %s, %s, %s)",
+                (principal, key, json.dumps(payload), status, fingerprint, FINGERPRINT_VERSION),
+            )
         db.commit()
-    return jsonify(payload), status
+        return jsonify(payload), status
+    except ForeignItemConflict:
+        db.rollback()
+        return jsonify({"error": "item_id_collection_conflict"}), 409
+    except FeedProtocolUnavailable:
+        db.rollback()
+        return jsonify({"error": "collection_feed_unavailable"}), 503
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        cur.close()
 
 
 def require_collections_enabled(view):
@@ -549,6 +659,10 @@ def _normalize_item(raw):
     }
 
 
+class ForeignItemConflict(Exception):
+    pass
+
+
 def _upsert_item(cur, principal, collection_id, item):
     if item["kind"] == "track":
         cur.execute(
@@ -575,7 +689,7 @@ def _upsert_item(cur, principal, collection_id, item):
         item["id"] = existing[0]
     cur.execute(
         f"""
-        INSERT INTO {collection_items_table()}
+        INSERT INTO {collection_items_table()} AS target
             (principal, id, collection_id, kind, track_id, provider_album_id, album_key,
              title, artist, album, cover_item_id, position)
         VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
@@ -590,6 +704,8 @@ def _upsert_item(cur, principal, collection_id, item):
             cover_item_id = EXCLUDED.cover_item_id,
             position = EXCLUDED.position,
             updated_at = now()
+        WHERE target.collection_id = EXCLUDED.collection_id
+        RETURNING id
         """,
         (
             principal,
@@ -606,6 +722,8 @@ def _upsert_item(cur, principal, collection_id, item):
             item["position"],
         ),
     )
+    if cur.fetchone() is None:
+        raise ForeignItemConflict()
 
 
 def register_collection_routes(bp):
@@ -656,8 +774,8 @@ def register_collection_routes(bp):
         if not collections:
             return jsonify({"error": "The backup does not contain any collections."}), 400
 
-        def mutate(principal):
-            result = _restore_principal_collections(principal, collections)
+        def mutate(cur, principal):
+            result = _restore_principal_collections(cur, principal, collections)
             return {"restored": True, **result}, 201
 
         return _mutation_response(mutate)
@@ -667,29 +785,27 @@ def register_collection_routes(bp):
     def collection_create():
         body = request.get_json(silent=True) or {}
 
-        def mutate(principal):
+        def mutate(cur, principal):
             try:
                 name, description = _clean_collection_body(body)
             except ValueError as exc:
                 return _error(str(exc), 400)
             collection_id = str(body.get("id") or uuid.uuid4())
-            db = get_db()
-            cur = db.cursor()
             cur.execute(
                 f"""
                 INSERT INTO {collections_table()} (principal, id, name, description)
                 VALUES (%s, %s, %s, %s)
                 ON CONFLICT (principal, id) DO NOTHING
+                RETURNING id
                 """,
                 (principal, collection_id, name, description),
             )
+            inserted = cur.fetchone() is not None
             collection = _fetch_collection(cur, principal, collection_id)
-            if collection and collection["revision"] == 1:
+            if inserted:
                 _record_change(
                     cur, principal, collection_id, "collection", collection_id, "upsert", collection
                 )
-            cur.close()
-            db.commit()
             return {"collection": collection}, 201
 
         return _mutation_response(mutate)
@@ -726,21 +842,16 @@ def register_collection_routes(bp):
     def collection_update(collection_id):
         body = request.get_json(silent=True) or {}
 
-        def mutate(principal):
-            db = get_db()
-            cur = db.cursor()
-            current = _fetch_collection(cur, principal, collection_id)
+        def mutate(cur, principal):
+            current = _lock_collection(cur, principal, collection_id)
             if not current:
-                cur.close()
                 return _error("collection_not_found", 404)
             expected = _expected_revision(body)
             if expected is not None and expected != current["revision"]:
-                cur.close()
                 return _error("revision_conflict", 409, current=current)
             try:
                 name, description = _clean_collection_body(body, partial=True)
             except ValueError as exc:
-                cur.close()
                 return _error(str(exc), 400)
             name = current["name"] if name is None else name
             description = current["description"] if "description" not in body else description
@@ -756,8 +867,6 @@ def register_collection_routes(bp):
             _record_change(
                 cur, principal, collection_id, "collection", collection_id, "upsert", updated
             )
-            cur.close()
-            db.commit()
             return {"collection": updated}, 200
 
         return _mutation_response(mutate)
@@ -767,17 +876,15 @@ def register_collection_routes(bp):
     def collection_delete(collection_id):
         body = request.get_json(silent=True) or {}
 
-        def mutate(principal):
-            db = get_db()
-            cur = db.cursor()
-            current = _fetch_collection(cur, principal, collection_id)
+        def mutate(cur, principal):
+            current = _lock_collection(cur, principal, collection_id, include_deleted=True)
             if not current:
-                cur.close()
                 return {"deleted": True}, 200
             expected = _expected_revision(body)
             if expected is not None and expected != current["revision"]:
-                cur.close()
                 return _error("revision_conflict", 409, current=current)
+            if current["deleted_at"] is not None:
+                return {"deleted": True}, 200
             cur.execute(
                 f"""
                 UPDATE {collections_table()}
@@ -790,8 +897,6 @@ def register_collection_routes(bp):
             _record_change(
                 cur, principal, collection_id, "collection", collection_id, "delete", payload
             )
-            cur.close()
-            db.commit()
             return {"deleted": True, **payload}, 200
 
         return _mutation_response(mutate)
@@ -799,7 +904,7 @@ def register_collection_routes(bp):
     @bp.put("/api/collections/<collection_id>/items/<item_id>")
     @require_collections_enabled
     def collection_item_upsert(collection_id, item_id):
-        body = request.get_json(silent=True) or {}
+        body = dict(request.get_json(silent=True) or {})
         body["id"] = item_id
         return _write_items(collection_id, [body], 200)
 
@@ -815,20 +920,16 @@ def register_collection_routes(bp):
     def _write_items(collection_id, raw_items, success_status):
         body = request.get_json(silent=True) or {}
 
-        def mutate(principal):
+        def mutate(cur, principal):
             try:
                 items = [_normalize_item(item) for item in raw_items]
             except (TypeError, ValueError) as exc:
                 return _error(str(exc), 400)
-            db = get_db()
-            cur = db.cursor()
-            current = _fetch_collection(cur, principal, collection_id)
+            current = _lock_collection(cur, principal, collection_id)
             if not current:
-                cur.close()
                 return _error("collection_not_found", 404)
             expected = _expected_revision(body)
             if expected is not None and expected != current["revision"]:
-                cur.close()
                 return _error("revision_conflict", 409, current=current)
             for item in items:
                 _upsert_item(cur, principal, collection_id, item)
@@ -856,8 +957,6 @@ def register_collection_routes(bp):
                     "upsert",
                     change_payload,
                 )
-            cur.close()
-            db.commit()
             return {"collection": updated, "items": items}, success_status
 
         return _mutation_response(mutate)
@@ -867,16 +966,12 @@ def register_collection_routes(bp):
     def collection_item_delete(collection_id, item_id):
         body = request.get_json(silent=True) or {}
 
-        def mutate(principal):
-            db = get_db()
-            cur = db.cursor()
-            current = _fetch_collection(cur, principal, collection_id)
+        def mutate(cur, principal):
+            current = _lock_collection(cur, principal, collection_id)
             if not current:
-                cur.close()
                 return _error("collection_not_found", 404)
             expected = _expected_revision(body)
             if expected is not None and expected != current["revision"]:
-                cur.close()
                 return _error("revision_conflict", 409, current=current)
             cur.execute(
                 f"DELETE FROM {collection_items_table()} "
@@ -906,8 +1001,6 @@ def register_collection_routes(bp):
                         "collection_updated_at": updated["updated_at"],
                     },
                 )
-            cur.close()
-            db.commit()
             return {"deleted": removed, "collection": updated}, 200
 
         return _mutation_response(mutate)
@@ -923,16 +1016,12 @@ def register_collection_routes(bp):
         if not item_ids or len(item_ids) > 500:
             return jsonify({"error": "item_ids must contain 1 to 500 entries"}), 400
 
-        def mutate(principal):
-            db = get_db()
-            cur = db.cursor()
-            current = _fetch_collection(cur, principal, collection_id)
+        def mutate(cur, principal):
+            current = _lock_collection(cur, principal, collection_id)
             if not current:
-                cur.close()
                 return _error("collection_not_found", 404)
             expected = _expected_revision(body)
             if expected is not None and expected != current["revision"]:
-                cur.close()
                 return _error("revision_conflict", 409, current=current)
             cur.execute(
                 f"DELETE FROM {collection_items_table()} "
@@ -962,8 +1051,6 @@ def register_collection_routes(bp):
                         "collection_updated_at": updated["updated_at"],
                     },
                 )
-            cur.close()
-            db.commit()
             return {
                 "deleted": removed_ids,
                 "deleted_count": len(removed_ids),
@@ -983,14 +1070,24 @@ def register_collection_routes(bp):
         db = get_db()
         cur = db.cursor()
         cur.execute(
+            f"SELECT protocol_version, head_seq FROM {collection_feed_state_table()} "
+            "WHERE singleton = 1"
+        )
+        state = cur.fetchone()
+        if state is None or state[0] != FEED_PROTOCOL_VERSION:
+            db.rollback()
+            cur.close()
+            return jsonify({"error": "collection_feed_unavailable"}), 503
+        head_seq = state[1]
+        cur.execute(
             f"""
             SELECT seq, collection_id, entity_kind, entity_id, operation,
                    payload, created_at
               FROM {collection_changes_table()}
-             WHERE principal = %s AND seq > %s
+             WHERE principal = %s AND seq > %s AND seq <= %s
              ORDER BY seq ASC LIMIT %s
             """,
-            (current_principal(), cursor, limit),
+            (current_principal(), cursor, head_seq, limit),
         )
         changes = _all_dicts(cur)
         cur.close()

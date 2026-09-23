@@ -240,14 +240,46 @@ def edge_publication_db(lumae_postgres_db, monkeypatch):
     cur.execute("""INSERT INTO plugin_lumae_analysis__catalog_sources
         (catalog_instance_id, current_core_server_id, provider_type, server_name, is_default, rebind_status)
         VALUES ('catalog-a','server-a','navidrome','Test',TRUE,'active')""")
+    cur.execute("""INSERT INTO plugin_lumae_analysis__catalog_state
+        (catalog_instance_id, current_core_server_id, provider_type,
+         published_generation, catalog_epoch, status)
+        VALUES ('catalog-a', 'server-a', 'navidrome', 1, 'epoch-a', 'complete')""")
+    cur.execute("""INSERT INTO plugin_lumae_analysis__catalog_tracks
+        (catalog_instance_id, published_generation, track_id, title, metadata_fp,
+         media_fp, payload, first_seen_at, last_seen_at)
+        VALUES ('catalog-a', 1, 'track-a', 'Track A', 'metadata',
+                'private/path:123:456', '{}'::jsonb, now(), now())""")
     cur.execute("""CREATE TABLE plugin_lumae_analysis__source_profiles (
         catalog_instance_id TEXT NOT NULL, track_id TEXT NOT NULL, media_signature TEXT,
         sample_rate INTEGER, duration_ms INTEGER, ref_lufs REAL, start_ramp BYTEA, end_ramp BYTEA,
-        analyzer_ver INTEGER, analyzed_at TEXT, status TEXT, last_error TEXT,
+        analyzer_ver INTEGER, profile_schema_ver INTEGER, analyzed_at TIMESTAMP,
+        status TEXT, last_error TEXT, attempt_token TEXT,
+        attempt_media_signature TEXT, attempt_catalog_epoch TEXT,
+        attempt_started_at TIMESTAMP, attempt_analyzer_ver INTEGER,
+        attempt_profile_schema_ver INTEGER,
+        PRIMARY KEY (catalog_instance_id, track_id))""")
+    from plugins.LumaeAnalysis import profile_publication
+    profile_publication.migrate_attempts(cur)
+    cur.execute("""CREATE TABLE plugin_lumae_analysis__published_source_profiles (
+        catalog_instance_id TEXT NOT NULL, track_id TEXT NOT NULL,
+        sample_rate INTEGER NOT NULL, duration_ms INTEGER NOT NULL,
+        ref_lufs REAL NOT NULL, start_ramp BYTEA NOT NULL, end_ramp BYTEA NOT NULL,
+        analyzer_ver INTEGER NOT NULL, profile_schema_ver INTEGER NOT NULL,
+        media_signature TEXT, analyzed_at TIMESTAMP NOT NULL,
         PRIMARY KEY (catalog_instance_id, track_id))""")
     cur.execute("""INSERT INTO plugin_lumae_analysis__source_profiles
-        VALUES ('catalog-a','track-a','private/path:123:456',48000,209,-14,%s,%s,1,
-                '2026-08-28T00:00:00Z','ready',NULL)""", (b'\x01\x02\x03', b'\x04\x05\x06'))
+        (catalog_instance_id,track_id,media_signature,sample_rate,duration_ms,
+         ref_lufs,start_ramp,end_ramp,analyzer_ver,profile_schema_ver,
+         analyzed_at,status,last_error)
+        VALUES ('catalog-a','track-a','private/path:123:456',48000,209,-14,%s,%s,
+                1,1,'2026-08-28T00:00:00Z','ready',NULL)""",
+        (b'\x01\x02\x03', b'\x04\x05\x06'))
+    cur.execute("""INSERT INTO plugin_lumae_analysis__published_source_profiles
+        (catalog_instance_id,track_id,media_signature,sample_rate,duration_ms,
+         ref_lufs,start_ramp,end_ramp,analyzer_ver,profile_schema_ver,analyzed_at)
+        VALUES ('catalog-a','track-a','private/path:123:456',48000,209,-14,%s,%s,
+                1,1,'2026-08-28T00:00:00Z')""",
+        (b'\x01\x02\x03', b'\x04\x05\x06'))
     cur.close()
     catalog_enrichment.migrate_enrichment(db)
     edge_profile_store.migrate_edge_profiles(db)
@@ -276,7 +308,7 @@ def test_edge_upgrade_publication_is_atomic_identical_on_all_routes_and_idempote
     assert store.update_edge_job(db, 'catalog-a', job, 'running')
     assert store.publish_edge_profile(db, 'catalog-a', job, payload, 'private/path:123:456')
     assert not store.publish_edge_profile(db, 'catalog-a', job, payload, 'private/path:123:456')
-    direct = mod.serialize_ready_profile(mod.fetch_profile_rows(['track-a'], 'catalog-a')[0])
+    direct = mod.serialize_ready_profile(mod.fetch_published_profile_rows(['track-a'], 'catalog-a')[0])
     cur = db.cursor()
     bootstrap = enrichment._profile_rows(cur, 'catalog-a', '', 100)[0]
     cur.execute('SELECT payload FROM plugin_lumae_analysis__profile_changes ORDER BY seq')
@@ -347,17 +379,19 @@ def test_replaced_source_rejects_completed_old_job_and_never_serializes_stale_ed
     job = jobs[0]
     payload = _edge_payload_for_job(job)
     cur = db.cursor()
-    cur.execute("UPDATE plugin_lumae_analysis__source_profiles SET media_signature='new master'")
+    cur.execute("UPDATE plugin_lumae_analysis__published_source_profiles SET media_signature='new master'")
+    cur.execute("UPDATE plugin_lumae_analysis__catalog_tracks SET media_fp='new master' WHERE track_id='track-a'")
     db.commit()
     assert not store.publish_edge_profile(db, 'catalog-a', job, payload, 'private/path:123:456')
-    assert 'edge_profile' not in mod.serialize_ready_profile(mod.fetch_profile_rows(['track-a'], 'catalog-a')[0])
+    assert 'edge_profile' not in mod.serialize_ready_profile(mod.fetch_published_profile_rows(['track-a'], 'catalog-a')[0])
     new_jobs, _ = store.claim_edge_jobs(db, 'catalog-a', ['track-a'])
     assert new_jobs[0]['media_revision'] != job['media_revision']
     payload = _edge_payload_for_job(new_jobs[0])
     assert store.publish_edge_profile(db, 'catalog-a', new_jobs[0], payload, 'new master')
-    cur.execute("UPDATE plugin_lumae_analysis__source_profiles SET media_signature='third master'")
+    cur.execute("UPDATE plugin_lumae_analysis__published_source_profiles SET media_signature='third master'")
+    cur.execute("UPDATE plugin_lumae_analysis__catalog_tracks SET media_fp='third master' WHERE track_id='track-a'")
     db.commit()
-    assert 'edge_profile' not in mod.serialize_ready_profile(mod.fetch_profile_rows(['track-a'], 'catalog-a')[0])
+    assert 'edge_profile' not in mod.serialize_ready_profile(mod.fetch_published_profile_rows(['track-a'], 'catalog-a')[0])
     cur.close()
 
 
@@ -1749,7 +1783,7 @@ def test_collection_restore_route_validates_checksum_and_uses_current_principal(
     monkeypatch.setattr(
         collections,
         "_restore_principal_collections",
-        lambda principal, payload: (
+        lambda cur, principal, payload: (
             restored.append((principal, payload))
             or {
                 "collections": [{"id": "restored-1", "name": payload[0]["name"]}],
@@ -1758,6 +1792,11 @@ def test_collection_restore_route_validates_checksum_and_uses_current_principal(
             }
         ),
     )
+    def dispatch_mutation(handler):
+        payload, status = handler(object(), collections.current_principal())
+        return collections.jsonify(payload), status
+
+    monkeypatch.setattr(collections, "_mutation_response", dispatch_mutation)
     app = Flask(__name__)
 
     @app.before_request
@@ -1842,7 +1881,7 @@ def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(
     )
     payload = collections._normalize_backup_document(_collection_backup_fixture(collections))
 
-    result = collections._restore_principal_collections("user:alice", payload)
+    result = collections._restore_principal_collections(db.cursor_obj, "user:alice", payload)
 
     collection_inserts = [
         call for call in db.cursor_obj.executed if "INSERT INTO" in call[0] and "collections" in call[0]
@@ -1858,7 +1897,7 @@ def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(
     assert changes[1][5]["collection_revision"] == 2
     assert result["collection_count"] == 1
     assert result["item_count"] == 1
-    assert db.commits == 1
+    assert db.commits == 0
 
 
 def test_collection_library_normalizes_live_track_and_disc_numbers():
@@ -2045,9 +2084,17 @@ def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch
             self.description = []
             self.rows = []
             self.collection_reads = 0
+            self.feed_head = 0
 
         def execute(self, sql, params=None):
-            if "SELECT c.id, c.name" in sql:
+            if "UPDATE" in sql and "collection_feed_state" in sql:
+                self.feed_head += 1
+                self.rows = [(self.feed_head,)]
+            elif "SHOW transaction_isolation" in sql:
+                self.rows = [("read committed",)]
+            elif "FOR UPDATE" in sql:
+                self.rows = [(None,)]
+            elif "SELECT c.id, c.name" in sql:
                 self.collection_reads += 1
                 self.description = [
                     ("id",),
@@ -2100,6 +2147,9 @@ def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch
         def commit(self):
             self.commits += 1
 
+        def rollback(self):
+            pass
+
     db = BatchDeleteDb()
     monkeypatch.setattr(collections, "get_setting", lambda key, default=None: True)
     monkeypatch.setattr(collections, "get_db", lambda: db)
@@ -2112,6 +2162,7 @@ def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch
     assert response.status_code == 200
     assert response.get_json()["deleted"] == ["item-1", "item-2"]
     assert response.get_json()["collection"]["revision"] == 2
+    assert db.cursor_obj.feed_head == 2
     assert db.commits == 1
 
 
@@ -2267,6 +2318,10 @@ def test_profiles_endpoint_splits_ready_missing_and_failed(monkeypatch):
         "fetch_profile_rows",
         lambda ids, catalog_instance_id=None: rows,
     )
+    monkeypatch.setattr(
+        mod, "fetch_published_profile_rows",
+        lambda ids, catalog_instance_id: [row for row in rows if row["status"] == "ready"],
+    )
     client = plugin_client(mod)
 
     response = client.get("/api/profiles?ids=ready-1,missing-1,failed-1,skipped-1")
@@ -2304,30 +2359,37 @@ def test_profiles_endpoint_fails_closed_when_source_is_ambiguous(monkeypatch):
 
 def test_scoped_profile_writes_use_catalogue_and_track_composite_key(monkeypatch):
     mod = load_plugin()
-    db = FakeDb(rows=[])
-    monkeypatch.setattr(mod, "get_db", lambda: db)
+    calls = []
+    monkeypatch.setattr(mod, "get_db", lambda: object())
     monkeypatch.setattr(
-        mod,
-        "source_profiles_table",
-        lambda: "plugin_lumae_analysis__source_profiles",
+        mod, "admit_attempts",
+        lambda db, source, ids, **kwargs: calls.append((source, ids, kwargs))
+        or {"same-track-id": "claim-token"},
     )
-
-    mod.mark_pending(["same-track-id"], catalog_instance_id="catalog-b")
-
-    sql, params = db.cursor_obj.executed[-1]
-    assert "ON CONFLICT (catalog_instance_id, track_id)" in sql
-    assert params[:2] == ("catalog-b", ["same-track-id"])
+    assert mod.mark_pending(["same-track-id"], catalog_instance_id="catalog-b") == {
+        "same-track-id": "claim-token"
+    }
+    assert len(calls) == 1
+    assert calls[0][0:2] == ("catalog-b", ["same-track-id"])
+    assert calls[0][2]["priority"] == "background"
+    assert calls[0][2]["analyzer_version"] == mod.ANALYZER_VERSION
+    assert calls[0][2]["schema_version"] == mod.SCHEMA_VERSION
+    assert calls[0][2]["recovery_arm"] is mod.arm_profile_claim_recovery
 
 
 def test_analyze_endpoint_promotes_pending_and_enqueues_small_high_priority_chunks(monkeypatch):
     mod = load_plugin()
     calls = []
     rows = [
-        {"track_id": "ready-1", "status": "ready"},
+        {"track_id": "ready-1", "status": "ready", "media_signature": "catalog-media:same"},
         {"track_id": "pending-1", "status": "pending"},
         {"track_id": "stale-1", "status": "stale"},
     ]
     source = {"catalog_instance_id": "catalog-a", "server_id": "server-a"}
+    monkeypatch.setattr(
+        mod, "catalog_media_signature",
+        lambda track_id, **_kwargs: "catalog-media:same",
+    )
     monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
     monkeypatch.setattr(
         mod,
@@ -2339,7 +2401,7 @@ def test_analyze_endpoint_promotes_pending_and_enqueues_small_high_priority_chun
         "mark_pending",
         lambda ids, catalog_instance_id=None, priority="background": calls.append(
             ("mark_pending", ids, catalog_instance_id, priority)
-        ),
+        ) or {track_id: f"token-{track_id}" for track_id in ids},
     )
     monkeypatch.setattr(
         mod,
@@ -2376,6 +2438,8 @@ def test_analyze_endpoint_promotes_pending_and_enqueues_small_high_priority_chun
                 "catalog-a",
                 "server-a",
                 "interactive",
+                {track_id: f"token-{track_id}" for track_id in
+                 ["stale-1", "missing-1", "pending-1"]},
             ),
             "high",
         ),
@@ -2387,6 +2451,18 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
     audio = tmp_path / "analysis-hook.flac"
     audio.write_bytes(b"hook audio")
     db = FakeDb(rows=[])
+    original_execute = db.cursor_obj.execute
+
+    def execute_profile_stream(sql, params=None):
+        original_execute(sql, params)
+        if "SELECT epoch, head_seq, floor_seq FROM plugin_lumae_analysis__profile_stream_state" in sql:
+            db.cursor_obj.rows = [("profile-epoch", 0, 0)]
+        elif "RETURNING head_seq" in sql:
+            db.cursor_obj.rows = [(1,)]
+        else:
+            db.cursor_obj.rows = []
+
+    monkeypatch.setattr(db.cursor_obj, "execute", execute_profile_stream)
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
     monkeypatch.setattr(
@@ -2431,6 +2507,20 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
         ),
     )
 
+    monkeypatch.setattr(
+        mod, "mark_pending",
+        lambda ids, catalog_instance_id=None, priority="background":
+            {ids[0]: "hook-token"},
+    )
+    monkeypatch.setattr(
+        mod, "catalog_media_signature",
+        lambda *args, **kwargs: "catalog-media:hook-revision",
+    )
+    monkeypatch.setattr(
+        mod, "upsert_profile",
+        lambda *args, **kwargs: seen.update({"publication": (args, kwargs)}) or True,
+    )
+
     result = mod.analyze_song_hook(
         {
             "item_id": "track-a",
@@ -2445,16 +2535,10 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
     assert seen["path"] == str(audio)
     assert seen["run"] == ("legacy-default", "catalog-a", "analysis-run-a")
     assert audio.exists()
-    params = next(
-        params
-        for sql, params in db.cursor_obj.executed
-        if "INSERT INTO plugin_lumae_analysis__source_profiles" in sql
-    )
-    assert params[0] == "catalog-a"
-    assert params[1] == "track-a"
-    assert params[2] == 44100
-    assert params[9].startswith("analysis-hook|track-a|/music/raw-song.flac|")
-    assert params[11] == "ready"
+    args, kwargs = seen["publication"]
+    assert args[0] == "track-a"
+    assert args[4] == "catalog-media:hook-revision"
+    assert kwargs == {"catalog_instance_id": "catalog-a", "attempt_token": "hook-token"}
 
 
 def test_analysis_run_events_coalesce_to_one_durable_source_request(monkeypatch):
@@ -3242,9 +3326,23 @@ class CronCursor(FakeCursor):
     def __init__(self, existing=None):
         super().__init__(rows=[])
         self.existing = existing
+        self.feed_version = 1
+        self.current_row = None
+        self.timeouts = ("0", "0")
+
+    def execute(self, sql, params=None):
+        super().execute(sql, params)
+        normalized = " ".join(sql.split())
+        self.current_row = None
+        if "current_setting('lock_timeout')" in normalized:
+            self.current_row = self.timeouts
+        elif "SELECT protocol_version FROM plugin_lumae_analysis__collection_feed_state" in normalized:
+            self.current_row = (self.feed_version,)
+        elif "set_config('lock_timeout'" in normalized:
+            self.timeouts = params
 
     def fetchone(self):
-        return self.existing
+        return self.current_row if self.current_row is not None else self.existing
 
 
 class CronDb(FakeDb):
@@ -3470,7 +3568,7 @@ def test_analyze_one_track_persists_ready_profile_with_pr721_score_shape(monkeyp
     assert params[1] == 48000
     assert params[6] == mod.ANALYZER_VERSION
     assert params[7] == mod.SCHEMA_VERSION
-    assert params[10] == "ready"
+    assert params[9] == "ready"
 
 
 def test_analyze_one_track_persists_failed_profile(monkeypatch, tmp_path):
@@ -3520,6 +3618,28 @@ def test_find_backfill_ids_includes_missing_old_and_signature_changed_but_not_fa
         "old-analyzer",
         "changed-media",
     ]
+
+
+@pytest.mark.parametrize("stored_sig", [None, ""])
+def test_find_backfill_ids_accepts_ready_missing_stored_signature(monkeypatch, stored_sig):
+    mod = load_plugin()
+    rows = [
+        ("ready-missing-sig", "catalog-media:media-a", stored_sig, mod.ANALYZER_VERSION, "ready"),
+    ]
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=rows))
+
+    assert mod.find_backfill_ids(limit=1) == ["ready-missing-sig"]
+
+
+@pytest.mark.parametrize("stored_sig", [None, ""])
+def test_ready_missing_media_fingerprint_is_not_a_backfill_candidate(monkeypatch, stored_sig):
+    mod = load_plugin()
+    row = ("ready-no-fingerprint", "catalog-media:", stored_sig, mod.ANALYZER_VERSION, "ready")
+    monkeypatch.setattr(mod, "get_db", lambda: FakeDb(rows=[row]))
+    monkeypatch.setattr(mod, "fetch_analysis_rows", lambda **_kwargs: [row])
+
+    assert mod.find_backfill_ids(limit=1) == []
+    assert mod.find_all_backfill_ids() == []
 
 
 def test_find_backfill_ids_includes_explicit_stale_rows(monkeypatch, tmp_path):
@@ -3666,6 +3786,132 @@ def test_analysis_status_counts_treats_retryable_skipped_rows_as_needed(monkeypa
     }
 
 
+@pytest.mark.parametrize("source_scoped", [False, True])
+@pytest.mark.parametrize("missing_media_fp", [False, True])
+def test_postgres_backfill_ready_missing_signatures_do_not_starve_later_rows(
+    monkeypatch, lumae_postgres_db, source_scoped, missing_media_fp,
+):
+    mod = load_plugin()
+    from plugins.LumaeAnalysis import catalog
+
+    catalog.migrate_catalog(lumae_postgres_db)
+    profile_table = (
+        "plugin_lumae_analysis__source_profiles"
+        if source_scoped else "plugin_lumae_analysis__profiles"
+    )
+    cur = lumae_postgres_db.cursor()
+    cur.execute(
+        f"""
+        CREATE TABLE {profile_table} (
+            {"catalog_instance_id TEXT NOT NULL," if source_scoped else ""}
+            track_id TEXT NOT NULL,
+            media_signature TEXT,
+            analyzer_ver INTEGER,
+            status TEXT
+        )
+        """
+    )
+    if source_scoped:
+        from plugins.LumaeAnalysis import profile_publication
+        profile_publication.migrate_attempts(cur)
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_sources
+            (catalog_instance_id, current_core_server_id, provider_type,
+             server_name, is_default, rebind_status)
+        VALUES ('catalog-a', 'server-a', 'navidrome', 'Registry source', TRUE, 'active')
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_state
+            (catalog_instance_id, current_core_server_id, provider_type,
+             published_generation, catalog_epoch, status)
+        VALUES ('catalog-a', 'server-a', 'navidrome', 4, 'epoch-a', 'complete')
+        """
+    )
+    cur.execute(
+        """
+        INSERT INTO plugin_lumae_analysis__catalog_tracks
+            (catalog_instance_id, published_generation, track_id, title,
+             analysis_eligible, metadata_fp, media_fp, payload,
+             first_seen_at, last_seen_at)
+        VALUES
+            ('catalog-a', 4, 'a-null', 'Null signature', TRUE, 'meta-a', 'media-a',
+             '{}'::jsonb, now(), now()),
+            ('catalog-a', 4, 'b-empty', 'Empty signature', TRUE, 'meta-b', 'media-b',
+             '{}'::jsonb, now(), now()),
+            ('catalog-a', 4, 'z-stale', 'Later eligible', TRUE, 'meta-z', 'media-z',
+             '{}'::jsonb, now(), now())
+        """
+    )
+    columns = (
+        "catalog_instance_id, track_id, media_signature, analyzer_ver, status"
+        if source_scoped else "track_id, media_signature, analyzer_ver, status"
+    )
+    prefix = "'catalog-a', " if source_scoped else ""
+    cur.execute(
+        f"""
+        INSERT INTO {profile_table} ({columns})
+        VALUES
+            ({prefix}'a-null', NULL, %s, 'ready'),
+            ({prefix}'b-empty', '', %s, 'ready'),
+            ({prefix}'z-stale', 'catalog-media:old-z', %s, 'stale')
+        """,
+        (mod.ANALYZER_VERSION,) * 3,
+    )
+    cur.close()
+    lumae_postgres_db.commit()
+    monkeypatch.setattr(mod, "get_db", lambda: lumae_postgres_db)
+    scope = {"catalog_instance_id": "catalog-a", "server_id": "server-a"} if source_scoped else {}
+
+    if missing_media_fp:
+        cur = lumae_postgres_db.cursor()
+        cur.execute(
+            """
+            UPDATE plugin_lumae_analysis__catalog_tracks
+               SET media_fp=CASE track_id WHEN 'a-null' THEN NULL ELSE '' END
+             WHERE track_id IN ('a-null', 'b-empty')
+            """
+        )
+        cur.close()
+        lumae_postgres_db.commit()
+        assert [row[0] for row in mod.fetch_backfill_rows(1, **scope)] == ["z-stale"]
+        assert mod.find_backfill_ids(limit=1, **scope) == ["z-stale"]
+        cur = lumae_postgres_db.cursor()
+        cur.execute(
+            f"UPDATE {profile_table} SET media_signature='catalog-media:media-z', "
+            "status='ready' WHERE track_id='z-stale'"
+        )
+        cur.close()
+        lumae_postgres_db.commit()
+
+    for track_id, current_sig in (
+        ("a-null", "catalog-media:media-a"),
+        ("b-empty", "catalog-media:media-b"),
+    ):
+        if missing_media_fp:
+            cur = lumae_postgres_db.cursor()
+            cur.execute(
+                "UPDATE plugin_lumae_analysis__catalog_tracks SET media_fp=%s "
+                "WHERE track_id=%s",
+                (current_sig.removeprefix("catalog-media:"), track_id),
+            )
+            cur.close()
+            lumae_postgres_db.commit()
+        assert [row[0] for row in mod.fetch_backfill_rows(1, **scope)] == [track_id]
+        assert mod.find_backfill_ids(limit=1, **scope) == [track_id]
+        cur = lumae_postgres_db.cursor()
+        cur.execute(
+            f"UPDATE {profile_table} SET media_signature=%s WHERE track_id=%s",
+            (current_sig, track_id),
+        )
+        cur.close()
+        lumae_postgres_db.commit()
+
+    assert mod.find_backfill_ids(limit=1, **scope) == ([] if missing_media_fp else ["z-stale"])
+
+
 def test_postgres_backfill_retries_registry_backed_skipped_profiles(
     monkeypatch,
     lumae_postgres_db,
@@ -3687,6 +3933,8 @@ def test_postgres_backfill_retries_registry_backed_skipped_profiles(
         )
         """
     )
+    from plugins.LumaeAnalysis import profile_publication
+    profile_publication.migrate_attempts(cur)
     cur.execute(
         """
         INSERT INTO plugin_lumae_analysis__catalog_sources
@@ -3809,7 +4057,7 @@ def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch)
     monkeypatch.setattr(
         mod,
         "mark_pending",
-        lambda ids, priority="background": calls.append(("mark_pending", ids, priority)),
+        lambda ids, catalog_instance_id=None, priority="background": calls.append(("mark_pending", ids, priority)) or {},
     )
     monkeypatch.setattr(
         mod,
@@ -3821,7 +4069,7 @@ def test_queue_backfill_batch_marks_pending_and_enqueues_next_batch(monkeypatch)
     assert calls == [
         ("find", 3),
         ("mark_pending", ["a", "b"], "background"),
-        ("analyze_tracks_task", (["a", "b"], None, None, "background"), "default"),
+        ("analyze_tracks_task", (["a", "b"], None, None, "background", None), "default"),
     ]
 
 
@@ -3947,7 +4195,7 @@ def test_profile_backfill_task_processes_one_batch_then_yields_worker(monkeypatc
         "mark_pending",
         lambda ids, catalog_instance_id=None, priority="background": calls.append(
             ("pending", ids, catalog_instance_id, priority)
-        ),
+        ) or {track_id: f"token-{track_id}" for track_id in ids},
     )
     monkeypatch.setattr(
         mod,
@@ -3980,7 +4228,7 @@ def test_profile_backfill_task_releases_claimed_rows_when_batch_crashes(monkeypa
     )
     monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda _catalog_id: 0)
     monkeypatch.setattr(mod, "find_backfill_ids", lambda *_args, **_kwargs: ["track-a"])
-    monkeypatch.setattr(mod, "mark_pending", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "mark_pending", lambda ids, **_kwargs: {track_id: f"token-{track_id}" for track_id in ids})
     monkeypatch.setattr(
         mod,
         "analyze_tracks_task",
@@ -3989,7 +4237,7 @@ def test_profile_backfill_task_releases_claimed_rows_when_batch_crashes(monkeypa
     monkeypatch.setattr(
         mod,
         "release_pending",
-        lambda ids, catalog_instance_id=None, reason=None: calls.append(
+        lambda ids, catalog_instance_id=None, reason=None, tokens=None: calls.append(
             ("release", ids, catalog_instance_id, reason)
         ),
     )
@@ -4007,33 +4255,13 @@ def test_legacy_oversized_background_job_is_drained_into_bounded_chain(monkeypat
     mod = load_plugin()
     ids = [f"track-{index}" for index in range(mod.MAX_BACKFILL_BATCH_SIZE + 1)]
     calls = []
-    monkeypatch.setattr(
-        mod,
-        "release_pending",
-        lambda selected, catalog_instance_id=None, reason=None: calls.append(
-            ("release", selected, catalog_instance_id, reason)
-        ),
-    )
-    monkeypatch.setattr(
-        mod,
-        "start_profile_backfill",
-        lambda **kwargs: calls.append(("start", kwargs)) or {"queued": True},
-    )
-
+    monkeypatch.setattr(mod, "release_pending", lambda *a, **k: calls.append("release"))
+    monkeypatch.setattr(mod, "start_profile_backfill", lambda **k: calls.append("start"))
     result = mod.analyze_tracks_task(ids, "catalog-a", "server-a")
-
     assert result["attempted"] == 0
     assert result["deferred"] == len(ids)
-    assert calls[0][0:3] == ("release", ids, "catalog-a")
-    assert "bounded 0.8.1" in calls[0][3]
-    assert calls[1] == (
-        "start",
-        {
-            "catalog_instance_id": "catalog-a",
-            "server_id": "server-a",
-            "enqueue_job": False,
-        },
-    )
+    assert result["superseded"] == len(ids)
+    assert calls == []
 
 
 def test_background_task_skips_ready_and_interactively_promoted_tracks(monkeypatch):
@@ -4057,7 +4285,7 @@ def test_background_task_skips_ready_and_interactively_promoted_tracks(monkeypat
         "fetch_profile_rows",
         lambda ids, catalog_instance_id=None: [rows[ids[0]]],
     )
-    monkeypatch.setattr(mod, "catalog_media_signature", lambda *_args: "catalog-media:same")
+    monkeypatch.setattr(mod, "catalog_media_signature", lambda *_args, **_kwargs: "catalog-media:same")
     monkeypatch.setattr(
         mod,
         "analyze_one_track",
@@ -4065,7 +4293,8 @@ def test_background_task_skips_ready_and_interactively_promoted_tracks(monkeypat
     )
     monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
 
-    result = mod.analyze_tracks_task(["ready", "promoted"], "catalog-a", "server-a")
+    result = mod.analyze_tracks_task(["ready", "promoted"], "catalog-a", "server-a",
+                                     attempt_tokens={"ready": "a", "promoted": "b"})
 
     assert result == {
         "attempted": 0,
@@ -4101,7 +4330,9 @@ def test_track_batch_counts_attempts_separately_from_reused_and_promoted_tracks(
     )
 
     result = mod.analyze_tracks_task(
-        ["good", "bad", "missing", "cached", "playing"], "catalog-a", "server-a"
+        ["good", "bad", "missing", "cached", "playing"], "catalog-a", "server-a",
+        attempt_tokens={track_id: f"token-{track_id}" for track_id in
+                        ["good", "bad", "missing", "cached", "playing"]},
     )
 
     assert attempted == ["good", "bad", "missing"]
@@ -4134,7 +4365,8 @@ def test_track_batch_does_not_count_tracks_paused_before_dispatch_as_attempted(m
         mod, "release_pending", lambda ids, **_kwargs: released.extend(ids)
     )
 
-    result = mod.analyze_tracks_task(["a", "b", "c"], "catalog-a", "server-a")
+    result = mod.analyze_tracks_task(["a", "b", "c"], "catalog-a", "server-a",
+                                     attempt_tokens={"a": "a", "b": "b", "c": "c"})
 
     assert result["attempted"] == 1
     assert result["ready"] == 1
@@ -4151,7 +4383,7 @@ def test_profile_enqueue_failure_releases_pending_rows_for_retry(monkeypatch):
         "mark_pending",
         lambda ids, catalog_instance_id=None, priority="background": calls.append(
             ("pending", ids, catalog_instance_id, priority)
-        ),
+        ) or {track_id: f"token-{track_id}" for track_id in ids},
     )
     monkeypatch.setattr(
         mod,
@@ -4161,7 +4393,7 @@ def test_profile_enqueue_failure_releases_pending_rows_for_retry(monkeypatch):
     monkeypatch.setattr(
         mod,
         "release_pending",
-        lambda ids, catalog_instance_id=None, reason=None: calls.append(
+        lambda ids, catalog_instance_id=None, reason=None, tokens=None: calls.append(
             ("released", ids, catalog_instance_id, reason)
         ),
     )
@@ -4515,6 +4747,7 @@ def test_maintenance_pause_blocks_background_work_but_preserves_control_state(
             {
                 "catalog_instance_id": "catalog-a",
                 "reason": "Lumae background maintenance is paused",
+                "tokens": None,
             },
         ),
         (
@@ -4522,6 +4755,7 @@ def test_maintenance_pause_blocks_background_work_but_preserves_control_state(
             {
                 "catalog_instance_id": "catalog-a",
                 "reason": "Lumae background maintenance is paused",
+                "tokens": None,
             },
         ),
     ]
@@ -4762,7 +4996,8 @@ def test_reconcile_profile_batch_reports_track_outcomes_without_batch_retry(
     monkeypatch.setattr(mod, "recover_stale_pending_profiles", lambda _catalog_id: 0)
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 2)
     monkeypatch.setattr(mod, "find_backfill_ids", lambda *_args, **_kwargs: next(batches))
-    monkeypatch.setattr(mod, "mark_pending", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "next_profile_retry_at", lambda _catalog_id: None)
+    monkeypatch.setattr(mod, "mark_pending", lambda ids, **_kwargs: {track_id: f"token-{track_id}" for track_id in ids})
     monkeypatch.setattr(mod, "heartbeat_profile_backfill", lambda _catalog_id: None)
     monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
     monkeypatch.setattr(mod, "profile_task_disposition", lambda *_args, **_kwargs: "analyze")
@@ -7920,6 +8155,8 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
         def execute(self, sql, params=()):
             normalized = " ".join(sql.split())
             self.db.executed.append((normalized, params))
+            if self.db.fail_items and "AS items" in normalized and "analysis_items" in normalized:
+                raise RuntimeError("private-token-in-sql-error")
             if "AS total" in normalized and "track_analysis_links" in normalized:
                 self.result = [(1000, 930, 800, 130, 10, 20, 40, 850)]
             elif "AS items" in normalized and "analysis_items" in normalized:
@@ -7976,9 +8213,10 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
             return None
 
     class Db:
-        def __init__(self):
+        def __init__(self, fail_items=False):
             self.executed = []
             self.rollbacks = 0
+            self.fail_items = fail_items
 
         def cursor(self):
             return Cursor(self)
@@ -8025,6 +8263,25 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
         (sql, params) for sql, params in db.executed if "AS mapping_rows" in sql
     )
     assert core_query[1] == ("server-a",)
+
+    failing_db = Db(fail_items=True)
+    partial = state.collect_database_state(
+        failing_db, compatibility, [source], readiness_by_source={"catalog-a": {"status": "progressive"}}
+    )
+    assert partial["status"] == "partial"
+    assert failing_db.rollbacks == 1
+    assert partial["sources"][0]["items"]["items"] == 0
+    assert partial["sources"][0]["profiles"]["ready"] == 550
+    assert partial["sources"][0]["errors"][0]["operation"] == "analysis_items_summary"
+    assert partial["sources"][0]["diagnostics"]["scope"] == "server_db_execute_fetch"
+    assert any(
+        row["operation"] == "analysis_items_summary" and row["status"] == "error"
+        for row in partial["sources"][0]["diagnostics"]["operations"]
+    )
+    body = state.render_database_state(partial)
+    assert "analysis_items_summary" in body
+    assert "Server database query timings (execute + fetch)" in body
+    assert "private-token-in-sql-error" not in body
 
 
 def test_database_state_reads_v2_core_as_one_direct_provider():
@@ -9842,20 +10099,16 @@ def test_enrichment_cleanup_bounds_relationship_history_to_two_snapshots():
         def execute(self, sql, params=None):
             self.executed.append((sql, params))
             if "SELECT p.catalog_instance_id" in sql:
-                self.rows = [
-                    (
-                        "catalog-a",
-                        "profile-epoch",
-                        0,
-                        21_709,
-                        "relationship-epoch",
-                        7_620,
-                        1_324,
-                        581,
-                    )
-                ]
+                self.rows = [("catalog-a", "relationship-epoch", 7_620, 1_324, 581)]
+            elif "FROM plugin_lumae_analysis__profile_stream_state" in sql and "FOR UPDATE" in sql:
+                self.rows = [("profile-epoch", 0, 0)]
+            elif "SELECT COUNT(*) FROM plugin_lumae_analysis__source_profiles" in sql:
+                self.rows = [(21_709,)]
             else:
                 self.rows = []
+
+        def fetchone(self):
+            return self.rows[0] if self.rows else None
 
         def fetchall(self):
             return list(self.rows)
@@ -9933,3 +10186,25 @@ def test_retired_dj_routes_are_absent():
     assert not any("/dj/" in rule.rule for rule in app.url_map.iter_rules())
     manifest = json.loads(pathlib.Path("plugins/LumaeAnalysis/plugin.json").read_text())
     assert not any("dj" in key.lower() for key in manifest["capabilities"])
+
+
+def test_database_state_page_redacts_outer_snapshot_exception(monkeypatch):
+    mod = load_plugin()
+    secret = "postgres://alice:token@host/private.sql"
+    monkeypatch.setattr(mod, "detect_core", lambda: types.SimpleNamespace(
+        adapter="v3_registry",
+        as_dict=lambda: {"core_version": "v3.0.5", "core_adapter": "v3_registry"},
+    ))
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    def fail_source_resolution(_db):
+        raise RuntimeError(secret)
+    monkeypatch.setattr(mod, "resolve_catalog_source", fail_source_resolution)
+    monkeypatch.setattr(mod, "render_database_state", lambda snapshot: repr(snapshot))
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+
+    response = plugin_client(mod).get("/database-state")
+
+    assert response.status_code == 200
+    body = response.get_data(as_text=True)
+    assert "Database diagnostic snapshot failed." in body
+    assert secret not in body

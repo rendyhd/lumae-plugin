@@ -1,0 +1,1 @@
+HEAD baseline exposes raw exception text in database-state errors; new redaction regression fails against HEAD as expected.

@@ -1,0 +1,295 @@
+Command: C:\Users\rendy\vscode\lumae-plugin\.pytest-tmp\settings-env\Scripts\python.exe -m pytest tests/plugins -q -r s --basetemp .pytest-tmp/task1c-pg -p no:cacheprovider
+LUMAE_POSTGRES_TEST_DSN: disposable localhost PostgreSQL 17
+
+........................................................................ [ 14%]
+........................................................................ [ 28%]
+........................................................................ [ 43%]
+...................................F...F................................ [ 57%]
+........................................................................ [ 72%]
+........................................................................ [ 86%]
+.....................................................FFF.........        [100%]
+================================== FAILURES ===================================
+_______________ test_migrate_disables_legacy_backfill_schedule ________________
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001B8B1F4C9B0>
+
+    def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
+        mod = load_plugin()
+        db = CronDb(existing=None)
+        queued = []
+        monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+        monkeypatch.setattr(
+            mod,
+            "enqueue",
+            lambda *args, **kwargs: queued.append((args, kwargs)),
+        )
+    
+>       mod.migrate(db)
+
+tests\plugins\test_lumae_analysis.py:4371: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+plugins\LumaeAnalysis\__init__.py:1265: in migrate
+    migrate_collections(db)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+db = <test_lumae_analysis.CronDb object at 0x000001B8B1F4D400>
+
+    def migrate_collections(db):
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {collections_table()} (
+                principal TEXT NOT NULL,
+                id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                deleted_at TIMESTAMPTZ,
+                PRIMARY KEY (principal, id)
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {collection_items_table()} (
+                principal TEXT NOT NULL,
+                id TEXT NOT NULL,
+                collection_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('album', 'track')),
+                track_id TEXT,
+                provider_album_id TEXT,
+                album_key TEXT,
+                title TEXT,
+                artist TEXT NOT NULL DEFAULT '',
+                album TEXT,
+                cover_item_id TEXT,
+                position INTEGER NOT NULL DEFAULT 0,
+                added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (principal, id),
+                FOREIGN KEY (principal, collection_id)
+                    REFERENCES {collections_table()} (principal, id) ON DELETE CASCADE
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {collection_changes_table()} (
+                seq BIGSERIAL PRIMARY KEY,
+                principal TEXT NOT NULL,
+                collection_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Serialize the seed against legacy change writers during the cutover.
+        # Host installation owns the outer transaction; the lock lasts to its commit.
+        cur.execute("SET LOCAL lock_timeout = '5s'")
+        cur.execute("SET LOCAL statement_timeout = '30s'")
+        cur.execute(f"LOCK TABLE {collection_changes_table()} IN ACCESS EXCLUSIVE MODE")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {collection_feed_state_table()} (
+                singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+                protocol_version INTEGER NOT NULL,
+                epoch UUID NOT NULL,
+                head_seq BIGINT NOT NULL CHECK (head_seq >= 0)
+            )
+            """
+        )
+        cur.execute(
+            f"INSERT INTO {collection_feed_state_table()} "
+            f"(singleton, protocol_version, epoch, head_seq) "
+            f"SELECT 1, %s, gen_random_uuid(), COALESCE(MAX(seq), 0) "
+            f"FROM {collection_changes_table()} ON CONFLICT (singleton) DO NOTHING",
+            (FEED_PROTOCOL_VERSION,),
+        )
+        cur.execute(
+            f"SELECT protocol_version FROM {collection_feed_state_table()} WHERE singleton = 1"
+        )
+        state = cur.fetchone()
+        if state is None or state[0] != FEED_PROTOCOL_VERSION:
+>           raise FeedProtocolUnavailable("unknown collection feed protocol")
+E           plugins.LumaeAnalysis.collection_manager.FeedProtocolUnavailable: unknown collection feed protocol
+
+plugins\LumaeAnalysis\collection_manager.py:172: FeedProtocolUnavailable
+_______ test_migrate_is_idempotent_and_preserves_existing_plugin_tables _______
+
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001B8B18D7CE0>
+
+    def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch):
+        mod = load_plugin()
+        db = CronDb(existing=None)
+        monkeypatch.setattr(mod, "profiles_table", lambda: PLUGIN_TABLE)
+    
+>       mod.migrate(db)
+
+tests\plugins\test_lumae_analysis.py:4565: 
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+plugins\LumaeAnalysis\__init__.py:1265: in migrate
+    migrate_collections(db)
+_ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _ _
+
+db = <test_lumae_analysis.CronDb object at 0x000001B8B139E630>
+
+    def migrate_collections(db):
+        cur = db.cursor()
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {collections_table()} (
+                principal TEXT NOT NULL,
+                id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                description TEXT,
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                deleted_at TIMESTAMPTZ,
+                PRIMARY KEY (principal, id)
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {collection_items_table()} (
+                principal TEXT NOT NULL,
+                id TEXT NOT NULL,
+                collection_id TEXT NOT NULL,
+                kind TEXT NOT NULL CHECK (kind IN ('album', 'track')),
+                track_id TEXT,
+                provider_album_id TEXT,
+                album_key TEXT,
+                title TEXT,
+                artist TEXT NOT NULL DEFAULT '',
+                album TEXT,
+                cover_item_id TEXT,
+                position INTEGER NOT NULL DEFAULT 0,
+                added_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+                PRIMARY KEY (principal, id),
+                FOREIGN KEY (principal, collection_id)
+                    REFERENCES {collections_table()} (principal, id) ON DELETE CASCADE
+            )
+            """
+        )
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {collection_changes_table()} (
+                seq BIGSERIAL PRIMARY KEY,
+                principal TEXT NOT NULL,
+                collection_id TEXT NOT NULL,
+                entity_kind TEXT NOT NULL,
+                entity_id TEXT NOT NULL,
+                operation TEXT NOT NULL,
+                payload JSONB NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        # Serialize the seed against legacy change writers during the cutover.
+        # Host installation owns the outer transaction; the lock lasts to its commit.
+        cur.execute("SET LOCAL lock_timeout = '5s'")
+        cur.execute("SET LOCAL statement_timeout = '30s'")
+        cur.execute(f"LOCK TABLE {collection_changes_table()} IN ACCESS EXCLUSIVE MODE")
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {collection_feed_state_table()} (
+                singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
+                protocol_version INTEGER NOT NULL,
+                epoch UUID NOT NULL,
+                head_seq BIGINT NOT NULL CHECK (head_seq >= 0)
+            )
+            """
+        )
+        cur.execute(
+            f"INSERT INTO {collection_feed_state_table()} "
+            f"(singleton, protocol_version, epoch, head_seq) "
+            f"SELECT 1, %s, gen_random_uuid(), COALESCE(MAX(seq), 0) "
+            f"FROM {collection_changes_table()} ON CONFLICT (singleton) DO NOTHING",
+            (FEED_PROTOCOL_VERSION,),
+        )
+        cur.execute(
+            f"SELECT protocol_version FROM {collection_feed_state_table()} WHERE singleton = 1"
+        )
+        state = cur.fetchone()
+        if state is None or state[0] != FEED_PROTOCOL_VERSION:
+>           raise FeedProtocolUnavailable("unknown collection feed protocol")
+E           plugins.LumaeAnalysis.collection_manager.FeedProtocolUnavailable: unknown collection feed protocol
+
+plugins\LumaeAnalysis\collection_manager.py:172: FeedProtocolUnavailable
+_____________ test_current_release_contains_supported_source_only _____________
+
+    def test_current_release_contains_supported_source_only():
+        import zipfile
+    
+        metadata = json.loads((ROOT / "plugins/LumaeAnalysis/plugin.json").read_text())
+        latest = metadata["versions"][0]
+        assert latest["version"] == "1.2.5"
+        archive = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+        assert hashlib.md5(archive.read_bytes()).hexdigest() == latest["checksum"]
+        with zipfile.ZipFile(archive) as package:
+            names = package.namelist()
+            assert not any(Path(name).name.startswith(("dj_", "provision_dj")) for name in names)
+            assert "edge_profiles.py" in names
+            assert "personal_discovery.py" in names
+            assert "music_metadata.py" in names
+>           assert package.read("__init__.py") == (ROOT / "plugins/LumaeAnalysis/__init__.py").read_bytes()
+E           assert b'import base...default")\r\n' == b'import base...default")\r\n'
+E             
+E             At index 2333 diff: b'\r' != b','
+E             Use -v to get more diff
+
+tests\plugins\test_release_channels.py:139: AssertionError
+__________ test_release_archive_is_identical_across_platforms[win32] __________
+
+tmp_path = WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1c-pg/test_release_archive_is_identi0')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001B8B1EBB8C0>
+platform = 'win32'
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, platform):
+        import zipfile
+    
+        # ZipInfo otherwise records the host platform in every central directory entry.
+        from types import SimpleNamespace
+    
+        monkeypatch.setattr(zipfile, "sys", SimpleNamespace(platform=platform))
+        candidate = tmp_path / "release.zip"
+        builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
+        published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+>       assert builder.same_zip_contents(candidate, published)
+E       AssertionError: assert False
+E        +  where False = <function same_zip_contents at 0x000001B8B1363600>(WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1c-pg/test_release_archive_is_identi0/release.zip'), WindowsPath('C:/Users/rendy/vscode/lumae-plugin/dist/lumae_analysis/lumae_analysis_1.2.5.zip'))
+E        +    where <function same_zip_contents at 0x000001B8B1363600> = builder.same_zip_contents
+
+tests\plugins\test_release_channels.py:157: AssertionError
+__________ test_release_archive_is_identical_across_platforms[linux] __________
+
+tmp_path = WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1c-pg/test_release_archive_is_identi1')
+monkeypatch = <_pytest.monkeypatch.MonkeyPatch object at 0x000001B8B1B8C230>
+platform = 'linux'
+
+    @pytest.mark.parametrize("platform", ["win32", "linux"])
+    def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, platform):
+        import zipfile
+    
+        # ZipInfo otherwise records the host platform in every central directory entry.
+        from types import SimpleNamespace
+    
+        monkeypatch.setattr(zipfile, "sys", SimpleNamespace(platform=platform))
+        candidate = tmp_path / "release.zip"
+        builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
+        published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+>       assert builder.same_zip_contents(candidate, published)
+E       AssertionError: assert False
+E        +  where False = <function same_zip_contents at 0x000001B8B1363600>(WindowsPath('C:/Users/rendy/vscode/lumae-plugin/.pytest-tmp/task1c-pg/test_release_archive_is_identi1/release.zip'), WindowsPath('C:/Users/rendy/vscode/lumae-plugin/dist/lumae_analysis/lumae_analysis_1.2.5.zip'))
+E        +    where <function same_zip_contents at 0x000001B8B1363600> = builder.same_zip_contents
+
+tests\plugins\test_release_channels.py:157: AssertionError
+5 failed, 492 passed in 45.78s

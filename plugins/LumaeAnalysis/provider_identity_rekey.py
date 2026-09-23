@@ -314,6 +314,15 @@ def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings):
         "AND target.catalog_instance_id=%s",
         (catalog_instance_id,),
     )
+    from .profile_publication import rekey_published_profiles
+    rekey_published_profiles(cur, catalog_instance_id, tracks)
+    if tracks:
+        cur.execute(
+            f"""UPDATE {t('source_profiles')} SET attempt_token=NULL, status='stale'
+                 WHERE catalog_instance_id=%s AND track_id=ANY(%s::text[])
+                   AND attempt_token IS NOT NULL""",
+            (catalog_instance_id, [row["new_id"] for row in tracks]),
+        )
     # The legacy table belongs to the sole pre-registry Navidrome source. Do
     # not guess ownership on a multi-source installation.
     if tracks:

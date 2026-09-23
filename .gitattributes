@@ -1,0 +1,2 @@
+docs/remediation/evidence/*.log -whitespace
+docs/remediation/evidence/phase0-client/*.log -whitespace
