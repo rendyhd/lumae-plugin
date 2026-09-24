@@ -22,3 +22,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P0-4 sync contract | on phase/0-foundation | Phase 0 PR | | docs only; review fixes applied |
 | P0-2 migrated_db fixture | on phase/0-foundation | Phase 0 PR | | 582 passed |
 | P0-3 perf harness and baseline | on phase/0-foundation | Phase 0 PR | | baseline: 6/7 budgets missed (expected) |
+| P2-7 FederatedAlbums proxy timeouts | on phase/2 (pending) | Phase 2 PR | | 598 passed |
