@@ -48,8 +48,9 @@ def _seed_events(db, epoch, first, last):
     """Bulk-append events first..last as a long publication pass would."""
     with db.cursor() as cur:
         cur.execute(
-            f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation) "
-            "SELECT %s, %s, n, 'track-' || n, 'delete' FROM generate_series(%s, %s) AS n",
+            f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation, "
+            "writer_generation) "
+            "SELECT %s, %s, n, 'track-' || n, 'delete', 2 FROM generate_series(%s, %s) AS n",
             (SOURCE, epoch, first, last),
         )
         cur.execute(
@@ -177,8 +178,9 @@ def test_publication_leaves_other_epochs_to_maintenance(migrated_db):
     epoch = _source(migrated_db)
     with migrated_db.cursor() as cur:
         cur.execute(
-            f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation) "
-            "SELECT %s, 'retired-epoch', n, 'old-' || n, 'delete' FROM generate_series(1, 5) AS n",
+            f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation, "
+            "writer_generation) "
+            "SELECT %s, 'retired-epoch', n, 'old-' || n, 'delete', 2 FROM generate_series(1, 5) AS n",
             (SOURCE,),
         )
     migrated_db.commit()

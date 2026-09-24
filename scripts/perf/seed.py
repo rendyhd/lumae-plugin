@@ -318,8 +318,8 @@ def seed(args):
         (src, head, floor))
     # Events look like complete_attempt's serialize_profile() payloads (no edge).
     s.run("profile_changes", f"""INSERT INTO {T}profile_changes
-        (catalog_instance_id, epoch, seq, track_id, operation, payload)
-        SELECT %s, 'pepoch', s, p.track_id, 'upsert',
+        (catalog_instance_id, epoch, seq, track_id, operation, writer_generation, payload)
+        SELECT %s, 'pepoch', s, p.track_id, 'upsert', 2,
                jsonb_build_object('track_id', p.track_id, 'source', 'waveform',
                  'sample_rate', p.sample_rate, 'duration_ms', p.duration_ms,
                  'ref_lufs', p.ref_lufs, 'start_ramp', encode(p.start_ramp, 'base64'),

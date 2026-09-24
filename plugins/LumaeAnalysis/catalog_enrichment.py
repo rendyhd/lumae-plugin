@@ -30,6 +30,7 @@ from .edge_profiles import opaque_revision
 from .edge_profile_store import edge_join
 
 from .catalog import (
+    JOURNAL_WRITER_GENERATION,
     CatalogScanError,
     canonical_json,
     change_journal_retention_limit,
@@ -314,6 +315,18 @@ def migrate_enrichment(db):
             PRIMARY KEY (catalog_instance_id, epoch, seq)
         )
         """,
+        # AUD-05 fence: a 1.2.5 worker writes source_profiles 'ready' without a
+        # published row, then journals it in the same transaction. Its journal
+        # insert omits this column, fails, and rolls the source row back too.
+        f"""
+        ALTER TABLE {t("profile_changes")}
+        ADD COLUMN IF NOT EXISTS writer_generation SMALLINT NOT NULL
+            DEFAULT {JOURNAL_WRITER_GENERATION}
+        """,
+        f"""
+        ALTER TABLE {t("profile_changes")}
+        ALTER COLUMN writer_generation DROP DEFAULT
+        """,
         f"""
         CREATE TABLE IF NOT EXISTS {t("profile_bootstrap_sessions")} (
             session_id UUID PRIMARY KEY,
@@ -568,8 +581,9 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
     cur.execute(
         f"""
         INSERT INTO {t("profile_changes")}
-            (catalog_instance_id, epoch, seq, track_id, operation, payload)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            (catalog_instance_id, epoch, seq, track_id, operation, payload,
+             writer_generation)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
         """,
         (
             catalog_instance_id,
@@ -578,6 +592,7 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
             str(track_id),
             operation,
             _profile_json(payload) if payload is not None and operation == "upsert" else None,
+            JOURNAL_WRITER_GENERATION,
         ),
     )
     cur.execute(
