@@ -200,8 +200,10 @@ Status codes:
 
 | Status | Code | When |
 |---|---|---|
-| 410 | `bootstrap_required` | the cursor epoch ≠ the current epoch, **or** `cursor.seq < floor_seq` (the journal was compacted past it) (591-593) |
-| 400 | `invalid_cursor` | malformed cursor; the cursor belongs to another source; **the cursor is ahead of head** (594-596) |
+| 410 | `bootstrap_required` | the cursor epoch ≠ the current epoch, **or** `cursor.seq < floor_seq` (the journal was compacted past it) (591-593), **or** (from P1-7) the page is not dense: with `cursor.seq < head_seq` the returned seqs are not exactly `cursor.seq+1 … cursor.seq+min(limit, head_seq − cursor.seq)` (an event is missing) |
+| 400 | `invalid_cursor` | malformed cursor; the cursor belongs to another source; **the cursor is ahead of head** (594-596; unchanged by P1-7) |
+
+From P1-7 (unreleased, ships in 1.3.0): the reader takes the stream state (epoch, head, floor) and the page of events in **one statement** (`catalog.read_change_page`: a CTE over `profile_stream_state` laterally joined with `profile_changes`), so both come from one snapshot. Before, the state and the events were two statements, and a compaction committing between them could return a page that silently started after a deleted event (LUM-001 gap F5). The page is then checked for density as above; a violation is the same 410 `bootstrap_required` the floor and epoch checks return. The response shape is unchanged. The catalogue (`GET /api/catalog/changes`), analysis (`GET /api/catalog/analysis/changes`) and relationship (`GET /api/catalog/relationships/changes`) change readers had the same two-statement pattern and use the same single-snapshot read and density check, with the same 410 `bootstrap_required` and 400 `invalid_cursor` (cursor ahead of head) codes; their `head_cursor`, `has_more` and, for the catalogue, `remaining_events`, `snapshot_generation`, `snapshot_entity_counts`, `snapshot_estimated_bytes` and `fingerprint_schema_version` now come from that same snapshot.
 
 Retention: each publication compacts the journal to its last **50,000** events (`PROFILE_CHANGE_RETENTION_EVENTS`, `catalog_enrichment.py:50, 497`). The maintenance path uses `max(1000, 2 × profile_count)` (`catalog_enrichment.py:158-210`, line 193; `catalog.py:50-55`). A client more than about 50k events behind gets a 410 and must bootstrap again.
 
