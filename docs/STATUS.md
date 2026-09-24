@@ -23,3 +23,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P0-2 migrated_db fixture | on phase/0-foundation | Phase 0 PR | | 582 passed |
 | P0-3 perf harness and baseline | on phase/0-foundation | Phase 0 PR | | baseline: 6/7 budgets missed (expected) |
 | P2-7 FederatedAlbums proxy timeouts | on phase/2-performance | Phase 2 PR | | 598 passed |
+| P2-2 incremental projection | on phase/2-performance | Phase 2 PR | | 613 passed, 1 xfailed; no-change 30.5→4.0 s (1,596→356 MB), delta 65.0→5.8 s |

@@ -330,6 +330,116 @@ def test_input_changes_discard_stale_checkpoints(relationship_db, changed):
     assert scalar(db, 'SELECT count(*) FROM plugin_lumae_analysis__relationship_builds') == 1
 
 
+def republish_analysis(db, change_sql=None):
+    """Publish analysis generation N+1 as a copy of N, optionally edited."""
+    with db.cursor() as cur:
+        cur.execute("SELECT projection_generation FROM plugin_lumae_analysis__analysis_state")
+        generation = cur.fetchone()[0]
+        for table in ('analysis_items', 'track_analysis_links'):
+            cur.execute(f"""
+                CREATE TEMP TABLE copied ON COMMIT DROP AS
+                SELECT * FROM plugin_lumae_analysis__{table} WHERE projection_generation=%s;
+                UPDATE copied SET projection_generation=projection_generation+1;
+                INSERT INTO plugin_lumae_analysis__{table} SELECT * FROM copied;
+                DROP TABLE copied;
+            """, (generation,))
+        if change_sql:
+            cur.execute(change_sql, (generation + 1,))
+        cur.execute("UPDATE plugin_lumae_analysis__analysis_state SET projection_generation=%s",
+                    (generation + 1,))
+    db.commit()
+    return generation + 1
+
+
+def test_relationship_identity_digests_the_analysis_inputs_not_the_generation(relationship_db):
+    db = relationship_db
+    with db.cursor() as cur:
+        before = rb.input_identity(cur, 'catalog-a')
+    db.rollback()
+    assert 'analysis_generation' not in before
+    republish_analysis(db)
+    with db.cursor() as cur:
+        assert rb.input_identity(cur, 'catalog-a') == before
+    db.rollback()
+    # UMAP coordinates share the payload but are not a relationship input.
+    republish_analysis(db, "UPDATE plugin_lumae_analysis__analysis_items "
+                           "SET scalar_payload=scalar_payload||'{\"umap\":{\"x\":1,\"y\":2}}' "
+                           "WHERE projection_generation=%s")
+    with db.cursor() as cur:
+        assert rb.input_identity(cur, 'catalog-a') == before
+    db.rollback()
+    for change in (
+        "UPDATE plugin_lumae_analysis__analysis_items SET scalar_payload='{\"energy\":0.5}' "
+        "WHERE projection_generation=%s AND analysis_id='ai-1'",
+        "UPDATE plugin_lumae_analysis__analysis_items SET musicnn_fp='changed' "
+        "WHERE projection_generation=%s AND analysis_id='ai-2'",
+        "UPDATE plugin_lumae_analysis__track_analysis_links SET status='pending' "
+        "WHERE projection_generation=%s AND provider_track_id='tr-3'",
+    ):
+        republish_analysis(db, change)
+        with db.cursor() as cur:
+            changed = rb.input_identity(cur, 'catalog-a')
+        db.rollback()
+        assert changed['analysis_inputs'] != before['analysis_inputs'], change
+        before = changed
+
+
+def test_same_inputs_in_a_new_analysis_generation_keep_the_checkpoint(relationship_db):
+    db = relationship_db
+    advance(db, batch_size=1)
+    build_id = scalar(db, 'SELECT build_id FROM plugin_lumae_analysis__relationship_builds')
+    generation = republish_analysis(db)
+    finish(db)
+    assert scalar(db, 'SELECT build_id FROM plugin_lumae_analysis__relationship_builds') == build_id
+    assert e.relationship_status(db, 'catalog-a')['source_analysis_generation'] == generation
+
+
+def test_completed_relationships_are_current_for_a_generation_with_the_same_inputs(relationship_db):
+    db = relationship_db
+    first = finish(db)
+    before = published(db)
+    generation = republish_analysis(db)
+    # No rescoring and no new relationship generation: the completed build is
+    # recorded as current for the new analysis generation.
+    assert finish(db, candidate_lookup=lambda *_: pytest.fail('rescored unchanged inputs')) == first
+    assert published(db) == before
+    status = e.relationship_status(db, 'catalog-a')
+    assert status['generation'] == first['generation']
+    assert status['source_analysis_generation'] == generation
+
+
+def test_generation_republished_and_pruned_while_loading_inputs_reloads_them(relationship_db, monkeypatch):
+    """A projection may publish identical inputs as N+1 and prune N between
+    the build's initialize() and its input load. The digest still matches, so
+    only the generation check stops an empty load from publishing deletions."""
+    db = relationship_db
+    other = connection_like(db)
+    load = e._load_relationship_inputs
+    raced = []
+
+    def racing_load(cur, source):
+        if not raced:
+            loaded = source['analysis']['generation']
+            raced.append(republish_analysis(other))
+            with other.cursor() as ocur:
+                for table in ('analysis_items', 'track_analysis_links'):
+                    ocur.execute(f'DELETE FROM plugin_lumae_analysis__{table} '
+                                 'WHERE projection_generation=%s', (loaded,))
+            other.commit()
+        return load(cur, source)
+
+    monkeypatch.setattr(e, '_load_relationship_inputs', racing_load)
+    try:
+        result = finish(db)
+    finally:
+        other.close()
+    assert raced == [2]
+    assert (result['album_count'], result['artist_count'], result['track_count']) == (2, 2, 8)
+    assert len(published(db)) == 4
+    assert scalar(db, "SELECT count(*) FROM plugin_lumae_analysis__relationship_changes "
+                      "WHERE operation='delete'") == 0
+    assert e.relationship_status(db, 'catalog-a')['source_analysis_generation'] == 2
+
 def bump_analysis_epoch(db):
     with db.cursor() as cur:
         cur.execute("UPDATE plugin_lumae_analysis__analysis_state SET analysis_epoch=analysis_epoch||'-next'")
