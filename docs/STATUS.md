@@ -23,3 +23,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P0-2 migrated_db fixture | merged | rendyhd/lumae-plugin#5 | 38c11a4 | 582 passed |
 | P0-3 perf harness and baseline | merged | rendyhd/lumae-plugin#5 | 38c11a4 | baseline: 6/7 budgets missed (expected) |
 | P1-1 no-op republish keeps edges | on phase/1-stop-the-bleeding | Phase 1 PR | | 596 passed |
+| P1-2 journal compaction and retention | on phase/1-stop-the-bleeding | Phase 1 PR | | 607 passed; publication p95 20.9→6.2 ms (P1-2 alone), 8.2 ms with P1-1 |

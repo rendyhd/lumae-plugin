@@ -26,6 +26,7 @@ CHANGE_EVENT_OVERHEAD_BYTES = 192
 SNAPSHOT_ENTITY_OVERHEAD_BYTES = 96
 MIN_RETAINED_CHANGE_EVENTS = 1_000
 CHANGE_EVENT_SNAPSHOT_MULTIPLIER = 2
+MAX_HELD_RETENTION_MULTIPLIER = 4
 
 CATALOG_GENERATION_TABLES = (
     "catalog_libraries",
@@ -66,18 +67,56 @@ def compact_change_journal(
     epoch,
     head_seq,
     retention_limit,
+    purge_other_epochs=False,
+    hold_floor_seq=None,
+    current_floor=None,
+    max_advance=None,
 ):
-    """Bound one cursor journal and advance its bootstrap floor atomically."""
+    """Bound one cursor journal and advance its bootstrap floor atomically.
+
+    The retained-epoch delete is an index range delete on the
+    ``(catalog_instance_id, epoch, seq)`` primary key, so its cost is the
+    number of expired rows, not the journal size. Rows of other epochs are
+    removed only when ``purge_other_epochs`` is set: on epoch rotation and in
+    maintenance compaction, never on every publication.
+
+    ``hold_floor_seq`` keeps events after that seq readable (an open bootstrap
+    session that still has to replay them), but never lets the journal grow
+    past ``MAX_HELD_RETENTION_MULTIPLIER`` times the retention limit.
+
+    ``max_advance`` (with the locked ``current_floor``) bounds one call to that
+    many seqs past the current floor. A per-event publisher passes it, so a
+    released hold or a lowered limit never turns into one huge delete under the
+    publication locks; the backlog drains ``max_advance`` rows per publication
+    and maintenance, which passes no bound, catches up fully.
+    """
     retained = max(MIN_RETAINED_CHANGE_EVENTS, int(retention_limit or 0))
-    target_floor = max(0, int(head_seq or 0) - retained)
-    if target_floor > 0:
+    head_seq = int(head_seq or 0)
+    target_floor = max(0, head_seq - retained)
+    if hold_floor_seq is not None:
+        hard_floor = max(0, head_seq - retained * MAX_HELD_RETENTION_MULTIPLIER)
+        target_floor = max(hard_floor, min(target_floor, int(hold_floor_seq)))
+    advance = target_floor > 0
+    if current_floor is not None:
+        current_floor = int(current_floor)
+        if max_advance is not None:
+            target_floor = min(target_floor, current_floor + int(max_advance))
+        # Nothing past the locked floor has expired, or a hold keeps it.
+        advance = target_floor > current_floor
+        target_floor = max(target_floor, current_floor)
+    if purge_other_epochs:
+        cur.execute(
+            f"DELETE FROM {t(changes_table)} "
+            "WHERE catalog_instance_id=%s AND epoch<>%s",
+            (catalog_instance_id, str(epoch)),
+        )
+    if advance:
         cur.execute(
             f"""
             DELETE FROM {t(changes_table)}
-             WHERE catalog_instance_id=%s
-               AND (epoch<>%s OR (epoch=%s AND seq<=%s))
+             WHERE catalog_instance_id=%s AND epoch=%s AND seq<=%s
             """,
-            (catalog_instance_id, str(epoch), str(epoch), target_floor),
+            (catalog_instance_id, str(epoch), target_floor),
         )
         cur.execute(
             f"""
@@ -86,12 +125,6 @@ def compact_change_journal(
              WHERE catalog_instance_id=%s AND {epoch_column}=%s
             """,
             (target_floor, catalog_instance_id, str(epoch)),
-        )
-    else:
-        cur.execute(
-            f"DELETE FROM {t(changes_table)} "
-            "WHERE catalog_instance_id=%s AND epoch<>%s",
-            (catalog_instance_id, str(epoch)),
         )
     return target_floor
 
@@ -169,6 +202,7 @@ def prune_catalog_storage(db, catalog_instance_id=None, cursor=None):
             retention_limit=change_journal_retention_limit(
                 sum(int(value or 0) for value in catalog_counts.values())
             ),
+            purge_other_epochs=True,
         )
         if analysis_generation > 0:
             compact_change_journal(
@@ -183,6 +217,7 @@ def prune_catalog_storage(db, catalog_instance_id=None, cursor=None):
                 retention_limit=change_journal_retention_limit(
                     int(row[8] or 0) + int(row[9] or 0)
                 ),
+                purge_other_epochs=True,
             )
     if cursor is None:
         cur.close()
@@ -2052,7 +2087,13 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             epoch=publication_epoch,
             head_seq=next_seq,
             retention_limit=change_journal_retention_limit(sum(counts.values())),
+            purge_other_epochs=publication_epoch != str(locked_epoch),
         )
+        # P1-2: the profile journal keeps two libraries of events; follow the
+        # library size as each generation publishes, not only at startup.
+        from .catalog_enrichment import refresh_profile_retention
+
+        refresh_profile_retention(cur, catalog_instance_id, counts["track"])
         cur.close()
         db.commit()
         return {
