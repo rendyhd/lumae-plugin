@@ -1,3 +1,5 @@
+> **Historical record.** Current work status lives in [docs/STATUS.md](../STATUS.md); the active plan is [docs/plan/LUMAE_FINAL_PLAN_2026-09-24.md](../plan/LUMAE_FINAL_PLAN_2026-09-24.md).
+
 # Lumae remediation ledger
 
 Updated: 2026-09-24. Owner: remediation lead (current parent model/effort unverified). The user-supplied V2 resume brief supersedes routing and startup in the historical [master orchestration](LUMAE_ASTRA_MASTER_ORCHESTRATION.md); existing findings, decisions and evidence remain. No deployment, push, production data access or device mutation is authorized by this program.
