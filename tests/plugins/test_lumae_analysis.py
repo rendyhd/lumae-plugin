@@ -232,6 +232,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "available": mod.edge_runtime_available(),
                 "enabled": mod.edge_profiles_enabled(),
             },
+            "transport": {"gzip": True},
         },
         "status": "ok",
     }

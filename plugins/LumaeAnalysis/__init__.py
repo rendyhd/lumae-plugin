@@ -1,4 +1,5 @@
 import base64
+import gzip
 import json
 import os
 import re
@@ -215,6 +216,61 @@ register_shelf_routes(bp)
 personal_discovery.register_routes(bp)
 music_metadata.register_routes(bp)
 credits_service.register_routes(bp)
+
+
+GZIP_MIN_BYTES = 1024
+GZIP_LEVEL = 4  # ~99% of level 6 ratio for ~80% of the CPU on edge pages
+
+
+def _accepts_gzip(header):
+    """True when ``Accept-Encoding`` allows gzip. ``q=0`` refuses it (RFC 9110 12.5.3)."""
+    explicit = wildcard = None
+    for item in str(header or "").split(","):
+        name, _, params = item.partition(";")
+        name = name.strip().lower()
+        if not name:
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        if name in ("gzip", "x-gzip"):
+            explicit = quality if explicit is None else max(explicit, quality)
+        elif name == "*":
+            wildcard = quality
+    chosen = explicit if explicit is not None else wildcard
+    return chosen is not None and chosen > 0
+
+
+@bp.after_request
+def _compress_json_response(response):
+    """K1: gzip plugin JSON of at least 1 KiB for clients that accept it.
+
+    Blueprint-scoped, so host routes are never touched. Streamed and
+    passthrough bodies, non-200 statuses and already-encoded bodies are left
+    as they are.
+    """
+    if (response.status_code != 200
+            or response.mimetype != "application/json"
+            or response.direct_passthrough
+            or response.is_streamed
+            or "Content-Encoding" in response.headers):
+        return response
+    body = response.get_data()
+    if len(body) < GZIP_MIN_BYTES:
+        return response
+    response.vary.add("Accept-Encoding")
+    if not _accepts_gzip(request.headers.get("Accept-Encoding")):
+        return response
+    compressed = gzip.compress(body, compresslevel=GZIP_LEVEL, mtime=0)
+    response.set_data(compressed)
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = str(len(compressed))
+    return response
 
 
 def enqueue_bounded(func, *args, queue="default", timeout=None, **kwargs):
@@ -1864,6 +1920,7 @@ def health():
                 },
                 "catalog_mirror": catalog_capability(),
                 "credits": credits_service.capability(),
+                "transport": {"gzip": True},
             },
             "status": "ok" if compatibility.supported else compatibility.status,
         }
@@ -2545,7 +2602,7 @@ def profiles():
             })
         else:
             missing.append(track_id)
-    return jsonify(
+    return _private_json(
         {
             "schema_version": SCHEMA_VERSION,
             "analyzer_version": ANALYZER_VERSION,
