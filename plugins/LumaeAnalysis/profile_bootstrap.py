@@ -276,6 +276,7 @@ def create_session(body, principal):
                         "SET snapshot_count=%s WHERE session_id=%s", (ordinal, session_id))
     return {"protocol_version": 2, "schema_version": 1,
             "catalog_instance_id": body["catalog_instance_id"],
+            "principal_binding": principal,
             "session_token": token, "page_size": size,
             "snapshot_count": ordinal, "total_profiles": ordinal,
             "catalog_epoch": catalog_epoch, "profile_epoch": profile_epoch,

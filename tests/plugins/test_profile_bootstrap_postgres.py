@@ -98,6 +98,7 @@ def publish(db, track, operation="upsert"):
 def test_restart_snapshot_replay_and_finite_catchup(edge_publication_db):
     db = edge_publication_db
     created = profile_bootstrap.create_session(body(page_size=1), binding())
+    assert created["principal_binding"] == binding()
     token = created["session_token"]
     assert created["total_profiles"] == 1
     assert created["snapshot_seq"] == 0

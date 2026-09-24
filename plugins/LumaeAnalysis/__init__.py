@@ -1834,6 +1834,14 @@ def health():
             "schema_version": SCHEMA_VERSION,
             "analyzer_version": ANALYZER_VERSION,
             "capabilities": {
+                "profile_bootstrap": {
+                    "protocol_version": 2,
+                    "schema_version": 1,
+                    "auth": "account_session",
+                    "principal_binding": "subject_generation",
+                    "available": callable(getattr(host_api, "get_principal", None))
+                    and callable(getattr(host_api, "open_db_connection", None)),
+                },
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
                 "personal_discovery": {"schema_version": 1, "enabled": collections_enabled(), "scope": current_collection_scope()["mode"], "features": ["album_memory_context", "enjoyment_feedback"]},
