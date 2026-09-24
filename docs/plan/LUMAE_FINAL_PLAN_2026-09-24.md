@@ -61,11 +61,12 @@ This plan replaces Sections 12–14 of the old overview. It covers **every** aud
 4. **Review loop.** A reviewer agent runs. Fix CHANGES_REQUIRED and re-review until PASS. At most 3 rounds, then escalate to the user.
 5. **Performance WPs** must add before/after numbers from `scripts/perf/` (P0-3), plus an equivalence test showing identical outputs.
 6. **Contract WPs** update `docs/contracts/LUMAE_SYNC_CONTRACT.md` (P0-4) in the same PR and keep old clients working.
-7. **PR.**
-   - Open a PR to `main`. Commit messages are `fix|perf|feat(<area>): <WP-ID> — <title>`, ending with the session attribution lines.
-   - The orchestrator merges only after CI is green and the review is PASS. Squash-merge. `main` is pinned (P0-1), so merges never publish.
+7. **Integration: one PR per phase** (changed 2026-09-24 at the user's request, to cut PR noise for repo watchers).
+   - Implementers push an internal `wp/<ID>-<slug>` branch. No PR is opened for it.
+   - After review PASS, the orchestrator merges the WP into the phase branch (`phase/<n>-<slug>`) with `git merge --no-ff`, so each WP stays one identifiable unit. Commit messages are `fix|perf|feat(<area>): <WP-ID> — <title>`, ending with the session attribution lines.
+   - Each phase has **one** PR to `main`. It is opened as a draft when the phase's first WP lands, CI runs on every push, and it is marked ready and merged (merge commit, not squash) only when the phase exit gate passes. `main` is pinned (P0-1), so merges never publish.
    - Never use `[skip ci]` on code, and never force-push `main`.
-8. **Status.** Update the task, and add one line to `docs/STATUS.md` (WP, PR, merge SHA, tests). No separate bookkeeping commits.
+8. **Status.** Update the task, and add one line to `docs/STATUS.md` (WP, phase PR, WP merge SHA, tests). No separate bookkeeping commits.
 
 ### 1.3 File-conflict groups (serialize within a group)
 
@@ -130,6 +131,26 @@ Where different groups touch one file, keep each WP to the functions listed and 
 | K9 | **Collections conflicts:** with header `X-Lumae-Collections-Contract: 2`, `idempotency_key_conflict` includes `current`, and a duplicate membership returns 409 `membership_conflict {existing_item_id}` instead of a silent id remap. Create with an existing id returns 409. | P3-4 | Handle both; freeze reorder bodies at enqueue (C-13) | `capabilities.collections.contract:2` | 3 |
 | K10 | Collection items carry `catalog_instance_id` (LUM-013, additive); workbench routes take an explicit catalogue | P3-5 | Store and scope items (C-13) | `capabilities.collections.source_scoped_items:true` | 3 |
 | K11 | Profiles may carry `analyzer_ver:2` (BS.1770-4 `ref_lufs` and new ramps) | P3-1 | Accept v1 and v2; normalise by version (C-11) | `capabilities.lumae_analysis_profiles.analyzer_versions:[1,2]`, `loudness_method:"bs1770-4"` | 3 |
+
+**Contract findings from P0-4 (2026-09-24), folded into the WPs below:**
+
+| # | Finding in 1.2.5 | Handled by |
+|---|---|---|
+| 1 | `lumae_analysis_profiles` is only in `plugin.json`, not in the health payload, so the K11 gate needs a new health key | P3-1 adds `capabilities.lumae_analysis_profiles` to health |
+| 2 | `capabilities.transport` and `capabilities.profile_stream` don't exist | P1-4 and P3-2 add them as new objects |
+| 3 | v2 never returns 404 or 409; 404 only means an older plugin without the route | Contract; client treats a v2 404 as "unavailable" |
+| 4 | v2 expiry is a hard-coded 60 minutes in SQL; `SESSION_MINUTES` is unused | P1-6 uses one constant for absolute and sliding expiry |
+| 5 | Releasing an expired or stale session returns 410 and leaves the row, which holds a slot | P1-6 item 2 (release always deletes and returns 200) |
+| 6 | Health `available` is `bool(DATABASE_URL)`; `auth` says host_authenticated even when auth is off | P1-6 item 4 (K4) |
+| 7 | `/profiles/changes` cursor ahead of head returns 400 `invalid_cursor`; the collections feed returns an empty 200 and never 410 | Kept for v1; P3-4 (K8) adds 410 for collections |
+| 8 | `ref_lufs` is float64 in change events but float4 in reads and snapshots; only events pass the string sanitizer | P1-1 normalises to float4 and applies one serializer on every path |
+| 9 | Per-publication retention is a fixed 50k; maintenance keeps max(1000, 2×count) | P1-2 (one persisted retention limit, at least 50k) |
+| 10 | `/api/profiles` silently drops ids past 500 without listing them in `missing` | P3-2 lists truncated ids in `missing` (additive); client batches ≤100 (C-10) |
+| 11 | Timestamps mix no-zone and server-offset formats | P1-6 item 8 (UTC with `Z` for new fields; `analyzed_at` unchanged, documented) |
+| 12 | Collections: create with an existing id returns 201; duplicate membership remaps; no `current`; epoch not returned; journal and receipts never compacted | P3-4 (K8, K9, growth) |
+| 13 | Shelves idempotency is keyed by mutation id only | P3-4 item 5 (bind the body fingerprint, K9-gated) |
+
+1.2.5 ignores unknown body fields, query parameters and headers, so every opt-in signal is safe to send to old servers. The exception is `page_size` on v2 page, catch-up and release requests, which returns 400: clients send `page_size` only on create.
 
 **Unchanged by design:**
 - v2 `page_size` stays client-chosen (1–500). Byte-sized pages are a client choice: use `page_size` about 50 when edges are present.
@@ -435,7 +456,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   1. **Feed (K8):**
      - add `epoch`, `head_seq`, `has_more` and `next_cursor` (already present) to the response;
      - a 410 `collections_resync_required` when the request's `epoch` mismatches or the cursor is beyond head;
-     - `GET /collections/snapshot` returns collections, items and `{epoch, head_seq}` in one REPEATABLE READ transaction on an owned connection (reuse the `profile_bootstrap._connection` pattern);
+     - `GET /plugins/lumae_analysis/api/collections/snapshot` returns collections, items and `{epoch, head_seq}` in one REPEATABLE READ transaction on an owned connection (reuse the `profile_bootstrap._connection` pattern);
      - publish `floor_seq`, the head at cutover.
   2. **Restore and batch:**
      - allocate a block with `UPDATE feed_state SET head_seq=head_seq+n RETURNING` after staging, then insert the events in one multi-row insert;
@@ -691,7 +712,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
 | `Retry-After` on 429/503 | Honour it. |
 | `profile_stream.edge_refs` | Send `edge_refs=1` (query) or `edge_refs:true` (v2 body). Upserts may carry `edge_profile_ref:{media_revision, profile_digest}` instead of `edge_profile`. |
 | `edge_profiles.compact_transport` | Optionally send `edge_compact=1`. `boundaries` is omitted; rebuild it before verifying. |
-| `collections.feed_epoch` | Echo `epoch`; handle 410 `collections_resync_required` through `GET /collections/snapshot`; use `has_more`/`next_cursor`. |
+| `collections.feed_epoch` | Echo `epoch`; handle 410 `collections_resync_required` through `GET /plugins/lumae_analysis/api/collections/snapshot`; use `has_more`/`next_cursor`. |
 | `collections.contract: 2` | Send `X-Lumae-Collections-Contract: 2`; handle 409 `membership_conflict {existing_item_id}` and `idempotency_key_conflict` with `current`. |
 | `collections.source_scoped_items` | Items carry `catalog_instance_id`. |
 | `lumae_analysis_profiles.analyzer_versions` includes 2 | Profiles may have `analyzer_ver:2` (BS.1770-4 `ref_lufs`). |
@@ -842,7 +863,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
      - scope the feed cursor per (AudioMuse source, account), a v39 DDL or `sync_metadata` keys;
      - echo `epoch`;
      - page by `has_more`/`next_cursor`, not "fewer than 200 rows";
-     - on 410, fetch `GET /collections/snapshot` and merge with the outbox, preserving unsent mutations, memberships, order and undo;
+     - on 410, fetch `GET /plugins/lumae_analysis/api/collections/snapshot` and merge with the outbox, preserving unsent mutations, memberships, order and undo;
      - a failed feed shows a recoverable state, not a sticky string.
   5. **Before the plugin's LUM-014 ships:** align the album unique index with the server. Make it partial where `provider_album_id IS NULL` for `album_key`, so same-name editions with distinct provider ids can coexist. In v39, include `catalog_instance_id` when K10 is advertised.
   6. Send `X-Lumae-Collections-Contract: 2` when `collections.contract==2`.
