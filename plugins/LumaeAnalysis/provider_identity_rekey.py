@@ -570,6 +570,7 @@ def _publish_provider_identity_rekey(
         CATALOG_SCHEMA_VERSION,
         ENTITY_COLLECTIONS,
         ENTITY_ORDER,
+        JOURNAL_WRITER_GENERATION,
         _coverage,
         _estimate_snapshot_bytes,
         _insert_generation_rows,
@@ -712,8 +713,8 @@ def _publish_provider_identity_rekey(
             INSERT INTO {t('catalog_changes')}
                 (catalog_instance_id, epoch, seq, generation, entity_type,
                  entity_id, operation, change_reason, old_entity_id, payload,
-                 evidence)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb)
+                 evidence, writer_generation)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
             """,
             (
                 catalog_instance_id,
@@ -727,6 +728,7 @@ def _publish_provider_identity_rekey(
                 event.old_entity_id,
                 canonical_json(event.payload) if event.payload is not None else None,
                 canonical_json(evidence),
+                JOURNAL_WRITER_GENERATION,
             ),
         )
     last_seq = next_seq

@@ -126,12 +126,13 @@ def _source(db):
 # stream -> (changes table, extra column values, state table, epoch, head, floor)
 STREAMS = {
     "profile": (
-        "profile_changes", "track_id, operation", "'track-' || n, 'delete'",
+        "profile_changes", "track_id, operation, writer_generation",
+        "'track-' || n, 'delete', 2",
         "profile_stream_state", "epoch", "head_seq", "floor_seq",
     ),
     "catalog": (
-        "catalog_changes", "generation, entity_type, entity_id, operation",
-        "1, 'track', 'track-' || n, 'delete'",
+        "catalog_changes", "generation, entity_type, entity_id, operation, writer_generation",
+        "1, 'track', 'track-' || n, 'delete', 2",
         "catalog_state", "catalog_epoch", "catalog_head_seq", "catalog_floor_seq",
     ),
     "analysis": (

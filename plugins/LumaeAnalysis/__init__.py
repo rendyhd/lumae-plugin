@@ -121,7 +121,7 @@ from .reconcile import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.2.5"
+PLUGIN_VERSION = "1.3.0"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -1130,6 +1130,10 @@ def observe_provider_identities_on_start():
     except Exception:
         _rollback_if_possible(db)
         logger.exception("lumae_analysis could not ensure reconcile schema")
+    try:
+        log_integrity_on_start(db)
+    except Exception:
+        logger.exception("lumae_analysis could not check upgrade integrity")
     bridge = ProviderCatalogBridge()
     for server in bridge.list_servers():
         if not server.get("supported"):
@@ -1419,6 +1423,7 @@ def migrate(db):
     prune_catalog_storage(db)
     compact_enrichment_storage(db)
     migrate_collections(db)
+    refresh_integrity_snapshot(db)
     migrate_shelves(db)
     personal_discovery.migrate(db)
     music_metadata.migrate(db)
@@ -1882,6 +1887,206 @@ def resolve_profile_source(catalog_instance_id=None, server_id=None, db=None):
     return source
 
 
+def profiles_unpublished_ready_count(db):
+    """Current 'ready' source profiles that have no published row (AUD-05).
+
+    A 1.2.5 worker wrote 'ready' rows and journal events but never a
+    published_source_profiles row, and 1.3.0 then treats the track as current.
+    "Current" means what ``published_profile_current`` checks: an active
+    source, the track available in the published generation with the same
+    media fingerprint, and the current analyzer and schema versions. An
+    index-driven anti-join; the repair SQL is in docs/runbooks/UPGRADE_1.3.md.
+    Returns None before the publication table exists.
+    """
+    cur = db.cursor()
+    try:
+        cur.execute("SELECT to_regclass(%s)", (table("published_source_profiles"),))
+        exists = cur.fetchone()
+        if not exists or exists[0] is None:
+            return None
+        # Anti-join first (normally empty), then check currency by key.
+        cur.execute(
+            f"""
+            WITH unpublished AS MATERIALIZED (
+                SELECT s.catalog_instance_id, s.track_id, s.media_signature
+                  FROM {source_profiles_table()} s
+                 WHERE s.status='ready'
+                   AND s.analyzer_ver=%s AND s.profile_schema_ver=%s
+                   AND NOT EXISTS (
+                       SELECT 1 FROM {table('published_source_profiles')} p
+                        WHERE p.catalog_instance_id=s.catalog_instance_id
+                          AND p.track_id=s.track_id
+                   )
+            )
+            SELECT count(*)
+              FROM unpublished s
+              JOIN {table('catalog_sources')} src
+                ON src.catalog_instance_id=s.catalog_instance_id
+               AND src.rebind_status='active'
+              JOIN {table('catalog_state')} c
+                ON c.catalog_instance_id=s.catalog_instance_id
+              JOIN {table('catalog_tracks')} t
+                ON t.catalog_instance_id=s.catalog_instance_id
+               AND t.published_generation=c.published_generation
+               AND t.track_id=s.track_id
+             WHERE t.available=TRUE AND COALESCE(t.media_fp, '') <> ''
+               AND s.media_signature='catalog-media:' || t.media_fp
+            """,
+            (ANALYZER_VERSION, SCHEMA_VERSION),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    finally:
+        cur.close()
+
+
+def integrity_state_table():
+    return table("integrity_state")
+
+
+def refresh_integrity_snapshot(db):
+    """Recount ``profiles_unpublished_ready`` and persist it (AUD-05).
+
+    The anti-join reads every 'ready' profile (about 80 ms at 94k profiles),
+    so health never runs it: install and web-worker start refresh this row
+    and health reads it by primary key. Runs in the caller's transaction.
+    """
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {integrity_state_table()} (
+                name TEXT PRIMARY KEY,
+                value BIGINT,
+                checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        count = profiles_unpublished_ready_count(db)
+        cur.execute(
+            f"""
+            INSERT INTO {integrity_state_table()} (name, value, checked_at)
+            VALUES ('profiles_unpublished_ready', %s, now())
+            ON CONFLICT (name) DO UPDATE
+               SET value=EXCLUDED.value, checked_at=EXCLUDED.checked_at
+            """,
+            (count,),
+        )
+        return count
+    finally:
+        cur.close()
+
+
+def upgrade_fences_installed(cur):
+    """True when every AUD-05 fence is in the schema (one catalogue lookup).
+
+    ``profile_changes.writer_generation`` and ``catalog_changes.writer_generation``
+    are NOT NULL without a default, and ``collection_changes.seq`` has no
+    default. False means the 1.3.0 migration has not (fully) run, so 1.2.5
+    workers are not fenced.
+    """
+    cur.execute(
+        """
+        SELECT
+          (SELECT count(*) FROM pg_attribute
+            WHERE attrelid IN (to_regclass(%s), to_regclass(%s))
+              AND attname='writer_generation' AND attnotnull
+              AND NOT atthasdef AND NOT attisdropped) = 2
+          AND EXISTS (
+            SELECT 1 FROM pg_attribute
+             WHERE attrelid = to_regclass(%s) AND attname='seq'
+               AND NOT atthasdef AND NOT attisdropped)
+        """,
+        (table("profile_changes"), table("catalog_changes"),
+         table("collection_changes")),
+    )
+    row = cur.fetchone()
+    return bool(row[0]) if row else None
+
+
+def integrity_status(db=None):
+    """Health ``integrity``: fail-closed invariants of the 1.3.0 upgrade (AUD-05).
+
+    ``collections_feed_ok`` is live: False when a collection change row sits
+    past the feed head (collection writes then return 503
+    ``collection_feed_invariant``). ``profiles_unpublished_ready`` is the count
+    persisted by the last install or web-worker start, and
+    ``profiles_checked_at`` is when it was taken. ``fences_installed`` is False
+    until the 1.3.0 migration has installed every old-writer fence. Values are
+    None when unknown. All reads are index or catalogue lookups.
+    """
+    from .collection_manager import collection_feed_integrity
+
+    result = {
+        "collections_feed_ok": None,
+        "profiles_unpublished_ready": None,
+        "profiles_checked_at": None,
+        "fences_installed": None,
+    }
+    try:
+        db = db or get_db()
+    except Exception:
+        db = None
+    if db is None:
+        return result
+    try:
+        cur = db.cursor()
+        try:
+            result["collections_feed_ok"] = collection_feed_integrity(cur)
+            result["fences_installed"] = upgrade_fences_installed(cur)
+            cur.execute("SELECT to_regclass(%s)", (integrity_state_table(),))
+            if cur.fetchone()[0] is not None:
+                cur.execute(
+                    f"SELECT value, checked_at FROM {integrity_state_table()} "
+                    "WHERE name='profiles_unpublished_ready'"
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    result["profiles_unpublished_ready"] = (
+                        int(row[0]) if row[0] is not None else None
+                    )
+                    result["profiles_checked_at"] = (
+                        row[1].astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                        if row[1] is not None else None
+                    )
+        finally:
+            cur.close()
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not read upgrade integrity")
+    return result
+
+
+def log_integrity_on_start(db):
+    """Refresh the persisted profile count and log any violated invariant."""
+    try:
+        refresh_integrity_snapshot(db)
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not refresh upgrade integrity")
+    status = integrity_status(db)
+    _rollback_if_possible(db)
+    if status["fences_installed"] is False:
+        logger.error(
+            "lumae_analysis 1.3.0 migration is incomplete: 1.2.5 writers are not "
+            "fenced. Re-run the plugin install before starting RQ workers "
+            "(docs/runbooks/UPGRADE_1.3.md)"
+        )
+    if status["collections_feed_ok"] is False:
+        logger.error(
+            "lumae_analysis collection feed invariant violated (MAX(seq) > head_seq); "
+            "collection writes return 503 until repaired: docs/runbooks/UPGRADE_1.3.md"
+        )
+    if status["profiles_unpublished_ready"]:
+        logger.warning(
+            "lumae_analysis found %s ready source profiles without a published row; "
+            "repair: docs/runbooks/UPGRADE_1.3.md",
+            status["profiles_unpublished_ready"],
+        )
+    return status
+
+
 @bp.get("/api/health")
 def health():
     compatibility = detect_core()
@@ -1922,6 +2127,7 @@ def health():
                 "credits": credits_service.capability(),
                 "transport": {"gzip": True},
             },
+            "integrity": integrity_status(),
             "status": "ok" if compatibility.supported else compatibility.status,
         }
     )

@@ -246,8 +246,9 @@ def test_standalone_compaction_rereads_locked_head(edge_publication_db, monkeypa
     cur.execute(f"SELECT epoch FROM {STATE} WHERE catalog_instance_id=%s", (SOURCE,))
     epoch = cur.fetchone()[0]
     cur.execute(
-        f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation) "
-        "SELECT %s, %s, n, 'seed-' || n, 'delete' FROM generate_series(1, 1001) AS n",
+        f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation, "
+            "writer_generation) "
+        "SELECT %s, %s, n, 'seed-' || n, 'delete', 2 FROM generate_series(1, 1001) AS n",
         (SOURCE, epoch),
     )
     cur.execute(f"UPDATE {STATE} SET head_seq=1001 WHERE catalog_instance_id=%s", (SOURCE,))
@@ -260,8 +261,9 @@ def test_standalone_compaction_rereads_locked_head(edge_publication_db, monkeypa
         cur.execute(f"SELECT head_seq FROM {STATE} WHERE catalog_instance_id=%s FOR UPDATE", (SOURCE,))
         assert cur.fetchone()[0] == 1001
         cur.execute(
-            f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation) "
-            "VALUES (%s, %s, 1002, 'seed-1002', 'delete')",
+            f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation, "
+            "writer_generation) "
+            "VALUES (%s, %s, 1002, 'seed-1002', 'delete', 2)",
             (SOURCE, epoch),
         )
         cur.execute(f"UPDATE {STATE} SET head_seq=1002 WHERE catalog_instance_id=%s", (SOURCE,))
@@ -499,8 +501,9 @@ def test_compactor_first_serializes_following_profile_publication(
     cur.execute(f"SELECT epoch FROM {STATE} WHERE catalog_instance_id=%s", (SOURCE,))
     epoch = cur.fetchone()[0]
     cur.execute(
-        f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation) "
-        "SELECT %s, %s, n, 'seed-' || n, 'delete' FROM generate_series(1, 1001) AS n",
+        f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation, "
+            "writer_generation) "
+        "SELECT %s, %s, n, 'seed-' || n, 'delete', 2 FROM generate_series(1, 1001) AS n",
         (SOURCE, epoch),
     )
     cur.execute(f"UPDATE {STATE} SET head_seq=1001 WHERE catalog_instance_id=%s", (SOURCE,))
@@ -711,8 +714,9 @@ def test_old_unlocked_allocator_collides_then_new_writer_succeeds(edge_publicati
             started.set()
             cur.execute(
                 f"INSERT INTO {CHANGES} "
-                "(catalog_instance_id, epoch, seq, track_id, operation, payload) "
-                "VALUES (%s, %s, %s, %s, 'upsert', %s::jsonb)",
+                "(catalog_instance_id, epoch, seq, track_id, operation, payload, "
+                "writer_generation) "
+                "VALUES (%s, %s, %s, %s, 'upsert', %s::jsonb, 2)",
                 (SOURCE, epoch, head + 1, "branch-old",
                  json.dumps({"track_id": "branch-old"})),
             )

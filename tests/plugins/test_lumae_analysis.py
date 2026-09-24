@@ -200,7 +200,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": RELEASE_VERSION,
+        "plugin_version": mod.PLUGIN_VERSION,
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -233,6 +233,13 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "enabled": mod.edge_profiles_enabled(),
             },
             "transport": {"gzip": True},
+        },
+        # The host stub has no database, so the invariants are unknown.
+        "integrity": {
+            "collections_feed_ok": None,
+            "profiles_unpublished_ready": None,
+            "profiles_checked_at": None,
+            "fences_installed": None,
         },
         "status": "ok",
     }
@@ -594,7 +601,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == RELEASE_VERSION
+    assert body["plugin_version"] == mod.PLUGIN_VERSION
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -2128,6 +2135,7 @@ def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch
             self.rows = []
             self.collection_reads = 0
             self.feed_head = 0
+            self.rowcount = 1
 
         def execute(self, sql, params=None):
             if "UPDATE" in sql and "collection_feed_state" in sql:

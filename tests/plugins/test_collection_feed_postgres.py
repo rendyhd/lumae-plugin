@@ -145,6 +145,10 @@ def test_populated_cache_sequence_migration_twice_preserves_epoch_and_head(colle
     with db.cursor() as cur:
         cur.execute(f"DROP TABLE {manager.collection_feed_state_table()}")
         cur.execute(f"ALTER SEQUENCE {manager.collection_changes_table()}_seq_seq CACHE 32")
+        # Rebuild the 1.2.5 schema: seq was a BIGSERIAL with a nextval default
+        # (1.3.0 migration drops it, AUD-05).
+        cur.execute(f"ALTER TABLE {manager.collection_changes_table()} ALTER COLUMN seq "
+                    f"SET DEFAULT nextval('{manager.collection_changes_table()}_seq_seq')")
         cur.execute(f"INSERT INTO {manager.collection_changes_table()} "
                     "(principal, collection_id, entity_kind, entity_id, operation, payload) "
                     "VALUES ('user:alice', 'legacy', 'collection', 'legacy', 'upsert', '{}'::jsonb) "
@@ -165,6 +169,11 @@ def test_populated_cache_sequence_migration_twice_preserves_epoch_and_head(colle
     assert state[1] == legacy_seq
     manager.migrate_collections(db)
     db.commit()
+    with db.cursor() as cur:
+        cur.execute("SELECT column_default FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name=%s "
+                    "AND column_name='seq'", (manager.collection_changes_table(),))
+        assert cur.fetchone() == (None,)
     with db.cursor() as cur:
         cur.execute(f"SELECT epoch::text, head_seq FROM {manager.collection_feed_state_table()}")
         assert cur.fetchone() == state

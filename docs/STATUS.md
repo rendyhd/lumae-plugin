@@ -26,3 +26,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P1-4 gzip transport and private headers | on phase/1-stop-the-bleeding | Phase 1 PR | | 628 passed; 50-row edge page 1002 KB → 372 KB (2.7×, distinct edges, gzip level 4) |
 | P1-2 journal compaction and retention | on phase/1-stop-the-bleeding | Phase 1 PR | | 607 passed; publication p95 20.9→6.2 ms (P1-2 alone), 8.2 ms with P1-1 |
 | P1-7 single-snapshot /changes reader | on phase/1-stop-the-bleeding | Phase 1 PR | | 674 passed |
+| P1-3 fences and 1.3.0 | on phase/1-stop-the-bleeding | Phase 1 PR | | 696 passed |

@@ -97,18 +97,19 @@ Never compare server timestamps with the device clock. `expires_at` is advisory;
 
 ### `GET /api/health` (`__init__.py:1823-1864`)
 
-This route always answers 200 (unless an exception occurs). It has no side effects.
+This route always answers 200 (unless an exception occurs). It has no side effects. From 1.3.0 it also reads the `integrity` object below (two index lookups, well under 1 ms at 94k profiles and 200k collection events).
 
 | Key | Value in 1.2.5 | Source |
 |---|---|---|
 | `plugin` | `"lumae_analysis"` | 1828 |
-| `plugin_version` | `"1.2.5"` | 1829 |
+| `plugin_version` | `"1.2.5"`; `"1.3.0"` from 1.3.0 (unreleased, P1-3) | 1829 |
 | `core_version`, `core_adapter`, `supported_core_range` | host detection; the range is `">=2.6.0,<4.0.0"` | 1830-1832 |
 | `sync_contract` | `{revision, producer, core_api_contract, streams:{catalog, analysis, profiles:{schema_version:1, analyzer_version:1, semantic_contracts:["lumae_playback_profile_v1"]}, credits, relationships}}` | `sync_contract()`, 1765-1801 |
 | `schema_version` | `1` (profile schema) | 1834 |
 | `analyzer_version` | `1` (waveform analyzer) | 1835 |
 | `status` | `"ok"` when the core is supported, otherwise the core compatibility status | 1862 |
 | `capabilities` | the table below | 1836-1861 |
+| `integrity` | absent | **New in 1.3.0 (unreleased, P1-3, AUD-05).** Operator diagnostics, not a client gate: `{collections_feed_ok: bool\|null, profiles_unpublished_ready: int\|null, profiles_checked_at: string\|null, fences_installed: bool\|null}`. `fences_installed` is live (one catalogue lookup): `false` means the 1.3.0 migration has not installed every old-writer fence (`writer_generation` NOT NULL without default on `profile_changes` and `catalog_changes`, no default on `collection_changes.seq`). `collections_feed_ok` is live: `false` means a collection change row sits past the feed head, and every collection mutation then returns 503 `collection_feed_invariant` (§5.3) until an operator repairs it. `profiles_unpublished_ready` counts current `ready` source profiles with no published row; it is recounted at install and at web-worker start, and `profiles_checked_at` (UTC, `Z`) says when. `null` means unknown (no database or an older schema). Repair SQL: `docs/runbooks/UPGRADE_1.3.md`. |
 
 `capabilities`: every key that exists today, with exact names.
 
@@ -124,7 +125,7 @@ This route always answers 200 (unless an exception occurs). It has no side effec
 | `credits` | `credits_service.capability()` | out of scope |
 | `transport` | `gzip: true` | **New in 1.3.0 (unreleased, K1).** Informational: gzip is negotiated per request through `Accept-Encoding` (§1.5). Absent in 1.2.5. |
 
-**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `transport` (added in 1.3.0, K1), `profile_stream`, `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled`, `edge_profiles.compact_transport`, `collections.feed_epoch`, `collections.contract`, `collections.source_scoped_items`, and `lumae_analysis_profiles`.
+**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream`, `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled`, `edge_profiles.compact_transport`, `collections.feed_epoch`, `collections.contract`, `collections.source_scoped_items`, and `lumae_analysis_profiles`.
 
 > Note: `lumae_analysis_profiles` is a **manifest** capability in `plugin.json` (with `schema_version`, `analyzer_version`, `profile_source`, `features`). It is not part of the health payload. See §9 item 1.
 
@@ -411,6 +412,7 @@ Every mutation runs through `_mutation_response` (546-608).
 **Other errors:**
 - 503 `unsupported_transaction_isolation` (the host connection is not READ COMMITTED);
 - 503 `collection_feed_unavailable`;
+- **503 `collection_feed_invariant`** (new in 1.3.0, P1-3): a committed change row sits past the feed head (`MAX(seq) > head_seq`, for example left by a 1.2.5 worker before the upgrade fence). The check runs inside each mutation against the head it has just locked; the mutation rolls back and nothing is written. Every collection write, for every principal, returns this until an operator runs the repair in `docs/runbooks/UPGRADE_1.3.md`; health reports it as `integrity.collections_feed_ok: false`. There is no `Retry-After`. Clients treat it like `collection_feed_unavailable`: keep the mutation queued and retry later. 1.2.5 instead failed these writes with a 500 (a unique violation) indefinitely (AUD-05);
 - 409 `item_id_collection_conflict` (the item id already belongs to another collection of this principal).
 
 | Route | Body | Success | Notes |

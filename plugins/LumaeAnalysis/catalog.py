@@ -27,6 +27,10 @@ SNAPSHOT_ENTITY_OVERHEAD_BYTES = 96
 MIN_RETAINED_CHANGE_EVENTS = 1_000
 CHANGE_EVENT_SNAPSHOT_MULTIPLIER = 2
 MAX_HELD_RETENTION_MULTIPLIER = 4
+# AUD-05 fence. 1.3.0 journal writers stamp this generation. The column has
+# no default, so a 1.2.5 worker's insert (which omits it) fails and rolls back
+# its whole publication. Keep it at 2 until a later release needs a new fence.
+JOURNAL_WRITER_GENERATION = 2
 
 CATALOG_GENERATION_TABLES = (
     "catalog_libraries",
@@ -1228,6 +1232,18 @@ def migrate_catalog(db):
         ALTER TABLE {t("catalog_changes")}
         ADD COLUMN IF NOT EXISTS evidence JSONB
         """,
+        # AUD-05: 1.2.5 publication does not withdraw profiles of changed
+        # media and 1.2.5 rekey does not move published profiles. Their
+        # catalog_changes insert omits this column and now fails closed.
+        f"""
+        ALTER TABLE {t("catalog_changes")}
+        ADD COLUMN IF NOT EXISTS writer_generation SMALLINT NOT NULL
+            DEFAULT {JOURNAL_WRITER_GENERATION}
+        """,
+        f"""
+        ALTER TABLE {t("catalog_changes")}
+        ALTER COLUMN writer_generation DROP DEFAULT
+        """,
         f"""
         ALTER TABLE {t("catalog_state")}
         ALTER COLUMN catalog_schema_version SET DEFAULT {CATALOG_SCHEMA_VERSION}
@@ -1992,8 +2008,9 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 f"""
                 INSERT INTO {t("catalog_changes")}
                     (catalog_instance_id, epoch, seq, generation, entity_type,
-                     entity_id, operation, change_reason, payload)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                     entity_id, operation, change_reason, payload,
+                     writer_generation)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                 """,
                 (
                     catalog_instance_id,
@@ -2005,6 +2022,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                     operation,
                     change_reason,
                     _json_param(payload) if payload is not None else None,
+                    JOURNAL_WRITER_GENERATION,
                 ),
             )
         duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))

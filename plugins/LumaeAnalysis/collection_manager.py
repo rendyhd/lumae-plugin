@@ -30,6 +30,15 @@ class FeedProtocolUnavailable(RuntimeError):
     """The committed collection feed frontier is absent or incompatible."""
 
 
+class FeedInvariantViolation(RuntimeError):
+    """A committed change row sits past the feed head (AUD-05).
+
+    Writing would allocate a seq that already exists, so every collection
+    write fails closed with 503 ``collection_feed_invariant`` until the head
+    is realigned (docs/runbooks/UPGRADE_1.3.md).
+    """
+
+
 def collections_table():
     return table("collections")
 
@@ -149,6 +158,11 @@ def migrate_collections(db):
     cur.execute("SET LOCAL lock_timeout = '5s'")
     cur.execute("SET LOCAL statement_timeout = '30s'")
     cur.execute(f"LOCK TABLE {collection_changes_table()} IN ACCESS EXCLUSIVE MODE")
+    # AUD-05 fence: 1.2.5 writers insert without seq and would take the
+    # BIGSERIAL default, a number the frontier later allocates again. Without
+    # a default their insert fails instead. Idempotent; the sequence stays
+    # owned by the column.
+    cur.execute(f"ALTER TABLE {collection_changes_table()} ALTER COLUMN seq DROP DEFAULT")
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {collection_feed_state_table()} (
@@ -492,14 +506,42 @@ def _record_change(cur, principal, collection_id, entity_kind, entity_id, operat
     allocated = cur.fetchone()
     if allocated is None:
         raise FeedProtocolUnavailable("collection feed frontier unavailable")
+    # The invariant MAX(seq) <= head is checked against the head this
+    # transaction has just locked: one primary-key probe in the same statement.
     cur.execute(
         f"""
         INSERT INTO {collection_changes_table()}
             (seq, principal, collection_id, entity_kind, entity_id, operation, payload)
-        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)
+        SELECT %s, %s, %s, %s, %s, %s, %s::jsonb
+         WHERE NOT EXISTS (
+             SELECT 1 FROM {collection_changes_table()} WHERE seq >= %s
+         )
         """,
-        (allocated[0], principal, collection_id, entity_kind, entity_id, operation, json.dumps(payload)),
+        (
+            allocated[0], principal, collection_id, entity_kind, entity_id, operation,
+            json.dumps(payload), allocated[0],
+        ),
     )
+    if cur.rowcount != 1:
+        raise FeedInvariantViolation("collection change rows exist past the feed head")
+
+
+def collection_feed_integrity(cur):
+    """True when MAX(collection_changes.seq) <= head_seq; None if unknown.
+
+    Two index lookups (the primary-key maximum and the singleton row), so it is
+    cheap enough for health and startup.
+    """
+    cur.execute("SELECT to_regclass(%s), to_regclass(%s)",
+                (collection_changes_table(), collection_feed_state_table()))
+    if None in cur.fetchone():
+        return None
+    cur.execute(
+        f"SELECT (SELECT COALESCE(MAX(seq), 0) FROM {collection_changes_table()}) <= head_seq "
+        f"FROM {collection_feed_state_table()} WHERE singleton = 1"
+    )
+    row = cur.fetchone()
+    return None if row is None else bool(row[0])
 
 
 def _expected_revision(body):
@@ -601,6 +643,13 @@ def _mutation_response(handler):
     except FeedProtocolUnavailable:
         db.rollback()
         return jsonify({"error": "collection_feed_unavailable"}), 503
+    except FeedInvariantViolation:
+        db.rollback()
+        current_app.logger.error(
+            "Collection feed invariant violated (MAX(seq) > head_seq); writes are "
+            "blocked until the head is realigned (docs/runbooks/UPGRADE_1.3.md)"
+        )
+        return jsonify({"error": "collection_feed_invariant"}), 503
     except Exception:
         db.rollback()
         raise
