@@ -1,0 +1,340 @@
+{
+  "benches": {
+    "boot_concurrency": {
+      "bench": "bootstrap_concurrency",
+      "first": {
+        "elapsed_s": 8.76,
+        "result": "bootstrap_snapshot_limit/413"
+      },
+      "page_size": 50,
+      "second_after_0.5s": {
+        "elapsed_s": 5.04,
+        "result": "bootstrap_unavailable/503"
+      }
+    },
+    "bootstrap": {
+      "bench": "bootstrap",
+      "conn_setup_ms": {
+        "max_ms": 6.48,
+        "n": 30,
+        "p50_ms": 3.29,
+        "p95_ms": 4.78
+      },
+      "create": {
+        "elapsed_s": 8.05,
+        "error": "bootstrap_snapshot_limit/413",
+        "global_lock_max_hold_ms": 8044.6,
+        "snapshot_rows": null,
+        "snapshot_table_mb": 109.1,
+        "wal_mb": 193.8
+      },
+      "create_lifted": {
+        "elapsed_s": 117.19,
+        "error": null,
+        "global_lock_max_hold_ms": 117189.8,
+        "snapshot_rows": 94000,
+        "snapshot_table_mb": 1583.8,
+        "wal_mb": 2368.3
+      },
+      "page_size": 50,
+      "pages": {
+        "first_pages_avg_bytes": 1003298,
+        "max_ms": 203.82,
+        "n": 1880,
+        "p50_ms": 22.54,
+        "p95_ms": 29.69,
+        "pages": 1880
+      },
+      "pages_from": "create_lifted",
+      "profiles": 94000
+    },
+    "feed_contention": {
+      "bench": "feed_contention",
+      "cases": [
+        {
+          "max_ms": 4.74,
+          "n": 300,
+          "p50_ms": 0.57,
+          "p95_ms": 1.25,
+          "singleton": false,
+          "threads": 1,
+          "tx_per_s": 1421
+        },
+        {
+          "max_ms": 26.92,
+          "n": 2400,
+          "p50_ms": 1.43,
+          "p95_ms": 3.9,
+          "singleton": false,
+          "threads": 8,
+          "tx_per_s": 4031
+        },
+        {
+          "max_ms": 3.2,
+          "n": 300,
+          "p50_ms": 0.83,
+          "p95_ms": 1.51,
+          "singleton": true,
+          "threads": 1,
+          "tx_per_s": 1104
+        },
+        {
+          "max_ms": 71.41,
+          "n": 2400,
+          "p50_ms": 6.45,
+          "p95_ms": 22.97,
+          "singleton": true,
+          "threads": 8,
+          "tx_per_s": 912
+        }
+      ]
+    },
+    "projection_delta": {
+      "analysis_items_mb": 294.7,
+      "bench": "projection",
+      "changes": 1,
+      "elapsed_s": 56.33,
+      "generation": 2,
+      "items": 69000,
+      "links": 132000,
+      "links_mb": 61.6,
+      "peak_rss_mb": 1595.5,
+      "ready": 76000,
+      "rss_growth_mb": 1473.1,
+      "scenario": "delta",
+      "statements": 201015,
+      "unchanged": false,
+      "wal_mb": 758.7
+    },
+    "projection_nochange": {
+      "analysis_items_mb": 147.4,
+      "bench": "projection",
+      "changes": 0,
+      "elapsed_s": 23.06,
+      "generation": 1,
+      "items": 69000,
+      "links": 132000,
+      "links_mb": 30.8,
+      "peak_rss_mb": 1595.6,
+      "ready": 76000,
+      "rss_growth_mb": 1473.2,
+      "scenario": "nochange",
+      "statements": 9,
+      "unchanged": true,
+      "wal_mb": 580.8
+    },
+    "publication": {
+      "bench": "publication",
+      "compaction_delete_ms": {
+        "max_ms": 23.34,
+        "n": 40,
+        "p50_ms": 11.46,
+        "p95_ms": 17.12
+      },
+      "complete_attempt_ms": {
+        "max_ms": 20.84,
+        "n": 40,
+        "p50_ms": 15.82,
+        "p95_ms": 18.17
+      },
+      "iterations": 40,
+      "record_profile_change_commit_ms": {
+        "max_ms": 23.43,
+        "n": 40,
+        "p50_ms": 14.02,
+        "p95_ms": 17.1
+      },
+      "record_profile_change_ms": {
+        "max_ms": 22.03,
+        "n": 40,
+        "p50_ms": 13.15,
+        "p95_ms": 16.35
+      },
+      "retained_events_after": 50000,
+      "retained_events_before": 50000,
+      "retention_limit": 50000
+    },
+    "route_floor": {
+      "bench": "route_floor",
+      "ping_delay_s": 0.0,
+      "routes": {
+        "/api/catalog/health": {
+          "bytes": 6888,
+          "eligible": 132000,
+          "http": 200,
+          "logged_errors": [],
+          "max_ms": 8.38,
+          "mean_ms": 4.95,
+          "n": 30,
+          "p50_ms": 4.6,
+          "p95_ms": 6.62,
+          "readiness_status": "progressive",
+          "ready_links": 76000,
+          "stmts_per_req": 8,
+          "upstream_pings": 1
+        }
+      }
+    },
+    "routes": {
+      "bench": "routes",
+      "ping_delay_s": 0.0,
+      "routes": {
+        "/api/catalog/health": {
+          "bytes": 6949,
+          "eligible": 132000,
+          "http": 200,
+          "logged_errors": [],
+          "max_ms": 419.6,
+          "mean_ms": 348.08,
+          "n": 30,
+          "p50_ms": 338.92,
+          "p95_ms": 399.67,
+          "readiness_status": "progressive",
+          "ready_links": 76000,
+          "stmts_per_req": 10,
+          "upstream_pings": 1
+        },
+        "/api/health": {
+          "bytes": 3189,
+          "http": 200,
+          "logged_errors": [],
+          "max_ms": 0.68,
+          "mean_ms": 0.32,
+          "n": 30,
+          "p50_ms": 0.29,
+          "p95_ms": 0.46,
+          "stmts_per_req": 0,
+          "upstream_pings": 0
+        },
+        "/settings/status": {
+          "bytes": 12978,
+          "http": 200,
+          "logged_errors": [],
+          "max_ms": 619.65,
+          "mean_ms": 551.44,
+          "n": 30,
+          "p50_ms": 546.67,
+          "p95_ms": 606.01,
+          "stmts_per_req": 16,
+          "upstream_pings": 0
+        }
+      }
+    }
+  },
+  "budgets": {
+    "bootstrap_create": {
+      "budget": "v2 create at 94k <=5 s, no global lock held >50 ms",
+      "measured": {
+        "elapsed_s": 8.05,
+        "error": "bootstrap_snapshot_limit/413",
+        "global_lock_max_hold_ms": 8044.6,
+        "lifted_limits": {
+          "elapsed_s": 117.19,
+          "error": null,
+          "global_lock_max_hold_ms": 117189.8,
+          "snapshot_table_mb": 1583.8,
+          "wal_mb": 2368.3
+        },
+        "profiles": 94000,
+        "wal_mb": 193.8
+      },
+      "met": false
+    },
+    "bootstrap_page": {
+      "budget": "v2 snapshot page <=50 ms p95 server-side",
+      "measured": {
+        "p95_ms": 29.69,
+        "page_size": 50,
+        "pages": 1880,
+        "pages_from": "create_lifted"
+      },
+      "met": true
+    },
+    "health": {
+      "budget": "/api/catalog/health <=50 ms p95 (provider ping excluded)",
+      "measured": {
+        "api_health_p95_ms": 0.46,
+        "http": 200,
+        "p95_ms": 399.67
+      },
+      "met": false
+    },
+    "projection_delta": {
+      "budget": "projection with a 1-row delta <=10 s",
+      "measured": {
+        "changes": 1,
+        "elapsed_s": 56.33,
+        "peak_rss_mb": 1595.5,
+        "wal_mb": 758.7
+      },
+      "met": false
+    },
+    "projection_nochange": {
+      "budget": "projection with no change <=5 s and <=400 MB peak RSS",
+      "measured": {
+        "elapsed_s": 23.06,
+        "peak_rss_mb": 1595.6,
+        "unchanged": true
+      },
+      "met": false
+    },
+    "publication": {
+      "budget": "publication critical section (complete_attempt) <=5 ms p95 at 50k retained events",
+      "measured": {
+        "p95_ms": 18.17,
+        "record_profile_change_commit_p95_ms": 17.1,
+        "retained_events": 50000
+      },
+      "met": false
+    },
+    "settings_status": {
+      "budget": "/settings/status <=100 ms p95",
+      "measured": {
+        "http": 200,
+        "p95_ms": 606.01
+      },
+      "met": false
+    }
+  },
+  "environment": {
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpus": 4,
+    "git_sha": "49b7428431c9698b9d58a55e500382ea48c6e635",
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "postgres": "PostgreSQL 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+    "postgres_settings": {
+      "effective_cache_size": "5242888kB",
+      "fsync": "on",
+      "max_wal_size": "1024MB",
+      "shared_buffers": "163848kB",
+      "synchronous_commit": "on",
+      "wal_level": "replica",
+      "work_mem": "4096kB"
+    },
+    "python": "3.11.15",
+    "ram_gb": 15.7,
+    "timestamp": "2026-09-24T18:54:19+00:00"
+  },
+  "fixture": {
+    "counts": {
+      "albums": 12000,
+      "artists": 6000,
+      "items": 69000,
+      "pairs": 7000,
+      "profiles": 94000,
+      "tasks": 150000,
+      "tracks": 132000
+    },
+    "edge_template": "docs/audit/2026-09-24/probes/lum010/edge.json",
+    "events": 50000,
+    "scale": 1.0,
+    "seed": 1
+  },
+  "options": {
+    "max_pages": 0,
+    "page_size": 50,
+    "ping_delay_s": 0.0,
+    "pub_n": 40,
+    "route_n": 30
+  }
+}
