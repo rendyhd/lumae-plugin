@@ -132,6 +132,26 @@ Where different groups touch one file, keep each WP to the functions listed and 
 | K10 | Collection items carry `catalog_instance_id` (LUM-013, additive); workbench routes take an explicit catalogue | P3-5 | Store and scope items (C-13) | `capabilities.collections.source_scoped_items:true` | 3 |
 | K11 | Profiles may carry `analyzer_ver:2` (BS.1770-4 `ref_lufs` and new ramps) | P3-1 | Accept v1 and v2; normalise by version (C-11) | `capabilities.lumae_analysis_profiles.analyzer_versions:[1,2]`, `loudness_method:"bs1770-4"` | 3 |
 
+**Contract findings from P0-4 (2026-09-24), folded into the WPs below:**
+
+| # | Finding in 1.2.5 | Handled by |
+|---|---|---|
+| 1 | `lumae_analysis_profiles` is only in `plugin.json`, not in the health payload, so the K11 gate needs a new health key | P3-1 adds `capabilities.lumae_analysis_profiles` to health |
+| 2 | `capabilities.transport` and `capabilities.profile_stream` don't exist | P1-4 and P3-2 add them as new objects |
+| 3 | v2 never returns 404 or 409; 404 only means an older plugin without the route | Contract; client treats a v2 404 as "unavailable" |
+| 4 | v2 expiry is a hard-coded 60 minutes in SQL; `SESSION_MINUTES` is unused | P1-6 uses one constant for absolute and sliding expiry |
+| 5 | Releasing an expired or stale session returns 410 and leaves the row, which holds a slot | P1-6 item 2 (release always deletes and returns 200) |
+| 6 | Health `available` is `bool(DATABASE_URL)`; `auth` says host_authenticated even when auth is off | P1-6 item 4 (K4) |
+| 7 | `/profiles/changes` cursor ahead of head returns 400 `invalid_cursor`; the collections feed returns an empty 200 and never 410 | Kept for v1; P3-4 (K8) adds 410 for collections |
+| 8 | `ref_lufs` is float64 in change events but float4 in reads and snapshots; only events pass the string sanitizer | P1-1 normalises to float4 and applies one serializer on every path |
+| 9 | Per-publication retention is a fixed 50k; maintenance keeps max(1000, 2×count) | P1-2 (one persisted retention limit, at least 50k) |
+| 10 | `/api/profiles` silently drops ids past 500 without listing them in `missing` | P3-2 lists truncated ids in `missing` (additive); client batches ≤100 (C-10) |
+| 11 | Timestamps mix no-zone and server-offset formats | P1-6 item 8 (UTC with `Z` for new fields; `analyzed_at` unchanged, documented) |
+| 12 | Collections: create with an existing id returns 201; duplicate membership remaps; no `current`; epoch not returned; journal and receipts never compacted | P3-4 (K8, K9, growth) |
+| 13 | Shelves idempotency is keyed by mutation id only | P3-4 item 5 (bind the body fingerprint, K9-gated) |
+
+1.2.5 ignores unknown body fields, query parameters and headers, so every opt-in signal is safe to send to old servers. The exception is `page_size` on v2 page, catch-up and release requests, which returns 400: clients send `page_size` only on create.
+
 **Unchanged by design:**
 - v2 `page_size` stays client-chosen (1–500). Byte-sized pages are a client choice: use `page_size` about 50 when edges are present.
 - The legacy `limit` and `/changes` `limit` also stay client-chosen.

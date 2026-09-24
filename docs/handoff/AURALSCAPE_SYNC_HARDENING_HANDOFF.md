@@ -38,6 +38,15 @@ The server plugin work happens in parallel in `rendyhd/lumae-plugin`. The author
 - An upsert without a valid `edge_profile` **deletes** the local edge (`publishedProfileRepo.ts:266, 351-388`). Keep that rule for servers without K6.
 - The server's 1.2.5 edge payload is about 19 KB; the waveform payload about 0.5 KB. At 94k tracks that is 1.82 GB of JSON (about 0.89 GB gzip). The 24,000-character edge budget (`edgeProfile.ts:68,104`) has about 20% headroom.
 
+### H.2a Contract facts to rely on (from the plugin's P0-4 contract doc)
+
+- 1.2.5 ignores unknown body fields, query parameters and headers, so opt-in signals are safe to send to old servers. **Exception:** `page_size` on v2 page, catch-up or release requests returns 400. Send it only on create.
+- A v2 route returning 404 means an older plugin without v2. v2 never returns 409.
+- `/api/profiles?ids=` silently drops ids beyond the first 500 and does not list them in `missing`. Batch at 100 or fewer.
+- `ref_lufs` arrives as float64 in change events and as float4 in reads and snapshots until plugin P1-1. Compare with tolerance, not exact equality.
+- A `/profiles/changes` cursor ahead of head returns 400 `invalid_cursor`, not 410. Treat it as needing a full resync.
+- Timestamps: `analyzed_at` has no zone; `expires_at` and `created_at` carry the server's offset. Parse offsets explicitly.
+
 ### H.3 Server capabilities you will detect
 
 All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, and every one is optional. K1–K11 are listed in the appendix at the end of this document.
