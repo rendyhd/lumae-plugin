@@ -36,6 +36,7 @@ from .catalog import (
     compact_change_journal,
     opaque_cursor,
     parse_opaque_cursor,
+    read_change_page,
     resolve_catalog_source,
 )
 
@@ -692,30 +693,23 @@ def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250):
     if len(sources) != 1 or sources[0]["catalog_instance_id"] != cursor["catalog_instance_id"]:
         raise ValueError("Cursor belongs to another profile source")
     cur = db.cursor()
-    epoch, head_seq, floor_seq = _profile_stream_state(cur, expected_id)
-    if cursor["epoch"] != epoch or cursor["seq"] < floor_seq:
+    try:
+        # State and events from one snapshot, checked for density (P1-7).
+        epoch, head_seq, rows, _state = read_change_page(
+            cur,
+            catalog_instance_id=expected_id,
+            cursor=cursor,
+            limit=limit,
+            state_table="profile_stream_state",
+            epoch_column="epoch",
+            head_column="head_seq",
+            floor_column="floor_seq",
+            changes_table="profile_changes",
+            columns=("seq", "track_id", "operation", "payload", "created_at"),
+            ahead_message="Cursor is ahead of the profile head",
+        )
+    finally:
         cur.close()
-        raise KeyError("bootstrap_required")
-    if cursor["seq"] > head_seq:
-        cur.close()
-        raise ValueError("Cursor is ahead of the profile head")
-    cur.execute(
-        f"""
-        SELECT seq, track_id, operation, payload, created_at
-          FROM {t("profile_changes")}
-         WHERE catalog_instance_id=%s AND epoch=%s AND seq>%s AND seq<=%s
-         ORDER BY seq LIMIT %s
-        """,
-        (
-            expected_id,
-            epoch,
-            cursor["seq"],
-            head_seq,
-            max(1, min(int(limit), 1000)),
-        ),
-    )
-    rows = cur.fetchall()
-    cur.close()
     changes = [
         {
             "seq": int(row[0]),
@@ -1791,31 +1785,31 @@ def read_relationship_changes(db, cursor_value, catalog_instance_id=None, limit=
     cursor = parse_opaque_cursor(cursor_value)
     expected_id = catalog_instance_id or cursor["catalog_instance_id"]
     status = relationship_status(db, expected_id)
-    head = parse_opaque_cursor(status["cursor"])
     if cursor["catalog_instance_id"] != expected_id:
         raise ValueError("Cursor belongs to another relationship source")
-    if cursor["epoch"] != head["epoch"] or cursor["seq"] < status["floor_seq"]:
+    if "cursor" not in status:
         raise KeyError("bootstrap_required")
-    if cursor["seq"] > head["seq"]:
-        raise ValueError("Cursor is ahead of the relationship head")
     cur = db.cursor()
-    cur.execute(
-        f"""
-        SELECT seq, generation, entity_type, entity_id, operation, payload, created_at
-          FROM {t("relationship_changes")}
-         WHERE catalog_instance_id=%s AND epoch=%s AND seq>%s AND seq<=%s
-         ORDER BY seq LIMIT %s
-        """,
-        (
-            expected_id,
-            head["epoch"],
-            cursor["seq"],
-            head["seq"],
-            max(1, min(int(limit), 1000)),
-        ),
-    )
-    rows = cur.fetchall()
-    cur.close()
+    try:
+        # State and events from one snapshot, checked for density (P1-7).
+        epoch, head_seq, rows, _state = read_change_page(
+            cur,
+            catalog_instance_id=expected_id,
+            cursor=cursor,
+            limit=limit,
+            state_table="relationship_state",
+            epoch_column="epoch",
+            head_column="head_seq",
+            floor_column="floor_seq",
+            changes_table="relationship_changes",
+            columns=(
+                "seq", "generation", "entity_type", "entity_id", "operation",
+                "payload", "created_at",
+            ),
+            ahead_message="Cursor is ahead of the relationship head",
+        )
+    finally:
+        cur.close()
     changes = [
         {
             "seq": int(row[0]),
@@ -1834,7 +1828,7 @@ def read_relationship_changes(db, cursor_value, catalog_instance_id=None, limit=
         "algorithm_version": status["algorithm_version"],
         "catalog_instance_id": expected_id,
         "changes": changes,
-        "cursor": opaque_cursor(expected_id, head["epoch"], next_seq),
-        "head_cursor": status["cursor"],
-        "has_more": next_seq < head["seq"],
+        "cursor": opaque_cursor(expected_id, epoch, next_seq),
+        "head_cursor": opaque_cursor(expected_id, epoch, head_seq),
+        "has_more": next_seq < head_seq,
     }

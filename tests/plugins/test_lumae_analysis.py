@@ -1053,23 +1053,26 @@ def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch)
     from plugins.LumaeAnalysis.catalog import opaque_cursor
 
     class Cursor:
-        def __init__(self, state_row=None):
-            self.state_row = state_row
+        """State and events arrive as one row set (P1-7 single snapshot)."""
+
+        def __init__(self, epoch, head, events):
+            self.rows = [(epoch, head, 0, *event) for event in events]
             self.calls = []
 
         def execute(self, sql, args):
             self.calls.append((" ".join(sql.split()), args))
 
-        def fetchone(self):
-            return self.state_row
-
         def fetchall(self):
-            return []
+            return self.rows
 
         def close(self):
             return None
 
-    profile_cursor = Cursor(("profile-epoch", 10, 0))
+    profile_cursor = Cursor(
+        "profile-epoch",
+        10,
+        [(seq, f"t{seq}", "ready", {}, "2026-07-30T12:00:00Z") for seq in (3, 4)],
+    )
     profile_db = type("Db", (), {"cursor": lambda _self: profile_cursor})()
     monkeypatch.setattr(
         catalog_enrichment,
@@ -1081,13 +1084,22 @@ def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch)
         profile_db,
         opaque_cursor("catalog-a", "profile-epoch", 2),
         catalog_instance_id="catalog-a",
+        limit=2,
     )
 
     assert profile_page["has_more"] is True
-    assert "seq>%s AND seq<=%s" in profile_cursor.calls[-1][0]
-    assert profile_cursor.calls[-1][1][2:4] == (2, 10)
+    assert "c.seq>%s AND c.seq<=s.head_seq" in profile_cursor.calls[-1][0]
+    assert "profile_stream_state" in profile_cursor.calls[-1][0]
+    assert profile_cursor.calls[-1][1][2] == 2
 
-    relationship_cursor = Cursor()
+    relationship_cursor = Cursor(
+        "relationship-epoch",
+        20,
+        [
+            (seq, 4, "album", f"album-{seq}", "upsert", {}, "2026-07-30T12:00:00Z")
+            for seq in (4, 5)
+        ],
+    )
     relationship_db = type(
         "Db", (), {"cursor": lambda _self: relationship_cursor}
     )()
@@ -1109,11 +1121,13 @@ def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch)
         relationship_db,
         opaque_cursor("catalog-a", "relationship-epoch", 3),
         catalog_instance_id="catalog-a",
+        limit=2,
     )
 
     assert relationship_page["has_more"] is True
-    assert "seq>%s AND seq<=%s" in relationship_cursor.calls[-1][0]
-    assert relationship_cursor.calls[-1][1][2:4] == (3, 20)
+    assert "c.seq>%s AND c.seq<=s.head_seq" in relationship_cursor.calls[-1][0]
+    assert "relationship_state" in relationship_cursor.calls[-1][0]
+    assert relationship_cursor.calls[-1][1][2] == 3
 
 
 def test_enrichment_stream_endpoints_are_source_scoped_and_nonblocking(monkeypatch):
@@ -1273,6 +1287,13 @@ def test_catalog_changes_report_remaining_events_and_estimated_bytes(monkeypatch
     db = FakeDb(
         [
             (
+                "epoch-a",
+                10,
+                0,
+                0,
+                {},
+                0,
+                1,
                 3,
                 8,
                 "track",
@@ -1290,6 +1311,7 @@ def test_catalog_changes_report_remaining_events_and_estimated_bytes(monkeypatch
     result = catalog.read_catalog_changes(
         db,
         catalog.opaque_cursor("catalog-a", "epoch-a", 2),
+        limit=1,
     )
 
     assert result["remaining_events"] == 7
