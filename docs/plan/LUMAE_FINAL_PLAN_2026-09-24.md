@@ -292,7 +292,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 - Change:
   1. The capture stores the waveform payload plus `edge_ref(media_revision, profile_digest)` from `edge_join()`. `MAX_SNAPSHOT_BYTES` counts waveform bytes only, and each row is serialized once.
   2. `snapshot_page` joins `edge_profiles` on `(catalog_instance_id, track_id, media_revision, profile_digest)`. If the reference is present, it embeds the edge; if the reference is gone (replaced or withdrawn after capture), the row is returned without `edge_profile`. The catch-up interval contains the replacing event.
-  3. Catch-up capture stores event payloads the same way, as a waveform part plus an edge reference. `MAX_CATCHUP_BYTES` excludes edges, and `MAX_CATCHUP_EVENTS` is raised to the retention limit from P1-2.
+  3. Catch-up capture stores event payloads the same way, as a waveform part plus an edge reference. `MAX_CATCHUP_BYTES` excludes edges, and `MAX_CATCHUP_EVENTS` is raised to at least 4 × `retention_limit` from P1-2 (the floor-hold cap). Otherwise a held session's catch-up returns 413 and the hold never helps (P1-2 review F1). Remove the `MAX_CATCHUP_EVENTS` monkeypatch in `test_profile_journal_compaction_postgres.py` once this lands.
   4. Additive migration: new column `edge_ref JSONB`; existing sessions are left as they are.
 - Tests:
   - create for 10k profiles with real 19 KB edges succeeds (previously 413);
@@ -310,6 +310,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
      - Admission runs in a short transaction under `pg_advisory_xact_lock(110094,10)`: purge expired **and identity-stale** rows (core server, epochs, inactive source); count slots; insert a session in state `capturing`.
      - Capture then runs under a **per-source** `pg_advisory_lock(110094, hashtext(source))`.
      - `capturing` rows older than 10 minutes are purged.
+     - The floor hold (P1-2) ignores sessions whose catalogue epoch or core server no longer matches: they would 410 anyway (P1-2 review F3). The session row for the hold is committed at admission, before capture, so the hold covers the capture window (F2).
   2. **Release** deletes any row matching token hash and source, even if identity-stale, and always returns 200 `released`.
   3. **K5:** optional `client_request_id` (UUID). An unexpired session with the same (source, id) and `pages_served=0` is deleted before a new one is created. New columns `client_request_id` and `pages_served`.
   4. **K4:** `Retry-After` on 429 (seconds until the earliest slot expires, capped at 300) and on 503 (5).
