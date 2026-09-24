@@ -19,3 +19,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P0-1 CI pinned artifact | merged | rendyhd/lumae-plugin#3 | 746a7b8 | 573 passed; retro review PASS |
 | P0-5 status and doc hygiene | merged | rendyhd/lumae-plugin#4 | 5766d68 | docs only; retro review PASS |
 | P0-1/P0-5 review follow-ups | on phase/0-foundation | Phase 0 PR | | release tests strengthened |
+| P0-4 sync contract | on phase/0-foundation | Phase 0 PR | | docs only; review fixes applied |
