@@ -47,7 +47,13 @@ RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR = 96
 RELATIONSHIP_MAX_CANDIDATE_ENTITIES = 384
 RELATIONSHIP_ENTITY_SAMPLE_LIMIT = 160
 ENRICHMENT_STALE_HOURS = 2
+# Minimum profile journal retention per source. The effective limit is
+# profile_change_retention_limit(library size), persisted per source in
+# profile_stream_state.retention_limit by compact_enrichment_storage.
 PROFILE_CHANGE_RETENTION_EVENTS = 50_000
+# Most journal rows one profile publication may compact past the current floor
+# (bounds the delete under the publication locks; maintenance is unbounded).
+PROFILE_COMPACTION_MAX_ADVANCE = 5_000
 MOOD_FEATURE_NAMES = ("danceable", "aggressive", "happy", "party", "relaxed", "sad")
 
 _ALBUM_WEIGHTS = {
@@ -155,6 +161,56 @@ def _profile_stream_state(cur, catalog_instance_id, *, for_update=False):
     return str(row[0]), int(row[1]), int(row[2])
 
 
+def profile_change_retention_limit(library_count):
+    """Profile events kept per source: two full libraries, at least 50k."""
+    return max(
+        PROFILE_CHANGE_RETENTION_EVENTS,
+        change_journal_retention_limit(library_count),
+    )
+
+
+def refresh_profile_retention(cur, catalog_instance_id, library_count):
+    """Persist the source's profile retention limit for a new library size.
+
+    Called when the catalogue publishes a generation (which already holds the
+    catalog_state row lock, the same order publishers use) and, with the
+    published-profile count as well, by compact_enrichment_storage.
+    """
+    retention_limit = profile_change_retention_limit(library_count)
+    cur.execute(
+        f"""
+        INSERT INTO {t('profile_stream_state')} AS p
+            (catalog_instance_id, epoch, head_seq, floor_seq, retention_limit, updated_at)
+        VALUES (%s, %s, 0, 0, %s, now())
+        ON CONFLICT (catalog_instance_id) DO UPDATE
+           SET retention_limit=EXCLUDED.retention_limit
+         WHERE p.retention_limit IS DISTINCT FROM EXCLUDED.retention_limit
+        """,
+        (catalog_instance_id, str(uuid.uuid4()), retention_limit),
+    )
+    return retention_limit
+
+
+def _profile_floor_hold(cur, catalog_instance_id, epoch):
+    """Oldest snapshot seq an open v2 bootstrap session still has to replay.
+
+    A session reads ``seq > snapshot_seq`` once, when its catch-up captures the
+    head; until then compaction must not advance the floor past it.
+    """
+    cur.execute(
+        f"""
+        SELECT MIN(snapshot_seq)
+          FROM {t('profile_bootstrap_sessions')}
+         WHERE source_scope=%s AND expires_at>now()
+           AND catalog_instance_id=%s AND profile_epoch=%s
+           AND head_seq IS NULL
+        """,
+        (catalog_instance_id, catalog_instance_id, str(epoch)),
+    )
+    row = cur.fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
 def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
     """Bound profile and relationship journals during upgrades and maintenance."""
     cur = cursor or db.cursor()
@@ -175,12 +231,25 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
         epoch, head_seq, _floor_seq = _profile_stream_state(
             cur, source_id, for_update=True
         )
+        # The library is the larger of the published profiles and the
+        # catalogue's tracks, so a first backfill is already covered.
         cur.execute(
-            f"SELECT COUNT(*) FROM {t('source_profiles')} "
-            "WHERE catalog_instance_id=%s",
-            (source_id,),
+            f"""
+            SELECT GREATEST(
+                (SELECT COUNT(*) FROM {t('published_source_profiles')}
+                  WHERE catalog_instance_id=%s),
+                COALESCE((SELECT (entity_counts->>'track')::bigint
+                            FROM {t('catalog_state')}
+                           WHERE catalog_instance_id=%s), 0))
+            """,
+            (source_id, source_id),
         )
-        profile_count = int(cur.fetchone()[0])
+        retention_limit = profile_change_retention_limit(cur.fetchone()[0])
+        cur.execute(
+            f"UPDATE {t('profile_stream_state')} SET retention_limit=%s "
+            "WHERE catalog_instance_id=%s",
+            (retention_limit, source_id),
+        )
         compact_change_journal(
             cur,
             catalog_instance_id=source_id,
@@ -190,7 +259,9 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
             floor_column="floor_seq",
             epoch=epoch,
             head_seq=head_seq,
-            retention_limit=change_journal_retention_limit(profile_count),
+            retention_limit=retention_limit,
+            purge_other_epochs=True,
+            hold_floor_seq=_profile_floor_hold(cur, source_id, epoch),
         )
         if row[1] is not None:
             compact_change_journal(
@@ -205,6 +276,7 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
                 retention_limit=change_journal_retention_limit(
                     int(row[3] or 0) + int(row[4] or 0)
                 ),
+                purge_other_epochs=True,
             )
     if cursor is None:
         cur.close()
@@ -223,6 +295,11 @@ def migrate_enrichment(db):
             floor_seq BIGINT NOT NULL DEFAULT 0,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
+        """,
+        f"""
+        ALTER TABLE {t("profile_stream_state")}
+        ADD COLUMN IF NOT EXISTS retention_limit BIGINT NOT NULL
+            DEFAULT {PROFILE_CHANGE_RETENTION_EVENTS}
         """,
         f"""
         CREATE TABLE IF NOT EXISTS {t("profile_changes")} (
@@ -482,7 +559,7 @@ def _profile_json(payload):
 
 def record_profile_change(cur, catalog_instance_id, track_id, status, payload=None):
     """Append a profile upsert/delete in the same transaction as its profile."""
-    epoch, head_seq, _floor_seq = _profile_stream_state(
+    epoch, head_seq, floor_seq = _profile_stream_state(
         cur, catalog_instance_id, for_update=True
     )
     seq = head_seq + 1
@@ -506,10 +583,11 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
         f"UPDATE {t('profile_stream_state')} "
         "SET head_seq=%s, updated_at=now() "
         "WHERE catalog_instance_id=%s AND epoch=%s AND head_seq=%s "
-        "RETURNING head_seq",
+        "RETURNING head_seq, retention_limit",
         (seq, catalog_instance_id, epoch, head_seq),
     )
-    if cur.fetchone() is None:
+    advanced = cur.fetchone()
+    if advanced is None:
         raise RuntimeError("Profile stream head changed during publication")
     compact_change_journal(
         cur,
@@ -520,7 +598,11 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
         floor_column="floor_seq",
         epoch=epoch,
         head_seq=seq,
-        retention_limit=PROFILE_CHANGE_RETENTION_EVENTS,
+        # Persisted by compact_enrichment_storage: no count(*) per publication.
+        retention_limit=max(PROFILE_CHANGE_RETENTION_EVENTS, int(advanced[1] or 0)),
+        hold_floor_seq=_profile_floor_hold(cur, catalog_instance_id, epoch),
+        current_floor=floor_seq,
+        max_advance=PROFILE_COMPACTION_MAX_ADVANCE,
     )
     return seq
 

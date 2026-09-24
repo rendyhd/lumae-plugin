@@ -205,6 +205,8 @@ Status codes:
 
 Retention: each publication compacts the journal to its last **50,000** events (`PROFILE_CHANGE_RETENTION_EVENTS`, `catalog_enrichment.py:50, 497`). The maintenance path uses `max(1000, 2 × profile_count)` (`catalog_enrichment.py:158-210`, line 193; `catalog.py:50-55`). A client more than about 50k events behind gets a 410 and must bootstrap again.
 
+From P1-2 (unreleased, ships in 1.3.0): one retention limit per source, `profile_stream_state.retention_limit` = max(50,000, 2 × library), where the library is the larger of the published profiles and the catalogue's tracks. It is refreshed when the catalogue publishes a new generation (from that generation's track count) and by maintenance (`compact_enrichment_storage`, run at plugin start); the limit never drops below 50,000; publication reads it and never counts. Each publication deletes only the expired range of the current epoch; other epochs are purged in maintenance or on catalogue epoch rotation. The floor does not advance past the `snapshot_seq` of an unexpired v2 session whose catch-up has not captured its head, but never keeps more than 4 × the retention limit. So a client is at least one full library of events (and at least 50k) behind before it gets a 410. The client-visible contract (410 `bootstrap_required` when `cursor.seq < floor_seq`) is unchanged.
+
 Since P1-1, event payloads are stored exactly as `serialize_profile` returns them (`catalog_enrichment._profile_json`: sorted keys, compact separators, no NaN), the same serializer that direct reads, bootstraps and v2 snapshots use, so an event and a read of the same row are equal. Events recorded by 1.2.5 went through `catalog.canonical_json` (`catalog.py:295-319`), which NFC-normalises and trims strings and turns empty strings into `null` (for example an empty ramp); such events can stay in the journal until compacted.
 
 ### 3.5 v2 profile bootstrap (`profile_bootstrap.py`; routes at `__init__.py:2600-2633`)
@@ -522,7 +524,7 @@ The code wins. Each item names the WP expected to act on it.
    - Events recorded by 1.2.5 and still in the journal carry float64 `ref_lufs` and went through the `catalog.canonical_json` sanitizer (NFC, trim, `""`→`null`).
    - Clients should keep comparing `ref_lufs` with a tolerance and treating `null` ramps like empty ramps, for 1.2.5 servers and old journal entries.
    - Rows published with a bare `media_fp` signature (no `catalog-media:` prefix) are not "current" for the analysis hook and compare as changed media, so after the upgrade each such row is re-analysed once and loses its edge once (the edge upgrade is then rescheduled for the prefixed signature).
-9. **Profile journal retention** is a fixed 50,000 events per publication, but `max(1000, 2×count)` in maintenance compaction. At 94k profiles, publication-time compaction is the binding limit.
+9. **Profile journal retention** is a fixed 50,000 events per publication, but `max(1000, 2×count)` in maintenance compaction. At 94k profiles, publication-time compaction is the binding limit. P1-2 replaces both with one persisted limit of at least 50k and 2× the library (§3.4).
 10. **`/api/profiles` silently truncates `ids` to 500.** K6 clients fetching misses must batch ≤500 ids and must not treat an unlisted id as "missing".
 11. **Timestamps** mix zone-less (`analyzed_at`) and offset (`expires_at`, `created_at`) forms (§1.6). The audit's "`expires_at` is non-UTC on a non-UTC server" is confirmed.
 12. **Collections today** (the baseline for K8/K9):

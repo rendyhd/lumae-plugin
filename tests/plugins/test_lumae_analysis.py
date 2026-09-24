@@ -10045,8 +10045,10 @@ def test_change_journal_compaction_advances_floor_and_deletes_expired_events():
     )
 
     assert floor == 127_604
-    assert cur.executed[0][1] == ("catalog-a", "epoch-a", "epoch-a", 127_604)
-    assert "seq<=%s" in cur.executed[0][0]
+    # P1-2: one index range delete on the retained epoch, no OR.
+    assert cur.executed[0][1] == ("catalog-a", "epoch-a", 127_604)
+    assert "epoch=%s AND seq<=%s" in cur.executed[0][0]
+    assert " OR " not in cur.executed[0][0].upper()
     assert cur.executed[1][1] == (127_604, "catalog-a", "epoch-a")
     assert "GREATEST(analysis_floor_seq, %s)" in cur.executed[1][0]
 
@@ -10123,7 +10125,7 @@ def test_enrichment_cleanup_bounds_relationship_history_to_two_snapshots():
                 self.rows = [("catalog-a", "relationship-epoch", 7_620, 1_324, 581)]
             elif "FROM plugin_lumae_analysis__profile_stream_state" in sql and "FOR UPDATE" in sql:
                 self.rows = [("profile-epoch", 0, 0)]
-            elif "SELECT COUNT(*) FROM plugin_lumae_analysis__source_profiles" in sql:
+            elif "SELECT GREATEST(" in sql and "published_source_profiles" in sql:
                 self.rows = [(21_709,)]
             else:
                 self.rows = []
