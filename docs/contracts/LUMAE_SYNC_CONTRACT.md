@@ -62,9 +62,21 @@ There are three shapes. Clients must accept all three.
 
 ### 1.5 Response headers
 
-`_private_json` (`__init__.py:2041-2047`) sets `Cache-Control: private, no-store` (the v2 bootstrap, edges and errors) or `private, no-cache` (legacy `/profiles/bootstrap` and `/profiles/changes`), plus `Vary: Authorization, Cookie` and `X-Content-Type-Options: nosniff`. `GET /api/profiles`, health and the collection routes use plain `jsonify`, with no cache headers. Shelves set `private, no-store` on reads (`shelves.py:218`).
+`_private_json` (`__init__.py:2041-2047`) sets `Cache-Control: private, no-store` (the v2 bootstrap, edges and errors) or `private, no-cache` (legacy `/profiles/bootstrap` and `/profiles/changes`), plus `Vary: Authorization, Cookie` and `X-Content-Type-Options: nosniff`. Health and the collection routes use plain `jsonify`, with no cache headers. Shelves set `private, no-store` on reads (`shelves.py:218`).
 
-Responses are **not** compressed today. K1 adds gzip.
+- **1.2.5:** `GET /api/profiles` used plain `jsonify`, with no cache headers.
+- **1.3.0 (unreleased, P1-4):** `GET /api/profiles` uses `_private_json`: `Cache-Control: private, no-store`, `Vary: Authorization, Cookie`, `X-Content-Type-Options: nosniff`.
+
+**Compression (K1).** 1.2.5 never compresses. From 1.3.0 a blueprint `after_request` hook (`_compress_json_response`, 1.3.0 `__init__.py:249-273`) gzips a plugin response (level 4) when **all** of these hold:
+- the request's `Accept-Encoding` allows gzip: `gzip` or `x-gzip` with q>0, or, when neither is listed, `*` with q>0. `gzip;q=0` (or `*;q=0` with no explicit gzip) refuses it; names are case-insensitive;
+- the status is 200;
+- the mimetype is `application/json`;
+- the uncompressed body is at least 1,024 bytes;
+- the response has no `Content-Encoding` yet and is neither streamed nor `direct_passthrough`.
+
+A compressed response carries `Content-Encoding: gzip` and `Content-Length` set to the **compressed** size. Every response that meets the last four conditions (whether or not the client accepted gzip) gets `Accept-Encoding` appended to its existing `Vary` (for example `Vary: Authorization, Cookie, Accept-Encoding`), never duplicated. Errors, small bodies, binary vectors and host routes outside the plugin blueprint are never compressed. The two JSON download attachments are also plugin JSON, so they are gzip-eligible like any other route: the collection backup download (`_backup_response`, `collection_manager.py:358`, `application/json; charset=utf-8`) and the provider-identity transition manifest download (`lumae-provider-rekey-<id>.json`, 1.3.0 `__init__.py:2482-2505`). `Content-Disposition` is unchanged; a client or browser saving the file receives the decoded JSON. The JSON after decoding is byte-for-byte the uncompressed body.
+
+Client rules: send `Accept-Encoding: gzip` only when the HTTP stack decodes it (native stacks do this transparently). Never use `Content-Length` as the decoded size: a transparent decoder may drop it or leave the compressed size (C-7). Measured on a 50-row page with real-sized (~20 KB) edges: about 1,002 KB → 372 KB (2.7×, level 4) when the rows' edges differ; pages whose edges repeat compress far more.
 
 ### 1.6 Timestamps
 
@@ -110,8 +122,9 @@ This route always answers 200 (unless an exception occurs). It has no side effec
 | `collections` | `schema_version: 1`, `backup_version: 1`, `enabled`, `scope` | `collection_manager.py:18-20, 53-57` |
 | `catalog_mirror` | `contract_revision`, `catalog_schema_version: 3`, `analysis_schema_version: 2`, `catalog_builder_version`, `supported_core_range`, `supported_provider_types: ["navidrome"]`, `features: [...]` | `catalog_capability()`, 1753-1762. `features` is the static `CATALOG_FEATURES` list (120-162), which includes `profile_cursor_stream` and `source_scoped_profiles`. |
 | `credits` | `credits_service.capability()` | out of scope |
+| `transport` | `gzip: true` | **New in 1.3.0 (unreleased, K1).** Informational: gzip is negotiated per request through `Accept-Encoding` (§1.5). Absent in 1.2.5. |
 
-**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `transport`, `profile_stream`, `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled`, `edge_profiles.compact_transport`, `collections.feed_epoch`, `collections.contract`, `collections.source_scoped_items`, and `lumae_analysis_profiles`.
+**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `transport` (added in 1.3.0, K1), `profile_stream`, `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled`, `edge_profiles.compact_transport`, `collections.feed_epoch`, `collections.contract`, `collections.source_scoped_items`, and `lumae_analysis_profiles`.
 
 > Note: `lumae_analysis_profiles` is a **manifest** capability in `plugin.json` (with `schema_version`, `analyzer_version`, `profile_source`, `features`). It is not part of the health payload. See §9 item 1.
 
@@ -153,6 +166,8 @@ Response 200: `{schema_version:1, analyzer_version:1, catalog_instance_id, profi
 - `profiles`: published rows (`published_source_profiles`), with an edge when one matches (§3.1).
 - `failed`: the latest attempt is `failed` or `skipped_no_file`, with `last_error` as the reason, or serialization failed.
 - `missing`: everything else, including pending work.
+
+Headers: from 1.3.0 the 200 response has private cache headers (§1.5); in 1.2.5 it has none. It is gzipped under K1 when large enough (§1.5).
 
 This route is read-only: it never schedules analysis. Use `POST /api/analyze` (below) for that.
 
@@ -461,7 +476,7 @@ Copied from plan §2. **Every server change is additive or opt-in.** Each work p
 
 | ID | Change | Server WP | Client | Gate | Phase | Status |
 |---|---|---|---|---|---|---|
-| K1 | Gzip transport for JSON ≥1 KiB | P1-4 | Verify decoding; fix `Content-Length` guards (C-7) | HTTP `Accept-Encoding` (native stacks send it); informational `capabilities.transport.gzip` | 1 | planned |
+| K1 | Gzip transport for JSON ≥1 KiB | P1-4 | Verify decoding; fix `Content-Length` guards (C-7) | HTTP `Accept-Encoding` (native stacks send it); informational `capabilities.transport.gzip` | 1 | shipped in 1.3.0 (unreleased) |
 | K2 | v2 snapshots store an edge *reference* and resolve it at page read. Wire format unchanged, except a row whose edge was replaced after capture arrives without `edge_profile` (the catch-up re-supplies it). | P1-5 | None; already handled | None | 1 | planned |
 | K3 | v2 sliding expiry: each page extends `expires_at` to at most `created+24h` | P1-6 | Send `expiry_mode:"sliding"`; accept a changing `expires_at` (C-6) | `capabilities.profile_bootstrap.sliding_expiry:true`; create body field | 1 | planned |
 | K4 | `Retry-After` on 429 and 503; truthful `available`; new `auth_enabled` field (the `auth` string is unchanged) | P1-6 | Back off and honour `Retry-After` (C-3) | Always additive (`capabilities.profile_bootstrap.auth_enabled`) | 1 | planned |
@@ -496,7 +511,7 @@ Copied from plan §2. **Every server change is additive or opt-in.** Each work p
 The code wins. Each item names the WP expected to act on it.
 
 1. **K11 gate location.** `lumae_analysis_profiles` exists only in `plugin.json` (manifest capabilities). **Health has no such key.** P3-1 must add a new `capabilities.lumae_analysis_profiles` object to `/api/health` (additive) for the gate in plan §2/H.3 to work. Until then the analyzer version is visible only as top-level `analyzer_version` and `sync_contract.streams.profiles.analyzer_version`.
-2. **New capability objects.** `capabilities.transport` (K1) and `capabilities.profile_stream` (K6) do not exist today. They are new objects, not new fields on existing ones.
+2. **New capability objects.** `capabilities.transport` (K1) and `capabilities.profile_stream` (K6) do not exist in 1.2.5. They are new objects, not new fields on existing ones. P1-4 added `capabilities.transport: {gzip: true}` in 1.3.0 (unreleased); `profile_stream` is still planned (P3-2).
 3. **The v2 bootstrap has no 404 or 409.** The only statuses are 200/400/410/413/429/503 (§3.5). A 404 means the route is missing.
 4. **The v2 session is absolute (60 minutes)**, hard-coded in SQL (`profile_bootstrap.py:245`); `SESSION_MINUTES` is unused. Release of an expired or stale session answers 410 and **leaves the row in place**, so it holds one of the 4 per-source slots until it expires (audit AUD-11). K5 alone does not fix this; P1-6 should.
 5. **`profile_bootstrap.available`** is `bool(DATABASE_URL)`, not a probe; `auth` is constant even when `AUTH_ENABLED=false` (K4).

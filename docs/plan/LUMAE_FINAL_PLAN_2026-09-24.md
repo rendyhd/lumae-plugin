@@ -281,7 +281,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 **P1-4 — Transport compression and private headers (AUD-02, K1).**
 - Files: `__init__.py` (`_private_json` 2041, `_catalog_error` 2050, `profiles()` 2507-2551, blueprint registration).
 - Change:
-  - Add a blueprint `after_request` that gzips (level 6) when all of these hold: the request's `Accept-Encoding` contains gzip, the response is `application/json`, the body is ≥1 KiB, the status is 200, and there is no existing `Content-Encoding`. Set `Content-Encoding`, `Vary: Accept-Encoding` (merged with existing values) and `Content-Length`.
+  - Add a blueprint `after_request` that gzips (level 4: about 99% of level 6's ratio for about 80% of its CPU, measured on 1 MB and 20 MB edge pages) when all of these hold: the request's `Accept-Encoding` contains gzip, the response is `application/json`, the body is ≥1 KiB, the status is 200, and there is no existing `Content-Encoding`. Set `Content-Encoding`, `Vary: Accept-Encoding` (merged with existing values) and `Content-Length`.
   - `profiles()` uses `_private_json`, so it gets private cache headers.
   - Health: `capabilities.transport:{gzip:true}`.
 - Tests: gzipped and plain responses round-trip; headers are correct; v2 pages, `/changes`, `/bootstrap` and `/api/profiles` are compressed; small responses are not.
