@@ -86,7 +86,13 @@ from .provider_identity_guard import (
     require_projection_reconcile,
 )
 from .provider_identity_rekey import read_transition_manifest, refresh_audiomuse_health
-from .profile_publication import admit_attempts, complete_attempt, migrate_attempts, release_attempts
+from .profile_publication import (
+    admit_attempts,
+    complete_attempt,
+    migrate_attempts,
+    published_profile_current,
+    release_attempts,
+)
 from . import profile_bootstrap
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
@@ -3192,6 +3198,15 @@ def analyze_song_hook(song):
     if not catalog_instance_id:
         logger.warning("lumae_analysis song hook skipped %s without an exact source", track_id)
         return {"track_id": track_id, "status": "skipped_source_unresolved"}
+    # An AudioMuse re-analysis pass fires this hook for every song. A current
+    # published profile needs no new attempt (AUD-03); changed media, a new
+    # analyzer or schema, and failed rows still requalify (LUM-007).
+    if published_profile_current(
+        get_db(), catalog_instance_id, track_id, ANALYZER_VERSION, SCHEMA_VERSION
+    ):
+        # Still heal a missing edge; a current edge makes this a no-op.
+        _schedule_edge_upgrade(track_id, catalog_instance_id, source_server_id)
+        return {"track_id": track_id, "status": "current"}
     tokens = mark_pending([track_id], catalog_instance_id, priority="interactive")
     token = tokens.get(track_id)
     if not token:

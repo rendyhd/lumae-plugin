@@ -15,7 +15,8 @@ SAFE_FAILURES = TRANSIENT_FAILURES | REVISION_FAILURES
 
 from plugin.api import table
 
-from .catalog_enrichment import record_profile_change, serialize_profile
+from .catalog_enrichment import float4, record_profile_change, serialize_profile
+from .edge_profile_store import edge_join
 
 
 def migrate_attempts(cur):
@@ -233,6 +234,43 @@ def release_attempts(db, source, tokens, reason, count_failure=True):
         cur.close()
 
 
+def published_profile_current(db, source, track_id, analyzer_version, schema_version):
+    """Whether the published row already represents the current media.
+
+    True only for an active source whose published row has the current media
+    fingerprint, analyzer and schema version, and whose attempt row has not
+    failed. Anything else (new media, a new analyzer or schema, a failed or
+    unpublished row) still goes through admission, so LUM-007 requalification
+    is unchanged. Read-only.
+    """
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""SELECT 1
+                  FROM {table('catalog_state')} c
+                  JOIN {table('catalog_sources')} src USING (catalog_instance_id)
+                  JOIN {table('catalog_tracks')} t
+                    ON t.catalog_instance_id=c.catalog_instance_id
+                   AND t.published_generation=c.published_generation
+                  JOIN {table('published_source_profiles')} p
+                    ON p.catalog_instance_id=t.catalog_instance_id
+                   AND p.track_id=t.track_id
+                  JOIN {table('source_profiles')} s
+                    ON s.catalog_instance_id=p.catalog_instance_id
+                   AND s.track_id=p.track_id
+                 WHERE c.catalog_instance_id=%s AND t.track_id=%s
+                   AND src.rebind_status='active' AND t.available=TRUE
+                   AND COALESCE(t.media_fp, '') <> ''
+                   AND p.media_signature='catalog-media:' || t.media_fp
+                   AND p.analyzer_ver=%s AND p.profile_schema_ver=%s
+                   AND s.status NOT IN ('failed', 'skipped_no_file')""",
+            (source, track_id, analyzer_version, schema_version),
+        )
+        return cur.fetchone() is not None
+    finally:
+        cur.close()
+
+
 def complete_attempt(db, source, track_id, token, result, status, error, media_sig,
                      analyzer_version, schema_version, failure_code=None):
     """Publish only the currently admitted revision, row and journal together."""
@@ -289,7 +327,8 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
         values = (
             int(getattr(result, "sample_rate", 0)),
             int(getattr(result, "duration_ms", 0)),
-            float(getattr(result, "ref_lufs", 0.0)),
+            # Stored as REAL: compare and insert at that precision (AUD-03).
+            float4(getattr(result, "ref_lufs", 0.0)),
             bytes(getattr(result, "start_ramp_blob", b"")),
             bytes(getattr(result, "end_ramp_blob", b"")),
             analyzer_version, schema_version, media_sig,
@@ -340,13 +379,15 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
             )
             previous = cur.fetchone()
             same = previous is not None and (
-                (int(previous[0]), int(previous[1]), float(previous[2]),
+                (int(previous[0]), int(previous[1]), float4(previous[2]),
                  bytes(previous[3]), bytes(previous[4]), int(previous[5]),
                  int(previous[6]), previous[7]) == values
             )
-            if not same:
-                # A changed waveform removes the old edge representation and
-                # its queued token before emitting the new public payload.
+            # The edge profile depends on the media, not on the waveform row.
+            media_changed = previous is None or previous[7] != media_sig
+            if not same and media_changed:
+                # New media removes the old edge representation and its
+                # queued token before emitting the new public payload.
                 cur.execute(
                     f"DELETE FROM {table('edge_profiles')} "
                     "WHERE catalog_instance_id=%s AND track_id=%s",
@@ -357,6 +398,7 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
                     "WHERE catalog_instance_id=%s AND track_id=%s",
                     (source, track_id),
                 )
+            if not same:
                 cur.execute(
                     f"""INSERT INTO {table('published_source_profiles')}
                         (catalog_instance_id, track_id, sample_rate, duration_ms,
@@ -377,7 +419,20 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
                     (source, track_id, *values),
                 )
                 stamp = cur.fetchone()[0]
-                payload = serialize_profile(track_id, *values[:6], stamp, media_sig)
+                edge = None
+                if not media_changed:
+                    # Clients delete their edge on an upsert without one, so a
+                    # waveform-only change carries the still-current edge.
+                    cur.execute(
+                        f"""SELECT edge.payload
+                              FROM {table('published_source_profiles')} p {edge_join()}
+                             WHERE p.catalog_instance_id=%s AND p.track_id=%s""",
+                        (source, track_id),
+                    )
+                    edge = cur.fetchone()[0]
+                payload = serialize_profile(
+                    track_id, *values[:6], stamp, media_sig, edge_profile=edge,
+                )
                 record_profile_change(cur, source, track_id, "ready", payload)
         db.commit()
         return True
