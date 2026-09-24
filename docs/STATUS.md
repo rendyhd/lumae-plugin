@@ -21,3 +21,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P0-1/P0-5 review follow-ups | on phase/0-foundation | Phase 0 PR | | release tests strengthened |
 | P0-4 sync contract | on phase/0-foundation | Phase 0 PR | | docs only; review fixes applied |
 | P0-2 migrated_db fixture | on phase/0-foundation | Phase 0 PR | | 582 passed |
+| P1-1 no-op republish keeps edges | on phase/1-stop-the-bleeding | Phase 1 PR | | 596 passed |

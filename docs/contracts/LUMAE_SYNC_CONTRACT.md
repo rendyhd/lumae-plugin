@@ -134,7 +134,7 @@ Every profile route is scoped by `catalog_instance_id`. Clients get it from `GET
 | `track_id` | string | provider track id |
 | `source` | `"waveform"` | constant |
 | `sample_rate`, `duration_ms` | int | |
-| `ref_lufs` | number | analyzer v1 reference loudness. Direct reads, bootstraps and v2 snapshots read it from a `REAL` (float4) column. Change events carry the analyzer's float64. The two can differ in low digits. |
+| `ref_lufs` | number or null | analyzer v1 reference loudness at the stored `REAL` (float4) precision, emitted as a decimal that round-trips the float4 value; equal to PostgreSQL's text form for the LUFS range (`catalog_enrichment.float4`). Every path emits the same value since P1-1; events recorded by 1.2.5 still in the journal carry the analyzer's float64, which can differ in low digits. A non-finite value is `null`. |
 | `start_ramp`, `end_ramp` | base64 string | MixRamp blobs |
 | `analyzer_ver` | int | `1` in 1.2.5 |
 | `analyzed_at` | ISO string without a zone (§1.6) | |
@@ -190,7 +190,7 @@ Status codes:
 
 Retention: each publication compacts the journal to its last **50,000** events (`PROFILE_CHANGE_RETENTION_EVENTS`, `catalog_enrichment.py:50, 497`). The maintenance path uses `max(1000, 2 × profile_count)` (`catalog_enrichment.py:158-210`, line 193; `catalog.py:50-55`). A client more than about 50k events behind gets a 410 and must bootstrap again.
 
-Event payloads are stored through `catalog.canonical_json` (`catalog.py:295-319`). That function NFC-normalises and trims strings, turns empty strings into `null`, and drops keys that match private or path patterns. Direct reads, bootstraps and v2 snapshots are **not** sanitised this way.
+Since P1-1, event payloads are stored exactly as `serialize_profile` returns them (`catalog_enrichment._profile_json`: sorted keys, compact separators, no NaN), the same serializer that direct reads, bootstraps and v2 snapshots use, so an event and a read of the same row are equal. Events recorded by 1.2.5 went through `catalog.canonical_json` (`catalog.py:295-319`), which NFC-normalises and trims strings and turns empty strings into `null` (for example an empty ramp); such events can stay in the journal until compacted.
 
 ### 3.5 v2 profile bootstrap (`profile_bootstrap.py`; routes at `__init__.py:2600-2633`)
 
@@ -440,7 +440,7 @@ Read routes:
 These rules hold against 1.2.5 and **must keep holding** for clients that do not opt in to anything.
 
 1. **An upsert without a valid `edge_profile` deletes the local edge.** A profile upsert (bootstrap row, v2 snapshot row, `/changes` or catch-up `upsert` event, or direct fetch) that has no `edge_profile`, or has one that fails validation or digest verification, **removes** the client's stored edge for that track (Auralscape `publishedProfileRepo.ts:266, 351-388`; *verified in the 2026-09-24 audit*, `docs/audit/2026-09-24/LUMAE_AUDIT_2026-09-24.md`, not checkable from this repo). The server relies on this in three places:
-   - **Waveform republish.** When the published 8-tuple (`sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp, analyzer_ver, profile_schema_ver, media_signature`) differs from the stored row, the server deletes the edge and its job and emits an upsert **without** an edge (`profile_publication.py:342-381`). It does not embed the edge. Because `ref_lufs` is compared as float4 against float64, an identical re-analysis almost always counts as "different" (audit AUD-03).
+   - **Waveform republish** (P1-1). The published 8-tuple (`sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp, analyzer_ver, profile_schema_ver, media_signature`) is compared at stored precision (`ref_lufs` as float4). An identical completion is a no-op: no head change, no event, edge rows untouched. If the tuple differs and `media_signature` changed (or there was no published row), the server deletes the edge and its job and emits an upsert **without** an edge; the edge upgrade is then scheduled for the new media. If only the waveform changed on the same media, the edge and its job are kept and the upsert **embeds the current edge** (`serialize_profile(..., edge_profile=<edge_join>)`), so clients keep it. The analysis hook also skips admission when the published row is already current (same media fingerprint, analyzer and schema version, not failed).
    - **Rekey.** A provider-identity rekey emits `delete(old)` + `upsert(new)` without an edge (`profile_publication.py:462-503`).
    - **Edge publication** emits a new `upsert` carrying the waveform fields **and** the edge (`edge_profile_store.py:155`).
 
@@ -503,9 +503,10 @@ The code wins. Each item names the WP expected to act on it.
 6. **Cursor ahead of head** on `/profiles/changes` is **400 `invalid_cursor`**, not 410. The collections feed returns an empty 200 in the same case. K8 makes collections answer 410; profiles are unchanged.
 7. **The boundaries formula** in plan K7 (`source.sample_rate` + `source.decoded_frames`) and in C-12 (`origin_frame`/`covered_frames`) are equivalent. Both were verified against `edge_profiles.py:146-152` and the golden fixture. §4.4 is the exact statement. `rate` is the **source** rate, not the 48 kHz measurement rate.
 8. **Payloads differ by path.**
-   - `ref_lufs` is float64 in `/changes` and catch-up events but float4-rounded in direct reads, bootstraps and v2 snapshots (AUD-03).
-   - Only event payloads go through the `catalog.canonical_json` sanitizer (NFC, trim, `""`→`null`).
-   - Clients should compare `ref_lufs` with a tolerance and treat `null` ramps like empty ramps.
+   - Fixed for new events by P1-1: every path emits float4 `ref_lufs` and the same serializer (§3.4).
+   - Events recorded by 1.2.5 and still in the journal carry float64 `ref_lufs` and went through the `catalog.canonical_json` sanitizer (NFC, trim, `""`→`null`).
+   - Clients should keep comparing `ref_lufs` with a tolerance and treating `null` ramps like empty ramps, for 1.2.5 servers and old journal entries.
+   - Rows published with a bare `media_fp` signature (no `catalog-media:` prefix) are not "current" for the analysis hook and compare as changed media, so after the upgrade each such row is re-analysed once and loses its edge once (the edge upgrade is then rescheduled for the prefixed signature).
 9. **Profile journal retention** is a fixed 50,000 events per publication, but `max(1000, 2×count)` in maintenance compaction. At 94k profiles, publication-time compaction is the binding limit.
 10. **`/api/profiles` silently truncates `ids` to 500.** K6 clients fetching misses must batch ≤500 ids and must not treat an unlisted id as "missing".
 11. **Timestamps** mix zone-less (`analyzed_at`) and offset (`expires_at`, `created_at`) forms (§1.6). The audit's "`expires_at` is non-UTC on a non-UTC server" is confirmed.

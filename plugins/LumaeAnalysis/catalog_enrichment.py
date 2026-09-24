@@ -425,6 +425,17 @@ def _bytes(value):
     return bytes(value)
 
 
+def float4(value):
+    """Return ``value`` at the ``REAL`` (float4) precision the profile tables store.
+
+    The result is a decimal that round-trips the float4 value; equal to
+    PostgreSQL's text form for the LUFS range. Publication compares
+    and inserts this value, and every payload path emits it, so change events,
+    bootstraps, snapshots and direct reads agree (AUD-03).
+    """
+    return float(str(np.float32(float(value))))
+
+
 def serialize_profile(
     track_id,
     sample_rate,
@@ -438,12 +449,13 @@ def serialize_profile(
     edge_profile=None,
 ):
     revision = opaque_revision(media_signature)
+    ref_lufs = float4(ref_lufs)
     payload = {
         "track_id": str(track_id),
         "source": "waveform",
         "sample_rate": int(sample_rate),
         "duration_ms": int(duration_ms),
-        "ref_lufs": float(ref_lufs),
+        "ref_lufs": ref_lufs if math.isfinite(ref_lufs) else None,
         "start_ramp": base64.b64encode(_bytes(start_ramp)).decode("ascii"),
         "end_ramp": base64.b64encode(_bytes(end_ramp)).decode("ascii"),
         "analyzer_ver": int(analyzer_ver),
@@ -455,6 +467,17 @@ def serialize_profile(
             and revision and edge_profile.get("media_revision") == revision):
         payload["edge_profile"] = edge_profile
     return payload
+
+
+def _profile_json(payload):
+    # ``serialize_profile`` output is already the wire form every read path
+    # returns, so events store it as is. The catalogue sanitizer
+    # (``catalog.canonical_json``) would rewrite empty ramps to null and could
+    # alter an embedded edge, making events differ from reads.
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    )
 
 
 def record_profile_change(cur, catalog_instance_id, track_id, status, payload=None):
@@ -476,7 +499,7 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
             seq,
             str(track_id),
             operation,
-            canonical_json(payload) if payload is not None and operation == "upsert" else None,
+            _profile_json(payload) if payload is not None and operation == "upsert" else None,
         ),
     )
     cur.execute(
