@@ -58,11 +58,12 @@ The probes are checked in under [`probes/`](probes/).
    - lock ordering is consistent, and no helper commits behind its caller.
 4. **The end-to-end sync that motivated the programme is still broken at the user's real scale.** The causes are ones the programme never tested, because its qualification ran on tiny fixtures with the admission guard mocked out:
    - **AUD-01 (P0, client).** A 5-minute identity-evidence timeout is treated as "the source changed" in the middle of a sync. The client then **deletes its staged progress**. Any profile bootstrap longer than 5 minutes cannot complete on either the v2 or the legacy path. The original incident's full-library (94k) enrichment took 6m40s. This is very likely a root cause of the original `succeeded=false` incident.
-   - **AUD-02 (P0 for release, both repositories).** Edge profiles make up **about 97% of every profile payload**: about 19 KB of edge data against about 0.5 KB for the base profile. Effects:
+   - **AUD-02 (P0 for release, both repositories).** The phone needs the full edge copy for offline playback, because many AudioMuse servers are not reachable from outside the home network. But neither bootstrap path can deliver it at real scale. Edge profiles make up **about 97% of every profile payload**: about 19 KB of edge data against about 0.5 KB for the base profile, which is 1.8 GB uncompressed at 94k tracks. Effects:
      - v2 bootstrap returns **413 once a source has about 7k edge-profiled tracks**.
      - The client never falls back to legacy after a 413.
-     - The legacy publication loads every staged edge into JavaScript inside one transaction. At 94k tracks that is about 1.8 GB.
-     - An on-demand edge warmup path already exists and makes the bulk copy unnecessary.
+     - The legacy publication loads every staged edge into JavaScript inside one transaction.
+     - Nothing is compressed: gzip alone halves the transfer.
+     - The "only once" premise is broken too: AUD-01, AUD-03 and AUD-12 each make the full first load happen again.
    - **AUD-03 (P1, server).** A float4-versus-float64 comparison makes almost every no-op re-analysis count as a change:
      - it republishes the profile and **deletes its edge profile**;
      - that triggers a media re-download and an edge re-analysis.
@@ -95,7 +96,7 @@ The probes are checked in under [`probes/`](probes/).
 | # | Action | Fixes | Size |
 |---|---|---|---|
 | 1 | Stop treating stale identity evidence as a source change inside sync. Refresh the evidence, or compare identity rather than age; never delete staging on age alone. Add wait-and-retry for provider user-state reads. | AUD-01, AUD-09 | Small (client) |
-| 2 | Take edge profiles out of the bulk bootstrap and journal payloads; serve them on demand or through a bounded separate stream. Count bytes without edges. Add client fallback and backoff for 413, 429 and 503. | AUD-02 | Medium (both) |
+| 2 | Keep the bulk edge copy (offline playback needs it), but make the first load feasible and happen once: gzip responses; no edge JSON copied into v2 session snapshots; byte-sized pages; client writes content-addressed edges page by page instead of in one giant transaction; fallback and backoff on 413, 429 and 503; events reference an unchanged edge by digest instead of re-sending it. | AUD-02 | Medium (both) |
 | 3 | Compare `ref_lufs` at float4 precision. Do not delete edge profiles when only the waveform changed but the media revision did not. | AUD-03 | Small |
 | 4 | Replace the per-publication full-journal delete with an index range delete. | AUD-04 | Trivial |
 | 5 | `ALTER … seq DROP DEFAULT` on `collection_changes`. Bump `PLUGIN_VERSION`, and extend worker attestation to every writer. Add a startup invariant check. | AUD-05 | Small |
@@ -159,17 +160,46 @@ The probes are checked in under [`probes/`](probes/).
   - Before LUM-008, edge publication was chunked.
 - Staging also regressed from multi-row chunk inserts to 2 DELETE + 2 INSERT per row.
 - Per-edge validation (base64, canonical JSON, pure-JS SHA-256) runs synchronously per page. Estimated at 0.5–1.5 s of blocking per page (SPECULATIVE).
-- The client already has on-demand edge warmup (`edgeProfileWarmup.ts:53-190`, `opportunistic_edge_profiles`), so playback does not need the bulk copy.
 
-**Fix:**
-- Make the bootstrap and journal payloads waveform-only; this is about 47 MB at 94k tracks.
-- Serve edges on demand (the existing batch route), and optionally through a separate bounded edge stream for downloaded or offline tracks.
-- Keep one contract revision for this, and count snapshot bytes without edges.
-- In the client:
-  - fall back to legacy on 413;
-  - back off and honour `Retry-After` on 429 and 503;
-  - chunk publication with keyset paging;
-  - release abandoned sessions.
+**Requirement.** The bulk copy is required: offline playback needs every edge profile on the phone, because many users' AudioMuse is reachable only on the home network. So the goal is to make a large *first* load feasible and to make sure it really happens only once. The on-demand warmup (`edgeProfileWarmup.ts:53-190`) can stay as a gap filler, but it does not replace the bulk copy.
+
+**First-load size at 94k tracks** (`probes/loudness_and_payload/edge_gzip.py`, 40 distinct synthetic tracks, so real music may compress somewhat differently):
+
+| Encoding | Per track | 94k tracks |
+|---|---|---|
+| Current JSON, uncompressed (what is sent today) | 19.4 KB | 1.82 GB |
+| Current JSON, gzip | 9.4 KB | **0.89 GB** |
+| Without the derivable `boundaries` arrays, gzip | 8.2 KB | **0.77 GB** |
+| Decoded binary arrays at rest on the phone | about 10 KB | about 0.95 GB |
+
+**Fix, keeping the bulk copy:**
+
+1. **Compress the transfer.** The host sends no `Content-Encoding`. Gzip the profile page, catch-up and changes responses in the plugin when `Accept-Encoding: gzip` is present. React Native's networking stack decompresses gzip transparently. This needs no contract change and halves the transfer.
+2. **Do not copy edge JSON into v2 session snapshots.** Each create currently writes up to the whole library's edges into `profile_bootstrap_snapshot`, which is about 1.8 GB of JSONB per session. Instead:
+   - Snapshot rows keep the waveform payload plus an edge reference `(media_revision, profile_digest)`.
+   - Pages resolve the edge payload from `edge_profiles` at read time.
+   - If the edge changed after capture, the catch-up delivers the new one, and the digest tells the client which version it holds.
+   - Alternatively, run a separate keyset-paged edge stream. Edges are content-addressed and self-validating, so they do not need snapshot consistency.
+
+   Either way the 128 MiB snapshot cap stops counting edge bytes; bound edge work per page instead.
+3. **Size pages by bytes, not rows.** 250 rows is about 5 MB of JSON per page. Aim for about 1 MB per page, and move validation off the JavaScript thread or into batches.
+4. **Write edges on the client page by page, not in one giant publication.** An edge row is valid only while its `media_revision` matches the track and its digest verifies, so it does not need the whole-library atomic swap that waveform profiles use:
+   - upsert edges as each page commits;
+   - drop stale ones by media revision or by tombstone;
+   - keep the atomic publication for the waveform and cursor state only.
+
+   This removes the about 1.8 GB JavaScript load and the doubled staging-plus-published storage.
+5. **Do not re-send unchanged edges.** Journal events currently embed the full edge on every waveform republish (`edge_profile_store.py:155`, `profile_publication.py:381`). Send the edge only when its digest changed, and otherwise send `edge_profile_digest` so the client keeps its copy. A future analyzer change such as LUM-005 v2 then costs about 0.5 KB per track instead of about 19 KB.
+6. **Make "only once" true:**
+   - AUD-01: the 5-minute timeout deletes progress.
+   - AUD-03: no-op re-analysis re-sends everything and forces a re-bootstrap past 50k events.
+   - AUD-12: the 60-minute session expiry restarts from zero.
+   - Size the journal retention to cover at least one full library pass (about 94k events), or make it byte-based.
+7. **Optional, needs a representation revision.** Drop the `boundaries` arrays, which are derivable from `origin_frame`, `covered_frames` and the sample rate (`edge_profiles.py:146-152`); that is 28% of the uncompressed payload. Store decoded binary on the phone instead of JSON strings. The digest must then be defined over the compact form, or the client must rebuild `boundaries` before verifying.
+8. **Client error handling:**
+   - fall back to legacy on 413;
+   - back off and honour `Retry-After` on 429 and 503;
+   - release abandoned sessions.
 
 ### AUD-03 — P1, server. A no-op re-analysis republishes the profile, deletes its edge profile and floods the journal. CONFIRMED
 
@@ -396,7 +426,7 @@ See §3.3e for a simpler design.
 - After LUM-001 (every publication emits a dense, full-payload event in the same transaction) and LUM-008 (the legacy route reads `published_source_profiles`), in-order idempotent replay of `(H0, H_end]` converges exactly. Durable client staging of `(after, H0, epoch)` then gives resume without any server session.
 - What legacy lacked was a small **retention lease** that compaction respects, identity fields in the token, and a client-chosen finite head. The catalogue stream already has this pattern ("unless an unexpired bootstrap lease pins them", `catalog.py:100`).
 - That design needs no owned connection, advisory lock, per-session materialisation (68 MB+ of WAL per create), byte caps, slot limits or HMAC session secrets, so the host question would never have arisen.
-- **Recommendation.** Do not rip out the shipped v2 now. Fix its operability (AUD-11), take edges out (AUD-02), and measure. If capture cost or operability stays a problem, collapse v2 onto the lease design in a later contract revision. The client staging and publication already fit either approach.
+- **Recommendation.** Do not rip out the shipped v2 now. Fix its operability (AUD-11), stop copying edge JSON into per-session snapshots (AUD-02), and measure. If capture cost or operability stays a problem, collapse v2 onto the lease design in a later contract revision. The client staging and publication already fit either approach.
 
 **f. Performance was deferred indefinitely although the user asked for it.** The plan makes performance wait for the no-PR correction, and implicitly for release gates. The measurements in §6 show the largest wins are small, local and testable by equivalence (AUD-04, AUD-07, AUD-08), and several fix correctness-adjacent problems (AUD-03). Performance should run in parallel with release hardening, not after it.
 
@@ -506,13 +536,18 @@ Environment: PG16, local, 4 vCPU, synthetic fixture, warm cache. These are relat
 | Projection, no change | 20–22 s, 1.5 GB | 2–4 s, <400 MB (estimate) | AUD-07 |
 | Projection, 1-row delta | 57 s, 320 MB WAL | 3–5 s (estimate) | AUD-07 |
 | v2 create at 94k, no edges | 5.0 s in-request, 68 MB WAL | off-thread or lease | AUD-11 |
-| Bootstrap payload at 94k | about 1.8 GB with edges | about 47 MB waveform-only | AUD-02 |
+| First-load payload at 94k (edges needed offline) | 1.82 GB uncompressed JSON, repeated whenever a re-bootstrap is forced | 0.89 GB gzip (0.77 GB compact), once | AUD-02 |
 | Workbench browse / search `all` | 0.3–0.6 s / 2.34 s | indexed keyset | LUM-016 |
 | Collection frontier ceiling | about 0.7–1.2k tx/s | fine at household scale | LUM-004 |
 
 ### 6.2 Where the time actually goes, end to end
 
-For the phone, the dominant costs are data volume (edges, about 40× the base payload) and repeated full bootstraps, not server query latency. The full bootstraps come from AUD-03 journal floods, AUD-01 aborts and AUD-12 expiry. Fixing AUD-01, 02 and 03 should remove most of the original 20-minute sync before any micro-optimisation. On the server, contention on the 4 host threads (AUD-08, AUD-11) matters more than any single query.
+For the phone, the dominant costs are data volume and *repeated* full bootstraps, not server query latency:
+- Edges are about 40× the base payload. They are needed offline, so the first load is inherently large.
+- It should happen once, compressed (about 0.9 GB instead of 1.8 GB at 94k), written page by page.
+- It currently repeats because of AUD-03 journal floods, AUD-01 aborts and AUD-12 expiry.
+
+Fixing AUD-01, 02 and 03 should remove most of the original 20-minute sync before any micro-optimisation. After that, steady-state deltas are small, especially once unchanged edges are referenced by digest instead of re-sent. On the server, contention on the 4 host threads (AUD-08, AUD-11) matters more than any single query.
 
 ### 6.3 Architecture (LUM-020)
 
@@ -581,7 +616,16 @@ For the phone, the dominant costs are data volume (edges, about 40× the base pa
 
 **Phase 1 — stop the bleeding (days; each item is small and independently testable):**
 1. Client: fix the identity check inside a run and add wait-and-retry for provider user-state (AUD-01, AUD-09). Add the >5-minute regression test.
-2. Take edges out of bulk bootstrap and journal payloads. Add client 413/429/503 fallback and backoff, chunked publication, and release of abandoned sessions (AUD-02, part of AUD-11).
+2. Keep the bulk edge copy for offline playback, but make the first load feasible and one-time:
+   - gzip responses;
+   - no edge JSON in v2 session snapshots;
+   - byte-sized pages;
+   - page-by-page, content-addressed edge writes on the client;
+   - reference unchanged edges by digest in events;
+   - 413/429/503 fallback and backoff;
+   - release abandoned sessions.
+
+   (AUD-02, part of AUD-11.)
 3. Fix the precision of the no-op comparison and keep edges when the media is unchanged (AUD-03).
 4. Replace the journal compaction with a range delete (AUD-04).
 5. Make CI green by construction, protect `main`, and stop using `[skip ci]` on code (AUD-06).

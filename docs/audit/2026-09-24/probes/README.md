@@ -15,6 +15,7 @@ LUMAE_POSTGRES_TEST_DSN=postgresql://postgres@127.0.0.1:5432/scratch \
 |---|---|---|
 | `loudness_and_payload/lufs_probe.py` | Analyzer `ref_lufs` compared with the BS.1770-4 reference (needs `pyloudnorm`): channel averaging, fixed 48 kHz coefficients, missing relative gate | AUD-10 |
 | `loudness_and_payload/edge_size.py`, `base_size.py` | Real edge-profile payload (about 19 KB) against the base profile (about 0.5 KB) | AUD-02 |
+| `loudness_and_payload/edge_gzip.py` | First-load size at 94k with 40 distinct synthetic tracks: current JSON, gzip, and without derivable `boundaries` | AUD-02 |
 | `lum010/test_probe_lum010.py` (+ `edge.json`) | 413 once there are about 7k edge profiles; global creation lock returns 503; stale-epoch lockout returns 429; errors turned into 503 without logging; account-era migration | AUD-02, AUD-11 |
 | `integrity/test_probe_integrity.py` | No-op republish deletes edges (float4/float64); stranded retry rows; maintenance pause uses up the attempt budget; `catalog_state` blocking; v1 `/changes` skip under concurrent compaction | AUD-03, LUM-001/007/008 |
 | `collections/test_probe_frontier.py` | Concurrent frontier: no skipped or duplicated events; throughput ceiling | LUM-004 |
