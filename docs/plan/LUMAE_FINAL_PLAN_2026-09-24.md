@@ -477,6 +477,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
      - the revision is bumped and events are emitted through `_record_change`;
      - scope to the matching catalogue once K10 lands;
      - **stop rewriting delivered `collection_changes` and receipt payloads**;
+     - `_copy_analysis_generation` runs `ANALYZE` on the new generation's key columns before commit, as P2-2 does for projection. Without it, `_load_relationship_inputs` can plan a quadratic nested loop after a rekey (found in P2-2).
      - a collision in one principal is isolated: that principal's rekey is deferred with a diagnostic, and the installation rekey proceeds.
   5. **Shelves:** `rekey_shelves` (179-194) takes the `shelf_scopes` lock before `nextval`, and shelf receipts bind the request fingerprint (235-238).
   6. **Growth:** compact `collection_changes` below `floor_seq` once K8 has shipped and clients have been observed on it. Receipts get a 30-day TTL.
