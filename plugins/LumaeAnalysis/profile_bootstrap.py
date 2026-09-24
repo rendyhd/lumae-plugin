@@ -16,8 +16,7 @@ from contextlib import contextmanager
 import psycopg2
 from psycopg2.extras import Json, execute_values
 
-import plugin.api as host_api
-from plugin.api import table
+from plugin.api import config, table
 
 from .catalog import opaque_cursor
 from .catalog_enrichment import serialize_profile
@@ -26,12 +25,15 @@ from .edge_profile_store import edge_join
 
 SESSION_MINUTES = 60
 MAX_PAGE = 500
-MAX_SESSIONS_PRINCIPAL = 4
+MAX_SESSIONS_SOURCE = 4
 MAX_SESSIONS_GLOBAL = 32
 MAX_SNAPSHOT_ROWS = 200_000
 MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
 MAX_CATCHUP_EVENTS = 50_000
 MAX_CATCHUP_BYTES = 128 * 1024 * 1024
+TRANSFER_CONTRACT = "source_scoped_v1"
+STATEMENT_TIMEOUT_MS = 20_000
+LOCK_TIMEOUT_MS = 5_000
 
 
 class BootstrapError(Exception):
@@ -102,6 +104,7 @@ def _ordinal(session, phase, token):
 def _require_request(body, *, creating=False):
     if (not isinstance(body, dict) or type(body.get("protocol_version")) is not int
             or body["protocol_version"] != 2
+            or body.get("transfer_contract") != TRANSFER_CONTRACT
             or type(body.get("schema_version")) is not int
             or body["schema_version"] != 1
             or not isinstance(body.get("catalog_instance_id"), str)
@@ -120,30 +123,19 @@ def _require_request(body, *, creating=False):
         invalid()
 
 
-def principal_binding(principal):
-    """Encode the host's durable account identity without a username fallback."""
-    if (getattr(principal, "kind", None) != "account"
-            or not isinstance(getattr(principal, "subject", None), str)
-            or not isinstance(getattr(principal, "authorization_generation", None), str)):
-        raise BootstrapError("authentication_required", 401)
-    try:
-        subject = str(uuid.UUID(principal.subject))
-        generation = str(uuid.UUID(principal.authorization_generation))
-    except (ValueError, AttributeError):
-        raise BootstrapError("authentication_required", 401) from None
-    return json.dumps({"kind": principal.kind, "subject": subject,
-                       "authorization_generation": generation},
-                      sort_keys=True, separators=(",", ":"))
-
-
 @contextmanager
 def _connection(*, repeatable=False, creator=False):
-    """Use one host-owned backend; never touch the request connection."""
+    """Own one backend for this operation, separate from the request connection."""
+    db = None
     try:
-        db = host_api.open_db_connection(
-            isolation="repeatable_read" if repeatable else "read_committed",
-            connect_timeout=5, statement_timeout_ms=20_000,
-            lock_timeout_ms=5_000)
+        db = psycopg2.connect(config.DATABASE_URL, connect_timeout=5)
+        db.set_session(isolation_level="REPEATABLE READ" if repeatable else "READ COMMITTED")
+        with db.cursor() as cur:
+            cur.execute("SELECT set_config('statement_timeout', %s, false)",
+                        (str(STATEMENT_TIMEOUT_MS),))
+            cur.execute("SELECT set_config('lock_timeout', %s, false)",
+                        (str(LOCK_TIMEOUT_MS),))
+        db.commit()
         try:
             if creator:
                 with db.cursor() as cur:
@@ -158,10 +150,18 @@ def _connection(*, repeatable=False, creator=False):
             raise
         finally:
             db.close()
+            db = None
     except BootstrapError:
         raise
-    except (psycopg2.Error, AttributeError, TypeError, OSError, ValueError) as exc:
-        raise BootstrapError("bootstrap_unavailable", 503) from exc
+    except (psycopg2.Error, AttributeError, TypeError, OSError, ValueError):
+        raise BootstrapError("bootstrap_unavailable", 503) from None
+    finally:
+        if db is not None:
+            try:
+                db.rollback()
+            except psycopg2.Error:
+                pass
+            db.close()
 
 
 def _state(cur, source):
@@ -178,10 +178,10 @@ def _state(cur, source):
     return row
 
 
-def _session(cur, body, principal, *, lock=False):
+def _session(cur, body, *, lock=False):
     token_hash = hashlib.sha256(body["session_token"].encode()).hexdigest()
     cur.execute(
-        f"""SELECT session_id, token_hash, signing_secret, principal,
+        f"""SELECT session_id, token_hash, signing_secret, source_scope,
                    catalog_instance_id, core_server_id, catalog_epoch,
                    profile_epoch, page_size, snapshot_seq, head_seq,
                    snapshot_count, expires_at, schema_version
@@ -189,7 +189,8 @@ def _session(cur, body, principal, *, lock=False):
              WHERE token_hash=%s""" + (" FOR UPDATE" if lock else ""),
         (token_hash,))
     row = cur.fetchone()
-    if row is None or row[3] != principal or row[4] != body["catalog_instance_id"]:
+    if (row is None or row[3] != body["catalog_instance_id"]
+            or row[4] != body["catalog_instance_id"]):
         gone()
     cur.execute("SELECT now()")
     if row[12] <= cur.fetchone()[0] or row[13] != 1:
@@ -216,7 +217,7 @@ def _metadata(session):
             "total_profiles": session[11], "expires_at": _iso(session[12])}
 
 
-def create_session(body, principal):
+def create_session(body):
     size = _require_request(body, creating=True)
     token = secrets.token_hex(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
@@ -226,22 +227,23 @@ def create_session(body, principal):
         with db.cursor() as cur:
             # Session advisory lock was acquired before the RR snapshot.
             cur.execute(f"DELETE FROM {_table('profile_bootstrap_sessions')} WHERE expires_at<=now()")
-            cur.execute(f"SELECT principal, count(*) FROM {_table('profile_bootstrap_sessions')} "
-                        "GROUP BY principal")
+            cur.execute(f"SELECT source_scope, count(*) FROM {_table('profile_bootstrap_sessions')} "
+                        "GROUP BY source_scope")
             counts = dict(cur.fetchall())
-            if sum(counts.values()) >= MAX_SESSIONS_GLOBAL or counts.get(principal, 0) >= MAX_SESSIONS_PRINCIPAL:
+            if (sum(counts.values()) >= MAX_SESSIONS_GLOBAL
+                    or counts.get(body["catalog_instance_id"], 0) >= MAX_SESSIONS_SOURCE):
                 raise BootstrapError("bootstrap_session_limit", 429)
             state = _state(cur, body["catalog_instance_id"])
             server, _, catalog_epoch, profile_epoch, snapshot_seq, _ = state
             cur.execute(
                 f"""INSERT INTO {_table('profile_bootstrap_sessions')}
-                    (session_id, token_hash, signing_secret, principal,
+                    (session_id, token_hash, signing_secret, source_scope,
                      catalog_instance_id, core_server_id, catalog_epoch,
                      profile_epoch, schema_version, page_size, snapshot_seq,
                      snapshot_count, expires_at)
                     VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,0,
                             now() + interval '60 minutes') RETURNING expires_at""",
-                (session_id, token_hash, secret, principal,
+                (session_id, token_hash, secret, body["catalog_instance_id"],
                  body["catalog_instance_id"], server, catalog_epoch,
                  profile_epoch, size, snapshot_seq))
             expires_at = cur.fetchone()[0]
@@ -275,8 +277,8 @@ def create_session(body, principal):
             cur.execute(f"UPDATE {_table('profile_bootstrap_sessions')} "
                         "SET snapshot_count=%s WHERE session_id=%s", (ordinal, session_id))
     return {"protocol_version": 2, "schema_version": 1,
+            "transfer_contract": TRANSFER_CONTRACT,
             "catalog_instance_id": body["catalog_instance_id"],
-            "principal_binding": principal,
             "session_token": token, "page_size": size,
             "snapshot_count": ordinal, "total_profiles": ordinal,
             "catalog_epoch": catalog_epoch, "profile_epoch": profile_epoch,
@@ -287,11 +289,11 @@ def create_session(body, principal):
                                              None, None, size), "snapshot", 0)}
 
 
-def snapshot_page(body, principal):
+def snapshot_page(body):
     _require_request(body)
     with _connection() as db:
         with db.cursor() as cur:
-            session, _ = _session(cur, body, principal, lock=True)
+            session, _ = _session(cur, body, lock=True)
             ordinal = _ordinal(session, "snapshot", body.get("page_token"))
             if ordinal > session[11] or (ordinal != 0 and ordinal % session[8]):
                 invalid()
@@ -302,6 +304,7 @@ def snapshot_page(body, principal):
             following = ordinal + len(profiles)
             more = following < session[11]
             return {"protocol_version": 2, "schema_version": 1,
+                    "transfer_contract": TRANSFER_CONTRACT,
                     "catalog_instance_id": session[4], "profiles": profiles,
                     **_metadata(session),
                     "cursor": opaque_cursor(session[4], session[7], session[9]),
@@ -309,11 +312,11 @@ def snapshot_page(body, principal):
                     "has_more": more}
 
 
-def catchup_page(body, principal):
+def catchup_page(body):
     _require_request(body)
     with _connection() as db:
         with db.cursor() as cur:
-            session, state = _session(cur, body, principal, lock=True)
+            session, state = _session(cur, body, lock=True)
             ordinal = _ordinal(session, "catchup", body.get("page_token"))
             if session[10] is None:
                 if ordinal:
@@ -370,6 +373,7 @@ def catchup_page(body, principal):
             more = following < count
             next_seq = changes[-1]["seq"] if changes else (head if not more else session[9])
             return {"protocol_version": 2, "schema_version": 1,
+                    "transfer_contract": TRANSFER_CONTRACT,
                     "catalog_instance_id": session[4], "changes": changes,
                     **_metadata(session),
                     "cursor": opaque_cursor(session[4], session[7], next_seq),
@@ -378,17 +382,16 @@ def catchup_page(body, principal):
                     "has_more": more}
 
 
-def release_session(body, principal):
+def release_session(body):
     _require_request(body)
     with _connection() as db:
         with db.cursor() as cur:
             token_hash = hashlib.sha256(body["session_token"].encode()).hexdigest()
-            cur.execute(f"SELECT principal, catalog_instance_id FROM {_table('profile_bootstrap_sessions')} "
+            cur.execute(f"SELECT 1 FROM {_table('profile_bootstrap_sessions')} "
                         "WHERE token_hash=%s", (token_hash,))
-            row = cur.fetchone()
-            if row is not None:
-                if row != (principal, body["catalog_instance_id"]):
-                    gone()
+            if cur.fetchone() is not None:
+                _session(cur, body, lock=True)
                 cur.execute(f"DELETE FROM {_table('profile_bootstrap_sessions')} WHERE token_hash=%s",
                             (token_hash,))
-    return {"protocol_version": 2, "schema_version": 1, "released": True}
+    return {"protocol_version": 2, "schema_version": 1,
+            "transfer_contract": TRANSFER_CONTRACT, "released": True}

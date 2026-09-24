@@ -241,8 +241,8 @@ def migrate_enrichment(db):
             session_id UUID PRIMARY KEY,
             token_hash TEXT NOT NULL UNIQUE,
             signing_secret TEXT NOT NULL,
-            principal TEXT NOT NULL,
-            principal_contract_version INTEGER NOT NULL DEFAULT 2,
+            source_scope TEXT NOT NULL,
+            transfer_contract_version INTEGER NOT NULL DEFAULT 3,
             catalog_instance_id TEXT NOT NULL,
             core_server_id TEXT NOT NULL,
             catalog_epoch TEXT NOT NULL,
@@ -258,19 +258,37 @@ def migrate_enrichment(db):
         """,
         f"""
         ALTER TABLE {t('profile_bootstrap_sessions')}
-        ADD COLUMN IF NOT EXISTS principal_contract_version INTEGER NOT NULL DEFAULT 1
-        """,
-        f"""
-        DELETE FROM {t('profile_bootstrap_sessions')}
-        WHERE principal_contract_version <> 2 OR principal LIKE 'user:%'
+        ADD COLUMN IF NOT EXISTS source_scope TEXT
         """,
         f"""
         ALTER TABLE {t('profile_bootstrap_sessions')}
-        ALTER COLUMN principal_contract_version SET DEFAULT 2
+        ADD COLUMN IF NOT EXISTS transfer_contract_version INTEGER NOT NULL DEFAULT 0
         """,
         f"""
-        CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_principal_idx')}
-        ON {t('profile_bootstrap_sessions')} (principal, expires_at)
+        DELETE FROM {t('profile_bootstrap_sessions')}
+        WHERE transfer_contract_version <> 3 OR source_scope IS NULL
+        """,
+        f"""
+        DO $$ BEGIN
+            IF EXISTS (
+                SELECT 1 FROM information_schema.columns
+                 WHERE table_schema=current_schema()
+                   AND table_name='{t('profile_bootstrap_sessions')}'
+                   AND column_name='principal'
+            ) THEN
+                ALTER TABLE {t('profile_bootstrap_sessions')}
+                    ALTER COLUMN principal DROP NOT NULL;
+            END IF;
+        END $$
+        """,
+        f"""
+        ALTER TABLE {t('profile_bootstrap_sessions')}
+        ALTER COLUMN source_scope SET NOT NULL,
+        ALTER COLUMN transfer_contract_version SET DEFAULT 3
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_source_idx')}
+        ON {t('profile_bootstrap_sessions')} (source_scope, expires_at)
         """,
         f"""
         CREATE TABLE IF NOT EXISTS {t('profile_bootstrap_snapshot')} (

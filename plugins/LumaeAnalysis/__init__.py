@@ -1837,10 +1837,9 @@ def health():
                 "profile_bootstrap": {
                     "protocol_version": 2,
                     "schema_version": 1,
-                    "auth": "account_session",
-                    "principal_binding": "subject_generation",
-                    "available": callable(getattr(host_api, "get_principal", None))
-                    and callable(getattr(host_api, "open_db_connection", None)),
+                    "auth": "host_authenticated",
+                    "transfer_contract": profile_bootstrap.TRANSFER_CONTRACT,
+                    "available": bool(getattr(host_api.config, "DATABASE_URL", None)),
                 },
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
@@ -2599,23 +2598,14 @@ def profile_changes_api():
 
 
 def _profile_bootstrap_v2(operation):
-    resolver = getattr(host_api, "get_principal", None)
-    opener = getattr(host_api, "open_db_connection", None)
-    if not callable(resolver) or not callable(opener):
-        return _catalog_error("bootstrap_unavailable", "host_api_unavailable", 503)
-    try:
-        principal = resolver()
-        binding = profile_bootstrap.principal_binding(principal)
-    except profile_bootstrap.BootstrapError:
-        return _catalog_error("authentication_required", "Authentication required.", 401)
-    except Exception:
+    if not getattr(host_api.config, "DATABASE_URL", None):
         return _catalog_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
     try:
         body = _json_body(max_bytes=16_384)
     except ValueError:
         return _catalog_error("invalid_profile_bootstrap", "Invalid bootstrap request.", 400)
     try:
-        result = operation(body, binding)
+        result = operation(body)
         return _private_json(result)
     except profile_bootstrap.BootstrapError as exc:
         return _catalog_error(exc.code, exc.code, exc.status)

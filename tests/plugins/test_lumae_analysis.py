@@ -211,10 +211,9 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
             "profile_bootstrap": {
                 "protocol_version": 2,
                 "schema_version": 1,
-                "auth": "account_session",
-                "principal_binding": "subject_generation",
-                "available": callable(getattr(mod.host_api, "get_principal", None))
-                and callable(getattr(mod.host_api, "open_db_connection", None)),
+                "auth": "host_authenticated",
+                "transfer_contract": "source_scoped_v1",
+                "available": bool(getattr(mod.host_api.config, "DATABASE_URL", None)),
             },
             "personal_discovery": {"schema_version": 1, "enabled": False, "scope": "shared", "features": ["album_memory_context", "enjoyment_feedback"]},
             "music_metadata": {"schema_version": 1, "enabled": True, "provider": "musicbrainz", "daily_request_limit": 80, "recording_membership": True},
@@ -238,16 +237,15 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     }
 
 
-def test_profile_bootstrap_capability_requires_both_host_apis(monkeypatch):
+def test_profile_bootstrap_capability_requires_public_database_url(monkeypatch):
     mod = load_plugin()
     client = plugin_client(mod)
-    monkeypatch.setattr(mod.host_api, "get_principal", lambda: None, raising=False)
-    monkeypatch.setattr(mod.host_api, "open_db_connection", lambda **kwargs: None, raising=False)
+    monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", "postgresql://test", raising=False)
     capability = client.get("/api/health").get_json()["capabilities"]["profile_bootstrap"]
     assert capability == {"protocol_version": 2, "schema_version": 1,
-                          "auth": "account_session",
-                          "principal_binding": "subject_generation", "available": True}
-    monkeypatch.setattr(mod.host_api, "open_db_connection", None)
+                          "auth": "host_authenticated",
+                          "transfer_contract": "source_scoped_v1", "available": True}
+    monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", None)
     capability = client.get("/api/health").get_json()["capabilities"]["profile_bootstrap"]
     assert capability["available"] is False
 
