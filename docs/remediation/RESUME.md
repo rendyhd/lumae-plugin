@@ -1,3 +1,5 @@
+> **Historical record.** Current work status lives in [docs/STATUS.md](../STATUS.md); the active plan is [docs/plan/LUMAE_FINAL_PLAN_2026-09-24.md](../plan/LUMAE_FINAL_PLAN_2026-09-24.md).
+
 # Lumae remediation — resume checkpoint (2026-09-24)
 
 The authoritative overview is [LUMAE_REMEDIATION_LEDGER.md](LUMAE_REMEDIATION_LEDGER.md). Preserve Phase 0, accepted decisions, task IDs, historical evidence, and prior review attribution. The user’s V2 brief replaced model routing and startup instructions only.
