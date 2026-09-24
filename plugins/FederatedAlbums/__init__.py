@@ -12,15 +12,19 @@ import ipaddress
 import json
 import secrets
 import socket
+import threading
 import unicodedata
 import uuid
 import time
-from collections import defaultdict
+from collections import OrderedDict, defaultdict
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from datetime import datetime, timezone
 from urllib.parse import quote, urlparse
 
 import numpy as np
 import requests
+from urllib3 import exceptions as urllib3_exceptions
 from flask import abort, Blueprint, Response, g, jsonify, request, stream_with_context
 from psycopg2.extras import DictCursor, Json
 
@@ -52,6 +56,16 @@ CATALOG_PAGE_SIZE = 250
 MAX_REMOTE_ALBUMS = 100_000
 MAX_REMOTE_RESPONSE_BYTES = 6 * 1024 * 1024
 MAX_ARTWORK_BYTES = 15 * 1024 * 1024
+# Friend servers are untrusted and remote: bound every request-thread call so a
+# slow or dead friend cannot pin the host's web threads (P2-7).
+FRIEND_TIMEOUT = (3, 5)  # (connect, read) seconds
+FRIEND_TOTAL_DEADLINE_SECONDS = 5.0
+MAX_FRIEND_ARTWORK_BYTES = 10 * 1024 * 1024
+FRIEND_NEGATIVE_TTL_SECONDS = 60
+FRIEND_NEGATIVE_CACHE_MAX = 256
+FRIEND_RESOLVE_TIMEOUT_SECONDS = 3.0
+# Friend upstream statuses that mean "the server is down", not "this album".
+FRIEND_UNAVAILABLE_STATUSES = (503, 504)
 TOKEN_PREFIX = "afa_"
 HOST_CAPABILITIES = {"scoped_bearer_auth": False}
 
@@ -626,6 +640,149 @@ def local_artwork(requested_album_key):
         return jsonify({"error": "Artwork could not be loaded"}), 502
 
 
+_FRIEND_FAILURES = OrderedDict()
+_FRIEND_FAILURES_LOCK = threading.Lock()
+# getaddrinfo has no timeout; resolve friend hosts off the request thread.
+_FRIEND_RESOLVER = ThreadPoolExecutor(max_workers=4, thread_name_prefix="friend-dns")
+
+
+def _now():
+    return time.monotonic()
+
+
+def _friend_backoff_remaining(base_url):
+    """Seconds left before a recently failing friend may be contacted again."""
+    with _FRIEND_FAILURES_LOCK:
+        until = _FRIEND_FAILURES.get(base_url)
+        if until is None:
+            return 0
+        remaining = until - _now()
+        if remaining <= 0:
+            _FRIEND_FAILURES.pop(base_url, None)
+            return 0
+        return remaining
+
+
+def _friend_mark_failed(base_url):
+    with _FRIEND_FAILURES_LOCK:
+        _FRIEND_FAILURES.pop(base_url, None)
+        _FRIEND_FAILURES[base_url] = _now() + FRIEND_NEGATIVE_TTL_SECONDS
+        while len(_FRIEND_FAILURES) > FRIEND_NEGATIVE_CACHE_MAX:
+            _FRIEND_FAILURES.popitem(last=False)
+
+
+def _friend_mark_ok(base_url):
+    with _FRIEND_FAILURES_LOCK:
+        _FRIEND_FAILURES.pop(base_url, None)
+
+
+def _validate_friend_url(value):
+    """``_validate_base_url`` with DNS resolution bounded in time."""
+    future = _FRIEND_RESOLVER.submit(_validate_base_url, value)
+    try:
+        return future.result(timeout=FRIEND_RESOLVE_TIMEOUT_SECONDS)
+    except FutureTimeout as exc:
+        future.cancel()
+        raise requests.exceptions.ConnectTimeout(
+            "Friend hostname resolution timed out"
+        ) from exc
+
+
+def _friend_timeout(deadline):
+    """(connect, read) timeouts capped by the time left before ``deadline``."""
+    remaining = max(0.05, deadline - _now())
+    return (min(FRIEND_TIMEOUT[0], remaining), min(FRIEND_TIMEOUT[1], remaining))
+
+
+class _FriendArtworkTooLarge(Exception):
+    pass
+
+
+def _friend_socket(upstream):
+    """Best-effort handle on the response socket, to cap each blocking read.
+
+    http.client detaches ``connection.sock`` once a response will close, so
+    fall back to the socket behind the response's buffered reader.
+    """
+    raw = getattr(upstream, "raw", None)
+    sock = getattr(getattr(raw, "connection", None), "sock", None)
+    if sock is None:
+        reader = getattr(getattr(raw, "_fp", None), "fp", None)
+        sock = getattr(getattr(reader, "raw", None), "_sock", None)
+    return sock if hasattr(sock, "settimeout") else None
+
+
+def _abort_friend_response(upstream):
+    """Wake a read blocked on a friend socket (close alone may not)."""
+    sock = _friend_socket(upstream)
+    if sock is not None:
+        try:
+            sock.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+    try:
+        upstream.close()
+    except Exception:
+        pass
+
+
+def _iter_friend_body(upstream, deadline):
+    """Yield body bytes as they arrive, never waiting past ``deadline``.
+
+    ``iter_content`` blocks until a whole chunk is buffered, which lets a
+    friend that sends a few bytes per read-timeout window hold a thread for
+    minutes. urllib3 2's ``read1`` returns after at most one socket read, and
+    each read's socket timeout is capped at the time left before the deadline.
+    """
+    read1 = getattr(getattr(upstream, "raw", None), "read1", None)
+    if read1 is None:
+        # urllib3 < 2 has no read1 and iter_content blocks per chunk: a
+        # watchdog tears the connection down when the deadline passes.
+        watchdog = threading.Timer(
+            max(0.05, deadline - _now()), _abort_friend_response, (upstream,)
+        )
+        watchdog.daemon = True
+        watchdog.start()
+        try:
+            yield from upstream.iter_content(64 * 1024)
+        finally:
+            watchdog.cancel()
+        return
+    sock = _friend_socket(upstream)
+    while True:
+        remaining = deadline - _now()
+        if remaining <= 0:
+            raise requests.exceptions.ReadTimeout("Friend artwork deadline exceeded")
+        if sock is not None:
+            try:
+                sock.settimeout(max(0.05, min(FRIEND_TIMEOUT[1], remaining)))
+            except OSError:
+                sock = None  # urllib3 closes the socket once the body is complete
+        try:
+            chunk = read1(64 * 1024, decode_content=True)
+        except urllib3_exceptions.ReadTimeoutError as exc:
+            raise requests.exceptions.ReadTimeout(exc) from exc
+        except urllib3_exceptions.ProtocolError as exc:
+            raise requests.exceptions.ChunkedEncodingError(exc) from exc
+        except (socket.timeout, TimeoutError) as exc:
+            raise requests.exceptions.ReadTimeout(exc) from exc
+        if not chunk:
+            return
+        yield chunk
+
+
+def _read_friend_artwork(upstream, deadline):
+    """Buffer a friend image within the size cap and the total deadline."""
+    body = bytearray()
+    for chunk in _iter_friend_body(upstream, deadline):
+        body += chunk
+        if len(body) > MAX_FRIEND_ARTWORK_BYTES:
+            raise _FriendArtworkTooLarge()
+        if _now() >= deadline:
+            raise requests.exceptions.ReadTimeout("Friend artwork deadline exceeded")
+    return bytes(body)
+
+
 @bp.get("/api/friend-artwork/<remote_instance>/<path:requested_album_key>")
 def friend_artwork(remote_instance, requested_album_key):
     names = _tables()
@@ -644,8 +801,22 @@ def friend_artwork(remote_instance, requested_album_key):
         row = cur.fetchone()
     if not row:
         return jsonify({"error": "Friend album not found"}), 404
+    backoff_key = str(row["base_url"] or "").strip().rstrip("/")
+    remaining = _friend_backoff_remaining(backoff_key)
+    if remaining > 0:
+        response = jsonify({"error": "Friend server is temporarily unavailable"})
+        response.headers["Retry-After"] = str(max(1, int(remaining + 0.999)))
+        return response, 503
+    upstream = None
     try:
-        base_url = _validate_base_url(row["base_url"])
+        deadline = _now() + FRIEND_TOTAL_DEADLINE_SECONDS
+        try:
+            base_url = _validate_friend_url(row["base_url"])
+        except ValueError:
+            # Unresolvable or disallowed: fails the same way until reconfigured.
+            _friend_mark_failed(backoff_key)
+            logger.warning("Friend Album Discovery friend URL could not be used")
+            return jsonify({"error": "Friend artwork could not be loaded"}), 502
         encoded_key = quote(requested_album_key, safe="")
         upstream = requests.get(
             f"{base_url}/plugins/federated_albums/api/artwork/{encoded_key}",
@@ -658,14 +829,47 @@ def friend_artwork(remote_instance, requested_album_key):
                 "Authorization": f"Bearer {row['access_token']}",
                 "Accept": "image/*",
             },
-            timeout=(5, 25),
+            timeout=_friend_timeout(deadline),
             allow_redirects=False,
             stream=True,
         )
-        return _image_response(upstream)
+        content_type = str(upstream.headers.get("Content-Type") or "")
+        content_length = _int_or_none(upstream.headers.get("Content-Length"))
+        if upstream.status_code in FRIEND_UNAVAILABLE_STATUSES:
+            _friend_mark_failed(backoff_key)
+            return jsonify({"error": "Artwork could not be loaded"}), 502
+        if upstream.status_code != 200 or not content_type.lower().startswith(
+            "image/"
+        ):
+            status = upstream.status_code if 400 <= upstream.status_code < 500 else 502
+            return jsonify({"error": "Artwork could not be loaded"}), status
+        if content_length is not None and content_length > MAX_FRIEND_ARTWORK_BYTES:
+            return jsonify({"error": "Artwork exceeds the proxy limit"}), 413
+        body = _read_friend_artwork(upstream, deadline)
+    except _FriendArtworkTooLarge:
+        return jsonify({"error": "Artwork exceeds the proxy limit"}), 502
+    except requests.exceptions.Timeout:
+        _friend_mark_failed(backoff_key)
+        logger.warning("Friend Album Discovery friend artwork timed out")
+        return jsonify({"error": "Friend artwork timed out"}), 504
+    except (
+        requests.exceptions.ConnectionError,
+        requests.exceptions.ChunkedEncodingError,
+    ):
+        _friend_mark_failed(backoff_key)
+        logger.warning("Friend Album Discovery friend server is unreachable")
+        return jsonify({"error": "Friend artwork could not be loaded"}), 502
     except Exception:
         logger.exception("Friend Album Discovery friend artwork proxy failed")
         return jsonify({"error": "Friend artwork could not be loaded"}), 502
+    finally:
+        if upstream is not None:
+            upstream.close()
+    _friend_mark_ok(backoff_key)
+    response = Response(body, content_type=content_type)
+    response.headers["Cache-Control"] = "private, max-age=3600"
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    return response
 
 
 def _json_fingerprint(value):
