@@ -1,0 +1,11 @@
+exec(open("explain_workbench.py").read().split("r = summarize(\"albums p1 title\"")[0])
+with conn.cursor() as c:
+    c.execute("SELECT name, album_artist_display FROM wb.catalog_albums WHERE album_id='al-ed-7'")
+    name, artist = c.fetchone()
+    c.execute("SELECT album_id, name, album_artist_display FROM wb.catalog_albums WHERE name=%s", (name,))
+    print("catalog albums with that name:", c.fetchall())
+r = summarize("album_detail merged", lambda: lib.album_detail(name, artist))
+print("   album_detail tracks:", len(r["tracks"]), "album_ids:", sorted({t["album_id"] for t in r["tracks"]}), "chosen provider_album_id:", r["album"]["provider_album_id"])
+r = lib.browse_library("albums", name.split()[1][:8], None, "title", 1, 36)
+print("   browse rows for that title:", [(i["title"][:14], i["artist"], i["track_count"], i["provider_album_id"], i["cover_item_id"]) for i in r["sections"]["albums"]["items"]])
+s = lib.library_stats(); print("   stats:", s, "(catalog has 8000 album rows)")
