@@ -246,7 +246,7 @@ def test_duplicate_concurrent_capture_and_interruption(edge_publication_db, monk
     assert [event["seq"] for event in results[0]["changes"]] == [1]
     before = profile_bootstrap.create_session(body())
     publish(db, "track-d")
-    monkeypatch.setattr(profile_bootstrap, "MAX_CATCHUP_EVENTS", 0)
+    monkeypatch.setattr(profile_bootstrap, "CATCHUP_RETENTION_MULTIPLIER", 0)
     with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.catchup_page(body(session_token=before["session_token"]))
     assert exc.value.status == 413
@@ -255,7 +255,8 @@ def test_duplicate_concurrent_capture_and_interruption(edge_publication_db, monk
             hashlib.sha256(before["session_token"].encode()).hexdigest(),))
         assert cur.fetchone()[0] is None
     db.rollback()
-    monkeypatch.setattr(profile_bootstrap, "MAX_CATCHUP_EVENTS", 50_000)
+    monkeypatch.setattr(profile_bootstrap, "CATCHUP_RETENTION_MULTIPLIER",
+                        profile_bootstrap.MAX_HELD_RETENTION_MULTIPLIER)
     assert [event["seq"] for event in profile_bootstrap.catchup_page(
         body(session_token=before["session_token"]))["changes"]] == [3]
 
