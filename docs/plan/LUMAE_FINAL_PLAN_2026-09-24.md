@@ -456,7 +456,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   1. **Feed (K8):**
      - add `epoch`, `head_seq`, `has_more` and `next_cursor` (already present) to the response;
      - a 410 `collections_resync_required` when the request's `epoch` mismatches or the cursor is beyond head;
-     - `GET /collections/snapshot` returns collections, items and `{epoch, head_seq}` in one REPEATABLE READ transaction on an owned connection (reuse the `profile_bootstrap._connection` pattern);
+     - `GET /plugins/lumae_analysis/api/collections/snapshot` returns collections, items and `{epoch, head_seq}` in one REPEATABLE READ transaction on an owned connection (reuse the `profile_bootstrap._connection` pattern);
      - publish `floor_seq`, the head at cutover.
   2. **Restore and batch:**
      - allocate a block with `UPDATE feed_state SET head_seq=head_seq+n RETURNING` after staging, then insert the events in one multi-row insert;
@@ -712,7 +712,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
 | `Retry-After` on 429/503 | Honour it. |
 | `profile_stream.edge_refs` | Send `edge_refs=1` (query) or `edge_refs:true` (v2 body). Upserts may carry `edge_profile_ref:{media_revision, profile_digest}` instead of `edge_profile`. |
 | `edge_profiles.compact_transport` | Optionally send `edge_compact=1`. `boundaries` is omitted; rebuild it before verifying. |
-| `collections.feed_epoch` | Echo `epoch`; handle 410 `collections_resync_required` through `GET /collections/snapshot`; use `has_more`/`next_cursor`. |
+| `collections.feed_epoch` | Echo `epoch`; handle 410 `collections_resync_required` through `GET /plugins/lumae_analysis/api/collections/snapshot`; use `has_more`/`next_cursor`. |
 | `collections.contract: 2` | Send `X-Lumae-Collections-Contract: 2`; handle 409 `membership_conflict {existing_item_id}` and `idempotency_key_conflict` with `current`. |
 | `collections.source_scoped_items` | Items carry `catalog_instance_id`. |
 | `lumae_analysis_profiles.analyzer_versions` includes 2 | Profiles may have `analyzer_ver:2` (BS.1770-4 `ref_lufs`). |
@@ -863,7 +863,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
      - scope the feed cursor per (AudioMuse source, account), a v39 DDL or `sync_metadata` keys;
      - echo `epoch`;
      - page by `has_more`/`next_cursor`, not "fewer than 200 rows";
-     - on 410, fetch `GET /collections/snapshot` and merge with the outbox, preserving unsent mutations, memberships, order and undo;
+     - on 410, fetch `GET /plugins/lumae_analysis/api/collections/snapshot` and merge with the outbox, preserving unsent mutations, memberships, order and undo;
      - a failed feed shows a recoverable state, not a sticky string.
   5. **Before the plugin's LUM-014 ships:** align the album unique index with the server. Make it partial where `provider_album_id IS NULL` for `album_key`, so same-name editions with distinct provider ids can coexist. In v39, include `catalog_instance_id` when K10 is advertised.
   6. Send `X-Lumae-Collections-Contract: 2` when `collections.contract==2`.
