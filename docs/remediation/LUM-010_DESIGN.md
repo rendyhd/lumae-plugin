@@ -1,5 +1,13 @@
 # LUM-010 server resumable profile bootstrap
 
+> **2026-09-24 re-adjudication:** This document records the earlier
+> account-principal/host-owned-connection design. The current source-scoped
+> implementation and stock-host evidence are in
+> [no-host qualification](evidence/lum010_no_host_qualification/QUALIFICATION.md).
+> The historical host API, account UUID and authorization-generation
+> requirements below are superseded for LUM-010. No AudioMuse core change is
+> required by the tested source-scoped protocol.
+
 ## Scope and contract
 
 The existing `GET /api/profiles`, `/api/profiles/bootstrap`, and

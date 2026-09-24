@@ -1,5 +1,10 @@
 # LUM-010 client capability negotiation correction
 
+> **2026-09-24 re-adjudication:** This is the historical account-bound
+> capability. The final capability names `source_scoped_v1` and
+> `host_authenticated`; Auralscape v2 works with stock bearer or account auth.
+> See [no-host qualification](evidence/lum010_no_host_qualification/QUALIFICATION.md).
+
 The reviewed v2 server/host SHAs remain immutable. Read-only inspection found a concrete gap: the plugin had account-only v2 POST routes, while `/api/health` provided no v2 capability. An Auralscape client could not safely distinguish an old plugin, a new plugin on an old host, and a qualified account-session host before starting replacement staging.
 
 This isolated follow-up adds `capabilities.profile_bootstrap` to health. It declares protocol 2, schema 1, `account_session` and `principal_binding: subject_generation`; `available` is true only if the public host principal resolver and owned database connection API are callable. After independent client review proved a cookie race, v2 create also echoes the canonical server-validated account subject and authorization generation binding. The host AJAX `/auth` endpoint exposes the matching binding with its issued cookie. Auralscape compares them before any v2 staging and persists the binding for resume. Neither endpoint accepts caller-supplied principal identity. Missing/invalid account principals still return 401, and owned-connection failures return 503. Existing clients ignore the additive fields.

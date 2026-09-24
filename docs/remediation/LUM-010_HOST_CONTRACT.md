@@ -1,5 +1,13 @@
 # LUM-010 host contract qualification
 
+> **2026-09-24 re-adjudication:** The HOLD and proposed host changes below
+> describe the former assumption that v2 transported personal account state.
+> Source and stock-host execution established a shared source/library payload
+> and a plugin-owned connection through public `plugin.api.config.DATABASE_URL`.
+> See [no-host qualification](evidence/lum010_no_host_qualification/QUALIFICATION.md)
+> for the current contract. The prior proposal remains audit history and is
+> not an AudioMuse PR requirement for LUM-010.
+
 ## Status and evidence boundary
 
 **HOLD current-host qualification.** This is a read-only source assessment of
