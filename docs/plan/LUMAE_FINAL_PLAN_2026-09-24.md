@@ -251,6 +251,8 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - the floor hold keeps an open session's `snapshot_seq` readable;
   - the statement plan uses the primary-key index (assert via `EXPLAIN` in the test).
 - Performance: publication critical section ≤5 ms at 50k retained events (P0-3).
+- **Decision (2026-09-24, orchestrator):** measured after P1-1 + P1-2, the critical section is 8.2 ms at p95 (it was 20.9 ms). About 1.9 ms of that is the edge that P1-1 now keeps and embeds (≈16 KB per event), and about 3.5 ms is 17 statement round-trips. Phase 1 accepts this. The ≤5 ms budget is re-checked after P3-2 (K6 edge references). If it still misses then, collapse the stream-state and compaction statements into CTEs (≈1 ms) and merge the two `source_profiles` updates (≈0.4 ms). No-op re-analysis, the common case, no longer publishes at all.
+- The `pub_bench.py` `compaction_delete_ms` figure still times the old OR delete. Update it together with the P3-2 re-check.
 
 **P1-3 — Fail-closed fences against old workers; version 1.3.0 (AUD-05).**
 - Files:
