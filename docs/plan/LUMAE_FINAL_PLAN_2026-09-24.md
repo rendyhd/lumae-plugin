@@ -61,11 +61,12 @@ This plan replaces Sections 12–14 of the old overview. It covers **every** aud
 4. **Review loop.** A reviewer agent runs. Fix CHANGES_REQUIRED and re-review until PASS. At most 3 rounds, then escalate to the user.
 5. **Performance WPs** must add before/after numbers from `scripts/perf/` (P0-3), plus an equivalence test showing identical outputs.
 6. **Contract WPs** update `docs/contracts/LUMAE_SYNC_CONTRACT.md` (P0-4) in the same PR and keep old clients working.
-7. **PR.**
-   - Open a PR to `main`. Commit messages are `fix|perf|feat(<area>): <WP-ID> — <title>`, ending with the session attribution lines.
-   - The orchestrator merges only after CI is green and the review is PASS. Squash-merge. `main` is pinned (P0-1), so merges never publish.
+7. **Integration: one PR per phase** (changed 2026-09-24 at the user's request, to cut PR noise for repo watchers).
+   - Implementers push an internal `wp/<ID>-<slug>` branch. No PR is opened for it.
+   - After review PASS, the orchestrator merges the WP into the phase branch (`phase/<n>-<slug>`) with `git merge --no-ff`, so each WP stays one identifiable unit. Commit messages are `fix|perf|feat(<area>): <WP-ID> — <title>`, ending with the session attribution lines.
+   - Each phase has **one** PR to `main`. It is opened as a draft when the phase's first WP lands, CI runs on every push, and it is marked ready and merged (merge commit, not squash) only when the phase exit gate passes. `main` is pinned (P0-1), so merges never publish.
    - Never use `[skip ci]` on code, and never force-push `main`.
-8. **Status.** Update the task, and add one line to `docs/STATUS.md` (WP, PR, merge SHA, tests). No separate bookkeeping commits.
+8. **Status.** Update the task, and add one line to `docs/STATUS.md` (WP, phase PR, WP merge SHA, tests). No separate bookkeeping commits.
 
 ### 1.3 File-conflict groups (serialize within a group)
 
