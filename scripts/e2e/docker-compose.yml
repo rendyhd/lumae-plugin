@@ -1,0 +1,126 @@
+# P2-6 end-to-end gate: the stock AudioMuse-AI host with the Lumae plugin mounted.
+#
+# The host image is pinned by digest. It is the image published for
+# NeptuneHub/AudioMuse-AI PR #927 (tag pr-927), whose tree is identical to the
+# merge commit 8aa1639c (v3.6.3); the 112 Python modules and supervisord.conf
+# in the image match that commit byte for byte. The Flask service runs the
+# image's own supervisord [program:flask]:
+#   gunicorn --workers 1 --threads 4 --worker-class gthread --keep-alive 5 --timeout 300 app:app
+#
+# There is no Redis service: AudioMuse at this commit queues tasks in
+# PostgreSQL (taskqueue/), and neither the host nor the plugin uses Redis.
+#
+# PostgreSQL 15 (postgres:15-alpine, like the stock compose) by default;
+# `-f docker-compose.pg17.yml` switches to PostgreSQL 17 (what CI uses);
+# `-f docker-compose.external-db.yml` points the host at an existing database.
+#
+#   docker compose up -d postgres
+#   docker compose run --rm lumae-install init           # host schema
+#   python3 seed_representative.py --host-schema audiomuse \
+#       --dsn postgresql://audiomuse:audiomusepassword@127.0.0.1:55433/audiomusedb \
+#       --navidrome-url http://navidrome-stub:4533
+#   docker compose run --rm lumae-install register       # plugin row + install hooks
+#   docker compose up -d audiomuse-ai-flask
+#   python3 run_server_matrix.py --host docker --compose docker-compose.yml \
+#       --dsn postgresql://audiomuse:audiomusepassword@127.0.0.1:55433/audiomusedb
+#
+# AUTH_ENABLED defaults to false (every transfer is anonymous, contract §1.2);
+# set AUTH_ENABLED=true and pass the host's API token to the runner
+# (--auth-token) to run the gate authenticated.
+name: lumae-e2e
+
+x-audiomuse-image: &audiomuse-image ghcr.io/neptunehub/audiomuse-ai@sha256:b91af8d05cb37f6fbc89a3c6e6f31d805f851fd650faf414f0cec7d03e9f05e8
+
+x-host-environment: &host-environment
+  TZ: "UTC"
+  POSTGRES_USER: ${POSTGRES_USER:-audiomuse}
+  POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-audiomusepassword}
+  POSTGRES_DB: ${POSTGRES_DB:-audiomusedb}
+  POSTGRES_HOST: "postgres"
+  POSTGRES_PORT: "5432"
+  TEMP_DIR: "/app/temp_audio"
+  AUTH_ENABLED: ${AUTH_ENABLED:-false}
+  # The plugin declares no pip requirements; never install at boot.
+  PLUGIN_ALLOW_PIP: "false"
+
+x-plugin-mounts: &plugin-mounts
+  - ../../plugins/LumaeAnalysis:/app/plugin/installed/lumae_analysis:ro
+  - ./host:/e2e:ro
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      TZ: "UTC"
+      POSTGRES_USER: ${POSTGRES_USER:-audiomuse}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-audiomusepassword}
+      POSTGRES_DB: ${POSTGRES_DB:-audiomusedb}
+    ports:
+      - "${E2E_POSTGRES_PORT:-55433}:5432"   # the seeder and the runner connect here
+    volumes:
+      - pgdata15:/var/lib/postgresql/data
+    shm_size: 256m
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 5s
+      retries: 60
+
+  # One-shot helper: `docker compose run --rm lumae-install init|register`.
+  lumae-install:
+    image: *audiomuse-image
+    profiles: ["tools"]
+    entrypoint: ["python3", "/e2e/install_plugin.py"]
+    command: ["register"]
+    environment: *host-environment
+    volumes: *plugin-mounts
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # Answers the provider ping of /api/catalog/health like a healthy LAN
+  # Navidrome (the seeded catalogue has no real server behind it).
+  navidrome-stub:
+    image: *audiomuse-image
+    entrypoint: ["python3", "/e2e/navidrome_stub.py", "--port", "4533"]
+    volumes:
+      - ./host:/e2e:ro
+
+  audiomuse-ai-flask:
+    image: *audiomuse-image
+    environment:
+      <<: *host-environment
+      SERVICE_TYPE: "flask"
+    ports:
+      - "${FRONTEND_PORT:-8000}:8000"
+    volumes:
+      - ../../plugins/LumaeAnalysis:/app/plugin/installed/lumae_analysis:ro
+      - ./host:/e2e:ro
+      - temp-audio-flask:/app/temp_audio
+    depends_on:
+      postgres:
+        condition: service_healthy
+      navidrome-stub:
+        condition: service_started
+
+  # Not needed by the gate (it drives no background task). With a real
+  # Navidrome configured it runs the plugin's cron and queue work:
+  # `docker compose --profile worker up -d`.
+  audiomuse-ai-worker:
+    image: *audiomuse-image
+    profiles: ["worker"]
+    environment:
+      <<: *host-environment
+      SERVICE_TYPE: "worker"
+    volumes:
+      - ../../plugins/LumaeAnalysis:/app/plugin/installed/lumae_analysis:ro
+      - temp-audio-worker:/app/temp_audio
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+volumes:
+  pgdata15:
+  pgdata17:
+  temp-audio-flask:
+  temp-audio-worker:

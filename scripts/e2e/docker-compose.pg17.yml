@@ -1,0 +1,8 @@
+# PostgreSQL 17 variant (the version CI uses):
+#   docker compose -f docker-compose.yml -f docker-compose.pg17.yml up -d postgres
+# It keeps its own volume, so the PostgreSQL 15 data directory is untouched.
+services:
+  postgres:
+    image: postgres:17
+    volumes: !override
+      - pgdata17:/var/lib/postgresql/data
