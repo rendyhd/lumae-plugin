@@ -10,6 +10,8 @@ import numpy as np
 from psycopg2.extras import DictCursor
 from plugin.api import get_db, table
 
+from . import migrations
+
 MAX_CANDIDATES = 512
 # Fixed seed and dimensions form an internal index version, not an API score.
 _PLANES = np.random.default_rng(0x464131).standard_normal((8, 8, 200))
@@ -36,23 +38,28 @@ def buckets(vector, probe=False):
 
 
 def migrate(db):
+    # DDL only for what is missing: a no-op re-migrate takes no table lock
+    # stronger than ROW EXCLUSIVE (P2-8).
     with db.cursor() as cur:
         for name in ("albums", "remote_albums"):
             target = table(name)
-            cur.execute(
-                f"ALTER TABLE {target} ADD COLUMN IF NOT EXISTS buckets INTEGER[]"
+            migrations.ensure_columns(
+                cur,
+                target,
+                "buckets INTEGER[]",
+                "search_document TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', album || ' ' || artist)) STORED",
             )
-            cur.execute(
-                f"ALTER TABLE {target} ADD COLUMN IF NOT EXISTS search_document TSVECTOR GENERATED ALWAYS AS (to_tsvector('simple', album || ' ' || artist)) STORED"
+            migrations.ensure_index(
+                cur,
+                f"CREATE INDEX IF NOT EXISTS {target}_buckets_idx ON {target} USING GIN(buckets)",
             )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS {target}_buckets_idx ON {target} USING GIN(buckets)"
+            migrations.ensure_index(
+                cur,
+                f"CREATE INDEX IF NOT EXISTS {target}_search_idx ON {target} USING GIN(search_document)",
             )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS {target}_search_idx ON {target} USING GIN(search_document)"
-            )
-        cur.execute(
-            f"CREATE INDEX IF NOT EXISTS {table('connections')}_owner_idx ON {table('connections')}(owner,id)"
+        migrations.ensure_index(
+            cur,
+            f"CREATE INDEX IF NOT EXISTS {table('connections')}_owner_idx ON {table('connections')}(owner,id)",
         )
 
 

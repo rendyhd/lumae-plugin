@@ -4,21 +4,24 @@ import uuid
 from psycopg2.extras import DictCursor
 from plugin.api import get_db, table
 
+from . import migrations
+
 LOCK_CLASS = 0x46414C42
 TASK_TYPE = "plugin.federated_albums.sync_reconcile"
 
 
 def migrate(db):
     with db.cursor() as cur:
-        for definition in (
+        # Only missing columns are added, so a no-op re-migrate takes no
+        # ACCESS EXCLUSIVE lock (P2-8).
+        migrations.ensure_columns(
+            cur,
+            table("connections"),
             "sync_token TEXT",
             "sync_status TEXT NOT NULL DEFAULT 'idle'",
             "sync_retry_at TIMESTAMPTZ",
             "sync_attempts INTEGER NOT NULL DEFAULT 0",
-        ):
-            cur.execute(
-                f"ALTER TABLE {table('connections')} ADD COLUMN IF NOT EXISTS {definition}"
-            )
+        )
         cur.execute(
             """INSERT INTO cron(name,task_type,cron_expr,enabled) VALUES(%s,%s,'* * * * *',TRUE)
             ON CONFLICT(task_type) DO NOTHING""",

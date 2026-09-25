@@ -428,7 +428,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 - Change: connect timeout 3 s, read timeout 5 s, a response size cap, and a short negative cache for failing friends. This keeps one slow friend server from pinning the 4 host threads.
 - Test: a mocked slow upstream returns within 6 s.
 
-**P2-8 — FederatedAlbums migration lock hygiene (follow-up found in P2-5).** FederatedAlbums still runs raw `ALTER`/`CREATE INDEX` on every migrate, which takes ACCESS EXCLUSIVE or SHARE locks each time: `catalog_store.py` ~43-55, `sync_jobs.py` ~20, `__init__.py` ~177. It is packaged separately, so it needs its own copy of the P2-5 helpers (`ensure_columns`/`ensure_index` with a bounded `lock_timeout` and retry). The plugin is private, not published, so this is low priority; it can run in any phase.
+**P2-8 — FederatedAlbums migration lock hygiene (follow-up found in P2-5).** FederatedAlbums still runs raw `ALTER`/`CREATE INDEX` on every migrate, which takes ACCESS EXCLUSIVE or SHARE locks each time: `catalog_store.py` ~43-55, `sync_jobs.py` ~20, `__init__.py` ~177. It is packaged separately, so it needs its own copy of the P2-5 helpers (`ensure_columns`/`ensure_index` with a bounded `lock_timeout` and retry). The plugin is private, not published, so this is low priority; it can run in any phase. Done: `plugins/FederatedAlbums/migrations.py` copies `run_ddl`, `ensure_columns` and `ensure_index`, and every per-migrate `ADD COLUMN` and `CREATE INDEX` now goes through them, so a no-op re-migrate takes no lock above ROW EXCLUSIVE and needed DDL waits boundedly (`tests/plugins/test_federated_albums_migration_locks_postgres.py`).
 
 ### Phase 3 — Semantics, product and structure
 

@@ -33,3 +33,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P2-2 incremental projection | on phase/2-performance | Phase 2 PR | | 613 passed, 1 xfailed; no-change 30.5→4.0 s (1,596→356 MB), delta 65.0→5.8 s |
 | P2-1 committed status summary | on phase/2-performance | Phase 2 PR | | 790 passed, 1 xfailed; health 349→4.2 ms, settings 496→6.9 ms (p95); no-change projection 2.45→2.7 s |
 | P2-5 migration lock hygiene | on phase/2-performance | Phase 2 PR | | 803 passed, 1 xfailed; re-run migrate on a populated schema: ACCESS EXCLUSIVE on 17 tables and SHARE on 16 (26 distinct) → no lock above ROW EXCLUSIVE; fresh and upgrade schema identical to base |
+| P2-8 FederatedAlbums migration locks | review pending | Phase 2 PR | | 811 passed, 1 xfailed; re-run migrate: ACCESS EXCLUSIVE and SHARE on 3 FederatedAlbums tables → no lock above ROW EXCLUSIVE; shared-cluster advisory pg_locks probes filtered by database |

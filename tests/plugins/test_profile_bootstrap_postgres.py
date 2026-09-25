@@ -516,6 +516,8 @@ def test_owned_backend_lock_cleanup_and_request_transaction(edge_publication_db,
             assert cur.fetchone()[0] is True
             cur.execute("SELECT pg_advisory_unlock(110094, 10)")
             cur.execute("SELECT pid FROM pg_locks WHERE locktype='advisory' AND granted "
+                        "AND database=(SELECT oid FROM pg_database "
+                        "WHERE datname=current_database()) "
                         "AND classid=110094 AND objid=hashtext(%s)::oid AND objsubid=2",
                         (SOURCE,))
             owned_pid.append(cur.fetchone()[0])
