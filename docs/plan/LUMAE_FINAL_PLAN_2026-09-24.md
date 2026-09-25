@@ -310,6 +310,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
      - Admission runs in a short transaction under `pg_advisory_xact_lock(110094,10)`: purge expired **and identity-stale** rows (core server, epochs, inactive source); count slots; insert a session in state `capturing`.
      - Capture then runs under a **per-source** `pg_advisory_lock(110094, hashtext(source))`.
      - `capturing` rows older than 10 minutes are purged.
+     - **Decision (P1-6 implementation, review-accepted):** the purge runs right after admission in its own best-effort transaction, not under the global admission lock. Admission counts only live sessions, so stale rows never occupy a slot. Deleting a stale 94k-row session under the lock would break the 50 ms global-lock budget. The purge uses `SKIP LOCKED`, is capped per call, and a failed purge never fails the create.
      - The floor hold (P1-2) ignores sessions whose catalogue epoch or core server no longer matches: they would 410 anyway (P1-2 review F3). The session row for the hold is committed at admission, before capture, so the hold covers the capture window (F2).
   2. **Release** deletes any row matching token hash and source, even if identity-stale, and always returns 200 `released`.
   3. **K5:** optional `client_request_id` (UUID). An unexpired session with the same (source, id) and `pages_served=0` is deleted before a new one is created. New columns `client_request_id` and `pages_served`.
