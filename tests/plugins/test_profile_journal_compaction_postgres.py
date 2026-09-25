@@ -260,10 +260,8 @@ def test_open_v2_session_holds_the_floor_until_catchup_captures_head(
             options=f"-c search_path={schema},public"),
         raising=False,
     )
-    # P1-5 dependency: MAX_CATCHUP_EVENTS is still 50k here, so a held session
-    # more than 50k events behind would get 413 at catch-up. P1-5 raises it to
-    # at least 4 x retention_limit (the hold cap); until then the test lifts it.
-    monkeypatch.setattr(profile_bootstrap, "MAX_CATCHUP_EVENTS", 1_000_000)
+    # The session is more than 50k events behind; the catch-up limit covers
+    # the hold (4 x retention_limit, P1-5), so the capture must not 413.
     _seed_events(migrated_db, epoch, 1, 10)
     body = {"protocol_version": 2, "schema_version": 1,
             "transfer_contract": profile_bootstrap.TRANSFER_CONTRACT,

@@ -27,3 +27,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P1-2 journal compaction and retention | on phase/1-stop-the-bleeding | Phase 1 PR | | 607 passed; publication p95 20.9→6.2 ms (P1-2 alone), 8.2 ms with P1-1 |
 | P1-7 single-snapshot /changes reader | on phase/1-stop-the-bleeding | Phase 1 PR | | 674 passed |
 | P1-3 fences and 1.3.0 | on phase/1-stop-the-bleeding | Phase 1 PR | | 696 passed |
+| P1-5 v2 snapshots store edge references | on phase/1-stop-the-bleeding | Phase 1 PR | | 705 passed; create@94k 8.42 s (413; 115.7 s / 2720 MB WAL with limits lifted) → 3.0–4.3 s / 73–75 MB WAL; page p95 31.4→24.8 ms (50 rows); global lock hold 3–4.3 s left for P1-6 |

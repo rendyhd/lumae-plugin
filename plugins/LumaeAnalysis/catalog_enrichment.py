@@ -401,6 +401,17 @@ def migrate_enrichment(db):
             UNIQUE (session_id, seq)
         )
         """,
+        # K2 (P1-5): captures store the waveform payload plus an edge
+        # reference {media_revision, profile_digest}, resolved at page read.
+        # Rows captured before 1.3.0 keep their embedded edge and a NULL ref.
+        f"""
+        ALTER TABLE {t('profile_bootstrap_snapshot')}
+        ADD COLUMN IF NOT EXISTS edge_ref JSONB
+        """,
+        f"""
+        ALTER TABLE {t('profile_bootstrap_catchup')}
+        ADD COLUMN IF NOT EXISTS edge_ref JSONB
+        """,
         f"""
         CREATE INDEX IF NOT EXISTS {t("profile_changes_track_idx")}
         ON {t("profile_changes")} (catalog_instance_id, track_id)
