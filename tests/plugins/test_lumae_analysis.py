@@ -7961,6 +7961,22 @@ def test_settings_page_exposes_manual_catch_up_and_status(monkeypatch):
     assert "View database state" in body
 
 
+# Statements around each bounded diagnostic read (P3-10).
+CONTROL_STATEMENTS = ("SAVEPOINT", "SET LOCAL", "ROLLBACK TO", "RELEASE")
+
+
+class ReadOnlyConnection:
+    """A request connection that accepts the diagnostic savepoints."""
+
+    def cursor(self):
+        return types.SimpleNamespace(
+            execute=lambda *_args, **_kwargs: None, close=lambda: None
+        )
+
+    def rollback(self):
+        return None
+
+
 def test_database_state_snapshot_is_source_scoped_and_generation_aware():
     state = importlib.import_module("plugins.LumaeAnalysis.database_state")
     compatibility_module = importlib.import_module("plugins.LumaeAnalysis.core_compat")
@@ -8010,6 +8026,11 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
 
         def execute(self, sql, params=()):
             normalized = " ".join(sql.split())
+            if normalized.startswith(CONTROL_STATEMENTS):
+                # The savepoint and SET LOCAL around each diagnostic read.
+                self.db.control.append(normalized)
+                self.result = None
+                return
             self.db.executed.append((normalized, params))
             if self.db.fail_items and "AS items" in normalized and "analysis_items" in normalized:
                 raise RuntimeError("private-token-in-sql-error")
@@ -8020,7 +8041,14 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
             elif "AS analysis_groups" in normalized:
                 self.result = [(850, 40, 4)]
             elif "AS catalogue_tracks" in normalized:
-                self.result = [(1000, 600, 550, 20, 5, 25, 400)]
+                # catalogue, eligible, stored, published, the work states
+                # (due, pending, deferred_no_media_revision, ready, deferred,
+                # cooling, exhausted, awaiting_revision, unscheduled),
+                # schedulable, failure categories.
+                self.result = [(
+                    1000, 990, 600, 540, 300, 20, 10, 550, 4, 5, 6, 7, 88, True,
+                    {"download_unavailable": 11, "silent_audio": 7, "": 1},
+                )]
             elif "FROM plugin_lumae_analysis__preparation_state" in normalized:
                 self.result = [
                     (
@@ -8071,6 +8099,7 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
     class Db:
         def __init__(self, fail_items=False):
             self.executed = []
+            self.control = []
             self.rollbacks = 0
             self.fail_items = fail_items
 
@@ -8104,6 +8133,19 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
     }
     assert result["items"]["shared_groups"] == 40
     assert result["profiles"]["ready"] == 550
+    assert result["profiles"]["published"] == 540
+    assert result["profiles"]["cooling"] == 5
+    assert result["profiles"]["exhausted"] == 6
+    assert result["profiles"]["schedulable"] is True
+    assert result["profiles"]["failure_categories"] == [
+        {"category": "uncategorized", "tracks": 1, "retry": "unknown"},
+        {"category": "download_unavailable", "tracks": 11, "retry": "transient"},
+        {"category": "silent_audio", "tracks": 7, "retry": "revision"},
+    ]
+    profile_query = next(
+        params for sql, params in db.executed if "AS catalogue_tracks" in sql
+    )
+    assert profile_query["source"] == "catalog-a"
     assert result["core"]["chromaprint"] == 725
     assert result["journals"]["bootstrap_leases"]["active"] == 1
     assert result["readiness"]["status"] == "progressive"
@@ -8125,8 +8167,14 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
         failing_db, compatibility, [source], readiness_by_source={"catalog-a": {"status": "progressive"}}
     )
     assert partial["status"] == "partial"
-    assert failing_db.rollbacks == 1
-    assert partial["sources"][0]["items"]["items"] == 0
+    # The failed read was rolled back to its savepoint, not the transaction.
+    assert failing_db.rollbacks == 0
+    assert (
+        "ROLLBACK TO SAVEPOINT lumae_diagnostic_read; RELEASE SAVEPOINT lumae_diagnostic_read"
+        in failing_db.control
+    )
+    # Unavailable, not zero.
+    assert partial["sources"][0]["items"]["items"] is None
     assert partial["sources"][0]["profiles"]["ready"] == 550
     assert partial["sources"][0]["errors"][0]["operation"] == "analysis_items_summary"
     assert partial["sources"][0]["diagnostics"]["scope"] == "server_db_execute_fetch"
@@ -8138,6 +8186,7 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
     assert "analysis_items_summary" in body
     assert "Server database query timings (execute + fetch)" in body
     assert "private-token-in-sql-error" not in body
+    assert "<span>Analysis items</span><strong>unavailable</strong>" in body
 
 
 def test_database_state_reads_v2_core_as_one_direct_provider():
@@ -8156,6 +8205,8 @@ def test_database_state_reads_v2_core_as_one_direct_provider():
             self.sql = ""
 
         def execute(self, sql, params=()):
+            if sql.startswith(CONTROL_STATEMENTS):
+                return
             self.sql = " ".join(sql.split())
             assert params == ()
 
@@ -8316,7 +8367,7 @@ def test_database_state_page_renders_partial_state_without_exposing_rows(monkeyp
         ],
         "errors": [{"section": "AudioMuse core", "message": "<private> failed"}],
     }
-    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "get_db", lambda: ReadOnlyConnection())
     monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
     monkeypatch.setattr(mod, "detect_core", lambda: types.SimpleNamespace(
         adapter="v3_registry",
@@ -10053,7 +10104,7 @@ def test_database_state_page_redacts_outer_snapshot_exception(monkeypatch):
         adapter="v3_registry",
         as_dict=lambda: {"core_version": "v3.0.5", "core_adapter": "v3_registry"},
     ))
-    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "get_db", lambda: ReadOnlyConnection())
     def fail_source_resolution(_db):
         raise RuntimeError(secret)
     monkeypatch.setattr(mod, "resolve_catalog_source", fail_source_resolution)

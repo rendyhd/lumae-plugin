@@ -77,7 +77,12 @@ from .catalog_enrichment import (
 from .catalog_readiness import CONTRACT_REVISION, v3_release_readiness
 from . import status_model
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
-from .database_state import collect_database_state, render_database_state, safe_snapshot_error
+from .database_state import (
+    bounded_reads,
+    collect_database_state,
+    render_database_state,
+    safe_snapshot_error,
+)
 from .settings_ui import SETTINGS_STATUS_SCRIPT
 from .provider_identity_guard import (
     TRANSITION_BLOCKER,
@@ -6434,24 +6439,30 @@ def database_state_page():
     compatibility = detect_core()
     db = get_db()
     try:
-        sources = resolve_catalog_source(db) if db is not None else []
-        readiness_by_source = {}
+        sources = []
+        if db is not None:
+            # Every read of this page runs under the diagnostic statement
+            # timeout, in a savepoint that is rolled back (P3-10).
+            with bounded_reads(db):
+                sources = resolve_catalog_source(db)
+        readiness = None
         if db is not None and compatibility.adapter == "v3_registry":
             policy = dedup_policy()
-            readiness_by_source = {
-                source["catalog_instance_id"]: v3_release_readiness(
-                    db, compatibility, source, policy
-                )
-                for source in sources
-            }
+
+            def v3_readiness(source):
+                return v3_release_readiness(db, compatibility, source, policy)
+
+            readiness = v3_readiness
         snapshot = collect_database_state(
             db,
             compatibility,
             sources,
-            readiness_by_source=readiness_by_source,
+            readiness=readiness,
         )
     except Exception as exc:
-        logger.warning("lumae_analysis could not collect database state")
+        logger.warning(
+            "lumae_analysis could not collect database state (%s)", type(exc).__name__
+        )
         snapshot = {
             "captured_at": utc_now_iso(),
             "status": "unavailable",
