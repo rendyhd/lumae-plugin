@@ -1,10 +1,11 @@
 """P3-13 (LUM-001 test strength): the profile stream head is serialised by a row lock.
 
-Each profile publisher allocates ``seq = head_seq + 1`` from
-``profile_stream_state`` with ``SELECT ... FOR UPDATE``
-(``catalog_enrichment._profile_stream_state``). It writes the event and the
-new head later in the same transaction. The audit found that removing that
-``FOR UPDATE`` failed only 1 of 39 tests, for two reasons:
+Both journal append paths, ``record_profile_change`` and (P2-3)
+``record_profile_deletions``, read the head from ``profile_stream_state`` with
+``SELECT ... FOR UPDATE`` (``catalog_enrichment._profile_stream_state``) and
+allocate the next seqs from it. They write the events and the new head later
+in the same transaction. The audit found that removing that ``FOR UPDATE``
+failed only 1 of 39 tests, for two reasons:
 
 * the real publishers (``complete_attempt``, the edge publisher, catalogue
   invalidation) first lock the source's ``catalog_state`` row, and that lock
@@ -14,20 +15,19 @@ new head later in the same transaction. The audit found that removing that
   state row then waits for that pending update anyway, so the row lock is
   never what orders them.
 
-These tests close both gaps. They call the journal append path
-(``record_profile_change``) and maintenance compaction
-(``compact_enrichment_storage``, which never takes ``catalog_state``) directly,
-on different tracks. Each test parks the first writer in the one window that
-only the row lock covers: after it read the head and before it wrote
-anything. The next writer must then wait on the stream-state row the first
-one holds. The tests prove this by polling ``pg_locks`` and
-``pg_blocking_pids`` with a bounded timeout, not with sleeps. After both
-commit, the journal must be dense: unique, contiguous seqs from ``floor + 1``
-to ``head``, all in the current epoch.
+These tests close both gaps. They call the append paths and maintenance
+compaction (``compact_enrichment_storage``, which never takes
+``catalog_state``) directly, on different tracks. Each test parks the first
+writer in the one window that only the row lock covers: after it read the head
+and before it wrote anything. The next writer must then wait, in its head
+read, on the stream-state row the first one holds. The tests prove this by
+polling ``pg_locks`` and ``pg_blocking_pids`` with a bounded timeout, not with
+sleeps. After both commit, the journal must be dense: unique, contiguous seqs
+from ``floor + 1`` to ``head``, all in the current epoch.
 
-Without the ``FOR UPDATE``, the next writer reads the same head without
-waiting. The parked publisher then collides on the same seq. A parked
-compaction instead computes the floor from a stale head or retention limit.
+Without the lock, the next writer reads the same head without waiting. The
+parked append then collides on the same seq. A parked compaction instead
+computes the floor from a stale head or retention limit.
 """
 
 import threading
@@ -49,6 +49,8 @@ CHANGES = f"{P}profile_changes"
 # The head read in _profile_stream_state, with or without its FOR UPDATE.
 HEAD_READ = f"SELECT epoch, head_seq, floor_seq FROM {STATE}"
 RETAINED = catalog.MIN_RETAINED_CHANGE_EVENTS
+# The journal append paths: record_profile_change, record_profile_deletions.
+APPENDS = ("change", "deletions")
 # Bound for every poll and hand-off. Nothing here waits this long when the
 # code is correct; it only turns a hang into a failure.
 WAIT_SECONDS = 10
@@ -133,17 +135,29 @@ class _Writer(threading.Thread):
                 pass
 
 
-def _publish(track, park=None):
-    """The journal append path, with no catalog_state lock in front of it."""
+def _journaled(kind, name):
+    """The (track, operation) events one append by ``kind`` journals, in order."""
+    if kind == "change":
+        return [(name, "upsert")]
+    return [(f"{name}/gone-1", "delete"), (f"{name}/gone-2", "delete")]
+
+
+def _append(kind, name, park=None):
+    """One journal append, with no catalog_state lock in front of it."""
 
     def action(conn):
         cur = conn.cursor()
         if park is not None:
             cur = _ParkingCursor(cur, park)
         with cur:
-            enrichment.record_profile_change(
-                cur, SOURCE, track, "ready", {"track_id": track}
-            )
+            if kind == "change":
+                enrichment.record_profile_change(
+                    cur, SOURCE, name, "ready", {"track_id": name}
+                )
+            else:
+                enrichment.record_profile_deletions(
+                    cur, SOURCE, [track for track, _op in _journaled(kind, name)]
+                )
 
     return action
 
@@ -161,28 +175,33 @@ def _compact(park=None):
 def _lock_wait(observer, writer):
     """Poll ``pg_locks`` until ``writer`` waits for a lock.
 
-    Returns the lock it waits for, or None if it finished without waiting.
+    Returns the lock it waits for and the statement that waits, or None if it
+    finished without waiting. The statement is read only after the wait is
+    seen, in a second query: one query that joined ``pg_stat_activity`` could
+    take its activity snapshot before the writer started the statement, and
+    report the previous one. A writer blocked on a lock cannot move on while
+    the holder stays parked.
     """
     deadline = time.monotonic() + WAIT_SECONDS
     while time.monotonic() < deadline:
         with observer.cursor() as cur:
             cur.execute(
-                """
-                SELECT l.locktype, l.mode, pg_blocking_pids(l.pid), a.query
-                  FROM pg_locks l
-                  JOIN pg_stat_activity a ON a.pid = l.pid
-                 WHERE l.pid = %s AND NOT l.granted
-                """,
+                "SELECT locktype, mode, pg_blocking_pids(pid) FROM pg_locks "
+                "WHERE pid = %s AND NOT granted",
                 (writer.pid,),
             )
             row = cur.fetchone()
-        if row is not None:
-            return {
-                "locktype": row[0],
-                "mode": row[1],
-                "blockers": set(row[2]),
-                "query": row[3],
-            }
+            if row is not None:
+                cur.execute(
+                    "SELECT query FROM pg_stat_activity WHERE pid = %s",
+                    (writer.pid,),
+                )
+                return {
+                    "locktype": row[0],
+                    "mode": row[1],
+                    "blockers": set(row[2]),
+                    "query": cur.fetchone()[0],
+                }
         if not writer.is_alive():
             return None
         writer.join(POLL_SECONDS)
@@ -219,9 +238,10 @@ def _interleave(observer, park, first, others):
 # Schema, fixtures and assertions.
 
 
-def _bound_lock_waits(conn):
+def _bound_waits(conn):
     with conn.cursor() as cur:
-        cur.execute("SET lock_timeout = '30s'")
+        cur.execute("SET lock_timeout = '8s'")
+        cur.execute("SET statement_timeout = '8s'")
     conn.commit()
 
 
@@ -236,7 +256,7 @@ def open_connection(migrated_db):
 
     def factory(autocommit=False):
         conn = connect(schema)
-        _bound_lock_waits(conn)
+        _bound_waits(conn)
         conn.autocommit = autocommit
         opened.append(conn)
         return conn
@@ -252,7 +272,7 @@ def open_connection(migrated_db):
 
 @pytest.fixture
 def first_connection(second_connection):
-    _bound_lock_waits(second_connection)
+    _bound_waits(second_connection)
     return second_connection
 
 
@@ -300,7 +320,7 @@ def _journal(db):
         )
         epoch, head, floor, retention = cur.fetchone()
         cur.execute(
-            f"SELECT seq, epoch, track_id FROM {CHANGES} "
+            f"SELECT seq, epoch, track_id, operation FROM {CHANGES} "
             "WHERE catalog_instance_id=%s ORDER BY seq",
             (SOURCE,),
         )
@@ -308,6 +328,24 @@ def _journal(db):
     db.commit()
     state = {"epoch": epoch, "head": head, "floor": floor, "retention": retention}
     return state, rows
+
+
+def _events(rows):
+    return [(row[2], row[3]) for row in rows]
+
+
+def _assert_waited_for(wait, writer, holders):
+    assert wait is not None, (
+        f"{writer.name} ran to completion while another writer held the "
+        f"stream head it had read: it never waited for the {STATE} row lock"
+    )
+    assert HEAD_READ in wait["query"], (
+        f"{writer.name} did not wait in its head read: {wait}"
+    )
+    holder_pids = {holder.pid for holder in holders}
+    assert wait["blockers"] and wait["blockers"] <= holder_pids, (
+        f"{writer.name} was blocked by {wait['blockers']}, not by {holder_pids}"
+    )
 
 
 def _assert_no_errors(*writers):
@@ -332,121 +370,138 @@ def _assert_dense(state, rows, epoch):
     )
 
 
-def _assert_waited_for(wait, writer, holders):
-    assert wait is not None, (
-        f"{writer.name} ran to completion while another writer held the "
-        f"stream head it had read: it never waited for the {STATE} row lock"
-    )
-    assert STATE in wait["query"], f"{writer.name} waited elsewhere: {wait}"
-    holder_pids = {holder.pid for holder in holders}
-    assert wait["blockers"] and wait["blockers"] <= holder_pids, (
-        f"{writer.name} was blocked by {wait['blockers']}, not by {holder_pids}"
-    )
-
-
 # --------------------------------------------------------------------------
-# Publishers on different tracks.
+# Appends on different tracks.
 
 
 @pytest.mark.parametrize("first_outcome", ["commit", "rollback"])
-def test_publisher_waits_for_a_head_another_publisher_read(
-    migrated_db, first_connection, open_connection, observer, first_outcome
+@pytest.mark.parametrize("second_kind", APPENDS)
+@pytest.mark.parametrize("first_kind", APPENDS)
+def test_append_waits_for_a_head_another_append_read(
+    migrated_db, first_connection, open_connection, observer,
+    first_kind, second_kind, first_outcome,
 ):
     epoch = _source(migrated_db)
-    park = _Park("track-first")
+    park = _Park("first")
     first = _Writer(
-        "track-first", first_connection, _publish("track-first", park),
+        "first", first_connection, _append(first_kind, "first", park),
         finish=first_outcome,
     )
-    second = _Writer("track-second", open_connection(), _publish("track-second"))
+    second = _Writer("second", open_connection(), _append(second_kind, "second"))
 
     waits = _interleave(observer, park, first, [second])
 
+    _assert_waited_for(waits["second"], second, holders=[first])
     _assert_no_errors(first, second)
     state, rows = _journal(migrated_db)
     _assert_dense(state, rows, epoch)
     expected = (
-        ["track-first", "track-second"] if first_outcome == "commit"
-        else ["track-second"]
-    )
-    assert [row[2] for row in rows] == expected
+        _journaled(first_kind, "first") if first_outcome == "commit" else []
+    ) + _journaled(second_kind, "second")
+    assert _events(rows) == expected
     assert (state["head"], state["floor"]) == (len(expected), 0)
-    _assert_waited_for(waits["track-second"], second, holders=[first])
 
 
-def test_publishers_on_different_tracks_queue_behind_a_read_head(
-    migrated_db, first_connection, open_connection, observer
+@pytest.mark.parametrize("first_kind", APPENDS)
+def test_appends_on_different_tracks_queue_behind_a_read_head(
+    migrated_db, first_connection, open_connection, observer, first_kind
 ):
     epoch = _source(migrated_db)
-    park = _Park("track-0")
-    first = _Writer("track-0", first_connection, _publish("track-0", park))
-    queued = [
-        _Writer(f"track-{i}", open_connection(), _publish(f"track-{i}"))
-        for i in (1, 2, 3)
-    ]
+    park = _Park("first")
+    first = _Writer("first", first_connection, _append(first_kind, "first", park))
+    kinds = {"first": first_kind}
+    queued = []
+    for i, kind in enumerate(("deletions", "change", "deletions"), 1):
+        name = f"queued-{i}"
+        kinds[name] = kind
+        queued.append(_Writer(name, open_connection(), _append(kind, name)))
 
     waits = _interleave(observer, park, first, queued)
 
+    for writer in queued:
+        _assert_waited_for(waits[writer.name], writer, holders=[first, *queued])
     _assert_no_errors(first, *queued)
     state, rows = _journal(migrated_db)
     _assert_dense(state, rows, epoch)
-    assert (state["head"], state["floor"]) == (4, 0)
-    assert rows[0][2] == "track-0"
-    assert sorted(row[2] for row in rows) == [f"track-{i}" for i in range(4)]
-    for writer in queued:
-        _assert_waited_for(waits[writer.name], writer, holders=[first, *queued])
+    total = sum(len(_journaled(kind, name)) for name, kind in kinds.items())
+    assert (state["head"], state["floor"]) == (total, 0)
+    # The first append keeps the seqs it read; every append's events are
+    # consecutive and in its own order.
+    by_writer = {}
+    for seq, _epoch, track, operation in rows:
+        by_writer.setdefault(track.split("/")[0], []).append((seq, (track, operation)))
+    assert sorted(by_writer) == sorted(kinds)
+    assert by_writer["first"][0][0] == 1
+    for name, kind in kinds.items():
+        seqs = [seq for seq, _event in by_writer[name]]
+        assert [event for _seq, event in by_writer[name]] == _journaled(kind, name)
+        assert seqs == list(range(seqs[0], seqs[0] + len(seqs)))
 
 
 # --------------------------------------------------------------------------
-# Publisher and maintenance compaction (P1-2 retention and bounded advance).
+# An append and maintenance compaction (P1-2 retention and bounded advance).
 
 
-def test_compaction_waits_for_a_head_a_publisher_read(
-    migrated_db, first_connection, open_connection, observer, monkeypatch
+@pytest.mark.parametrize("kind", APPENDS)
+def test_compaction_waits_for_a_head_an_append_read(
+    migrated_db, first_connection, open_connection, observer, monkeypatch, kind
 ):
     monkeypatch.setattr(enrichment, "PROFILE_CHANGE_RETENTION_EVENTS", RETAINED)
-    # A backlog larger than one publication may compact (P1-2 bounded advance).
+    # A backlog larger than one append may compact (P1-2 bounded advance).
     monkeypatch.setattr(enrichment, "PROFILE_COMPACTION_MAX_ADVANCE", 1)
     epoch = _source(migrated_db, head=RETAINED + 5, retention_limit=RETAINED)
-    park = _Park("publisher")
-    publisher = _Writer("publisher", first_connection, _publish("track-new", park))
+    events = _journaled(kind, "new")
+    park = _Park("append")
+    append = _Writer("append", first_connection, _append(kind, "new", park))
     compactor = _Writer("compactor", open_connection(), _compact())
 
-    waits = _interleave(observer, park, publisher, [compactor])
+    waits = _interleave(observer, park, append, [compactor])
 
-    _assert_no_errors(publisher, compactor)
+    _assert_waited_for(waits["compactor"], compactor, holders=[append])
+    _assert_no_errors(append, compactor)
     state, rows = _journal(migrated_db)
-    # The publication appends 1006 and advances the floor 0 -> 1 (bounded).
-    # Compaction then starts from that committed head, so the floor is
-    # 1006 - 1000. With a stale head (1005) it would stop at 5.
+    # The append takes the head to 1005 + n and its own compaction moves the
+    # floor from 0 by at most one seq per event (bounded). Compaction then
+    # starts from that committed head, so the floor is head - 1000 = 5 + n.
+    # From a stale head (1005) it would stop at 5.
+    head = RETAINED + 5 + len(events)
     assert (state["head"], state["floor"], state["retention"]) == (
-        RETAINED + 6, 6, RETAINED
+        head, head - RETAINED, RETAINED
     )
     _assert_dense(state, rows, epoch)
-    assert rows[-1] == (RETAINED + 6, epoch, "track-new")
-    _assert_waited_for(waits["compactor"], compactor, holders=[publisher])
+    assert _events(rows[-len(events):]) == events
 
 
-def test_publisher_waits_for_a_head_compaction_read(
-    migrated_db, first_connection, open_connection, observer, monkeypatch
+@pytest.mark.parametrize("kind", APPENDS)
+def test_append_waits_for_a_head_compaction_read(
+    migrated_db, first_connection, open_connection, observer, monkeypatch, kind
 ):
     monkeypatch.setattr(enrichment, "PROFILE_CHANGE_RETENTION_EVENTS", RETAINED)
+    monkeypatch.setattr(enrichment, "PROFILE_COMPACTION_MAX_ADVANCE", 1)
     # The persisted limit is stale (a larger library); compaction lowers it.
     epoch = _source(migrated_db, head=RETAINED + 5, retention_limit=RETAINED * 100)
+    events = _journaled(kind, "new")
     park = _Park("compactor")
     compactor = _Writer("compactor", first_connection, _compact(park))
-    publisher = _Writer("publisher", open_connection(), _publish("track-new"))
+    append = _Writer("append", open_connection(), _append(kind, "new"))
 
-    waits = _interleave(observer, park, compactor, [publisher])
+    waits = _interleave(observer, park, compactor, [append])
 
-    _assert_no_errors(compactor, publisher)
+    # This wait assertion is what pins the append's own lock. An append that
+    # read the head without the lock still waits for the parked compactor,
+    # but in its head UPDATE, and that UPDATE returns the retention limit the
+    # compactor committed.
+    _assert_waited_for(waits["append"], append, holders=[compactor])
+    _assert_no_errors(compactor, append)
     state, rows = _journal(migrated_db)
     # Compaction persists the lowered limit and moves the floor to 5. The
-    # publication then reads both, appends 1006 and moves the floor to 6.
-    # With the stale limit and floor it would compact nothing (floor 5).
+    # append then reads that floor, takes the head to 1005 + n and moves the
+    # floor by at most one seq per event, to head - 1000 = 5 + n. An append
+    # that computed from the floor it read before compaction (0) would stop
+    # at 5. One that also kept the stale limit would compact nothing.
+    head = RETAINED + 5 + len(events)
     assert (state["head"], state["floor"], state["retention"]) == (
-        RETAINED + 6, 6, RETAINED
+        head, head - RETAINED, RETAINED
     )
     _assert_dense(state, rows, epoch)
-    assert rows[-1] == (RETAINED + 6, epoch, "track-new")
-    _assert_waited_for(waits["publisher"], publisher, holders=[compactor])
+    assert _events(rows[-len(events):]) == events
