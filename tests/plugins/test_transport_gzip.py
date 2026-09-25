@@ -157,7 +157,7 @@ def test_v2_bootstrap_pages_are_gzipped(stubbed, monkeypatch, path):
     monkeypatch.setattr(stubbed.host_api.config, "DATABASE_URL", "postgresql://stub", raising=False)
     page = {"protocol_version": 2, "profiles": _large_profiles(), "has_more": False}
     for name in ("create_session", "snapshot_page", "catchup_page"):
-        monkeypatch.setattr(stubbed.profile_bootstrap, name, lambda _body: page)
+        monkeypatch.setattr(stubbed.profile_bootstrap, name, lambda _body, **_options: page)
     client = _app(stubbed).test_client()
 
     plain = client.post(PREFIX + path, json={})

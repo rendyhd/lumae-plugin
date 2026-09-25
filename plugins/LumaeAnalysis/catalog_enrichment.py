@@ -56,6 +56,10 @@ PROFILE_CHANGE_RETENTION_EVENTS = 50_000
 # Most journal rows one profile publication may compact past the current floor
 # (bounds the delete under the publication locks; maintenance is unbounded).
 PROFILE_COMPACTION_MAX_ADVANCE = 5_000
+# A v2 bootstrap session admitted in state 'capturing' whose capture has not
+# finished after this long was abandoned (its request died): it holds neither
+# a slot nor the journal floor, and the next create purges it.
+PROFILE_BOOTSTRAP_CAPTURE_MINUTES = 10
 MOOD_FEATURE_NAMES = ("danceable", "aggressive", "happy", "party", "relaxed", "sad")
 
 _ALBUM_WEIGHTS = {
@@ -102,6 +106,11 @@ def _json(value, fallback=None):
 
 
 def _iso(value):
+    """ISO-8601 text. A zoned value (TIMESTAMPTZ) is converted to UTC with a
+    ``Z`` suffix whatever the database session's TimeZone is. A naive value
+    (TIMESTAMP, e.g. a profile's ``analyzed_at``) keeps its zone-less form."""
+    if getattr(value, "tzinfo", None) is not None:
+        value = value.astimezone(timezone.utc)
     if hasattr(value, "isoformat"):
         return value.isoformat().replace("+00:00", "Z")
     return str(value)
@@ -193,19 +202,51 @@ def refresh_profile_retention(cur, catalog_instance_id, library_count):
     return retention_limit
 
 
+def live_bootstrap_session_sql(alias="s"):
+    """SQL condition: v2 bootstrap session ``alias`` is still servable.
+
+    A live session is unexpired, is not an abandoned capture (still
+    'capturing' after PROFILE_BOOTSTRAP_CAPTURE_MINUTES), and its source is
+    active with the same core server, catalogue epoch and profile epoch. Only
+    live sessions hold a slot or the journal floor; every other session would
+    answer 410 on its next request, and the next create purges it.
+    """
+    return f"""(
+        {alias}.expires_at > now()
+        AND ({alias}.state <> 'capturing'
+             OR {alias}.created_at > now()
+                 - interval '{int(PROFILE_BOOTSTRAP_CAPTURE_MINUTES)} minutes')
+        AND EXISTS (
+            SELECT 1
+              FROM {t('catalog_sources')} src
+              JOIN {t('catalog_state')} cs
+                ON cs.catalog_instance_id=src.catalog_instance_id
+              JOIN {t('profile_stream_state')} ps
+                ON ps.catalog_instance_id=src.catalog_instance_id
+             WHERE src.catalog_instance_id={alias}.catalog_instance_id
+               AND src.rebind_status='active'
+               AND src.current_core_server_id={alias}.core_server_id
+               AND cs.catalog_epoch={alias}.catalog_epoch
+               AND ps.epoch={alias}.profile_epoch))"""
+
+
 def _profile_floor_hold(cur, catalog_instance_id, epoch):
     """Oldest snapshot seq an open v2 bootstrap session still has to replay.
 
     A session reads ``seq > snapshot_seq`` once, when its catch-up captures the
-    head; until then compaction must not advance the floor past it.
+    head; until then compaction must not advance the floor past it. The row is
+    committed at admission, before the capture, with the admission head as
+    ``snapshot_seq`` (a lower bound of the capture's head), so the hold covers
+    the capture too. Sessions that are no longer live (identity-stale,
+    expired, abandoned captures) would 410 anyway and hold nothing.
     """
     cur.execute(
         f"""
-        SELECT MIN(snapshot_seq)
-          FROM {t('profile_bootstrap_sessions')}
-         WHERE source_scope=%s AND expires_at>now()
-           AND catalog_instance_id=%s AND profile_epoch=%s
-           AND head_seq IS NULL
+        SELECT MIN(s.snapshot_seq)
+          FROM {t('profile_bootstrap_sessions')} s
+         WHERE s.source_scope=%s AND s.catalog_instance_id=%s
+           AND s.profile_epoch=%s AND s.head_seq IS NULL
+           AND {live_bootstrap_session_sql('s')}
         """,
         (catalog_instance_id, catalog_instance_id, str(epoch)),
     )
@@ -411,6 +452,36 @@ def migrate_enrichment(db):
         f"""
         ALTER TABLE {t('profile_bootstrap_catchup')}
         ADD COLUMN IF NOT EXISTS edge_ref JSONB
+        """,
+        # P1-6 (K3/K5, AUD-11): a session is admitted as 'capturing' and
+        # becomes 'ready' when its capture commits; rows from before 1.3.0 are
+        # ready. expiry_mode 'sliding' extends expires_at on every page;
+        # client_request_id and pages_served let a retried create replace its
+        # unclaimed session. Additive, metadata-only defaults.
+        f"""
+        ALTER TABLE {t('profile_bootstrap_sessions')}
+        ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'ready',
+        ADD COLUMN IF NOT EXISTS expiry_mode TEXT NOT NULL DEFAULT 'absolute',
+        ADD COLUMN IF NOT EXISTS client_request_id UUID,
+        ADD COLUMN IF NOT EXISTS pages_served INTEGER NOT NULL DEFAULT 0
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_request_idx')}
+        ON {t('profile_bootstrap_sessions')} (source_scope, client_request_id)
+        WHERE client_request_id IS NOT NULL
+        """,
+        # Admitted creates per (source, caller) for the create rate limit;
+        # rows older than the window are purged by the next create.
+        f"""
+        CREATE TABLE IF NOT EXISTS {t('profile_bootstrap_creates')} (
+            catalog_instance_id TEXT NOT NULL,
+            caller_key TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        f"""
+        CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_creates_caller_idx')}
+        ON {t('profile_bootstrap_creates')} (catalog_instance_id, caller_key, created_at)
         """,
         f"""
         CREATE INDEX IF NOT EXISTS {t("profile_changes_track_idx")}
