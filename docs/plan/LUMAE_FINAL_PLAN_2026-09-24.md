@@ -409,6 +409,14 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   The 1 KiB-per-event catch-up byte cap never binds in practice.
 - If create is ≤5 s, no 503s occur under 2 concurrent creators, and the capped catch-up is acceptable, **close as not needed**.
 - Otherwise implement create → 202 `{status_url}` with the capture as an RQ task, add a new capability flag and a contract entry, and add client support through §H C-3.
+- **Decision (after P2-6, `docs/perf/E2E-2026-09-25.md`): implement, but server-internal and not 202 + RQ.**
+  - Measured at 94k with edges on gthread 1×4:
+    - a single create takes 4.0–4.3 s;
+    - two concurrent creators take p95 6.7–8.0 s on different sources (GIL contention) and 8.7–9.7 s on the same source (serialized on the per-source capture lock), with 1 of 40 returning 503 on the stock host;
+    - the capped catch-up (1,056,000 events) takes 48 s with flat memory and recovers through `Retry-After`, which is acceptable, so option (a) is not needed.
+  - P2-4 builds the snapshot and first catch-up rows in PostgreSQL with bounded `INSERT … SELECT` batches: byte-identical output, proven by an equivalence test against the old path. It also fixes the page query, which applies `ORDER BY ordinal LIMIT` before the lateral edge join; without statistics, the current plan does one edge lookup per remaining row.
+  - Acceptance is the P2-6 `creators` scenario: two-creator create p95 ≤5 s and no 503. On the same source, that requires one 94k capture in about 2.5 s or less.
+  - If SQL capture cannot reach that, the orchestrator decides between accepting a same-source wait (two devices of one library starting a first sync at once) and the 202 path.
 
 **P2-5 — Migration and lock hygiene (P3 migration items).**
 - Files: `migrate_attempts` and the other `ADD COLUMN IF NOT EXISTS` sequences; `collection_manager.py:147-151`.
