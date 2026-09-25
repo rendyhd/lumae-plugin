@@ -391,7 +391,12 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 
 **P2-4 — v2 capture off the request thread (conditional).**
 - After P1-5 and P1-6, measure create p95 at 94k with edges on gunicorn gthread×4 (P2-6).
-- If it is ≤5 s and no 503s occur under 2 concurrent creators, **close as not needed**.
+- Also measure a first **catch-up capture at the cap** (4 × retention, about 752k events at 94k). The P1-5 review extrapolated about 3.5–4 minutes on one web thread, about 690 MB of WAL and a table of about 750 MB. The client's 10 s fast-fail gives up long before that, and retries get 503 while the capture holds the session row. If this misses, choose one:
+  - (a) page the catch-up straight from `profile_changes` while the floor hold lasts the whole session, with no copy;
+  - (b) capture with a single `INSERT…SELECT` in SQL, or move capture to an RQ task (below).
+
+  The 1 KiB-per-event catch-up byte cap never binds in practice.
+- If create is ≤5 s, no 503s occur under 2 concurrent creators, and the capped catch-up is acceptable, **close as not needed**.
 - Otherwise implement create → 202 `{status_url}` with the capture as an RQ task, add a new capability flag and a contract entry, and add client support through §H C-3.
 
 **P2-5 — Migration and lock hygiene (P3 migration items).**
