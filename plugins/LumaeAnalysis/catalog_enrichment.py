@@ -256,7 +256,15 @@ def _profile_floor_hold(cur, catalog_instance_id, epoch):
 
 
 def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
-    """Bound profile and relationship journals during upgrades and maintenance."""
+    """Bound profile and relationship journals during upgrades and maintenance.
+
+    Also sweeps edge payloads that no published profile reaches: a catalogue
+    publication deletes the edges of the profiles it withdraws only after it
+    commits (P2-3), so a failed purge leaves them behind until the next
+    publication or this sweep.
+    """
+    from .profile_publication import purge_withdrawn_edges
+
     cur = cursor or db.cursor()
     cur.execute(
         f"""
@@ -270,6 +278,9 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
         (catalog_instance_id, catalog_instance_id),
     )
     rows = cur.fetchall()
+    # Before any stream-state row is locked below, so no publisher waits on it.
+    for row in rows:
+        purge_withdrawn_edges(cur, str(row[0]))
     for row in rows:
         source_id = str(row[0])
         epoch, head_seq, _floor_seq = _profile_stream_state(
@@ -675,6 +686,63 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
         hold_floor_seq=_profile_floor_hold(cur, catalog_instance_id, epoch),
         current_floor=floor_seq,
         max_advance=PROFILE_COMPACTION_MAX_ADVANCE,
+    )
+    return seq
+
+
+def record_profile_deletions(cur, catalog_instance_id, track_ids):
+    """Append one delete event per track, in order, with one compaction (P2-3).
+
+    Leaves the journal and stream state exactly as ``record_profile_change(...,
+    "deleted")`` called once per track would: the same seqs, rows and head, and
+    the same floor. Per event, compaction may advance the floor by at most
+    ``PROFILE_COMPACTION_MAX_ADVANCE`` towards a target that grows by at most
+    one seq per event, under a hold that cannot change inside the transaction.
+    So n appends reach ``min(target at the last head, floor +
+    n * PROFILE_COMPACTION_MAX_ADVANCE)``, which one compaction with that
+    bound computes, and delete the same rows. Returns the new head, or None
+    when ``track_ids`` is empty (then nothing is read or written).
+    """
+    track_ids = [str(track_id) for track_id in track_ids]
+    if not track_ids:
+        return None
+    epoch, head_seq, floor_seq = _profile_stream_state(
+        cur, catalog_instance_id, for_update=True
+    )
+    seq = head_seq + len(track_ids)
+    cur.execute(
+        f"""
+        INSERT INTO {t("profile_changes")}
+            (catalog_instance_id, epoch, seq, track_id, operation, payload,
+             writer_generation)
+        SELECT %s, %s, %s + event.ordinality, event.track_id, 'delete', NULL, %s
+          FROM unnest(%s::text[]) WITH ORDINALITY AS event(track_id, ordinality)
+        """,
+        (catalog_instance_id, epoch, head_seq, JOURNAL_WRITER_GENERATION, track_ids),
+    )
+    cur.execute(
+        f"UPDATE {t('profile_stream_state')} "
+        "SET head_seq=%s, updated_at=now() "
+        "WHERE catalog_instance_id=%s AND epoch=%s AND head_seq=%s "
+        "RETURNING head_seq, retention_limit",
+        (seq, catalog_instance_id, epoch, head_seq),
+    )
+    advanced = cur.fetchone()
+    if advanced is None:
+        raise RuntimeError("Profile stream head changed during publication")
+    compact_change_journal(
+        cur,
+        catalog_instance_id=catalog_instance_id,
+        state_table="profile_stream_state",
+        changes_table="profile_changes",
+        epoch_column="epoch",
+        floor_column="floor_seq",
+        epoch=epoch,
+        head_seq=seq,
+        retention_limit=max(PROFILE_CHANGE_RETENTION_EVENTS, int(advanced[1] or 0)),
+        hold_floor_seq=_profile_floor_hold(cur, catalog_instance_id, epoch),
+        current_floor=floor_seq,
+        max_advance=PROFILE_COMPACTION_MAX_ADVANCE * len(track_ids),
     )
     return seq
 

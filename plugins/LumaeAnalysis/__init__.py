@@ -1444,6 +1444,10 @@ def migrate(db):
     migrate_enrichment(db)
     credits_store.migrate(db)
     prune_catalog_storage(db)
+    # Must run after the published-profile seed above (marker
+    # published_source_profiles_seed_v1): its edge sweep deletes every edge
+    # no published profile reaches, which before the seed is every edge of a
+    # 1.2.5 install (P2-3).
     compact_enrichment_storage(db)
     migrate_collections(db)
     refresh_integrity_snapshot(db)

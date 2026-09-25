@@ -16,7 +16,12 @@ SAFE_FAILURES = TRANSIENT_FAILURES | REVISION_FAILURES
 from plugin.api import table
 
 from . import migrations
-from .catalog_enrichment import float4, record_profile_change, serialize_profile
+from .catalog_enrichment import (
+    float4,
+    record_profile_change,
+    record_profile_deletions,
+    serialize_profile,
+)
 from .edge_profile_store import edge_join
 
 
@@ -444,17 +449,87 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
         cur.close()
 
 
-def invalidate_catalog_changes(cur, source, generation, track_changes, *, full_reconcile=False):
-    """Withdraw known changed/deleted occurrences inside catalogue publication."""
+def _revision_lookup(cur, source, generation, changed):
+    """What the generation says about each changed track (one statement).
+
+    Returns ``(track_ids, gone, media_fps)``: ``gone`` when the change is a
+    deletion or the track is missing from or unavailable in the generation.
+    """
+    track_ids = list(changed)
+    cur.execute(
+        f"""SELECT c.track_id,
+                   c.deleted OR t.track_id IS NULL OR NOT t.available,
+                   t.media_fp
+              FROM unnest(%s::text[], %s::boolean[]) WITH ORDINALITY
+                   AS c(track_id, deleted, ordinality)
+              LEFT JOIN LATERAL (
+                  SELECT track_id, available, media_fp
+                    FROM {table('catalog_tracks')}
+                   WHERE catalog_instance_id=%s AND published_generation=%s
+                     AND track_id=c.track_id
+                   LIMIT 1
+              ) t ON TRUE
+             ORDER BY c.ordinality""",
+        (track_ids, [changed[track_id] == "delete" for track_id in track_ids],
+         source, generation),
+    )
+    rows = cur.fetchall()
+    return [row[0] for row in rows], [bool(row[1]) for row in rows], [row[2] for row in rows]
+
+
+def plan_catalog_invalidation(cur, source, generation, track_changes, *, full_reconcile=False):
+    """Read, for a catalogue publication, what its generation says (P2-3).
+
+    The generation's rows are the publisher's own, so this can run before
+    ``catalog_state`` is locked; ``withdraw_catalog_changes`` then compares
+    them with the profiles under the lock. A fingerprint-schema rebase
+    (``full_reconcile``) compares every published profile, and those can
+    change until the lock is held, so its lookup is left to the withdrawal.
+    """
     cur.execute("SELECT to_regclass(%s)", (table("published_source_profiles"),))
     publication_table = cur.fetchone()
     if not publication_table or publication_table[0] is None:
-        return 0
+        return None
     changed = {}
     for entity_type, track_id, operation, *_rest in track_changes:
         if entity_type == "track":
             changed[str(track_id)] = operation
-    if full_reconcile:
+    plan = {
+        "source": source,
+        "generation": generation,
+        "full_reconcile": bool(full_reconcile),
+        "changed": changed,
+        "lookup": None,
+    }
+    if changed and not full_reconcile:
+        plan["lookup"] = _revision_lookup(cur, source, generation, changed)
+    return plan
+
+
+# An occurrence is known stale when its track is gone from the generation, or
+# _known_different_signature(signature, 'catalog-media:' || media_fp).
+_STALE_OCCURRENCE = """(
+    c.gone OR (COALESCE({signature}, '') <> '' AND COALESCE(c.media_fp, '') <> ''
+               AND {signature} <> 'catalog-media:' || c.media_fp
+               AND {signature} <> c.media_fp))"""
+
+
+def withdraw_catalog_changes(cur, plan):
+    """Stale the attempts and withdraw the publications a plan finds stale.
+
+    Runs under the publication's ``catalog_state`` row lock, set-based: a
+    fixed number of statements for any number of changed tracks. It writes
+    the rows and journal events the per-track version (before P2-3) wrote,
+    except the withdrawn tracks' edge payloads, which ``purge_withdrawn_edges``
+    deletes. Attempt rows are locked in track-ID order, as before. Returns
+    the withdrawn track IDs in that order.
+    """
+    if plan is None:
+        return []
+    source = plan["source"]
+    changed = dict(plan["changed"])
+    lookup = plan["lookup"]
+    if plan["full_reconcile"]:
         # A fingerprint-schema rebase suppresses ordinary catalog events, so
         # compare every existing publication against the new generation.
         cur.execute(
@@ -471,48 +546,98 @@ def invalidate_catalog_changes(cur, source, generation, track_changes, *, full_r
                  WHERE catalog_instance_id=%s AND attempt_token IS NOT NULL""",
             (source,),
         )
-    withdrawn = 0
-    for track_id, operation in sorted(changed.items()):
-        cur.execute(
-            f"""SELECT media_fp, available FROM {table('catalog_tracks')}
-                 WHERE catalog_instance_id=%s AND published_generation=%s
-                   AND track_id=%s""",
-            (source, generation, track_id),
-        )
-        track = cur.fetchone()
-        known_deleted = operation == "delete" or track is None or not track[1]
-        revision = f"catalog-media:{track[0]}" if track and track[0] else None
-        cur.execute(
-            f"""SELECT attempt_media_signature, media_signature
-                  FROM {table('source_profiles')}
-                 WHERE catalog_instance_id=%s AND track_id=%s FOR UPDATE""",
-            (source, track_id),
-        )
-        attempt = cur.fetchone()
-        attempted_revision = (attempt[0] or attempt[1]) if attempt else None
-        if attempt and (
-            known_deleted
-            or _known_different_signature(attempted_revision, revision)
-        ):
-            cur.execute(
-                f"""UPDATE {table('source_profiles')}
-                       SET status='stale',
-                           last_error='Catalogue media revision changed or track removed',
-                           attempt_token=NULL
-                     WHERE catalog_instance_id=%s AND track_id=%s""",
-                (source, track_id),
+        if changed:
+            lookup = _revision_lookup(cur, source, plan["generation"], changed)
+    if not changed:
+        return []
+    track_ids, gone, media_fps = lookup
+    cur.execute(
+        f"""WITH c AS MATERIALIZED (
+                SELECT * FROM unnest(%(track_ids)s::text[], %(gone)s::boolean[],
+                                     %(media_fps)s::text[]) AS c(track_id, gone, media_fp)
+            ), stale AS MATERIALIZED (
+                SELECT s.track_id
+                  FROM {table('source_profiles')} s
+                  JOIN c ON s.catalog_instance_id=%(source)s AND s.track_id=c.track_id
+                 WHERE {_STALE_OCCURRENCE.format(
+                     signature="COALESCE(NULLIF(s.attempt_media_signature, ''), s.media_signature)"
+                 )}
+                 ORDER BY s.track_id COLLATE "C"
+                   FOR UPDATE OF s
+            ), staled AS (
+                UPDATE {table('source_profiles')} s
+                   SET status='stale',
+                       last_error='Catalogue media revision changed or track removed',
+                       attempt_token=NULL
+                  FROM stale
+                 WHERE s.catalog_instance_id=%(source)s AND s.track_id=stale.track_id
+            ), withdrawn AS (
+                DELETE FROM {table('published_source_profiles')} p
+                 USING c
+                 WHERE p.catalog_instance_id=%(source)s AND p.track_id=c.track_id
+                   AND {_STALE_OCCURRENCE.format(signature="p.media_signature")}
+             RETURNING p.track_id
             )
-        cur.execute(
-            f"""SELECT media_signature FROM {table('published_source_profiles')}
-                 WHERE catalog_instance_id=%s AND track_id=%s FOR UPDATE""",
-            (source, track_id),
-        )
-        published = cur.fetchone()
-        if published and (
-            known_deleted or _known_different_signature(published[0], revision)
-        ):
-            withdrawn += int(_withdraw(cur, source, track_id))
+            SELECT track_id FROM withdrawn ORDER BY track_id COLLATE "C" """,
+        {"source": source, "track_ids": track_ids, "gone": gone, "media_fps": media_fps},
+    )
+    withdrawn = [row[0] for row in cur.fetchall()]
+    record_profile_deletions(cur, source, withdrawn)
     return withdrawn
+
+
+def purge_withdrawn_edges(cur, source, track_ids=None):
+    """Delete edge payloads that no published waveform row reaches.
+
+    An edge is published only for a published waveform row with the same
+    media signature and is read only through one (``edge_join``). Once that
+    row is withdrawn or replaced the edge is unreachable, and it never becomes
+    reachable again: a waveform published for a track without a published
+    row drops the track's edges first (``complete_attempt``). So the deletion
+    can follow a withdrawal in a later transaction, after catalog_state is
+    released (P2-3), and the signature guard keeps any edge that is current.
+
+    The one exception is the upgrade from 1.2.5, which had no published rows:
+    ``migrate`` seeds them from the ready source profiles (marker
+    ``published_source_profiles_seed_v1``), and that makes the existing edges
+    reachable again. So the sweep may run only after that seed, which is
+    where ``migrate`` calls ``compact_enrichment_storage``.
+
+    ``track_ids`` limits it to those tracks. ``None`` sweeps the whole source,
+    which repairs a purge that never ran; the publication runs that sweep
+    after it commits, and ``compact_enrichment_storage`` in maintenance.
+    """
+    if track_ids is not None:
+        track_ids = [str(track_id) for track_id in track_ids]
+        if not track_ids:
+            return 0
+    cur.execute(
+        f"""DELETE FROM {table('edge_profiles')} e
+             WHERE e.catalog_instance_id=%s
+               AND (%s::text[] IS NULL OR e.track_id = ANY(%s::text[]))
+               AND NOT EXISTS (
+                   SELECT 1 FROM {table('published_source_profiles')} p
+                    WHERE p.catalog_instance_id=e.catalog_instance_id
+                      AND p.track_id=e.track_id
+                      AND p.media_signature=e.media_signature)""",
+        (source, track_ids, track_ids),
+    )
+    return max(0, int(getattr(cur, "rowcount", 0) or 0))
+
+
+def invalidate_catalog_changes(cur, source, generation, track_changes, *, full_reconcile=False):
+    """Withdraw known changed/deleted occurrences inside catalogue publication.
+
+    Plan, withdrawal and edge purge in the caller's transaction: the rows and
+    journal events of the per-track version, from a fixed number of
+    statements. Returns the number of withdrawn publications.
+    """
+    plan = plan_catalog_invalidation(
+        cur, source, generation, track_changes, full_reconcile=full_reconcile
+    )
+    withdrawn = withdraw_catalog_changes(cur, plan)
+    purge_withdrawn_edges(cur, source, withdrawn)
+    return len(withdrawn)
 
 
 def rekey_published_profiles(cur, source, tracks):

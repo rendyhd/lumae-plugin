@@ -389,6 +389,16 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - Measure the time `catalog_state` is held.
   - Evaluate `FOR SHARE` instead of `FOR UPDATE` for attempt admission and completion, which need only fence against publication. Adopt it only with a concurrency test proving LUM-008 invariants.
 - Budget: a full reconcile of 20k changed tracks holds `catalog_state` for ≤1 s (currently about 8 s).
+- **Outcome (merged, review PASS after 3 rounds).**
+  - The build runs before the lock. The publication then takes an advisory publisher lock, re-reads `catalog_state` as its base and re-checks it under `FOR UPDATE`.
+  - Withdrawals are set-based (`record_profile_deletions`) under the lock.
+  - Edge rows of withdrawn tracks are purged after the commit by a whole-source sweep (`purge_withdrawn_edges`). The sweep runs after each publication and in `compact_enrichment_storage`, and in `migrate` it must run **after** the 1.2.5 published-profile seed; a test pins that order.
+  - Hold at 20k changed of 132k: 147 s → 0.68 s median (0.73 s max); statements run under the lock: 672k → 12.
+- **Decision.** `FOR SHARE` was evaluated and not adopted. An admission batch and a completion both lock `source_profiles`/`published_source_profiles` rows and then `profile_stream_state`, so under `FOR SHARE` they deadlock (reproduced by `test_admission_batch_and_completion_serialize_without_deadlock`). They serialize on `profile_stream_state` anyway, and F4 is fixed by shortening the hold instead.
+- **Follow-ups (not blocking).**
+  - (L4) `inspect_catalog_identity` still takes `FOR UPDATE OF c` on `catalog_state` during a provider-identity transition. That path builds under the lock; drop `c` from that lock now that the publisher lock excludes a second publisher.
+  - The hold of a fingerprint-schema rebase is unmeasured.
+  - Overlapping refreshes publish in fetch-completion order, so a removed track can briefly reappear until the next refresh. A possible mitigation: skip as superseded when the generation published in the meantime came from a later scan.
 
 **P2-4 — v2 capture off the request thread (conditional).**
 - After P1-5 and P1-6, measure create p95 at 94k with edges on gunicorn gthread×4 (P2-6).
