@@ -22,12 +22,16 @@ A create runs in three transactions on that connection (P1-6, AUD-11):
    The lock is always unlocked explicitly. If the capture fails, the admitted
    row is deleted; if even that fails, it stops counting after
    ``PROFILE_BOOTSTRAP_CAPTURE_MINUTES``.
+
+The snapshot rows, and the first catch-up's rows, are built by
+``INSERT ... SELECT`` in the owned backend (P2-4), in batches that keep each
+statement short. No row passes through Python, so a capture never holds the
+web worker's GIL while it runs.
 """
 
 import base64
 import hashlib
 import hmac
-import io
 import json
 import math
 import re
@@ -47,9 +51,7 @@ from .catalog_enrichment import (
     PROFILE_BOOTSTRAP_CAPTURE_MINUTES,
     PROFILE_CHANGE_RETENTION_EVENTS,
     live_bootstrap_session_sql,
-    serialize_profile,
 )
-from .edge_profile_store import edge_join
 
 
 # Session lifetime: the absolute lifetime from admission, and the sliding
@@ -100,6 +102,11 @@ MAX_SNAPSHOT_BYTES = 128 * 1024 * 1024
 CATCHUP_RETENTION_MULTIPLIER = MAX_HELD_RETENTION_MULTIPLIER
 MAX_CATCHUP_BYTES = 128 * 1024 * 1024
 MAX_CATCHUP_EVENT_BYTES = 1024
+# Rows per capture batch (P2-4): published profiles (keyset on track_id) or
+# journal seqs. A batch is one or two statements of about 0.1 s, far below
+# STATEMENT_TIMEOUT_MS, and a catch-up batch's rows stay in work_mem.
+SNAPSHOT_BATCH_ROWS = 5_000
+CATCHUP_BATCH_EVENTS = 5_000
 TRANSFER_CONTRACT = "source_scoped_v1"
 STATEMENT_TIMEOUT_MS = 20_000
 LOCK_TIMEOUT_MS = 5_000
@@ -425,32 +432,388 @@ def _served(cur, session):
 # {"profile_digest": ...} (about 100 bytes less per row, which keeps a 94k
 # capture under its WAL budget). Only a catch-up reference whose journalled
 # edge names another revision than the event payload carries media_revision.
-_EDGE_REF = '{"profile_digest":%s}'
-_json_string = json.encoder.encode_basestring_ascii
+#
+# P2-4: the captures build their rows in SQL. Each row's JSON is written as the
+# text ``json.dumps(..., separators=(",", ":"))`` produced for it before, and
+# stored as JSONB from that text, so the stored rows, the pages and the byte
+# caps are unchanged (the equivalence test keeps the Python capture as its
+# oracle). The SQL spells out what the Python serializers did:
+#
+# * ``ref_lufs``: serialize_profile's float4() is numpy's shortest decimal of
+#   the REAL as psycopg2 read it (under the session's extra_float_digits;
+#   see _FLOAT4_SHORTEST), written as Python's float repr: fixed notation with
+#   at least one decimal for 1e-4 <= |x| < 1e16 (-14.0, never -14), exponent
+#   notation otherwise (1e-05), and null for NaN or infinity. to_jsonb(real)
+#   would give -14 and "NaN".
+# * ramps: base64 without the line breaks encode() inserts every 76 characters.
+# * timestamps: datetime.isoformat() drops ".000000"; +-infinity are
+#   psycopg2's datetime.max and datetime.min.
+# * byte counts: json.dumps escapes DEL and every non-ASCII character
+#   (ensure_ascii), which PostgreSQL's JSON text keeps as is.
+
+# Each query computes in stages that PostgreSQL may not flatten (LIMIT, OFFSET
+# 0 or a window function): the values read from the row, then the JSON text
+# built from them. Flattened, every reference to a value would compute it
+# again (the JSON text, sha256, to_char and the regexes several times a row).
+
+# float4() gives numpy's shortest decimal of the float4. PostgreSQL's float4
+# output is the same digits except where numpy finds a shorter decimal: exactly
+# on the rounding boundary of a value with an even mantissa (from 2^23 up, where
+# float4 values are integers: 3.3554448e+07 is 3.355445e+07 to numpy), and for
+# subnormal values when extra_float_digits < 1 gives 6 digits where fewer
+# identify the value. Only there are the shortest decimals searched: the first
+# length k at which a neighbour of the text, cut to k significant digits,
+# parses back to the same float4. If both neighbours do, numpy takes the one
+# nearer the float4's exact value m * 2^-q (from its bits; twice it is
+# compared with the neighbours' sum in exact integers), on a tie the even
+# digit. A neighbour at or beyond the float4 overflow threshold (FLT_MAX +
+# ulp/2) would not parse.
+_FLOAT4_SHORTEST = """(
+    SELECT CASE WHEN c.lo_ok AND c.hi_ok THEN CASE
+                     WHEN c.above > 0 THEN c.hi WHEN c.above < 0 THEN c.lo
+                     WHEN mod(trunc(abs(c.lo) / c.u), 2) = 0 THEN c.lo ELSE c.hi END
+                WHEN c.lo_ok THEN c.lo ELSE c.hi END
+      FROM (SELECT g.k, l.lo, l.hi, l.u, l.lo::real = a.x AS lo_ok,
+                   CASE WHEN abs(l.hi) >= 340282356779733661637539395458142568448 THEN FALSE
+                        ELSE l.hi::real = a.x END AS hi_ok,
+                   sign(2 * a.m * 2::numeric ^ greatest(-a.q, 0)
+                        - (abs(l.lo) + abs(l.hi)) * 2::numeric ^ greatest(a.q, 0)) AS above
+              FROM (SELECT d.v, d.x,
+                           CASE WHEN abs(d.v) >= 1 THEN length(split_part(abs(d.v)::text, '.', 1)) - 1
+                                ELSE length(ltrim(split_part(abs(d.v)::text, '.', 2), '0'))
+                                     - length(split_part(abs(d.v)::text, '.', 2)) - 1 END AS e,
+                           CASE WHEN d.exponent = 0 THEN d.mantissa
+                                ELSE d.mantissa + 8388608 END AS m,
+                           CASE WHEN d.exponent = 0 THEN 149 ELSE 150 - d.exponent END AS q
+                      FROM (SELECT f.v, f.x,
+                                   (get_byte(f.bits, 0) & 127) * 2 + (get_byte(f.bits, 1) >> 7)
+                                       AS exponent,
+                                   (get_byte(f.bits, 1) & 127) * 65536 + get_byte(f.bits, 2) * 256
+                                       + get_byte(f.bits, 3) AS mantissa
+                              FROM (SELECT p.ref_lufs::text::numeric AS v,
+                                           p.ref_lufs::text::real AS x,
+                                           float4send(p.ref_lufs::text::real) AS bits) f) d
+                   ) a
+             CROSS JOIN generate_series(1, 9) g(k)
+             CROSS JOIN LATERAL (
+                SELECT trunc(a.v, g.k - 1 - a.e) AS lo,
+                       trunc(a.v, g.k - 1 - a.e) + sign(a.v) * trunc(
+                           10::numeric ^ (a.e - g.k + 1), greatest(g.k - 1 - a.e, 0)) AS hi,
+                       trunc(10::numeric ^ (a.e - g.k + 1), greatest(g.k - 1 - a.e, 0)) AS u) l
+           ) c
+     WHERE c.lo_ok OR c.hi_ok
+     ORDER BY c.k LIMIT 1)"""
+
+# The profile's values (b): serialize_profile's inputs as they will be written.
+# lufs is the decimal float4() gives; lufs_text PostgreSQL's float4 text. Both
+# come from the text psycopg2 read, so they follow extra_float_digits as it did.
+_SNAPSHOT_VALUES = f"""
+    p.track_id, p.sample_rate, p.duration_ms, p.start_ramp, p.end_ramp,
+    p.analyzer_ver, p.analyzed_at, p.media_signature, p.ref_lufs::text AS lufs_text,
+    CASE WHEN p.ref_lufs IN ('NaN', 'Infinity', '-Infinity') THEN NULL
+         WHEN abs(p.ref_lufs) >= 8388608
+              OR p.ref_lufs <> 0 AND abs(p.ref_lufs) < '1.17549435e-38'::real
+         THEN {_FLOAT4_SHORTEST}
+         ELSE p.ref_lufs::text::numeric END AS lufs,
+    to_char(p.analyzed_at, 'YYYY-MM-DD"T"HH24:MI:SS.US') AS stamp"""
+
+# serialize_profile's ref_lufs and analyzed_at, as json.dumps writes them:
+# Python's float repr of lufs, fixed notation with a decimal between 1e-4 and
+# 1e16 and d.ddde-XX outside (the sign of a zero is kept only in the text).
+_SNAPSHOT_LUFS_DIGITS = "rtrim(ltrim(replace(abs(b.lufs)::text, '.', ''), '0'), '0')"
+_SNAPSHOT_LUFS = f"""CASE
+    WHEN b.lufs IS NULL THEN 'null'
+    WHEN b.lufs = 0 THEN CASE WHEN left(b.lufs_text, 1) = '-' THEN '-0.0' ELSE '0.0' END
+    WHEN abs(b.lufs) >= 0.0001 AND abs(b.lufs) < 1e16
+    THEN round(b.lufs, greatest(scale(b.lufs), 1))::text
+    ELSE CASE WHEN b.lufs < 0 THEN '-' ELSE '' END
+         || left({_SNAPSHOT_LUFS_DIGITS}, 1)
+         || CASE WHEN length({_SNAPSHOT_LUFS_DIGITS}) > 1
+                 THEN '.' || substr({_SNAPSHOT_LUFS_DIGITS}, 2) ELSE '' END
+         || CASE WHEN abs(b.lufs) >= 1
+                 THEN 'e+' || lpad((length(split_part(abs(b.lufs)::text, '.', 1)) - 1)::text, 2, '0')
+                 ELSE 'e-' || lpad((length(split_part(abs(b.lufs)::text, '.', 2))
+                                    - length(ltrim(split_part(abs(b.lufs)::text, '.', 2), '0'))
+                                    + 1)::text, 2, '0') END END"""
+_SNAPSHOT_STAMP = """CASE
+    WHEN b.analyzed_at = 'infinity' THEN '9999-12-31T23:59:59.999999'
+    WHEN b.analyzed_at = '-infinity' THEN '0001-01-01T00:00:00'
+    WHEN right(b.stamp, 7) = '.000000' THEN left(b.stamp, -7)
+    ELSE b.stamp END"""
+
+# base64 as b64encode writes it: encode() ends a line after every 57 bytes (76
+# characters), the last one included, and a ramp is rarely that long.
+_SNAPSHOT_BASE64 = (r"CASE WHEN octet_length({ramp}) >= 57 "
+                    r"THEN translate(encode({ramp}, 'base64'), E'\n', '') "
+                    r"ELSE encode({ramp}, 'base64') END")
+
+# json.dumps(serialize_profile(...), separators=(",", ":")), from b.
+_SNAPSHOT_DOC = r"""
+    '{"track_id":' || to_jsonb(b.track_id)::text
+    || ',"source":"waveform","sample_rate":' || b.sample_rate
+    || ',"duration_ms":' || b.duration_ms
+    || ',"ref_lufs":' || """ + _SNAPSHOT_LUFS + r"""
+    || ',"start_ramp":"' || """ + _SNAPSHOT_BASE64.format(ramp='b.start_ramp') + r"""
+    || '","end_ramp":"' || """ + _SNAPSHOT_BASE64.format(ramp='b.end_ramp') + r"""
+    || '","analyzer_ver":' || b.analyzer_ver
+    || ',"analyzed_at":"' || """ + _SNAPSHOT_STAMP + r"""
+    || '","media_signature":' || COALESCE('"' || b.revision || '"', 'null')
+    || ',"media_revision":' || COALESCE('"' || b.revision || '"', 'null')
+    || '}'"""
+
+# The length of that text without building it: its keys and punctuation, plus
+# each value (base64 of n bytes is 4 * ceil(n / 3) characters, analyzed_at 19
+# or, with microseconds, 26, a revision is "sha256:" and 64 hex digits). The
+# equivalence test checks it against json.dumps.
+_SNAPSHOT_DOC_FIXED = len(
+    '{"track_id":,"source":"waveform","sample_rate":,"duration_ms":,"ref_lufs":,'
+    '"start_ramp":"","end_ramp":"","analyzer_ver":,"analyzed_at":"",'
+    '"media_signature":,"media_revision":}')
+_SNAPSHOT_DOC_LENGTH = f"""
+    {_SNAPSHOT_DOC_FIXED} + length(to_jsonb(b.track_id)::text)
+    + length(b.sample_rate::text) + length(b.duration_ms::text)
+    + length({_SNAPSHOT_LUFS})
+    + 4 * ((octet_length(b.start_ramp) + 2) / 3) + 4 * ((octet_length(b.end_ramp) + 2) / 3)
+    + length(b.analyzer_ver::text)
+    + CASE WHEN b.analyzed_at = '-infinity' OR b.analyzed_at <> 'infinity'
+                AND date_trunc('second', b.analyzed_at) = b.analyzed_at THEN 19 ELSE 26 END
+    + CASE WHEN b.media_signature <> '' THEN 2 * 73 ELSE 2 * 4 END"""
+
+# The event's values (a): the journal row with its edge split off.
+_CATCHUP_VALUES = """
+    j.seq, j.track_id, j.operation, j.created_at,
+    CASE WHEN j.split THEN j.payload - 'edge_profile' ELSE j.payload END AS part_json,
+    to_char(j.created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.US') AS stamp,
+    CASE WHEN j.split THEN jsonb_strip_nulls(jsonb_build_object(
+        'media_revision', NULLIF(j.payload#>'{edge_profile,media_revision}',
+                                 j.payload->'media_revision'),
+        'profile_digest', j.payload#>'{edge_profile,profile_digest}'))
+    END AS edge_ref"""
+
+# json.dumps of the event dict the Python capture built, from b (b.part is the
+# payload part's JSON text).
+_CATCHUP_DOC = r"""
+    '{"seq":' || b.seq
+    || ',"track_id":' || to_jsonb(b.track_id)::text
+    || ',"operation":' || to_jsonb(b.operation)::text
+    || ',"payload":' || b.part
+    || ',"created_at":"' || CASE
+           WHEN b.created_at = 'infinity' THEN '9999-12-31T23:59:59.999999'
+           WHEN b.created_at = '-infinity' THEN '0001-01-01T00:00:00'
+           WHEN right(b.stamp, 7) = '.000000' THEN left(b.stamp, -7)
+           ELSE b.stamp END
+    || 'Z"}'"""
+
+# A JSON number with a fraction, as PostgreSQL writes it, is json.loads'
+# float; its text equals the float's repr unless it is below 1e-4 (repr uses
+# an exponent), has trailing zeros, or has 16 or more digits.
+_NOT_FLOAT_REPR = r"E'0\\.0000|\\.[0-9]*[0-9]0([^0-9]|$)|[0-9]{16}'"
 
 
-def _copy_value(value):
-    if value is None:
-        return "\\N"
-    text = str(value)
-    if "\\" in text:
-        text = text.replace("\\", "\\\\")
-    if "\t" in text or "\n" in text or "\r" in text:
-        text = text.replace("\t", "\\t").replace("\n", "\\n").replace("\r", "\\r")
-    return text
+def _float_repr_extra(number):
+    """SQL: len(repr(float(t))) - len(t) for ``number``, a JSON number text
+    with a fraction as PostgreSQL writes it. Numbers of more than 17
+    significant digits (no float repr; the journal never holds one) are
+    measured as if rounded to 17."""
+    return f"""(
+        SELECT d.neg - length(d.t) + CASE
+            WHEN d.n = 0 THEN 3
+            WHEN d.e >= -4 AND d.e < 16 AND d.e >= 0 THEN d.e + 2 + greatest(1, d.n - d.e - 1)
+            WHEN d.e >= -4 AND d.e < 16 THEN 1 - d.e + d.n
+            ELSE d.n + (d.n > 1)::int + 2 + greatest(2, length(abs(d.e)::text)) END
+          FROM (SELECT y.t, y.neg, least(length(rtrim(ltrim(y.ip || y.fp, '0'), '0')), 17) AS n,
+                       CASE WHEN ltrim(y.ip, '0') <> '' THEN length(ltrim(y.ip, '0')) - 1
+                            ELSE length(ltrim(y.fp, '0')) - length(y.fp) - 1 END AS e
+                  FROM (SELECT x.t, (left(x.t, 1) = '-')::int AS neg,
+                               split_part(ltrim(x.t, '-'), '.', 1) AS ip,
+                               split_part(x.t, '.', 2) AS fp
+                          FROM (SELECT {number} AS t) x) y) d)"""
 
 
-def _copy_rows(cur, name, columns, rows):
-    """Bulk-append rows with COPY: multi-insert WAL records and no per-row
-    statement parsing (most of a 94k capture's time and WAL)."""
+def _numbers_extra(numbers):
+    """SQL: what json.dumps(json.loads(t)) adds to the floats in ``numbers``,
+    a JSON text holding no strings (so every number in it is a number)."""
+    return f"""CASE WHEN {numbers} !~ {_NOT_FLOAT_REPR} THEN 0
+        ELSE (SELECT COALESCE(sum({_float_repr_extra('m[1]')}), 0)
+                FROM regexp_matches({numbers}, E'-?[0-9]+\\\\.[0-9]+', 'g') m) END"""
+
+
+# The payload part is PostgreSQL's JSON text of the journalled JSONB, which
+# the Python capture parsed and dumped again: json.dumps writes its ", " and
+# ": " separators without the space, and each float as its repr.
+# A flat object without a backslash (every value a scalar, no string holds a
+# quote) of k keys has exactly k '": ' and 2k - 1 separators, and its numbers
+# are its number values (a serialize_profile payload, as the journal holds
+# them). Anything else is measured on its text with the strings removed: then
+# the only spaces are separators and the only numbers are numbers.
+_FLAT_NUMBERS = """jsonb_path_query_array(b.part_json, 'strict $.* ? (@.type() == "number")')::text"""
+_CATCHUP_PART_EXTRA = f"""CASE
+    WHEN b.part = 'null' THEN 0
+    WHEN left(b.part, 1) = '{{' AND strpos(substr(b.part, 2), '{{') = 0
+         AND strpos(b.part, '[') = 0 AND strpos(b.part, E'\\\\') = 0
+    THEN -greatest(2 * ((length(b.part) - length(replace(b.part, '": ', ''))) / 3) - 1, 0)
+         + {_numbers_extra(_FLAT_NUMBERS)}
+    ELSE (SELECT -(length(x.bare) - length(replace(x.bare, ' ', ''))) + {_numbers_extra('x.bare')}
+            FROM (SELECT regexp_replace(b.part, E'"(?:[^"\\\\\\\\]|\\\\\\\\.)*"', '', 'g') AS bare) x)
+    END"""
+
+
+def _ascii_escape_extra(text):
+    """SQL: the characters ``json.dumps`` (``ensure_ascii``) writes beyond
+    PostgreSQL's JSON text for ``text``. Both escape quotes, backslashes and
+    control characters alike; Python also writes DEL and every non-ASCII
+    character as a 6-character ``\\uXXXX`` escape, and a character beyond the
+    Basic Multilingual Plane as two. In a UTF8 database a text without DEL
+    whose characters are all one byte long is ASCII, which is checked first."""
+    return (f"CASE WHEN octet_length({text}) = length({text}) AND strpos({text}, chr(127)) = 0 "
+            "AND (SELECT current_setting('server_encoding') = 'UTF8') THEN 0 "
+            f"WHEN {text} ~ E'[^\\\\x01-\\\\x7e]' THEN "
+            f"5 * length(regexp_replace({text}, E'[\\\\x01-\\\\x7e]+', '', 'g')) "
+            f"+ 6 * length(regexp_replace({text}, E'[^\\\\U00010000-\\\\U0010ffff]+', '', 'g')) "
+            "ELSE 0 END")
+
+
+def _snapshot_batch(cur, source, session_id, ordinal, after):
+    """Capture the next SNAPSHOT_BATCH_ROWS profiles after ``after`` (None:
+    from the start) as ordinals ``ordinal`` onwards, in two statements of the
+    capture's snapshot: measure the batch, then copy exactly its rows.
+
+    Returns ``(rows, json_bytes, last_track_id, unrepresentable)``, where
+    ``json_bytes`` counts the rows' waveform JSON as MAX_SNAPSHOT_BYTES does.
+    """
+    params = {"source": source, "after": after, "limit": SNAPSHOT_BATCH_ROWS,
+              "session_id": session_id, "ordinal": ordinal}
+    keyset = "" if after is None else " AND p.track_id > %(after)s"
+    edge_keyset = "" if after is None else " AND e.track_id > %(after)s"
+    cur.execute(
+        f"""SELECT count(*),
+                   COALESCE(sum({_SNAPSHOT_DOC_LENGTH}
+                                + {_ascii_escape_extra('b.track_id')}), 0),
+                   max(b.track_id), COALESCE(bool_or(b.unrepresentable), FALSE)
+              FROM (SELECT {_SNAPSHOT_VALUES},
+                           -- psycopg2 has no datetime for these: rows the
+                           -- Python capture failed on.
+                           (p.analyzed_at <> '-infinity' AND p.analyzed_at < '0001-01-01'
+                            OR p.analyzed_at <> 'infinity'
+                               AND p.analyzed_at >= '10000-01-01') AS unrepresentable
+                      FROM {_table('published_source_profiles')} p
+                     WHERE p.catalog_instance_id=%(source)s{keyset}
+                     ORDER BY p.track_id LIMIT %(limit)s) b""", params)
+    rows, json_bytes, last, unrepresentable = cur.fetchone()
     if not rows:
-        return
-    buffer = io.StringIO()
-    for row in rows:
-        buffer.write("\t".join(_copy_value(value) for value in row))
-        buffer.write("\n")
-    buffer.seek(0)
-    cur.copy_expert(f"COPY {_table(name)} ({', '.join(columns)}) FROM STDIN", buffer)
+        return rows, json_bytes, last, unrepresentable
+    params["last"] = last
+    # The edge each row embeds is the one edge_join() picks: for the row's
+    # (track_id, media_signature), the newest updated_at, then the lowest
+    # profile_digest. It is picked set-based over the batch's track range, a
+    # hash or merge join (see _capture_snapshot) instead of a lookup per row,
+    # and only its key columns are read, so the TOASTed edge payload is never
+    # detoasted or copied; snapshot_page resolves the reference (K2).
+    cur.execute(
+        f"""INSERT INTO {_table('profile_bootstrap_snapshot')}
+                   (session_id, ordinal, payload, edge_ref)
+            SELECT %(session_id)s, %(ordinal)s + b.i, ({_SNAPSHOT_DOC})::jsonb,
+                   CASE WHEN b.revision IS NOT NULL AND edge.media_revision=b.revision
+                             AND edge.profile_digest <> ''
+                        THEN jsonb_build_object('profile_digest', edge.profile_digest) END
+              FROM (SELECT {_SNAPSHOT_VALUES},
+                           CASE WHEN p.media_signature <> ''
+                                THEN 'sha256:' || encode(sha256(convert_to(
+                                    p.media_signature, 'UTF8')), 'hex')
+                           END AS revision,
+                           row_number() OVER (ORDER BY p.track_id) - 1 AS i
+                      FROM {_table('published_source_profiles')} p
+                     WHERE p.catalog_instance_id=%(source)s{keyset}
+                       AND p.track_id <= %(last)s) b
+              LEFT JOIN (
+                SELECT DISTINCT ON (e.track_id, e.media_signature)
+                       e.track_id, e.media_signature, e.media_revision, e.profile_digest
+                  FROM {_table('edge_profiles')} e
+                 WHERE e.catalog_instance_id=%(source)s{edge_keyset}
+                   AND e.track_id <= %(last)s
+                 ORDER BY e.track_id, e.media_signature, e.updated_at DESC, e.profile_digest
+              ) edge ON edge.track_id=b.track_id AND edge.media_signature=b.media_signature""",
+        params)
+    if cur.rowcount != rows:
+        raise RuntimeError("snapshot batch changed within its snapshot")
+    return rows, json_bytes, last, unrepresentable
+
+
+def _catchup_batch(cur, session, after, upto, count, byte_count, limits):
+    """Capture the journal events ``after < seq <= upto`` as ordinals
+    ``count`` onwards; ``byte_count`` is what the earlier batches used.
+
+    Returns ``(rows, first_gap, first_over, json_bytes)``: ``first_gap`` and
+    ``first_over`` are the batch indexes of the first event that is not the
+    next seq, and of the first that exceeds ``limits`` (None if none), and
+    ``json_bytes`` counts this batch's events as MAX_CATCHUP_BYTES does.
+    """
+    max_events, max_bytes = limits
+    cur.execute(
+        f"""WITH src AS MATERIALIZED (
+                SELECT c.seq, c.i, c.doc, c.edge_ref,
+                       length(c.doc) + {_ascii_escape_extra('c.doc')} + c.part_extra AS json_bytes
+                  FROM (SELECT b.seq, b.i, b.edge_ref, {_CATCHUP_DOC} AS doc,
+                               {_CATCHUP_PART_EXTRA} AS part_extra
+                          FROM (SELECT a.*, COALESCE(a.part_json::text, 'null') AS part
+                                  FROM (SELECT {_CATCHUP_VALUES},
+                                               row_number() OVER (ORDER BY j.seq) - 1 AS i
+                                          FROM (SELECT seq, track_id, operation, payload, created_at,
+                                                       COALESCE(
+                                                           jsonb_typeof(payload#>'{{edge_profile,media_revision}}')='string'
+                                                           AND jsonb_typeof(payload#>'{{edge_profile,profile_digest}}')='string',
+                                                           FALSE) AS split
+                                                  FROM {_table('profile_changes')}
+                                                 WHERE catalog_instance_id=%(source)s AND epoch=%(epoch)s
+                                                   AND seq>%(after)s AND seq<=%(upto)s) j
+                                         ORDER BY j.seq OFFSET 0) a
+                                OFFSET 0) b
+                        OFFSET 0) c
+            ), stored AS (
+                INSERT INTO {_table('profile_bootstrap_catchup')}
+                       (session_id, ordinal, seq, payload, edge_ref)
+                SELECT %(session_id)s, %(count)s + i, seq, doc::jsonb, edge_ref FROM src
+            )
+            SELECT count(*),
+                   min(i) FILTER (WHERE seq <> %(after)s + 1 + i),
+                   min(i) FILTER (WHERE %(count)s + i + 1 > %(max_events)s
+                                     OR %(byte_count)s + total > %(max_bytes)s),
+                   COALESCE(max(total), 0)
+              FROM (SELECT i, seq, sum(json_bytes) OVER (ORDER BY i) AS total FROM src) acc""",
+        {"source": session[4], "epoch": session[7], "after": after, "upto": upto,
+         "session_id": session[0], "count": count, "byte_count": byte_count,
+         "max_events": max_events, "max_bytes": max_bytes})
+    return cur.fetchone()
+
+
+def _capture_catchup(cur, session, head, limits):
+    """Capture the first catch-up, events ``snapshot_seq < seq <= head``, in
+    CATCHUP_BATCH_EVENTS batches; returns the event count.
+
+    Like the Python capture it replaced, it answers 410 at the first event
+    that is not the next seq (compacted or purged meanwhile), and 413 at the
+    first that exceeds ``limits``, whichever comes first. Journal rows never
+    change, they only disappear, so batches read in statements of their own
+    see the rows a single read would, unless some disappeared: 410 either way.
+    """
+    count = byte_count = 0
+    after = session[9]
+    while after < head:
+        upto = min(after + CATCHUP_BATCH_EVENTS, head)
+        rows, gap, over, json_bytes = _catchup_batch(
+            cur, session, after, upto, count, byte_count, limits)
+        if gap is not None and (over is None or gap <= over):
+            gone()
+        if over is not None:
+            raise BootstrapError("bootstrap_snapshot_limit", 413)
+        if rows != upto - after:
+            gone()  # the next event after this batch's last one is missing
+        count += rows
+        byte_count += json_bytes
+        after = upto
+    if count != head - session[9]:
+        gone()
+    return count
 
 
 def _edge_lookup(alias, profile):
@@ -641,42 +1004,32 @@ def _capture_snapshot(db, source, session_id, admitted):
         row = cur.fetchone()
         if row is None or not row[0]:
             gone()  # replaced by a retried create (K5) while it waited
-        reader = db.cursor(name=f"profile_snapshot_{session_id.replace('-', '')}")
-        reader.itersize = 500
-        # The same edge row edge_join() picks, but only its key columns,
-        # so the TOASTed edge payload is never detoasted or copied;
-        # snapshot_page resolves the reference (K2).
-        reader.execute(
-            f"""SELECT p.track_id, p.sample_rate, p.duration_ms, p.ref_lufs,
-                       p.start_ramp, p.end_ramp, p.analyzer_ver, p.analyzed_at,
-                       p.media_signature, edge.media_revision, edge.profile_digest
-                  FROM {_table('published_source_profiles')} p
-                  {edge_join(columns='e.media_revision, e.profile_digest')}
-                 WHERE p.catalog_instance_id=%s ORDER BY p.track_id""",
-            (source,))
+        # Batches are planned one by one; JIT compilation would cost more
+        # than a batch runs. A batch's edge join must be hashed or merged:
+        # without statistics for a source's rows (a source added or refilled
+        # since the last ANALYZE) both sides are estimated at one row, and a
+        # nested loop would run the edge side once per profile (a minute at
+        # 94k instead of a second).
+        cur.execute("SELECT set_config('jit', 'off', true), "
+                    "set_config('enable_nestloop', 'off', true)")
+        # Every batch reads this transaction's snapshot.
         ordinal = 0
         byte_count = 0
+        after = None
         while True:
-            rows = reader.fetchmany(500)
-            if not rows:
+            rows, json_bytes, last, unrepresentable = _snapshot_batch(
+                cur, source, session_id, ordinal, after)
+            if unrepresentable:
+                # The Python capture failed on these rows (psycopg2 has no
+                # datetime for them); keep failing rather than invent a text.
+                raise ValueError("analyzed_at outside the datetime range")
+            ordinal += rows
+            byte_count += json_bytes
+            if ordinal > MAX_SNAPSHOT_ROWS or byte_count > MAX_SNAPSHOT_BYTES:
+                raise BootstrapError("bootstrap_snapshot_limit", 413)
+            if rows < SNAPSHOT_BATCH_ROWS:
                 break
-            batch = []
-            for row in rows:
-                payload = serialize_profile(*row[:9])
-                text = json.dumps(payload, separators=(",", ":"))
-                byte_count += len(text.encode())
-                ordinal += 1
-                if ordinal > MAX_SNAPSHOT_ROWS or byte_count > MAX_SNAPSHOT_BYTES:
-                    raise BootstrapError("bootstrap_snapshot_limit", 413)
-                revision = payload.get("media_revision")
-                # serialize_profile embeds an edge only for the profile's
-                # current revision; snapshot_page re-checks the payload.
-                edge_ref = (_EDGE_REF % _json_string(row[10])
-                            if revision and row[9] == revision and row[10] else None)
-                batch.append((session_id, ordinal - 1, text, edge_ref))
-            _copy_rows(cur, "profile_bootstrap_snapshot",
-                       ("session_id", "ordinal", "payload", "edge_ref"), batch)
-        reader.close()
+            after = last
         # The captured head replaces the admission head the hold used so far.
         snapshot_seq = int(state[4])
         cur.execute(
@@ -745,14 +1098,21 @@ def snapshot_page(body):
             # the pre-K2 capture stored with the edge embedded. The lookup
             # matches the row's track_id and media_revision (see _edge_lookup),
             # so the edge payload is detoasted once, only to embed it.
+            # The page's rows are chosen (ORDER BY ... LIMIT) before the
+            # lookup: without statistics on the snapshot table (a fresh
+            # install) a planner could otherwise join every remaining row of
+            # the session, detoasting each edge, and limit only after sorting.
             cur.execute(
                 f"""SELECT CASE WHEN edge.payload IS NOT NULL
                             THEN s.payload || jsonb_build_object('edge_profile', edge.payload)
                             ELSE s.payload END
-                      FROM {_table('profile_bootstrap_snapshot')} s
+                      FROM (SELECT ordinal, payload, edge_ref
+                              FROM {_table('profile_bootstrap_snapshot')}
+                             WHERE session_id=%s AND ordinal>=%s
+                             ORDER BY ordinal LIMIT %s) s
                       {_edge_lookup('s', 's.payload')}
-                     WHERE s.session_id=%s AND s.ordinal>=%s ORDER BY s.ordinal LIMIT %s""",
-                (session[4], session[0], ordinal, session[8]))
+                     ORDER BY s.ordinal""",
+                (session[0], ordinal, session[8], session[4]))
             profiles = [row[0] for row in cur.fetchall()]
             following = ordinal + len(profiles)
             more = following < session[11]
@@ -777,56 +1137,10 @@ def catchup_page(body):
                 if session[9] < state[5]:
                     gone()
                 head = int(state[4])
-                reader = db.cursor(name=f"profile_catchup_{str(session[0]).replace('-', '')}")
-                reader.itersize = 500
-                # An upsert's embedded edge is split off in SQL (it never
-                # reaches Python) and kept as a reference, like the snapshot.
-                reader.execute(
-                    f"""SELECT seq, track_id, operation,
-                               CASE WHEN split THEN payload - 'edge_profile' ELSE payload END,
-                               created_at,
-                               CASE WHEN split THEN jsonb_strip_nulls(jsonb_build_object(
-                                   'media_revision', NULLIF(payload#>'{{edge_profile,media_revision}}',
-                                                            payload->'media_revision'),
-                                   'profile_digest', payload#>'{{edge_profile,profile_digest}}')
-                               )::text END
-                          FROM (SELECT seq, track_id, operation, payload, created_at,
-                                       COALESCE(
-                                           jsonb_typeof(payload#>'{{edge_profile,media_revision}}')='string'
-                                           AND jsonb_typeof(payload#>'{{edge_profile,profile_digest}}')='string',
-                                           FALSE) AS split
-                                  FROM {_table('profile_changes')}
-                                 WHERE catalog_instance_id=%s AND epoch=%s
-                                   AND seq>%s AND seq<=%s) j
-                         ORDER BY seq""",
-                    (session[4], session[7], session[9], head))
-                max_events, max_bytes = catchup_limits(state[6])
-                count = 0
-                bytes_used = 0
-                expected_seq = session[9] + 1
-                while True:
-                    rows = reader.fetchmany(500)
-                    if not rows:
-                        break
-                    batch = []
-                    for seq, track_id, operation, payload, created_at, edge_ref in rows:
-                        if seq != expected_seq:
-                            gone()
-                        expected_seq += 1
-                        event = {"seq": int(seq), "track_id": track_id,
-                                 "operation": operation, "payload": payload,
-                                 "created_at": _iso(created_at)}
-                        text = json.dumps(event, separators=(",", ":"))
-                        bytes_used += len(text.encode())
-                        count += 1
-                        if count > max_events or bytes_used > max_bytes:
-                            raise BootstrapError("bootstrap_snapshot_limit", 413)
-                        batch.append((session[0], count - 1, seq, text, edge_ref))
-                    _copy_rows(cur, "profile_bootstrap_catchup",
-                               ("session_id", "ordinal", "seq", "payload", "edge_ref"), batch)
-                reader.close()
-                if expected_seq != head + 1:
-                    gone()
+                # An upsert's embedded edge is split off in SQL and kept as a
+                # reference, like the snapshot. See _capture_snapshot for jit.
+                cur.execute("SELECT set_config('jit', 'off', true)")
+                _capture_catchup(cur, session, head, catchup_limits(state[6]))
                 cur.execute(f"UPDATE {_table('profile_bootstrap_sessions')} SET head_seq=%s "
                             "WHERE session_id=%s", (head, session[0]))
                 session = tuple(session[:10]) + (head,) + tuple(session[11:])
@@ -835,14 +1149,19 @@ def catchup_page(body):
             if ordinal > count or (ordinal != 0 and ordinal % session[8]):
                 invalid()
             session = _served(cur, session)
+            # The page's rows are chosen before the edge lookup, as in
+            # snapshot_page.
             cur.execute(
                 f"""SELECT CASE WHEN edge.payload IS NOT NULL
                             THEN jsonb_set(c.payload, '{{payload,edge_profile}}', edge.payload)
                             ELSE c.payload END
-                      FROM {_table('profile_bootstrap_catchup')} c
+                      FROM (SELECT ordinal, payload, edge_ref
+                              FROM {_table('profile_bootstrap_catchup')}
+                             WHERE session_id=%s AND ordinal>=%s
+                             ORDER BY ordinal LIMIT %s) c
                       {_edge_lookup('c', "c.payload->'payload'")}
-                     WHERE c.session_id=%s AND c.ordinal>=%s ORDER BY c.ordinal LIMIT %s""",
-                (session[4], session[0], ordinal, session[8]))
+                     ORDER BY c.ordinal""",
+                (session[0], ordinal, session[8], session[4]))
             changes = [row[0] for row in cur.fetchall()]
             following = ordinal + len(changes)
             more = following < count

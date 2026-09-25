@@ -291,16 +291,16 @@ def test_session_limits_epoch_and_rollback(edge_publication_db, monkeypatch):
         cur.execute(f"SELECT count(*) FROM {SESSIONS}")
         assert cur.fetchone()[0] == 0
     db.commit()
-    old = profile_bootstrap.serialize_profile
+    old = profile_bootstrap._snapshot_batch
 
     def interrupted(*args):
         raise RuntimeError("injected interruption")
 
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile", interrupted)
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", interrupted)
     with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.create_session(body())
     assert (exc.value.code, exc.value.status) == ("bootstrap_unavailable", 503)
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile", old)
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", old)
     with db.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM {SESSIONS}")
         assert cur.fetchone()[0] == 0
@@ -310,7 +310,7 @@ def test_session_limits_epoch_and_rollback(edge_publication_db, monkeypatch):
 def test_snapshot_and_cursor_share_one_mvcc_view(edge_publication_db, monkeypatch):
     db = edge_publication_db
     other = peer(db)
-    original = profile_bootstrap.serialize_profile
+    original = profile_bootstrap._snapshot_batch
     published = False
 
     def concurrent_publication(*args):
@@ -320,7 +320,7 @@ def test_snapshot_and_cursor_share_one_mvcc_view(edge_publication_db, monkeypatc
             publish(other, "track-b")
         return original(*args)
 
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile", concurrent_publication)
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", concurrent_publication)
     try:
         created = profile_bootstrap.create_session(body())
         assert published
@@ -418,7 +418,7 @@ def test_internal_serialization_error_has_safe_route_response(edge_publication_d
     def broken(*args):
         raise ValueError("sensitive internal serializer detail")
 
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile", broken)
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", broken)
     with app.test_client() as client:
         response = client.post("/api/profiles/bootstrap/sessions", json=body())
         assert response.status_code == 503
@@ -506,9 +506,9 @@ def test_owned_backend_lock_cleanup_and_request_transaction(edge_publication_db,
         cur.execute("SELECT pg_backend_pid(), txid_current()")
         request_pid, request_txid = cur.fetchone()
     owned_pid = []
-    original = profile_bootstrap.serialize_profile
+    original = profile_bootstrap._snapshot_batch
 
-    def inspect_capture(*row):
+    def inspect_capture(*args):
         with observer.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(110094, hashtext(%s))", (SOURCE,))
             assert cur.fetchone()[0] is False
@@ -522,9 +522,9 @@ def test_owned_backend_lock_cleanup_and_request_transaction(edge_publication_db,
                         (SOURCE,))
             owned_pid.append(cur.fetchone()[0])
         observer.rollback()
-        return original(*row)
+        return original(*args)
 
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile", inspect_capture)
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", inspect_capture)
     try:
         profile_bootstrap.create_session(body())
         assert owned_pid and owned_pid[0] != request_pid
@@ -553,8 +553,8 @@ def test_owned_connection_rolls_back_and_closes_on_capture_error(edge_publicatio
         return lease
 
     monkeypatch.setattr(profile_bootstrap.psycopg2, "connect", track_open)
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile",
-                        lambda *_row: (_ for _ in ()).throw(RuntimeError("capture failed")))
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch",
+                        lambda *_args: (_ for _ in ()).throw(RuntimeError("capture failed")))
     with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.create_session(body())
     assert (exc.value.code, exc.value.status) == ("bootstrap_unavailable", 503)
