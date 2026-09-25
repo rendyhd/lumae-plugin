@@ -535,6 +535,20 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - the shelves late-commit test;
   - K8 and K9 in both header modes;
   - the old-client compatibility tests.
+- **Split and outcome.** P3-4 runs as three WPs: **P3-4a** (items 1–2), **P3-4b** (items 3, 5 and 7) and **P3-4c** (item 4). Item 6 (growth) waits until after the release, as written.
+- **P3-4a (merged, review PASS after 2 rounds).**
+  - **410 gating:** `collections_resync_required` (reasons `epoch_mismatch` and `cursor_ahead`) is returned **only when the request echoes a non-empty `epoch`**. A client that doesn't echo it keeps today's empty 200 for a cursor past head. This follows §2's rule that unchanged clients keep working. `floor_seq` is published but not yet enforced; the growth WP decides the 410 for a cursor below the floor.
+  - **Snapshot:** unpaged, one at a time per process (`BoundedSemaphore(1)`; a request that waits more than 2 s gets 503 with `Retry-After: 5`). Measured at 20k items: 0.3–0.4 s and +61 MB RSS; at 100k: 1.7–1.9 s and +255 MB.
+  - **Restores:**
+    - Chunks of at most 2,000 rows. Keyed restores resume through `collection_restores`, and a key held by an unfinished restore can't be reused by another request (409).
+    - Another principal's write waits at most 20–136 ms during a 20k restore (1×20k and 2,000×10; it was 9.85–17.6 s before).
+    - Only the event and receipt inserts run while the feed head is held; a test pins this.
+  - **Follow-ups:**
+    - build the snapshot JSON in SQL (`json_agg`);
+    - keep the restore key per backup checksum for the page's lifetime, so a retry after a reload resumes instead of duplicating;
+    - a test for a collection finished in an earlier chunk and deleted before the last chunk (mutant M21 survives);
+    - clean up stale `collection_restores` rows (growth WP);
+    - operator epoch rotation after a DB restore is runbook repair C.
 
 **P3-5 — Workbench LUM-013 → 014 → 015 → 016 (K10).** Serial, one PR each.
 - **LUM-013:**

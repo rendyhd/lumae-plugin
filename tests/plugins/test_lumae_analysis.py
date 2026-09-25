@@ -227,6 +227,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "backup_version": 1,
                 "enabled": False,
                 "scope": "shared",
+                "feed_epoch": True,
             },
             "catalog_mirror": mod.catalog_capability(),
             "credits": mod.credits_service.capability(),
@@ -1941,10 +1942,8 @@ def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(
     )
     monkeypatch.setattr(
         collections,
-        "_record_change",
-        lambda cur, principal, collection_id, entity_kind, entity_id, operation, payload: changes.append(
-            (principal, collection_id, entity_kind, entity_id, operation, payload)
-        ),
+        "_record_changes",
+        lambda cur, staged: changes.extend(staged),
     )
     payload = collections._normalize_backup_document(_collection_backup_fixture(collections))
 
@@ -2156,7 +2155,7 @@ def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch
 
         def execute(self, sql, params=None):
             if "UPDATE" in sql and "collection_feed_state" in sql:
-                self.feed_head += 1
+                self.feed_head += params[0]
                 self.rows = [(self.feed_head,)]
             elif "SHOW transaction_isolation" in sql:
                 self.rows = [("read committed",)]
@@ -2192,6 +2191,10 @@ def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch
             elif "DELETE FROM" in sql and "id = ANY" in sql:
                 self.rows = [("item-1",), ("item-2",)]
                 self.description = [("id",)]
+            elif "INSERT INTO" in sql and "collection_changes" in sql:
+                # One block insert per mutation (P3-4a): report its rows.
+                self.rowcount = len(params[1])
+                self.rows = []
             else:
                 self.rows = []
 
@@ -8508,6 +8511,23 @@ def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypa
     assert "if(event.key==='Escape'){event.preventDefault();closeLibrary()}" in body
     assert "Adding ${count}" in body
     assert "const copies=items.map(({id,collection_id,added_at,updated_at,...item})=>item)" in body
+
+
+def test_collection_restore_ui_reuses_one_idempotency_key_per_backup():
+    ui = importlib.import_module("plugins.LumaeAnalysis.collection_ui")
+    body = ui.render_collection_workbench("Label", "Detail")
+    # A chunked restore that fails part-way resumes only under the same key
+    # (P3-4a), so the key belongs to the loaded backup, not to the click.
+    reset = body[body.index("function resetBackup("):body.index("function openBackup(")]
+    inspect = body[body.index("async function inspectBackup("):body.index("async function restoreBackup(")]
+    restore = body[body.index("async function restoreBackup("):body.index("async function saveCollection(")]
+    assert "let restoreDocument=null,restoreKey=null;" in body
+    assert "restoreDocument=null;restoreKey=null;" in reset
+    assert "restoreDocument=null;restoreKey=null;" in inspect
+    assert "restoreDocument=documentBody;restoreKey=mutationKey();" in inspect
+    assert "headers:{'Idempotency-Key':restoreKey}" in restore
+    assert "mutationKey()" not in restore
+    assert "Choose Restore copies again to finish it; nothing is added twice." in restore
 
 
 def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):

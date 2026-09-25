@@ -55,6 +55,9 @@ is safe to run again. On success it has:
 
 - dropped the `collection_changes.seq` default (the sequence itself remains
   owned by the column);
+- added `collection_feed_state.floor_seq`, set once to the feed head at the
+  upgrade (the K8 cutover; the feed epoch is kept), and the
+  `collection_restores` progress table for chunked restores;
 - added `writer_generation` to `profile_changes` and `catalog_changes`, filled
   existing rows with 2 and dropped the column default;
 - retargeted queued, running and failed catalogue preparations to plugin
@@ -247,6 +250,23 @@ then resolved against the current catalogue. Then run **Prepare Lumae** (or
 wait for the reconcile schedule) so the backfill picks the rows up. Restart the
 web server, or wait for its next start, to refresh
 `profiles_unpublished_ready`.
+
+### C. Rotate the collections feed epoch (after restoring a database backup)
+
+A restored database keeps the collections feed `epoch` of the dump, but its
+history ends where the dump does. Clients that sync with the K8 epoch
+(`capabilities.collections.feed_epoch`) detect this on their own only when
+their cursor is past the restored head. Rotate the epoch after any restore of
+the plugin tables, so every such client resyncs from the snapshot:
+
+```sql
+UPDATE plugin_lumae_analysis__collection_feed_state
+   SET epoch = gen_random_uuid(), floor_seq = head_seq
+ WHERE singleton = 1;
+```
+
+It takes effect immediately; no restart is needed. Clients that do not echo
+the epoch (older apps) are unaffected.
 
 ## Known gap: 1.2.5 fingerprint rebase
 

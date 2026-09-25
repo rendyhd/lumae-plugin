@@ -67,7 +67,7 @@ There are three shapes. Clients must accept all three.
 - **1.2.5:** `GET /api/profiles` used plain `jsonify`, with no cache headers.
 - **1.3.0 (unreleased, P1-4):** `GET /api/profiles` uses `_private_json`: `Cache-Control: private, no-store`, `Vary: Authorization, Cookie`, `X-Content-Type-Options: nosniff`.
 
-**`Retry-After` (K4).** 1.2.5 never sends it. From 1.3.0 (unreleased, P1-6) every v2 bootstrap **429** carries `Retry-After: <seconds>` (a whole number, 1–300) and every v2 bootstrap **503** carries `Retry-After: 5` (§3.5). Other routes and statuses do not send it. Clients wait at least that long before retrying, and use their own backoff when the header is absent (1.2.5).
+**`Retry-After` (K4).** 1.2.5 never sends it. From 1.3.0 (unreleased, P1-6) every v2 bootstrap **429** carries `Retry-After: <seconds>` (a whole number, 1–300) and every v2 bootstrap **503** carries `Retry-After: 5` (§3.5). From 1.3.0 (unreleased, P3-4a) a collection mutation's **503 `collection_busy`** (§5.3) and every **503 from the collections snapshot** (§5.2a) also carry `Retry-After: 5`. Other routes and statuses do not send it. Clients wait at least that long before retrying, and use their own backoff when the header is absent (1.2.5).
 
 **Compression (K1).** 1.2.5 never compresses. From 1.3.0 a blueprint `after_request` hook (`_compress_json_response`, 1.3.0 `__init__.py:249-273`) gzips a plugin response (level 4) when **all** of these hold:
 - the request's `Accept-Encoding` allows gzip: `gzip` or `x-gzip` with q>0, or, when neither is listed, `*` with q>0. `gzip;q=0` (or `*;q=0` with no explicit gzip) refuses it; names are case-insensitive;
@@ -122,12 +122,12 @@ This route always answers 200 (unless an exception occurs). It has no side effec
 | `personal_discovery` | `schema_version: 1`, `enabled`, `scope: "shared"\|"personal"`, `features: ["album_memory_context","enjoyment_feedback"]` | out of scope here; see `docs/discovery-api-v1.md` |
 | `music_metadata` | `schema_version: 1`, `enabled`, `provider: "musicbrainz"`, `daily_request_limit: 80`, `recording_membership: true` | out of scope |
 | `shelves` | `schema_version: 1`, `enabled`, `scope` | `enabled` is the collection-manager setting |
-| `collections` | `schema_version: 1`, `backup_version: 1`, `enabled`, `scope` | `collection_manager.py:18-20, 53-57` |
+| `collections` | `schema_version: 1`, `backup_version: 1`, `enabled`, `scope`. **1.3.0 adds** `feed_epoch: true` (K8, P3-4a). | `collection_manager.py:18-20, 53-57`. `feed_epoch` gates the feed `epoch` echo and 410 (§5.2) and the snapshot route (§5.2a). |
 | `catalog_mirror` | `contract_revision`, `catalog_schema_version: 3`, `analysis_schema_version: 2`, `catalog_builder_version`, `supported_core_range`, `supported_provider_types: ["navidrome"]`, `features: [...]` | `catalog_capability()`, 1753-1762. `features` is the static `CATALOG_FEATURES` list (120-162), which includes `profile_cursor_stream` and `source_scoped_profiles`. |
 | `credits` | `credits_service.capability()` | out of scope |
 | `transport` | `gzip: true` | **New in 1.3.0 (unreleased, K1).** Informational: gzip is negotiated per request through `Accept-Encoding` (§1.5). Absent in 1.2.5. |
 
-**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream`, `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `collections.feed_epoch`, `collections.contract`, `collections.source_scoped_items`, and `lumae_analysis_profiles`.
+**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream`, `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `collections.feed_epoch` (added in 1.3.0, P3-4a), `collections.contract`, `collections.source_scoped_items`, and `lumae_analysis_profiles`.
 
 > Note: `lumae_analysis_profiles` is a **manifest** capability in `plugin.json` (with `schema_version`, `analyzer_version`, `profile_source`, `features`). It is not part of the health payload. See §9 item 1.
 
@@ -411,21 +411,63 @@ All of these routes return **404 `{"error":"collection_manager_disabled"}`** whe
 |---|---|
 | `cursor` | integer; default 0; negative values clamp to 0. Not an integer: 400 `invalid_cursor`. |
 | `limit` | integer, default 200, clamped to **1–500**. Not an integer: also 400 `invalid_cursor` (same `try` block, 1065-1069). |
+| `epoch` | **1.3.0 (K8), optional.** The `epoch` of an earlier feed or snapshot response, echoed. Absent or empty means "not echoed". 1.2.5 ignores it. |
 
-Response 200: `{changes:[{seq, collection_id, entity_kind: "collection"|"item", entity_id, operation: "upsert"|"delete", payload, created_at}…], next_cursor}`.
+Response 200: `{changes:[{seq, collection_id, entity_kind: "collection"|"item", entity_id, operation: "upsert"|"delete", payload, created_at}…], next_cursor}`, plus from 1.3.0 `epoch`, `head_seq`, `floor_seq` and `has_more` (K8, below).
 - `seq` values come from one installation-wide counter (`collection_feed_state.head_seq`, 484-501). One principal's seqs therefore have **gaps**. They are strictly increasing.
 - Only events with `seq ≤ head_seq` are returned.
 - `next_cursor` = the last returned seq, or the request cursor if the page is empty.
-- There is **no `has_more`, no `epoch` and no `head_seq`** in the response. Page until `changes` is empty.
-- It **never returns 410**. A cursor past head returns an empty page and echoes the cursor, so a client cannot detect a server-side reset (K8).
+- 1.2.5: there is **no `has_more`, no `epoch` and no `head_seq`** in the response. Page until `changes` is empty.
+- 1.2.5: it **never returns 410**. A cursor past head returns an empty page and echoes the cursor, so a client cannot detect a server-side reset. From 1.3.0 this still holds for a request that does not echo `epoch`.
 - 503 `collection_feed_unavailable`: the feed state row is missing or has an unknown protocol.
 - The journal and idempotency receipts are never compacted.
+
+**K8: epoch, head and paging (1.3.0, unreleased, P3-4a; gate `capabilities.collections.feed_epoch: true`).** Every 200 carries four more keys, whether or not the request echoes `epoch`. The 1.2.5 keys and their values are unchanged byte for byte (`tests/plugins/collection_feed_v1_golden.json` pins them).
+
+| Key | Meaning |
+|---|---|
+| `epoch` | UUID string identifying this feed's lifetime: `collection_feed_state.epoch`. It changes only when the feed is re-seeded (a new database, or the state row recreated) or rotated by an operator (`docs/runbooks/UPGRADE_1.3.md`, repair C). Upgrading to 1.3.0 keeps the existing epoch. Compare it as a UUID. |
+| `head_seq` | The installation-wide feed head this page was read at (an integer ≥ 0). Every event with `seq ≤ head_seq` is committed and visible. It is global, so it is usually above the principal's last seq. |
+| `floor_seq` | The head at cutover: when this epoch's feed was seeded, or when 1.3.0 first migrated an older installation (and set to the head by a rotation). Nothing at or below it is guaranteed to stay in the journal. 1.3.0 never deletes events, so today the whole journal is present; a later release may compact below it (plan P3-4 item 6), and will say how that is signalled. |
+| `has_more` | `true` when this principal has more events with `seq` above `next_cursor` and at or below `head_seq`. Page with `cursor=next_cursor` until it is `false`; do not infer the end from a short page. |
+
+**410 `{"error":"collections_resync_required","reason":…}`** is returned **only when the request echoes `epoch`** (non-empty), and then when:
+- `reason: "epoch_mismatch"`: the echoed value is not this feed's epoch (including a value that is not a UUID). Checked first.
+- `reason: "cursor_ahead"`: `cursor > head_seq`. The server lost history the client has seen, for example after a database restore.
+
+A request without `epoch` never gets 410: a cursor past head is still the 1.2.5 empty 200 that echoes the cursor (now with `has_more: false`). The plan says the cursor rule applies "or when the cursor is past head" without the echo; that would change an existing status for a client that has not opted in (§8 rule 1), so both 410 causes need the echo. `cursor == head_seq` is a normal empty page.
+
+**Client rules (K8).**
+1. Use K8 only when `capabilities.collections.feed_epoch` is `true`. Store the cursor and the epoch together.
+2. Without a stored epoch, call without `epoch` (or fetch the snapshot) and store the returned `epoch`. Echo it on every later feed request.
+3. On 410, discard the cursor, fetch the snapshot (§5.2a), merge it with unsent local mutations, then continue with `cursor = snapshot.head_seq` and `epoch = snapshot.epoch`.
+4. A database restored from a backup keeps its epoch. A client whose cursor is past the restored head gets `cursor_ahead`; one whose cursor is not past it cannot tell, unless the operator rotates the epoch after the restore (runbook repair C).
 
 Payloads:
 - collection upsert: the collection object;
 - collection delete: `{id, revision}`;
 - item upsert: the normalised item plus `collection_revision` and `collection_updated_at`;
 - item delete: `{id, collection_id, collection_revision, collection_updated_at}`.
+
+### 5.2a `GET /api/collections/snapshot` (1.3.0, unreleased, K8, P3-4a)
+
+The full path is `GET /plugins/lumae_analysis/api/collections/snapshot`. 1.2.5 has no such route (Flask 404). Auth, principal and the 404 `collection_manager_disabled` rule are the same as the feed's. No parameters.
+
+Response 200:
+```
+{schema_version: 1, scope: "personal"|"shared",
+ epoch, head_seq, floor_seq,
+ collections: [<collection object>…], collection_count,
+ items: [<item object>…], item_count}
+```
+- `collections`: the principal's **active** collections (tombstones are left out, as in `GET /api/collections`), each exactly the §5.1 object that `GET /api/collections/<id>` returns, ordered by `created_at`, then `id`.
+- `items`: every item of those collections, exactly the §5.1 stored-row shape of `GET /api/collections/<id>` (with `collection_id`, `added_at`, `updated_at`), ordered by `collection_id`, `kind`, `position`, `added_at`, `id`.
+- `epoch`, `head_seq`, `floor_seq`: as in the feed (§5.2).
+- **Consistency.** The route reads on its own connection in one read-only REPEATABLE READ transaction, and the feed state is its first read. Every writer moves the head in the transaction that writes the rows, so the snapshot reflects **exactly** the events with `seq ≤ head_seq`: a write that commits during the snapshot is either entirely in it (and in `head_seq`) or entirely absent. Continue the feed with `cursor = head_seq`.
+- **503 `{"error":"collection_feed_unavailable"}` with `Retry-After: 5`**: the feed state row is missing or has an unknown protocol, `DATABASE_URL` is unset, the database is unreachable or timed out (statement timeout 30 s, lock timeout 5 s), or the worker is busy with another snapshot (below). A connection failure is logged as a warning naming only the error class.
+- **One at a time.** A web worker process builds one snapshot at a time (a process-wide slot): a request that cannot start within 2 s gets the 503 above, so concurrent requests cannot each hold a large snapshot in memory. Retry after `Retry-After`.
+
+**Size.** One response, not paged. Measured on the test database with realistic item rows: 20,000 items take 0.38 s and 8.0 MB of JSON (0.7 MB with K1 gzip); 100,000 items (the backup limit) take 1.6 s and 40 MB (3.7 MB gzip), with about 200–255 MB of transient memory in the web worker while it is built (hence the one-at-a-time slot). At household sizes no page shape is needed, so none is defined. If one is needed later it would be additive, for example `?limit=&after=<opaque>` pages that each run their own REPEATABLE READ read and return `has_more`, with the client continuing the feed from the **first** page's `head_seq`: every event carries the entity's full state or a delete by id, so replaying events a later page already reflects is harmless.
 
 ### 5.3 Mutations
 
@@ -447,7 +489,10 @@ Every mutation runs through `_mutation_response` (546-608).
 - 503 `unsupported_transaction_isolation` (the host connection is not READ COMMITTED);
 - 503 `collection_feed_unavailable`;
 - **503 `collection_feed_invariant`** (new in 1.3.0, P1-3): a committed change row sits past the feed head (`MAX(seq) > head_seq`, for example left by a 1.2.5 worker before the upgrade fence). The check runs inside each mutation against the head it has just locked; the mutation rolls back and nothing is written. Every collection write, for every principal, returns this until an operator runs the repair in `docs/runbooks/UPGRADE_1.3.md`; health reports it as `integrity.collections_feed_ok: false`. There is no `Retry-After`. Clients treat it like `collection_feed_unavailable`: keep the mutation queued and retry later. 1.2.5 instead failed these writes with a 500 (a unique violation) indefinitely (AUD-05);
-- 409 `item_id_collection_conflict` (the item id already belongs to another collection of this principal).
+- 409 `item_id_collection_conflict` (the item id already belongs to another collection of this principal);
+- **503 `{"error":"collection_busy"}` with `Retry-After: 5`** (new in 1.3.0, P3-4a): the mutation waited more than **3 s** for one lock (the idempotency key's advisory lock, the collection row, or the feed head). Each mutation transaction runs with `SET LOCAL lock_timeout = '3s'`, so the host connection's own setting is untouched. The transaction rolls back: nothing from it is written and no receipt is stored, so retrying with the same `Idempotency-Key` runs the mutation again. In a chunked restore (below) the chunks committed before it stay, and that retry resumes after them. 1.2.5 waited without a bound (the host's timeout, if any, gave a 500). Keep the mutation queued and retry after `Retry-After`.
+
+**Feed writes (1.3.0, P3-4a).** A mutation stages all its change events, then reserves them as one block, `UPDATE collection_feed_state SET head_seq = head_seq + n RETURNING head_seq` (seqs `head−n+1 … head`), and writes them with one multi-row INSERT in feed order. This replaces one head update and one insert per event. The seqs a client sees are unchanged: strictly increasing, gapless at the head, global. The P1-3 fence (no `seq` default) and the invariant check are kept: the INSERT writes nothing if any row already sits at or above the block's first seq, and the mutation answers `collection_feed_invariant`. The feed head is locked only from the block's reservation to commit, and only the event INSERT and (in a restore's last chunk, or any mutation with a key) the receipt INSERT run in that window: nothing per collection or per item. On the test database that is about 17 ms for 500 events, and at most 67 ms per chunk for a 20,000-item restore into one collection, 89 ms for 2,000 collections of 10 items and 180 ms for 2,000 collections of 50 items (the last chunk 4, 73 and 63 ms). Another principal's write during those restores waited at most 76, 98 and 201 ms.
 
 | Route | Body | Success | Notes |
 |---|---|---|---|
@@ -458,11 +503,18 @@ Every mutation runs through `_mutation_response` (546-608).
 | `POST /api/collections/<id>/items/batch` (911-917) | `{items:[≤500], base_revision?}` | 200 `{collection, items}` | More than 500 items or not a list: 400. Revision +1 per request, **even when `items` is empty**: an empty batch still bumps the revision and returns 200 (915, 928-935). |
 | `DELETE /api/collections/<id>/items/<item_id>` (964-1005) | `{base_revision?}` | 200 `{deleted: bool, collection}` | A missing item gives `deleted:false` and no revision bump. |
 | `DELETE /api/collections/<id>/items/batch` (1008-1059) | `{item_ids:[1–500], base_revision?}` | 200 `{deleted:[ids], deleted_count, collection}` | |
-| `POST /api/collections/restore` (767-780) | backup document | 201 `{restored:true, …}` | additive restore |
+| `POST /api/collections/restore` (767-780) | backup document | 201 `{restored:true, collections, collection_count, item_count}` | additive restore; chunked from 1.3.0 (below) |
+
+**Restore (1.3.0, unreleased, P3-4a).** The response body and status are unchanged. A restore commits in transactions of at most **2,000 rows**, where a row is one collection it creates or one item (`RESTORE_CHUNK_ROWS`). A backup that fits in one chunk behaves exactly as in 1.2.5: one transaction, each collection at revision 2 (1 if it has no items). A larger backup is split in backup order; a collection's items may span chunks.
+- **Events.** The chunk that creates a collection emits its `collection` upsert, and then the items of that chunk. A later chunk that adds items to the same collection bumps its revision once and emits only `item` upserts, each carrying the new `collection_revision`, like a batch upsert. The events of the whole restore are in the same order as in 1.2.5. The final revision of a collection is 1 plus the number of chunks that wrote its items (a 5,000-item collection ends at revision 4, not 2); clients must use the returned revision, not assume 2.
+- **Between chunks**, other requests (feed, snapshot, list and detail) see the restored collections grow chunk by chunk. Each committed chunk is a consistent prefix of the restore. A collection deleted by a client before the restore finished stays deleted, and its remaining items are skipped.
+- **The response** lists every restored collection as it stands when the last chunk commits (a collection deleted meanwhile is listed as its tombstone); `collection_count` and `item_count` count the backup. It is stored as the receipt in the last chunk's transaction.
+- **Interruption and retry.** With an `Idempotency-Key`, each chunk's transaction also records progress (`collection_restores`: the restore's id, chunk size and chunks done) under the key's advisory lock. Collection and item ids derive from that restore id, so a retry with the same key and body resumes after the last committed chunk and ends in the same final state and the same events as an uninterrupted restore, without duplicates. Two requests with the same key never apply a chunk twice; both return the same 201 (one of them with `Idempotency-Replayed: true`). While a keyed restore is unfinished, any request that reuses its key with another fingerprint (another restore body, or any other mutation route) is 409 `idempotency_key_conflict` and changes nothing; only a retry of the same restore resumes it. After it finishes, the stored receipt decides as for any other mutation. The progress row is deleted with the chunk that stores the receipt; one left by a client that never retries stays until a later clean-up (plan P3-4 item 6). **Without a key**, a restore that fails after its first chunk keeps the chunks already committed, and a retry restores another full copy. Always send a key. The AudioMuse web manager sends one key per loaded backup file, so choosing *Restore copies* again after a failure resumes the restore; loading the file again starts a new copy.
 
 Read routes:
 - `GET /api/collections` (732-753) returns `{schema_version, scope, collections}`;
 - `GET /api/collections/<id>` (813-824) returns `{collection, items}`, or 404;
+- `GET /api/collections/snapshot` (1.3.0, K8) returns every active collection and item with the feed head (§5.2a);
 - backup, export and search are also available.
 
 **Item normalisation and membership (`_normalize_item` 637-659, `_upsert_item` 666-726).**
@@ -523,7 +575,7 @@ Copied from plan §2. **Every server change is additive or opt-in.** Each work p
 | K5 | Optional create `client_request_id`; a duplicate unclaimed session is replaced, not leaked | P1-6 | Send a UUID per create attempt (C-3) | `capabilities.profile_bootstrap.idempotent_create:true` | 1 | shipped in 1.3.0 (unreleased): a create with the same `client_request_id` replaces the source's unexpired session with that id that has served no page yet, also while it is still capturing (§3.5) |
 | K6 | **Edge references in events and pages:** with `edge_refs=1` (query) or `edge_refs:true` (v2 body), an upsert whose edge is unchanged carries `edge_profile_ref:{media_revision, profile_digest}` instead of the full edge. Without the opt-in, the server expands to the full edge exactly as today. | P3-2 | Keep the local edge when digest and revision match; fetch misses through `GET /api/profiles?ids=` (C-10) | `capabilities.profile_stream.edge_refs:true` (new `profile_stream` object) | 3; must ship before P3-1 regeneration | planned |
 | K7 | Compact edge transport (optional): with `edge_compact=1` the server omits the derivable `boundaries`, and the client rebuilds them (§4.4) **before** verifying the unchanged v2 digest | P3-3 | Rebuild, then verify (C-12) | `capabilities.edge_profiles.compact_transport:true` | 3, optional | planned |
-| K8 | **Collections feed:** the response adds `epoch`, `head_seq` and `has_more`. 410 `collections_resync_required` is returned **only** when the request echoes `epoch` and it mismatches, or when the cursor is past head. A new snapshot endpoint, **planned path `GET /plugins/lumae_analysis/api/collections/snapshot`** (P3-4 implements exactly this path), returns all of the principal's collections, items and head in one REPEATABLE READ transaction. | P3-4 | Echo the epoch; resync on 410; page by `has_more`/`next_cursor` (C-13) | `capabilities.collections.feed_epoch:true` | 3 | planned |
+| K8 | **Collections feed:** the response adds `epoch`, `head_seq` and `has_more`. 410 `collections_resync_required` is returned **only** when the request echoes `epoch` and it mismatches, or when the cursor is past head. A new snapshot endpoint, **planned path `GET /plugins/lumae_analysis/api/collections/snapshot`** (P3-4 implements exactly this path), returns all of the principal's collections, items and head in one REPEATABLE READ transaction. | P3-4 | Echo the epoch; resync on 410; page by `has_more`/`next_cursor` (C-13) | `capabilities.collections.feed_epoch:true` | 3 | shipped in 1.3.0 (unreleased, P3-4a): every feed 200 adds `epoch`, `head_seq`, `floor_seq` (the head at cutover) and `has_more`; 410 `collections_resync_required` with `reason` `epoch_mismatch` or `cursor_ahead`, **both only when the request echoes `epoch`** (without it a cursor past head stays the empty 200); `GET /api/collections/snapshot` on an owned read-only REPEATABLE READ connection, one at a time per worker; collection mutations bound lock waits to 3 s (503 `collection_busy`, `Retry-After: 5`) and write events as one seq block; restores commit in resumable chunks of at most 2,000 rows (§5.2, §5.2a, §5.3) |
 | K9 | **Collections conflicts:** with header `X-Lumae-Collections-Contract: 2`, `idempotency_key_conflict` includes `current`, and a duplicate membership returns 409 `membership_conflict {existing_item_id}` instead of a silent id remap. Create with an existing id returns 409. | P3-4 | Handle both; freeze reorder bodies at enqueue (C-13) | `capabilities.collections.contract:2` | 3 | planned |
 | K10 | Collection items carry `catalog_instance_id` (LUM-013, additive); workbench routes take an explicit catalogue | P3-5 | Store and scope items (C-13) | `capabilities.collections.source_scoped_items:true` | 3 | planned |
 | K11 | Profiles may carry `analyzer_ver:2` (BS.1770-4 `ref_lufs` and new ramps) | P3-1 | Accept v1 and v2; normalise by version (C-11) | `capabilities.lumae_analysis_profiles.analyzer_versions:[1,2]`, `loudness_method:"bs1770-4"` (**new health key**; see §9 item 1) | 3 | planned |
@@ -555,7 +607,7 @@ The code wins. Each item names the WP expected to act on it.
 3. **The v2 bootstrap has no 404 or 409.** The only statuses are 200/400/410/413/429/503 (§3.5). A 404 means the route is missing.
 4. **The v2 session is absolute (60 minutes)**, hard-coded in SQL (`profile_bootstrap.py:245`); `SESSION_MINUTES` is unused. Release of an expired or stale session answers 410 and **leaves the row in place**, so it holds one of the 4 per-source slots until it expires (audit AUD-11). K5 alone does not fix this; P1-6 should. **Fixed in 1.3.0 (P1-6):** `SESSION_MINUTES` is the one lifetime constant for absolute and sliding (K3) sessions; release deletes expired and stale rows and answers 200; stale rows never count toward the slots (§3.5).
 5. **`profile_bootstrap.available`** is `bool(DATABASE_URL)`, not a probe; `auth` is constant even when `AUTH_ENABLED=false` (K4). **Fixed in 1.3.0 (P1-6):** `available` is a cached probe of the migrated tables on the plugin's own connection, and `auth_enabled` reports the live setting; `auth` is unchanged (§2).
-6. **Cursor ahead of head** on `/profiles/changes` is **400 `invalid_cursor`**, not 410. The collections feed returns an empty 200 in the same case. K8 makes collections answer 410; profiles are unchanged.
+6. **Cursor ahead of head** on `/profiles/changes` is **400 `invalid_cursor`**, not 410. The collections feed returns an empty 200 in the same case. K8 makes collections answer 410 (`cursor_ahead`), but **only when the request echoes `epoch`** (1.3.0, P3-4a): the plan says "or when the cursor is past head" without the echo, which would change the status an unchanged client gets (§8 rule 1). Profiles are unchanged.
 7. **The boundaries formula** in plan K7 (`source.sample_rate` + `source.decoded_frames`) and in C-12 (`origin_frame`/`covered_frames`) are equivalent. Both were verified against `edge_profiles.py:146-152` and the golden fixture. §4.4 is the exact statement. `rate` is the **source** rate, not the 48 kHz measurement rate.
 8. **Payloads differ by path.**
    - Fixed for new events by P1-1: every path emits float4 `ref_lufs` and the same serializer (§3.4).
@@ -569,6 +621,6 @@ The code wins. Each item names the WP expected to act on it.
     - creating an existing id returns 201 with the existing (or `null`) collection and no event;
     - a duplicate membership silently remaps the item id;
     - `idempotency_key_conflict` has no `current`;
-    - the feed has no epoch in the response (an epoch exists internally in `collection_feed_state`);
+    - the feed has no epoch in the response (an epoch exists internally in `collection_feed_state`; 1.3.0 K8 returns it, §5.2);
     - journal and receipts are never compacted.
 13. **Shelves idempotency** is keyed by mutation `id` only, with no body fingerprint. This is not covered by K1–K11; it is recorded here for completeness.

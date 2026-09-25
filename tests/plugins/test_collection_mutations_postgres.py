@@ -274,7 +274,7 @@ def test_restore_fault_rolls_back_and_lost_response_replays_ids(collection_api, 
         [{"name": "Restored", "items": [{"kind": "track", "track_id": "restore-track"}]}],
         "personal",
     )
-    original = manager._record_change
+    original = manager._record_changes
     fired = []
 
     def fail_after_write(cur, *args):
@@ -283,7 +283,7 @@ def test_restore_fault_rolls_back_and_lost_response_replays_ids(collection_api, 
             fired.append(True)
             raise RuntimeError("injected restore fault")
 
-    monkeypatch.setattr(manager, "_record_change", fail_after_write)
+    monkeypatch.setattr(manager, "_record_changes", fail_after_write)
     with pytest.raises(RuntimeError, match="injected"):
         call("POST", "/api/collections/restore", backup, key="restore")
     db = connect()
@@ -294,7 +294,7 @@ def test_restore_fault_rolls_back_and_lost_response_replays_ids(collection_api, 
         assert cur.fetchone()[0] == 0
     assert _counts(db, manager) == (0, 0)
     db.close()
-    monkeypatch.setattr(manager, "_record_change", original)
+    monkeypatch.setattr(manager, "_record_changes", original)
     first = call("POST", "/api/collections/restore", backup, key="restore")
     assert first.status_code == 201
     replay = call("POST", "/api/collections/restore", backup, key="restore")
