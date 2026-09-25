@@ -3,6 +3,7 @@
 import hashlib
 import json
 import re
+import threading
 import uuid
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
@@ -43,14 +44,14 @@ SNAPSHOT_CONNECT_TIMEOUT_S = 5
 SNAPSHOT_STATEMENT_TIMEOUT_MS = 30_000
 SNAPSHOT_LOCK_TIMEOUT_MS = 5_000
 UNAVAILABLE_RETRY_AFTER_S = 5
+# One snapshot is built at a time per web worker process (100k items take
+# about 250 MB while the JSON is built). Another waits this long, then 503s.
+SNAPSHOT_WAIT_S = 2
+_SNAPSHOT_SLOT = threading.BoundedSemaphore(1)
 
 
 class FeedProtocolUnavailable(RuntimeError):
     """The committed collection feed frontier is absent or incompatible."""
-
-
-class RestoreKeyConflict(RuntimeError):
-    """An unfinished restore holds this idempotency key for another body."""
 
 
 class FeedInvariantViolation(RuntimeError):
@@ -371,6 +372,21 @@ def _fetch_collection(cur, principal, collection_id, include_deleted=False):
     return _row_dict(cur, cur.fetchone())
 
 
+def _fetch_collections(cur, principal, collection_ids):
+    """Collection objects by id, tombstones included, in one query."""
+    if not collection_ids:
+        return {}
+    cur.execute(
+        _collection_select()
+        + """
+         WHERE c.principal = %s AND c.id = ANY(%s)
+         GROUP BY c.principal, c.id
+        """,
+        (principal, list(collection_ids)),
+    )
+    return {row["id"]: row for row in _all_dicts(cur)}
+
+
 def _fetch_items(cur, principal, collection_id):
     cur.execute(
         f"""
@@ -645,9 +661,10 @@ class _RestoreRun:
     With an idempotency key, progress is a ``collection_restores`` row written
     in each chunk's transaction, under the key's advisory lock. A retry with
     the same key and body resumes after the last committed chunk, and two
-    requests with the same key never apply a chunk twice. A restore that fits
-    in one chunk writes no progress row. Without a key, progress lives only in
-    this object.
+    requests with the same key never apply a chunk twice. While the row
+    exists, ``_begin_mutation`` answers any other body under that key with
+    ``idempotency_key_conflict``. A restore that fits in one chunk writes no
+    progress row. Without a key, progress lives only in this object.
     """
 
     def __init__(self, collections, key, fingerprint):
@@ -657,8 +674,6 @@ class _RestoreRun:
         self.restore_id = None
         self.chunks = None
         self.done = 0
-        # collection id -> (index of the chunk that last wrote it, its state then)
-        self.states = {}
 
     def _plan(self, restore_id, chunk_rows):
         if self.chunks is None or str(restore_id) != str(self.restore_id):
@@ -670,17 +685,16 @@ class _RestoreRun:
         if not self.key:
             self._plan(self.restore_id or uuid.uuid4(), RESTORE_CHUNK_ROWS)
             return self.done, False
+        # _begin_mutation has matched this request's fingerprint to the row.
         cur.execute(
-            f"SELECT restore_id, chunk_rows, chunks_done, request_fingerprint "
+            f"SELECT restore_id, chunk_rows, chunks_done "
             f"FROM {collection_restores_table()} "
             "WHERE principal = %s AND idempotency_key = %s FOR UPDATE",
             (principal, self.key),
         )
         row = cur.fetchone()
         if row is not None:
-            restore_id, chunk_rows, done, fingerprint = row
-            if fingerprint != self.fingerprint:
-                raise RestoreKeyConflict()
+            restore_id, chunk_rows, done = row
             self._plan(restore_id, chunk_rows)
             return done, True
         if self.done:
@@ -702,39 +716,44 @@ class _RestoreRun:
     def step(self, cur, principal):
         done, tracked = self._progress(cur, principal)
         chunk = self.chunks[done]
-        result = _restore_principal_collections(cur, principal, chunk)
-        for segment, state in zip(chunk, result["collections"]):
-            self.states[segment["id"]] = (done, state)
-        self.done = done = done + 1
-        if done < len(self.chunks):
-            if tracked:
+        last = done == len(self.chunks) - 1
+        # Everything except the chunk's own writes happens first: once the
+        # chunk appends its events it holds the feed head until commit, and
+        # only the receipt insert may run then (nothing per collection).
+        if tracked:
+            if last:
+                cur.execute(
+                    f"DELETE FROM {collection_restores_table()} "
+                    "WHERE principal = %s AND idempotency_key = %s",
+                    (principal, self.key),
+                )
+            else:
                 cur.execute(
                     f"UPDATE {collection_restores_table()} "
                     "SET chunks_done = %s, updated_at = now() "
                     "WHERE principal = %s AND idempotency_key = %s",
-                    (done, principal, self.key),
+                    (done + 1, principal, self.key),
                 )
+        finished = {}
+        if last:
+            # The response lists collections finished by earlier chunks (by
+            # this request or another with the same key) as they stand now;
+            # the last chunk does not touch them.
+            written = {segment["id"] for segment in chunk}
+            finished = _fetch_collections(cur, principal, [
+                segment["id"]
+                for earlier in self.chunks[:-1] for segment in earlier
+                if segment["create"] and segment["id"] not in written
+            ])
+        result = _restore_principal_collections(cur, principal, chunk)
+        self.done = done + 1
+        if not last:
             return None
-        if tracked:
-            cur.execute(
-                f"DELETE FROM {collection_restores_table()} "
-                "WHERE principal = %s AND idempotency_key = %s",
-                (principal, self.key),
-            )
-        # Each collection as it stands now: the final chunk's own states, and
-        # a fresh read for collections finished by an earlier chunk (possibly
-        # committed by another request with the same key).
-        restored = []
-        for segment in (segment for chunk in self.chunks for segment in chunk):
-            if not segment["create"]:
-                continue
-            state = self.states.get(segment["id"])
-            if state is not None and state[0] == done - 1:
-                restored.append(state[1])
-            else:
-                restored.append(
-                    _fetch_collection(cur, principal, segment["id"], include_deleted=True)
-                )
+        states = {segment["id"]: state for segment, state in zip(chunk, result["collections"])}
+        restored = [
+            states[segment["id"]] if segment["id"] in states else finished.get(segment["id"])
+            for planned in self.chunks for segment in planned if segment["create"]
+        ]
         return {
             "restored": True,
             "collections": restored,
@@ -992,6 +1011,17 @@ def _begin_mutation(db, cur, principal, key, fingerprint):
     )
     saved = cur.fetchone()
     if not saved:
+        # An unfinished chunked restore owns the key: only a retry of that
+        # restore (same fingerprint) may use it, whatever the route.
+        cur.execute(
+            f"SELECT request_fingerprint FROM {collection_restores_table()} "
+            "WHERE principal = %s AND idempotency_key = %s",
+            (principal, key),
+        )
+        restoring = cur.fetchone()
+        if restoring is not None and restoring[0] != fingerprint:
+            db.rollback()
+            return jsonify({"error": "idempotency_key_conflict"}), 409
         return None
     payload_text, status, saved_digest, saved_version = saved
     if saved_digest is None and saved_version is None:
@@ -1037,9 +1067,6 @@ def _mutation_response(handler):
     except ForeignItemConflict:
         db.rollback()
         return jsonify({"error": "item_id_collection_conflict"}), 409
-    except RestoreKeyConflict:
-        db.rollback()
-        return jsonify({"error": "idempotency_key_conflict"}), 409
     except FeedProtocolUnavailable:
         db.rollback()
         return jsonify({"error": "collection_feed_unavailable"}), 503
@@ -1577,19 +1604,28 @@ def register_collection_routes(bp):
     def collection_snapshot():
         principal = current_principal()
         scope = current_collection_scope()["mode"]
+
+        def unavailable():
+            return (jsonify({"error": "collection_feed_unavailable"}), 503,
+                    {"Retry-After": str(UNAVAILABLE_RETRY_AFTER_S)})
+
+        if not _SNAPSHOT_SLOT.acquire(timeout=SNAPSHOT_WAIT_S):
+            return unavailable()
         try:
             with _snapshot_connection() as db:
                 with db.cursor() as cur:
                     snapshot = _read_snapshot(cur, principal)
+            return jsonify({"schema_version": COLLECTIONS_SCHEMA_VERSION, "scope": scope,
+                            **snapshot})
         except (FeedProtocolUnavailable, psycopg2.OperationalError,
                 psycopg2.InterfaceError) as exc:
             if not isinstance(exc, FeedProtocolUnavailable):
                 current_app.logger.warning(
                     "Collection snapshot database unavailable (%s)", type(exc).__name__
                 )
-            return (jsonify({"error": "collection_feed_unavailable"}), 503,
-                    {"Retry-After": str(UNAVAILABLE_RETRY_AFTER_S)})
-        return jsonify({"schema_version": COLLECTIONS_SCHEMA_VERSION, "scope": scope, **snapshot})
+            return unavailable()
+        finally:
+            _SNAPSHOT_SLOT.release()
 
     @bp.get("/api/collections/search")
     @require_collections_enabled

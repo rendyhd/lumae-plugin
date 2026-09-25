@@ -187,8 +187,8 @@ def _principal_state(api, user):
     return content, revisions
 
 
-def _event_shape(api, user):
-    """The principal's feed with ids canonicalised and revisions/times dropped."""
+def _changes(api, user="alice"):
+    """The principal's whole feed, paged by has_more."""
     changes = []
     cursor = 0
     while True:
@@ -196,7 +196,12 @@ def _event_shape(api, user):
         changes += page["changes"]
         cursor = page["next_cursor"]
         if not page["has_more"]:
-            break
+            return changes
+
+
+def _event_shape(api, user):
+    """The principal's feed with ids canonicalised and revisions/times dropped."""
+    changes = _changes(api, user)
     ids = {}
     volatile = {"revision", "collection_revision", "collection_updated_at", "created_at",
                 "updated_at", "album_count", "track_count"}
@@ -271,6 +276,17 @@ def test_chunked_restore_equals_unchunked_and_resumes_idempotently(collections_a
     other = _backup(manager, [("Else", 1)])
     conflict = api.call("POST", "/api/collections/restore", other, key="d", user="dave")
     assert (conflict.status_code, conflict.get_json()) == (409, {"error": "idempotency_key_conflict"})
+    # So is any other route reusing the unfinished restore's key; it would
+    # otherwise store a receipt that strands the restore.
+    for method, path, body in (("POST", "/api/collections", {"id": "x", "name": "X"}),
+                               ("PATCH", "/api/collections/none", {"name": "Y"})):
+        reused = api.call(method, path, body, key="d", user="dave")
+        assert (reused.status_code, reused.get_json()) == (409, {"error": "idempotency_key_conflict"})
+    assert api.call("GET", "/api/collections/x", user="dave").status_code == 404
+    # Keys are per principal: another user's "d" is unrelated.
+    assert api.call("POST", "/api/collections", {"id": "x", "name": "X"}, key="d",
+                    user="bob").status_code == 201
+    assert _restores(api) == [("user:dave", 1, 3)]
     fail_on.clear()
     resumed = api.call("POST", "/api/collections/restore", backup, key="d", user="dave")
     assert resumed.status_code == 201
@@ -327,15 +343,126 @@ def test_concurrent_retries_with_one_key_apply_each_chunk_once(collections_api, 
     assert _restores(api) == []
 
 
-def test_other_principal_write_waits_briefly_during_a_20k_restore(collections_api, monkeypatch):
+def test_collection_deleted_during_a_restore_stays_deleted(collections_api, monkeypatch):
+    api = collections_api
+    manager = api.manager
+    backup = _backup(manager, [("Big", 5_000), ("Small", 3)])
+    original = manager._restore_principal_collections
+    chunks, deleted = [], []
+
+    def delete_before_chunk_two(cur, principal, segments):
+        chunks.append(segments)
+        if len(chunks) == 2:
+            # Chunk 1 is committed and chunk 2 has not touched Big yet: a
+            # client deletes the half-restored collection.
+            big = segments[0]
+            assert (big["name"], big["create"]) == ("Big", False)
+            client = threading.Thread(target=lambda: deleted.append(
+                api.call("DELETE", f"/api/collections/{big['id']}", {})))
+            client.start()
+            client.join(20)
+        return original(cur, principal, segments)
+
+    monkeypatch.setattr(manager, "_restore_principal_collections", delete_before_chunk_two)
+    response = api.call("POST", "/api/collections/restore", backup, key="del")
+    assert response.status_code == 201, response.get_json()
+    assert len(chunks) == 3 and deleted[0].status_code == 200
+    big, small = response.get_json()["collections"]
+    # Reported as its tombstone: revision 2 after chunk 1, 3 for the delete.
+    assert (big["name"], big["revision"], big["track_count"]) == ("Big", 3, 1_999)
+    assert big["deleted_at"] is not None
+    assert (small["name"], small["revision"], small["track_count"], small["deleted_at"]) == (
+        "Small", 2, 3, None)
+    snapshot = api.call("GET", "/api/collections/snapshot").get_json()
+    assert [c["name"] for c in snapshot["collections"]] == ["Small"]
+    # Items after the delete were skipped: no rows and no events for them.
+    big_events = [(c["entity_kind"], c["operation"]) for c in _changes(api) if c["collection_id"] == big["id"]]
+    assert big_events == [("collection", "upsert")] + [("item", "upsert")] * 1_999 + [
+        ("collection", "delete")]
+    db = api.connect()
+    with db.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {manager.collection_items_table()} "
+                    "WHERE collection_id = %s", (big["id"],))
+        assert cur.fetchone()[0] == 1_999
+    db.close()
+
+
+def _record_head_holds(api, monkeypatch, thread_name):
+    """[(seconds, statements)] for each transaction of ``thread_name``'s
+    requests that took the feed head: the time from the head UPDATE to the
+    commit, and every statement run in between."""
+    manager = api.manager
+    holds = []
+    state = {"since": None, "statements": []}
+    original_get_db = manager.get_db
+
+    class Cursor:
+        def __init__(self, cursor):
+            self.cursor = cursor
+
+        def execute(self, sql, params=None):
+            if state["since"] is not None:
+                state["statements"].append(" ".join(sql.split())[:50])
+            result = self.cursor.execute(sql, params)
+            if (state["since"] is None and sql.lstrip().startswith("UPDATE")
+                    and manager.collection_feed_state_table() in sql):
+                state["since"] = time.perf_counter()
+            return result
+
+        def __getattr__(self, name):
+            return getattr(self.cursor, name)
+
+    class Db:
+        def __init__(self, db):
+            self.db = db
+
+        def cursor(self):
+            return Cursor(self.db.cursor())
+
+        def _end(self):
+            if state["since"] is not None:
+                holds.append((time.perf_counter() - state["since"], list(state["statements"])))
+                state["since"] = None
+                state["statements"].clear()
+
+        def commit(self):
+            self.db.commit()
+            self._end()
+
+        def rollback(self):
+            self.db.rollback()
+            self._end()
+
+        def __getattr__(self, name):
+            return getattr(self.db, name)
+
+    def get_db():
+        db = original_get_db()
+        return Db(db) if threading.current_thread().name == thread_name else db
+
+    monkeypatch.setattr(manager, "get_db", get_db)
+    return holds
+
+
+@pytest.mark.parametrize("collections,items", [(1, 20_000), (2_000, 10)],
+                         ids=["1x20000", "2000x10"])
+def test_other_principal_write_waits_briefly_during_a_large_restore(
+        collections_api, monkeypatch, collections, items):
     """docs/audit/.../collections/test_probe_restore_hold.py (and the frontier
     probe's restore case), inverted. LUM-004 budget: another principal's write
     waits <= 500 ms during a 20k-item restore (audit: 9.85 s; f36e087 on the
-    test database: the feed head held 17.6 s, the write timed out at 4 s)."""
+    test database: the feed head held 17.6 s, the write timed out at 4 s).
+
+    2,000 collections of 10 items is the shape where the last chunk used to
+    read every earlier collection while holding the head (review MEDIUM-1).
+    While a chunk holds the head, only its event INSERT and, in the last
+    chunk, the receipt INSERT may run, whatever the number of collections.
+    """
     api = collections_api
     manager = api.manager
     assert api.call("POST", "/api/collections", {"id": "bobc", "name": "b"}, user="bob").status_code == 201
-    backup = _backup(manager, [("Big", 20_000)])
+    backup = _backup(manager, [(f"C{c}", items) for c in range(collections)])
+    holds = _record_head_holds(api, monkeypatch, "restore")
     reached = threading.Event()
     done = threading.Event()
     original = manager._record_changes
@@ -374,9 +501,17 @@ def test_other_principal_write_waits_briefly_during_a_20k_restore(collections_ap
     for thread in threads:
         thread.join(600)
     assert result["restore"].status_code == 201
+    assert result["restore"].get_json()["collection_count"] == collections
+    rows = collections * (items + 1)
+    assert len(holds) == -(-rows // manager.RESTORE_CHUNK_ROWS)
+    for _, statements in holds:
+        assert 1 <= len(statements) <= 2, statements
+        assert all(statement.startswith("INSERT INTO") for statement in statements), statements
     assert len(latencies) >= 5 and set(statuses) == {200}
-    print(f"bob write latency while the 20k restore appends events: n={len(latencies)} "
-          f"max={max(latencies) * 1000:.0f} ms median={sorted(latencies)[len(latencies) // 2] * 1000:.0f} ms")
+    print(f"\n{collections}x{items}: bob write latency n={len(latencies)} "
+          f"max={max(latencies) * 1000:.0f} ms median={sorted(latencies)[len(latencies) // 2] * 1000:.0f} ms; "
+          f"head held per chunk max={max(h for h, _ in holds) * 1000:.0f} ms "
+          f"last={holds[-1][0] * 1000:.0f} ms")
     assert max(latencies) <= 0.5
 
 

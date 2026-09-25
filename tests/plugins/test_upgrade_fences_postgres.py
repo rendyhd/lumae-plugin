@@ -526,6 +526,32 @@ def test_runbook_repair_a_realigns_the_feed_head(collection_api):
     assert changes == [1, 7, 8]
 
 
+def test_runbook_repair_c_rotates_the_feed_epoch(collection_api):
+    manager_mod, call, connect = collection_api
+    assert call("POST", "/api/collections", {"id": "a", "name": "a"}).status_code == 201
+    before = call("GET", "/api/collections/changes").get_json()
+    db = connect()
+    try:
+        with db.cursor() as cur:
+            cur.execute(_runbook_sql(
+                "UPDATE plugin_lumae_analysis__collection_feed_state\n   SET epoch = gen_random_uuid()"))
+        db.commit()
+    finally:
+        db.rollback()
+        db.close()
+    stale = call("GET", f"/api/collections/changes?cursor={before['next_cursor']}"
+                        f"&epoch={before['epoch']}")
+    assert stale.status_code == 410
+    assert stale.get_json() == {"error": "collections_resync_required", "reason": "epoch_mismatch"}
+    after = call("GET", "/api/collections/changes").get_json()
+    assert after["epoch"] != before["epoch"]
+    assert (after["head_seq"], after["floor_seq"]) == (before["head_seq"], before["head_seq"])
+    # History and clients that do not echo the epoch are unaffected.
+    assert after["changes"] == before["changes"]
+    assert call("GET", f"/api/collections/changes?cursor={after['head_seq']}"
+                       f"&epoch={after['epoch']}").status_code == 200
+
+
 # -- health -------------------------------------------------------------------
 
 

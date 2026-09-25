@@ -9,6 +9,7 @@ import json
 import pathlib
 import re
 import threading
+import time
 import types
 
 import pytest
@@ -458,6 +459,57 @@ def test_snapshot_503s_with_retry_after_when_unavailable(collections_api, monkey
         assert response.get_json() == {"error": "collection_feed_unavailable"}
     monkeypatch.setattr(api.manager, "get_setting", lambda key, default=None: False)
     assert api.call("GET", "/api/collections/snapshot").status_code == 404
+
+
+def test_snapshot_builds_one_at_a_time_per_process(collections_api, monkeypatch):
+    """A 100k-item snapshot costs about 250 MB while it is built, so a worker
+    builds one at a time; a request that cannot start within 2 s gets 503."""
+    api = collections_api
+    manager = api.manager
+    assert api.call("POST", "/api/collections", {"id": "a", "name": "A"}).status_code == 201
+    assert manager.SNAPSHOT_WAIT_S == 2
+    original = manager._read_snapshot
+    active, peak = [0], [0]
+    guard = threading.Lock()
+
+    def slow_read(cur, principal):
+        with guard:
+            active[0] += 1
+            peak[0] = max(peak[0], active[0])
+        try:
+            time.sleep(0.15)
+            return original(cur, principal)
+        finally:
+            with guard:
+                active[0] -= 1
+
+    monkeypatch.setattr(manager, "_read_snapshot", slow_read)
+    results = []
+    readers = [threading.Thread(target=lambda: results.append(
+        api.call("GET", "/api/collections/snapshot"))) for _ in range(4)]
+    for reader in readers:
+        reader.start()
+    for reader in readers:
+        reader.join(20)
+    assert [r.status_code for r in results] == [200] * 4
+    assert peak[0] == 1
+    # Held elsewhere: 503 after the wait, and the slot is released after
+    # every outcome, including an error.
+    monkeypatch.setattr(manager, "SNAPSHOT_WAIT_S", 0.2)
+    assert manager._SNAPSHOT_SLOT.acquire(timeout=1)
+    try:
+        started = time.monotonic()
+        busy = api.call("GET", "/api/collections/snapshot")
+        waited = time.monotonic() - started
+    finally:
+        manager._SNAPSHOT_SLOT.release()
+    assert (busy.status_code, busy.get_json(), busy.headers["Retry-After"]) == (
+        503, {"error": "collection_feed_unavailable"}, "5")
+    assert 0.15 <= waited < 2
+    monkeypatch.setattr(plugin_api_module.config, "DATABASE_URL", None)
+    assert api.call("GET", "/api/collections/snapshot").status_code == 503
+    assert manager._SNAPSHOT_SLOT.acquire(blocking=False)
+    manager._SNAPSHOT_SLOT.release()
 
 
 def test_floor_seq_is_the_head_at_cutover(migrated_db, run_plugin_migration):
