@@ -182,6 +182,8 @@ The response shape and values are unchanged. What changed is when its values are
 Response 200: `{schema_version:1, analyzer_version:1, catalog_instance_id, profiles:[profile…], missing:[id…], failed:[{track_id, reason}…]}`.
 - `profiles`: published rows (`published_source_profiles`), with an edge when one matches (§3.1).
 - `failed`: the latest attempt is `failed` or `skipped_no_file`, with `last_error` as the reason, or serialization failed.
+  - A reason written by 1.2.5 is one of its failure categories: `download_unavailable`, `media_unavailable`, `silent_audio`, `unsupported_media`, `resource_limit`, `analysis_timeout`, `analysis_error`, `queue_unavailable`. It is `failed` when none is stored; rows carried over from pre-0.8 installs can still hold older free text.
+  - From 1.3.0 (P3-8, LUM-018) the server records two finer categories, `media_error` (the decoder rejected the data) and `analysis_crash` (the analysis worker died). It reports them as `unsupported_media` and `analysis_error`, so no new reason reaches clients (§8.5). A hard-limit kill is reported as `analysis_timeout`, as before.
 - `missing`: everything else, including pending work.
 
 Headers: from 1.3.0 the 200 response has private cache headers (§1.5); in 1.2.5 it has none. It is gzipped under K1 when large enough (§1.5).
