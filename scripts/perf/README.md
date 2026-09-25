@@ -68,7 +68,11 @@ full production schema. After migrating, `seed.py` bulk-loads the following:
   events, which stay at the production retention of 50k. The publication
   budget is defined at 50k events.
 - Other options: `--no-project` skips the first projection, and `--seed N` sets
-  the random seed.
+  the random seed. `--host-schema existing` seeds a database whose host tables
+  the stock AudioMuse host already created (no `host_schema.sql`, no reset),
+  and `--item-ids canonical` gives the analysis items AudioMuse 3.6 content
+  ids (`fp_4<hex>`) so that host does not relabel them at start. The P2-6 gate
+  uses both through `scripts/e2e/seed_representative.py`.
 - The table `lumae_perf_fixture` records scale, counts and seed, and
   `run_baseline.py` copies that into its results.
 
