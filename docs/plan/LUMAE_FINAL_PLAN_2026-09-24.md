@@ -417,6 +417,22 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - P2-4 builds the snapshot and first catch-up rows in PostgreSQL with bounded `INSERT … SELECT` batches: byte-identical output, proven by an equivalence test against the old path. It also fixes the page query, which applies `ORDER BY ordinal LIMIT` before the lateral edge join; without statistics, the current plan does one edge lookup per remaining row.
   - Acceptance is the P2-6 `creators` scenario: two-creator create p95 ≤5 s and no 503. On the same source, that requires one 94k capture in about 2.5 s or less.
   - If SQL capture cannot reach that, the orchestrator decides between accepting a same-source wait (two devices of one library starting a first sync at once) and the 202 path.
+- **Outcome (P2-4 and P2-4b merged, reviews PASS).**
+  - Single create at 94k: 3.6–4.0 s → 2.0–2.2 s.
+  - Different-source two-creator p95: 6.3–6.6 s → 2.4–3.3 s.
+  - Status routes are back within budget during creates.
+  - A page query on a table without statistics does 50 edge lookups instead of one per remaining row.
+  - **Same-source two-creator p95 does not reliably meet 5 s.** Across 10 full-scale runs it was 4.58–6.12 s, with 0 × 503 in every run. The two creates serialize on the per-source capture lock, so the second waits for the whole first capture. The runs also churn about 3.8M snapshot rows, which triggers autovacuum.
+- **Decision (orchestrator): accept the same-source wait, and do not build the 202 + RQ path.**
+  - The case needs two devices of one library to start a first sync within about 2 s of each other.
+  - The second create still succeeds, well inside the client's 10 s create timeout and the 5 s lock timeout (the lock is held for about 2 s).
+  - No 503 occurred in any post-P2-4 run.
+  - The 202 path would add a capability flag, a contract entry and client work (C-3) for this case alone.
+  - The budget now reads: single create ≤5 s; two creators on **different** sources p95 ≤5 s; two creators on the **same** source no 503 and p95 ≤10 s.
+  - Re-check at P4-2 qualification on the stock host.
+- **Follow-ups (low, not blocking).**
+  - If every row's `ref_lufs` is non-plain (NaN, infinite, or within 1e-4 of 0), a 94k create takes 5.6–6.2 s because the Python fallback is slow. Fix it with COPY or `page_size=len(values)`, and a track-range predicate on the fallback SELECT.
+  - Compute the float4 text once in `_PLAIN_LUFS`: +6% create time was measured.
 
 **P2-5 — Migration and lock hygiene (P3 migration items).**
 - Files: `migrate_attempts` and the other `ADD COLUMN IF NOT EXISTS` sequences; `collection_manager.py:147-151`.

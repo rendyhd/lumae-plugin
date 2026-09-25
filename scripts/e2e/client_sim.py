@@ -156,6 +156,8 @@ class Stats:
         self.status = collections.Counter()
         self.events = collections.Counter()
         self.sqlite_tx_ms = []
+        # (kind, time.monotonic()) of each request that failed on the wire.
+        self.failures = []
 
     def record(self, kind, status, ms, wire=0, decoded=0):
         with self.lock:
@@ -167,6 +169,10 @@ class Stats:
     def count(self, name, n=1):
         with self.lock:
             self.events[name] += n
+
+    def failure(self, kind):
+        with self.lock:
+            self.failures.append((kind, time.monotonic()))
 
     def summary(self):
         with self.lock:
@@ -290,6 +296,7 @@ class Transport:
     def _failed(self, kind, started, exc):
         ms = (time.perf_counter() - started) * 1000
         self.stats.record(kind, "conn_error", ms)
+        self.stats.failure(kind)
         raise TransportError(f"{type(exc).__name__}: {exc}") from None
 
 
@@ -489,6 +496,13 @@ class SyncClient:
                     raise SyncFailed(f"{kind}: server unreachable for {self.max_outage_s:.0f}s ({exc})")
                 time.sleep(min(5.0, 0.2 * 2 ** min(attempt, 5)) * (0.75 + random.random() / 2))
                 continue
+            if resp.status in (429, 502, 503, 504):
+                # Deferred or unavailable: bounded like a connection outage.
+                now = time.monotonic()
+                outage_started = outage_started or now
+                if now - outage_started > self.max_outage_s:
+                    raise SyncFailed(f"{kind}: still {resp.status} after "
+                                     f"{self.max_outage_s:.0f}s")
             if resp.status in (429, 503):
                 self.stats.count(f"deferred_{resp.status}")
                 try:
@@ -617,6 +631,9 @@ class SyncClient:
                 continue
             if resp.status in (429, 503):
                 self.stats.count(f"deferred_{resp.status}")
+                if time.perf_counter() - t0 > self.max_outage_s:
+                    raise SyncFailed(f"v2 create: still {resp.status} after "
+                                     f"{self.max_outage_s:.0f}s")
                 try:
                     wait = int(resp.header("Retry-After"))
                 except (TypeError, ValueError):

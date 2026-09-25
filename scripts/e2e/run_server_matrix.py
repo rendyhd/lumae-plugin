@@ -578,12 +578,18 @@ class Plugin:
         so a kill lands during the capture deterministically at any scale.
         """
         conn = self.stub.connect()
-        conn.autocommit = False
-        with conn.cursor() as cur:
-            cur.execute("SET lock_timeout = '30s'")
-            cur.execute(f"LOCK TABLE {self.T}{table} IN ACCESS EXCLUSIVE MODE")
-            cur.execute("SELECT pg_backend_pid()")
-            pid = cur.fetchone()[0]
+        try:
+            conn.autocommit = False
+            with conn.cursor() as cur:
+                cur.execute("SET lock_timeout = '30s'")
+                cur.execute(f"LOCK TABLE {self.T}{table} IN ACCESS EXCLUSIVE MODE")
+                cur.execute("SELECT pg_backend_pid()")
+                pid = cur.fetchone()[0]
+        except BaseException:
+            # A lock timeout (or anything else) must not leak the connection.
+            with contextlib.suppress(Exception):
+                conn.close()
+            raise
 
         def blocked_captures():
             with conn.cursor() as cur:
@@ -1266,10 +1272,12 @@ def run_kill_restart(ctx):
     threads = []
     mutations = collections.Counter()
     k5 = {}
+    killed_at = {}
 
     def restart(entry, started, between=None):
         log(f"  kill -9 at {entry['point']} ({entry['kind']}, in flight: "
             f"{entry.get('request_in_flight')})")
+        killed_at[entry["point"]] = time.monotonic()
         ctx.server.restart(between=between)
         entry["restart_s"] = round(time.perf_counter() - started, 2)
         kills.append(entry)
@@ -1303,29 +1311,34 @@ def run_kill_restart(ctx):
         blocked, release = plugin.block_capture(table)
 
         def run():
-            started = time.perf_counter()
-            # The capture waits at most its 5 s lock_timeout, then answers 503.
-            deadline = started + 4
-            waiting = 0
-            while time.perf_counter() < deadline:
-                waiting = blocked()
-                if waiting:
-                    break
-                time.sleep(0.005)
-            if not waiting:
+            # release() is idempotent; the finally frees the lock (and its
+            # connection) even if a step below raises.
+            try:
+                started = time.perf_counter()
+                # The capture waits at most its 5 s lock_timeout, then answers 503.
+                deadline = started + 4
+                waiting = 0
+                while time.perf_counter() < deadline:
+                    waiting = blocked()
+                    if waiting:
+                        break
+                    time.sleep(0.005)
+                if not waiting:
+                    release()
+                    kills.append({"point": label, "kind": "in_capture", "blocked_capture": False,
+                                  "request_in_flight": client.transport.inflight_kind})
+                    return
+                if label == "create_capture":
+                    row = plugin.query(
+                        f"SELECT session_id::text FROM {plugin.T}profile_bootstrap_sessions "
+                        "WHERE client_request_id=%s AND state='capturing'",
+                        (client.state["client_request_id"],), one=True)
+                    k5["orphan_session"] = row[0] if row else None
+                restart({"point": label, "kind": "in_capture", "blocked_capture": True,
+                         "request_in_flight": client.transport.inflight_kind}, started,
+                        between=release)
+            finally:
                 release()
-                kills.append({"point": label, "kind": "in_capture", "blocked_capture": False,
-                              "request_in_flight": client.transport.inflight_kind})
-                return
-            if label == "create_capture":
-                row = plugin.query(
-                    f"SELECT session_id::text FROM {plugin.T}profile_bootstrap_sessions "
-                    "WHERE client_request_id=%s AND state='capturing'",
-                    (client.state["client_request_id"],), one=True)
-                k5["orphan_session"] = row[0] if row else None
-            restart({"point": label, "kind": "in_capture", "blocked_capture": True,
-                     "request_in_flight": client.transport.inflight_kind}, started,
-                    between=release)
         thread = threading.Thread(target=run, daemon=True)
         thread.start()
         threads.append(thread)
@@ -1417,9 +1430,21 @@ def run_kill_restart(ctx):
                    all(k.get("blocked_capture") for k in kills if k["kind"] == "in_capture"),
                    [(k["point"], k.get("blocked_capture")) for k in kills
                     if k["kind"] == "in_capture"])
-    scenario.check("the client saw each cut-off request fail",
-                   scenario.metrics["conn_errors"] >= len(cut),
-                   {"conn_errors": scenario.metrics["conn_errors"], "cut_off": len(cut)})
+    # Each cut-off request is matched to its own client-side failure: the
+    # first unmatched connection failure of the kind in flight, after the kill.
+    # (A retry while the server was down fails too, so counting is not enough.)
+    unmatched = sorted(stats.failures, key=lambda failure: failure[1])
+    matched = []
+    for kill in sorted(cut, key=lambda k: killed_at.get(k["point"], float("inf"))):
+        at = killed_at.get(kill["point"])
+        hit = None if at is None else next(
+            (f for f in unmatched if f[0] == kill.get("request_in_flight") and f[1] >= at), None)
+        if hit is not None:
+            unmatched.remove(hit)
+        matched.append((kill["point"], kill.get("request_in_flight"), hit is not None))
+    scenario.check("the client saw each cut-off request fail (matched one to one)",
+                   bool(cut) and all(ok for _point, _kind, ok in matched),
+                   {"matched": matched, "conn_errors": scenario.metrics["conn_errors"]})
     scenario.check("the lost create was retried with the same client_request_id (K5)",
                    bool(events.get("create_retries", 0) >= 1 and k5.get("request_id")
                         and k5.get("request_id") == k5.get("request_id_after")),
@@ -1645,7 +1670,7 @@ def environment(plugin, server):
         "SELECT pg_database_size(current_database())", one=True)[0]) / 1e6, 1)
     info["server"] = server.describe()
     with contextlib.suppress(Exception):
-        info["git_sha"] = subprocess.run(["git", "-C", REPO, "rev-parse", "--short", "HEAD"],
+        info["git_sha"] = subprocess.run(["git", "-C", REPO, "describe", "--always", "--dirty"],
                                          capture_output=True, text=True).stdout.strip()
     return info
 

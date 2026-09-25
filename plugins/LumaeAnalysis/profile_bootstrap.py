@@ -43,6 +43,7 @@ from datetime import timezone
 
 import psycopg2
 import psycopg2.errors
+from psycopg2.extras import execute_values
 
 from plugin.api import config, logger, table
 
@@ -51,7 +52,9 @@ from .catalog_enrichment import (
     PROFILE_BOOTSTRAP_CAPTURE_MINUTES,
     PROFILE_CHANGE_RETENTION_EVENTS,
     live_bootstrap_session_sql,
+    serialize_profile,
 )
+from .edge_profile_store import edge_join
 
 
 # Session lifetime: the absolute lifetime from admission, and the sliding
@@ -432,19 +435,17 @@ def _served(cur, session):
 # {"profile_digest": ...} (about 100 bytes less per row, which keeps a 94k
 # capture under its WAL budget). Only a catch-up reference whose journalled
 # edge names another revision than the event payload carries media_revision.
-#
+_EDGE_REF = '{"profile_digest":%s}'
+_json_string = json.encoder.encode_basestring_ascii
+
 # P2-4: the captures build their rows in SQL. Each row's JSON is written as the
 # text ``json.dumps(..., separators=(",", ":"))`` produced for it before, and
 # stored as JSONB from that text, so the stored rows, the pages and the byte
 # caps are unchanged (the equivalence test keeps the Python capture as its
 # oracle). The SQL spells out what the Python serializers did:
 #
-# * ``ref_lufs``: serialize_profile's float4() is numpy's shortest decimal of
-#   the REAL as psycopg2 read it (under the session's extra_float_digits;
-#   see _FLOAT4_SHORTEST), written as Python's float repr: fixed notation with
-#   at least one decimal for 1e-4 <= |x| < 1e16 (-14.0, never -14), exponent
-#   notation otherwise (1e-05), and null for NaN or infinity. to_jsonb(real)
-#   would give -14 and "NaN".
+# * ``ref_lufs``: a plain value as serialize_profile's float4() writes it
+#   (see _PLAIN_LUFS); a row with any other value is serialized in Python.
 # * ramps: base64 without the line breaks encode() inserts every 76 characters.
 # * timestamps: datetime.isoformat() drops ".000000"; +-infinity are
 #   psycopg2's datetime.max and datetime.min.
@@ -456,85 +457,50 @@ def _served(cur, session):
 # built from them. Flattened, every reference to a value would compute it
 # again (the JSON text, sha256, to_char and the regexes several times a row).
 
-# float4() gives numpy's shortest decimal of the float4. PostgreSQL's float4
-# output is the same digits except where numpy finds a shorter decimal: exactly
-# on the rounding boundary of a value with an even mantissa (from 2^23 up, where
-# float4 values are integers: 3.3554448e+07 is 3.355445e+07 to numpy), and for
-# subnormal values when extra_float_digits < 1 gives 6 digits where fewer
-# identify the value. Only there are the shortest decimals searched: the first
-# length k at which a neighbour of the text, cut to k significant digits,
-# parses back to the same float4. If both neighbours do, numpy takes the one
-# nearer the float4's exact value m * 2^-q (from its bits; twice it is
-# compared with the neighbours' sum in exact integers), on a tie the even
-# digit. A neighbour at or beyond the float4 overflow threshold (FLT_MAX +
-# ulp/2) would not parse.
-_FLOAT4_SHORTEST = """(
-    SELECT CASE WHEN c.lo_ok AND c.hi_ok THEN CASE
-                     WHEN c.above > 0 THEN c.hi WHEN c.above < 0 THEN c.lo
-                     WHEN mod(trunc(abs(c.lo) / c.u), 2) = 0 THEN c.lo ELSE c.hi END
-                WHEN c.lo_ok THEN c.lo ELSE c.hi END
-      FROM (SELECT g.k, l.lo, l.hi, l.u, l.lo::real = a.x AS lo_ok,
-                   CASE WHEN abs(l.hi) >= 340282356779733661637539395458142568448 THEN FALSE
-                        ELSE l.hi::real = a.x END AS hi_ok,
-                   sign(2 * a.m * 2::numeric ^ greatest(-a.q, 0)
-                        - (abs(l.lo) + abs(l.hi)) * 2::numeric ^ greatest(a.q, 0)) AS above
-              FROM (SELECT d.v, d.x,
-                           CASE WHEN abs(d.v) >= 1 THEN length(split_part(abs(d.v)::text, '.', 1)) - 1
-                                ELSE length(ltrim(split_part(abs(d.v)::text, '.', 2), '0'))
-                                     - length(split_part(abs(d.v)::text, '.', 2)) - 1 END AS e,
-                           CASE WHEN d.exponent = 0 THEN d.mantissa
-                                ELSE d.mantissa + 8388608 END AS m,
-                           CASE WHEN d.exponent = 0 THEN 149 ELSE 150 - d.exponent END AS q
-                      FROM (SELECT f.v, f.x,
-                                   (get_byte(f.bits, 0) & 127) * 2 + (get_byte(f.bits, 1) >> 7)
-                                       AS exponent,
-                                   (get_byte(f.bits, 1) & 127) * 65536 + get_byte(f.bits, 2) * 256
-                                       + get_byte(f.bits, 3) AS mantissa
-                              FROM (SELECT p.ref_lufs::text::numeric AS v,
-                                           p.ref_lufs::text::real AS x,
-                                           float4send(p.ref_lufs::text::real) AS bits) f) d
-                   ) a
-             CROSS JOIN generate_series(1, 9) g(k)
-             CROSS JOIN LATERAL (
-                SELECT trunc(a.v, g.k - 1 - a.e) AS lo,
-                       trunc(a.v, g.k - 1 - a.e) + sign(a.v) * trunc(
-                           10::numeric ^ (a.e - g.k + 1), greatest(g.k - 1 - a.e, 0)) AS hi,
-                       trunc(10::numeric ^ (a.e - g.k + 1), greatest(g.k - 1 - a.e, 0)) AS u) l
-           ) c
-     WHERE c.lo_ok OR c.hi_ok
-     ORDER BY c.k LIMIT 1)"""
+# A "plain" ref_lufs is written in SQL. Analyzed loudness is plain in practice
+# (the analyzer rejects non-finite loudness; only a level within 1e-4 LUFS of 0
+# would not be). A row with any other value is serialized in Python by
+# serialize_profile itself (_snapshot_fallback).
+#
+# serialize_profile writes float4(v): v is the double psycopg2 parsed from
+# PostgreSQL's float4 text t of the REAL x, and float4() is numpy's shortest
+# decimal of float32(v), written as Python's float repr. For a plain x that is
+# t in fixed notation with at least one decimal (-14.0, never -14; to_jsonb
+# would give -14 and "NaN"), because:
+# * float32(v) is t's float4: checked, since the double can round to the
+#   neighbour (for 7.038531e-26, float4() gives 7.0385313e-26). An exhaustive
+#   search (every float4 with 1e-5 <= |x| < 2^23, every decimal of at most 6
+#   digits) finds no plain value where it does; the check keeps the rule from
+#   depending on that;
+# * numpy's shortest decimal of it is t: with extra_float_digits >= 1, t is
+#   PostgreSQL's shortest decimal, and below 2^23 no shorter decimal lies on
+#   a rounding boundary, where the two can differ (from 2^25 up); with
+#   extra_float_digits < 1, t has at most 6 significant digits, which no
+#   shorter decimal shares within a normal float4;
+# * 1e-4 <= |t| < 1e16 as a decimal, where repr uses fixed notation.
+# Not plain: NaN and infinities, |x| >= 2^23, 0 < |t| < 1e-4 (the subnormals
+# included), and a failed check. The CASE casts t only where it is a normal
+# float4 (t can overflow one elsewhere: 3.403e+38 with extra_float_digits = -2).
+_PLAIN_LUFS = """CASE
+    WHEN p.ref_lufs = 0 THEN TRUE
+    WHEN abs(p.ref_lufs) >= 0.00001 AND abs(p.ref_lufs) < 8388608
+    THEN abs(p.ref_lufs::text::numeric) >= 0.0001
+         AND p.ref_lufs::text::float8::real = p.ref_lufs::text::real
+    ELSE FALSE END"""
 
 # The profile's values (b): serialize_profile's inputs as they will be written.
-# lufs is the decimal float4() gives; lufs_text PostgreSQL's float4 text. Both
-# come from the text psycopg2 read, so they follow extra_float_digits as it did.
 _SNAPSHOT_VALUES = f"""
     p.track_id, p.sample_rate, p.duration_ms, p.start_ramp, p.end_ramp,
-    p.analyzer_ver, p.analyzed_at, p.media_signature, p.ref_lufs::text AS lufs_text,
-    CASE WHEN p.ref_lufs IN ('NaN', 'Infinity', '-Infinity') THEN NULL
-         WHEN abs(p.ref_lufs) >= 8388608
-              OR p.ref_lufs <> 0 AND abs(p.ref_lufs) < '1.17549435e-38'::real
-         THEN {_FLOAT4_SHORTEST}
-         ELSE p.ref_lufs::text::numeric END AS lufs,
+    p.analyzer_ver, p.analyzed_at, p.media_signature,
+    p.ref_lufs::text AS lufs_text, {_PLAIN_LUFS} AS plain,
     to_char(p.analyzed_at, 'YYYY-MM-DD"T"HH24:MI:SS.US') AS stamp"""
 
-# serialize_profile's ref_lufs and analyzed_at, as json.dumps writes them:
-# Python's float repr of lufs, fixed notation with a decimal between 1e-4 and
-# 1e16 and d.ddde-XX outside (the sign of a zero is kept only in the text).
-_SNAPSHOT_LUFS_DIGITS = "rtrim(ltrim(replace(abs(b.lufs)::text, '.', ''), '0'), '0')"
-_SNAPSHOT_LUFS = f"""CASE
-    WHEN b.lufs IS NULL THEN 'null'
-    WHEN b.lufs = 0 THEN CASE WHEN left(b.lufs_text, 1) = '-' THEN '-0.0' ELSE '0.0' END
-    WHEN abs(b.lufs) >= 0.0001 AND abs(b.lufs) < 1e16
-    THEN round(b.lufs, greatest(scale(b.lufs), 1))::text
-    ELSE CASE WHEN b.lufs < 0 THEN '-' ELSE '' END
-         || left({_SNAPSHOT_LUFS_DIGITS}, 1)
-         || CASE WHEN length({_SNAPSHOT_LUFS_DIGITS}) > 1
-                 THEN '.' || substr({_SNAPSHOT_LUFS_DIGITS}, 2) ELSE '' END
-         || CASE WHEN abs(b.lufs) >= 1
-                 THEN 'e+' || lpad((length(split_part(abs(b.lufs)::text, '.', 1)) - 1)::text, 2, '0')
-                 ELSE 'e-' || lpad((length(split_part(abs(b.lufs)::text, '.', 2))
-                                    - length(ltrim(split_part(abs(b.lufs)::text, '.', 2), '0'))
-                                    + 1)::text, 2, '0') END END"""
+# A plain ref_lufs as json.dumps writes it (NULL for any other); the text of a
+# negative zero is "-0".
+_SNAPSHOT_LUFS = """CASE
+    WHEN NOT b.plain THEN NULL
+    WHEN b.lufs_text = '-0' THEN '-0.0'
+    ELSE round(b.lufs_text::numeric, greatest(scale(b.lufs_text::numeric), 1))::text END"""
 _SNAPSHOT_STAMP = """CASE
     WHEN b.analyzed_at = 'infinity' THEN '9999-12-31T23:59:59.999999'
     WHEN b.analyzed_at = '-infinity' THEN '0001-01-01T00:00:00'
@@ -579,7 +545,12 @@ _SNAPSHOT_DOC_LENGTH = f"""
                 AND date_trunc('second', b.analyzed_at) = b.analyzed_at THEN 19 ELSE 26 END
     + CASE WHEN b.media_signature <> '' THEN 2 * 73 ELSE 2 * 4 END"""
 
-# The event's values (a): the journal row with its edge split off.
+# The event's values (a): the journal row with its edge split off. The payload
+# is copied as journalled, while the Python capture parsed it (json.loads) and
+# dumped it again (json.dumps). That round trip changes no number the journal
+# holds: its only writer, _profile_json, writes json.dumps text, so every number
+# is a Python float repr or int, which reads back to the same float or int and
+# is written again as the same repr, and JSONB keeps its value and scale.
 _CATCHUP_VALUES = """
     j.seq, j.track_id, j.operation, j.created_at,
     CASE WHEN j.split THEN j.payload - 'edge_profile' ELSE j.payload END AS part_json,
@@ -605,16 +576,26 @@ _CATCHUP_DOC = r"""
     || 'Z"}'"""
 
 # A JSON number with a fraction, as PostgreSQL writes it, is json.loads'
-# float; its text equals the float's repr unless it is below 1e-4 (repr uses
-# an exponent), has trailing zeros, or has 16 or more digits.
+# float. For a number that was a float repr (as every journalled number is; see
+# _CATCHUP_VALUES) the text equals the repr unless it is below 1e-4: repr used
+# an exponent (1e-05), which JSONB keeps as 0.00001. The pattern also matches
+# trailing zeros (never in a repr) and 16 or more digits (a long repr, such as
+# 0.30000000000000004, whose count comes out unchanged); those are measured
+# one by one as well.
 _NOT_FLOAT_REPR = r"E'0\\.0000|\\.[0-9]*[0-9]0([^0-9]|$)|[0-9]{16}'"
 
 
 def _float_repr_extra(number):
     """SQL: len(repr(float(t))) - len(t) for ``number``, a JSON number text
-    with a fraction as PostgreSQL writes it. Numbers of more than 17
-    significant digits (no float repr; the journal never holds one) are
-    measured as if rounded to 17."""
+    with a fraction as PostgreSQL writes it.
+
+    Exact only when ``t`` holds the digits of a Python float repr, as every
+    number in the journal does (its only writer, _profile_json, writes
+    json.dumps text): repr(float(t)) then has the same significant digits,
+    and only the notation is worked out here. For any other number (more than
+    17 significant digits, or 16 or 17 that are not the shortest repr of their
+    float) repr(float(t)) has other digits, and the count is wrong; ``least``
+    only keeps the arithmetic bounded for such a number."""
     return f"""(
         SELECT d.neg - length(d.t) + CASE
             WHEN d.n = 0 THEN 3
@@ -675,11 +656,13 @@ def _ascii_escape_extra(text):
 
 def _snapshot_batch(cur, source, session_id, ordinal, after):
     """Capture the next SNAPSHOT_BATCH_ROWS profiles after ``after`` (None:
-    from the start) as ordinals ``ordinal`` onwards, in two statements of the
-    capture's snapshot: measure the batch, then copy exactly its rows.
+    from the start) as ordinals ``ordinal`` onwards, in statements of the
+    capture's snapshot: measure the batch, copy exactly its rows with a plain
+    ref_lufs, and serialize the others in Python (_snapshot_fallback).
 
     Returns ``(rows, json_bytes, last_track_id, unrepresentable)``, where
     ``json_bytes`` counts the rows' waveform JSON as MAX_SNAPSHOT_BYTES does.
+    Nothing is copied if a row is unrepresentable (the capture then fails).
     """
     params = {"source": source, "after": after, "limit": SNAPSHOT_BATCH_ROWS,
               "session_id": session_id, "ordinal": ordinal}
@@ -687,20 +670,23 @@ def _snapshot_batch(cur, source, session_id, ordinal, after):
     edge_keyset = "" if after is None else " AND e.track_id > %(after)s"
     cur.execute(
         f"""SELECT count(*),
-                   COALESCE(sum({_SNAPSHOT_DOC_LENGTH}
-                                + {_ascii_escape_extra('b.track_id')}), 0),
-                   max(b.track_id), COALESCE(bool_or(b.unrepresentable), FALSE)
+                   COALESCE(sum({_SNAPSHOT_DOC_LENGTH} + {_ascii_escape_extra('b.track_id')})
+                            FILTER (WHERE b.plain), 0),
+                   max(b.track_id), COALESCE(bool_or(b.unrepresentable), FALSE),
+                   array_agg(b.i ORDER BY b.i) FILTER (WHERE NOT b.plain),
+                   array_agg(b.track_id ORDER BY b.i) FILTER (WHERE NOT b.plain)
               FROM (SELECT {_SNAPSHOT_VALUES},
                            -- psycopg2 has no datetime for these: rows the
                            -- Python capture failed on.
                            (p.analyzed_at <> '-infinity' AND p.analyzed_at < '0001-01-01'
                             OR p.analyzed_at <> 'infinity'
-                               AND p.analyzed_at >= '10000-01-01') AS unrepresentable
+                               AND p.analyzed_at >= '10000-01-01') AS unrepresentable,
+                           row_number() OVER (ORDER BY p.track_id) - 1 AS i
                       FROM {_table('published_source_profiles')} p
                      WHERE p.catalog_instance_id=%(source)s{keyset}
                      ORDER BY p.track_id LIMIT %(limit)s) b""", params)
-    rows, json_bytes, last, unrepresentable = cur.fetchone()
-    if not rows:
+    rows, json_bytes, last, unrepresentable, positions, others = cur.fetchone()
+    if not rows or unrepresentable:
         return rows, json_bytes, last, unrepresentable
     params["last"] = last
     # The edge each row embeds is the one edge_join() picks: for the row's
@@ -708,7 +694,8 @@ def _snapshot_batch(cur, source, session_id, ordinal, after):
     # profile_digest. It is picked set-based over the batch's track range, a
     # hash or merge join (see _capture_snapshot) instead of a lookup per row,
     # and only its key columns are read, so the TOASTed edge payload is never
-    # detoasted or copied; snapshot_page resolves the reference (K2).
+    # detoasted or copied; snapshot_page resolves the reference (K2). The
+    # ordinals count every row of the batch, the plain ones are copied here.
     cur.execute(
         f"""INSERT INTO {_table('profile_bootstrap_snapshot')}
                    (session_id, ordinal, payload, edge_ref)
@@ -732,11 +719,48 @@ def _snapshot_batch(cur, source, session_id, ordinal, after):
                  WHERE e.catalog_instance_id=%(source)s{edge_keyset}
                    AND e.track_id <= %(last)s
                  ORDER BY e.track_id, e.media_signature, e.updated_at DESC, e.profile_digest
-              ) edge ON edge.track_id=b.track_id AND edge.media_signature=b.media_signature""",
+              ) edge ON edge.track_id=b.track_id AND edge.media_signature=b.media_signature
+             WHERE b.plain""",
         params)
-    if cur.rowcount != rows:
+    if cur.rowcount != rows - len(others or ()):
         raise RuntimeError("snapshot batch changed within its snapshot")
+    if others:
+        json_bytes += _snapshot_fallback(cur, source, session_id, ordinal, positions, others)
     return rows, json_bytes, last, unrepresentable
+
+
+def _snapshot_fallback(cur, source, session_id, ordinal, positions, track_ids):
+    """Serialize the batch's rows whose ref_lufs is not plain as the capture
+    did before P2-4: serialize_profile, json.dumps and the same edge
+    reference, from the rows psycopg2 reads in the capture's snapshot. Inserts
+    them at their ordinals and returns their JSON bytes. Analyzed loudness is
+    plain in practice, so this rarely runs (see _PLAIN_LUFS)."""
+    cur.execute(
+        f"""SELECT p.track_id, p.sample_rate, p.duration_ms, p.ref_lufs,
+                   p.start_ramp, p.end_ramp, p.analyzer_ver, p.analyzed_at,
+                   p.media_signature, edge.media_revision, edge.profile_digest
+              FROM {_table('published_source_profiles')} p
+              {edge_join(columns='e.media_revision, e.profile_digest')}
+             WHERE p.catalog_instance_id=%s AND p.track_id=ANY(%s)
+             ORDER BY p.track_id""", (source, list(track_ids)))
+    found = cur.fetchall()
+    if [row[0] for row in found] != list(track_ids):
+        raise RuntimeError("snapshot batch changed within its snapshot")
+    byte_count = 0
+    values = []
+    for position, row in zip(positions, found):
+        payload = serialize_profile(*row[:9])
+        text = json.dumps(payload, separators=(",", ":"))
+        byte_count += len(text.encode())
+        revision = payload.get("media_revision")
+        edge_ref = (_EDGE_REF % _json_string(row[10])
+                    if revision and row[9] == revision and row[10] else None)
+        values.append((session_id, ordinal + position, text, edge_ref))
+    execute_values(
+        cur, f"INSERT INTO {_table('profile_bootstrap_snapshot')} "
+             "(session_id, ordinal, payload, edge_ref) VALUES %s",
+        values, template="(%s, %s, %s::jsonb, %s::jsonb)")
+    return byte_count
 
 
 def _catchup_batch(cur, session, after, upto, count, byte_count, limits):
