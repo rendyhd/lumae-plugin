@@ -26,6 +26,11 @@ CHANGE_EVENT_OVERHEAD_BYTES = 192
 SNAPSHOT_ENTITY_OVERHEAD_BYTES = 96
 MIN_RETAINED_CHANGE_EVENTS = 1_000
 CHANGE_EVENT_SNAPSHOT_MULTIPLIER = 2
+MAX_HELD_RETENTION_MULTIPLIER = 4
+# AUD-05 fence. 1.3.0 journal writers stamp this generation. The column has
+# no default, so a 1.2.5 worker's insert (which omits it) fails and rolls back
+# its whole publication. Keep it at 2 until a later release needs a new fence.
+JOURNAL_WRITER_GENERATION = 2
 
 CATALOG_GENERATION_TABLES = (
     "catalog_libraries",
@@ -66,18 +71,56 @@ def compact_change_journal(
     epoch,
     head_seq,
     retention_limit,
+    purge_other_epochs=False,
+    hold_floor_seq=None,
+    current_floor=None,
+    max_advance=None,
 ):
-    """Bound one cursor journal and advance its bootstrap floor atomically."""
+    """Bound one cursor journal and advance its bootstrap floor atomically.
+
+    The retained-epoch delete is an index range delete on the
+    ``(catalog_instance_id, epoch, seq)`` primary key, so its cost is the
+    number of expired rows, not the journal size. Rows of other epochs are
+    removed only when ``purge_other_epochs`` is set: on epoch rotation and in
+    maintenance compaction, never on every publication.
+
+    ``hold_floor_seq`` keeps events after that seq readable (an open bootstrap
+    session that still has to replay them), but never lets the journal grow
+    past ``MAX_HELD_RETENTION_MULTIPLIER`` times the retention limit.
+
+    ``max_advance`` (with the locked ``current_floor``) bounds one call to that
+    many seqs past the current floor. A per-event publisher passes it, so a
+    released hold or a lowered limit never turns into one huge delete under the
+    publication locks; the backlog drains ``max_advance`` rows per publication
+    and maintenance, which passes no bound, catches up fully.
+    """
     retained = max(MIN_RETAINED_CHANGE_EVENTS, int(retention_limit or 0))
-    target_floor = max(0, int(head_seq or 0) - retained)
-    if target_floor > 0:
+    head_seq = int(head_seq or 0)
+    target_floor = max(0, head_seq - retained)
+    if hold_floor_seq is not None:
+        hard_floor = max(0, head_seq - retained * MAX_HELD_RETENTION_MULTIPLIER)
+        target_floor = max(hard_floor, min(target_floor, int(hold_floor_seq)))
+    advance = target_floor > 0
+    if current_floor is not None:
+        current_floor = int(current_floor)
+        if max_advance is not None:
+            target_floor = min(target_floor, current_floor + int(max_advance))
+        # Nothing past the locked floor has expired, or a hold keeps it.
+        advance = target_floor > current_floor
+        target_floor = max(target_floor, current_floor)
+    if purge_other_epochs:
+        cur.execute(
+            f"DELETE FROM {t(changes_table)} "
+            "WHERE catalog_instance_id=%s AND epoch<>%s",
+            (catalog_instance_id, str(epoch)),
+        )
+    if advance:
         cur.execute(
             f"""
             DELETE FROM {t(changes_table)}
-             WHERE catalog_instance_id=%s
-               AND (epoch<>%s OR (epoch=%s AND seq<=%s))
+             WHERE catalog_instance_id=%s AND epoch=%s AND seq<=%s
             """,
-            (catalog_instance_id, str(epoch), str(epoch), target_floor),
+            (catalog_instance_id, str(epoch), target_floor),
         )
         cur.execute(
             f"""
@@ -86,12 +129,6 @@ def compact_change_journal(
              WHERE catalog_instance_id=%s AND {epoch_column}=%s
             """,
             (target_floor, catalog_instance_id, str(epoch)),
-        )
-    else:
-        cur.execute(
-            f"DELETE FROM {t(changes_table)} "
-            "WHERE catalog_instance_id=%s AND epoch<>%s",
-            (catalog_instance_id, str(epoch)),
         )
     return target_floor
 
@@ -169,6 +206,7 @@ def prune_catalog_storage(db, catalog_instance_id=None, cursor=None):
             retention_limit=change_journal_retention_limit(
                 sum(int(value or 0) for value in catalog_counts.values())
             ),
+            purge_other_epochs=True,
         )
         if analysis_generation > 0:
             compact_change_journal(
@@ -183,6 +221,7 @@ def prune_catalog_storage(db, catalog_instance_id=None, cursor=None):
                 retention_limit=change_journal_retention_limit(
                     int(row[8] or 0) + int(row[9] or 0)
                 ),
+                purge_other_epochs=True,
             )
     if cursor is None:
         cur.close()
@@ -1193,6 +1232,18 @@ def migrate_catalog(db):
         ALTER TABLE {t("catalog_changes")}
         ADD COLUMN IF NOT EXISTS evidence JSONB
         """,
+        # AUD-05: 1.2.5 publication does not withdraw profiles of changed
+        # media and 1.2.5 rekey does not move published profiles. Their
+        # catalog_changes insert omits this column and now fails closed.
+        f"""
+        ALTER TABLE {t("catalog_changes")}
+        ADD COLUMN IF NOT EXISTS writer_generation SMALLINT NOT NULL
+            DEFAULT {JOURNAL_WRITER_GENERATION}
+        """,
+        f"""
+        ALTER TABLE {t("catalog_changes")}
+        ALTER COLUMN writer_generation DROP DEFAULT
+        """,
         f"""
         ALTER TABLE {t("catalog_state")}
         ALTER COLUMN catalog_schema_version SET DEFAULT {CATALOG_SCHEMA_VERSION}
@@ -1957,8 +2008,9 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 f"""
                 INSERT INTO {t("catalog_changes")}
                     (catalog_instance_id, epoch, seq, generation, entity_type,
-                     entity_id, operation, change_reason, payload)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+                     entity_id, operation, change_reason, payload,
+                     writer_generation)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
                 """,
                 (
                     catalog_instance_id,
@@ -1970,6 +2022,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                     operation,
                     change_reason,
                     _json_param(payload) if payload is not None else None,
+                    JOURNAL_WRITER_GENERATION,
                 ),
             )
         duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))
@@ -2052,7 +2105,13 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             epoch=publication_epoch,
             head_seq=next_seq,
             retention_limit=change_journal_retention_limit(sum(counts.values())),
+            purge_other_epochs=publication_epoch != str(locked_epoch),
         )
+        # P1-2: the profile journal keeps two libraries of events; follow the
+        # library size as each generation publishes, not only at startup.
+        from .catalog_enrichment import refresh_profile_retention
+
+        refresh_profile_retention(cur, catalog_instance_id, counts["track"])
         cur.close()
         db.commit()
         return {
@@ -2134,6 +2193,92 @@ def parse_opaque_cursor(value):
         }
     except (KeyError, TypeError, ValueError, UnicodeError, json.JSONDecodeError) as exc:
         raise ValueError("Malformed catalogue cursor") from exc
+
+
+def read_change_page(
+    cur,
+    *,
+    catalog_instance_id,
+    cursor,
+    limit,
+    state_table,
+    epoch_column,
+    head_column,
+    floor_column,
+    changes_table,
+    columns,
+    ahead_message,
+    state_columns=(),
+):
+    """Read one v1 ``/changes`` page from a single snapshot (P1-7).
+
+    The stream state (epoch, head, floor) and the events come from **one**
+    statement, so a compaction that commits in between can never pair an old
+    floor with an already-trimmed journal. The page is then checked for
+    density: when ``cursor < head`` it must start at ``cursor + 1``, be
+    contiguous and hold ``min(limit, head - cursor)`` events. Anything else is
+    ``KeyError("bootstrap_required")`` (410), like an old epoch or a cursor
+    below the floor; a cursor ahead of the head stays ``ValueError`` (400).
+
+    Returns ``(epoch, head_seq, rows, state)``; each row holds ``columns`` in
+    order, and ``columns[0]`` must be ``"seq"``. ``state`` maps each of
+    ``state_columns`` (extra columns of the state row) to its value in that
+    same snapshot.
+    """
+    if columns[0] != "seq":
+        raise ValueError("read_change_page needs seq as the first column")
+    limit = max(1, min(int(limit), 1000))
+    after = int(cursor["seq"])
+    select = ", ".join(f"c.{column}" for column in columns)
+    extra = "".join(f", {column}" for column in state_columns)
+    extra_out = "".join(f", s.{column}" for column in state_columns)
+    cur.execute(
+        f"""
+        WITH state AS (
+            SELECT {epoch_column} AS epoch, {head_column} AS head_seq,
+                   {floor_column} AS floor_seq{extra}
+              FROM {t(state_table)}
+             WHERE catalog_instance_id=%s
+        )
+        SELECT s.epoch, s.head_seq, s.floor_seq{extra_out}, page.*
+          FROM state AS s
+          LEFT JOIN LATERAL (
+              SELECT {select}
+                FROM {t(changes_table)} AS c
+               WHERE c.catalog_instance_id=%s AND c.epoch=s.epoch
+                 AND c.seq>%s AND c.seq<=s.head_seq
+                 AND s.epoch=%s AND s.floor_seq<=%s
+               ORDER BY c.seq
+               LIMIT %s
+          ) AS page ON TRUE
+         ORDER BY page.seq
+        """,
+        (
+            catalog_instance_id,
+            catalog_instance_id,
+            after,
+            str(cursor["epoch"]),
+            after,
+            limit,
+        ),
+    )
+    result = cur.fetchall()
+    if not result:
+        raise KeyError("bootstrap_required")
+    epoch, head_seq, floor_seq = str(result[0][0]), int(result[0][1]), int(result[0][2])
+    if cursor["epoch"] != epoch or after < floor_seq:
+        raise KeyError("bootstrap_required")
+    if after > head_seq:
+        raise ValueError(ahead_message)
+    first = 3 + len(state_columns)
+    state = dict(zip(state_columns, result[0][3:first]))
+    rows = [row[first:] for row in result if row[first] is not None]
+    seqs = [int(row[0]) for row in rows]
+    expected = min(limit, head_seq - after)
+    if seqs != list(range(after + 1, after + 1 + expected)):
+        # A trimmed or missing event: the client cannot continue densely.
+        raise KeyError("bootstrap_required")
+    return epoch, head_seq, rows, state
 
 
 def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=False):
@@ -2556,30 +2701,33 @@ def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=N
     source = sources[0]
     if source["catalog_instance_id"] != cursor["catalog_instance_id"]:
         raise ValueError("Cursor belongs to another catalogue source")
-    state = source["catalog"]
-    if cursor["epoch"] != state["epoch"] or cursor["seq"] < state["floor_seq"]:
-        raise KeyError("bootstrap_required")
-    if cursor["seq"] > state["head_seq"]:
-        raise ValueError("Cursor is ahead of the catalogue head")
     cur = db.cursor()
-    cur.execute(
-        f"""
-        SELECT seq, generation, entity_type, entity_id, operation, old_entity_id,
-               payload, evidence, created_at, change_reason
-          FROM {t("catalog_changes")}
-         WHERE catalog_instance_id=%s AND epoch=%s AND seq > %s
-         ORDER BY seq
-         LIMIT %s
-        """,
-        (
-            source["catalog_instance_id"],
-            state["epoch"],
-            cursor["seq"],
-            max(1, min(int(limit), 1000)),
-        ),
-    )
-    rows = cur.fetchall()
-    cur.close()
+    try:
+        # State and events from one snapshot, checked for density (P1-7).
+        epoch, head_seq, rows, snapshot = read_change_page(
+            cur,
+            catalog_instance_id=source["catalog_instance_id"],
+            cursor=cursor,
+            limit=limit,
+            state_table="catalog_state",
+            epoch_column="catalog_epoch",
+            head_column="catalog_head_seq",
+            floor_column="catalog_floor_seq",
+            changes_table="catalog_changes",
+            columns=(
+                "seq", "generation", "entity_type", "entity_id", "operation",
+                "old_entity_id", "payload", "evidence", "created_at",
+                "change_reason",
+            ),
+            ahead_message="Cursor is ahead of the catalogue head",
+            # The snapshot metadata comes from the same snapshot as the page.
+            state_columns=(
+                "published_generation", "entity_counts",
+                "snapshot_estimated_bytes", "fingerprint_schema_version",
+            ),
+        )
+    finally:
+        cur.close()
     changes = [
         {
             "seq": int(row[0]),
@@ -2596,7 +2744,7 @@ def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=N
         for row in rows
     ]
     next_seq = changes[-1]["seq"] if changes else cursor["seq"]
-    remaining_events = max(0, int(state["head_seq"]) - int(next_seq))
+    remaining_events = max(0, head_seq - int(next_seq))
     page_estimated_bytes = sum(
         len(canonical_json(change).encode("utf-8")) + CHANGE_EVENT_OVERHEAD_BYTES
         for change in changes
@@ -2610,17 +2758,15 @@ def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=N
         "catalog_instance_id": source["catalog_instance_id"],
         "server_id": source["server_id"],
         "fingerprint_schema_version": int(
-            state.get("fingerprint_schema_version", 1) or 1
+            snapshot["fingerprint_schema_version"] or 1
         ),
-        "snapshot_generation": int(state.get("generation", 0) or 0),
-        "snapshot_entity_counts": state.get("entity_counts") or {},
-        "snapshot_estimated_bytes": int(
-            state.get("snapshot_estimated_bytes", 0) or 0
-        ),
+        "snapshot_generation": int(snapshot["published_generation"] or 0),
+        "snapshot_entity_counts": _state_counts(snapshot["entity_counts"]) or {},
+        "snapshot_estimated_bytes": int(snapshot["snapshot_estimated_bytes"] or 0),
         "changes": changes,
-        "cursor": opaque_cursor(source["catalog_instance_id"], state["epoch"], next_seq),
-        "head_cursor": opaque_cursor(source["catalog_instance_id"], state["epoch"], state["head_seq"]),
-        "has_more": next_seq < state["head_seq"],
+        "cursor": opaque_cursor(source["catalog_instance_id"], epoch, next_seq),
+        "head_cursor": opaque_cursor(source["catalog_instance_id"], epoch, head_seq),
+        "has_more": next_seq < head_seq,
         "remaining_events": remaining_events,
         "page_estimated_bytes": page_estimated_bytes,
         "estimated_remaining_bytes": remaining_events * average_event_bytes,

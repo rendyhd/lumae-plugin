@@ -36,10 +36,12 @@ def migrate_edge_profiles(db):
     cur.close()
 
 
-def edge_join(profile_alias='p'):
+def edge_join(profile_alias='p', columns='e.payload'):
     # Internal signatures stay on the server. Only their opaque revision is public.
+    # ``columns`` lets a caller read only key columns of the chosen edge row
+    # (the v2 capture stores a reference and never detoasts the payload).
     return f"""LEFT JOIN LATERAL (
-        SELECT e.payload FROM {table('edge_profiles')} e
+        SELECT {columns} FROM {table('edge_profiles')} e
          WHERE e.catalog_instance_id={profile_alias}.catalog_instance_id
            AND e.track_id={profile_alias}.track_id
            AND e.media_signature={profile_alias}.media_signature

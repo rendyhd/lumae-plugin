@@ -70,6 +70,20 @@ def _frontier(db):
     return state, events, profiles
 
 
+def _fail_after_compaction(monkeypatch, fault):
+    if fault != "after_compaction":
+        return
+    original = enrichment.compact_change_journal
+
+    def compact_then_fail(cur, **kwargs):
+        floor = original(cur, **kwargs)
+        if type(cur).__name__ == "FailingCursor":
+            raise RuntimeError(f"fault {fault}")
+        return floor
+
+    monkeypatch.setattr(enrichment, "compact_change_journal", compact_then_fail)
+
+
 def _wait_for_lock(observer, pid, started):
     assert started.wait(5), "peer did not start"
     deadline = time.monotonic() + 5
@@ -227,12 +241,14 @@ def test_different_sources_publish_without_waiting(edge_publication_db):
 
 def test_standalone_compaction_rereads_locked_head(edge_publication_db, monkeypatch):
     monkeypatch.setattr(enrichment, "resolve_catalog_source", lambda *_a, **_k: [{"catalog_instance_id": SOURCE}])
+    monkeypatch.setattr(enrichment, "PROFILE_CHANGE_RETENTION_EVENTS", 1_000)
     cur = edge_publication_db.cursor()
     cur.execute(f"SELECT epoch FROM {STATE} WHERE catalog_instance_id=%s", (SOURCE,))
     epoch = cur.fetchone()[0]
     cur.execute(
-        f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation) "
-        "SELECT %s, %s, n, 'seed-' || n, 'delete' FROM generate_series(1, 1001) AS n",
+        f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation, "
+            "writer_generation) "
+        "SELECT %s, %s, n, 'seed-' || n, 'delete', 2 FROM generate_series(1, 1001) AS n",
         (SOURCE, epoch),
     )
     cur.execute(f"UPDATE {STATE} SET head_seq=1001 WHERE catalog_instance_id=%s", (SOURCE,))
@@ -245,8 +261,9 @@ def test_standalone_compaction_rereads_locked_head(edge_publication_db, monkeypa
         cur.execute(f"SELECT head_seq FROM {STATE} WHERE catalog_instance_id=%s FOR UPDATE", (SOURCE,))
         assert cur.fetchone()[0] == 1001
         cur.execute(
-            f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation) "
-            "VALUES (%s, %s, 1002, 'seed-1002', 'delete')",
+            f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation, "
+            "writer_generation) "
+            "VALUES (%s, %s, 1002, 'seed-1002', 'delete', 2)",
             (SOURCE, epoch),
         )
         cur.execute(f"UPDATE {STATE} SET head_seq=1002 WHERE catalog_instance_id=%s", (SOURCE,))
@@ -484,13 +501,15 @@ def test_compactor_first_serializes_following_profile_publication(
     cur.execute(f"SELECT epoch FROM {STATE} WHERE catalog_instance_id=%s", (SOURCE,))
     epoch = cur.fetchone()[0]
     cur.execute(
-        f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation) "
-        "SELECT %s, %s, n, 'seed-' || n, 'delete' FROM generate_series(1, 1001) AS n",
+        f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, operation, "
+            "writer_generation) "
+        "SELECT %s, %s, n, 'seed-' || n, 'delete', 2 FROM generate_series(1, 1001) AS n",
         (SOURCE, epoch),
     )
     cur.execute(f"UPDATE {STATE} SET head_seq=1001 WHERE catalog_instance_id=%s", (SOURCE,))
     cur.close()
     edge_publication_db.commit()
+    monkeypatch.setattr(enrichment, "PROFILE_CHANGE_RETENTION_EVENTS", 1_000)
     compactor = _peer(edge_publication_db)
     publisher = _peer(edge_publication_db)
     original = enrichment.compact_change_journal
@@ -525,8 +544,10 @@ def test_compactor_first_serializes_following_profile_publication(
             compact_future.result(timeout=5)
             publish_future.result(timeout=5)
         state, events, profiles = _frontier(edge_publication_db)
-        assert state[1:] == (1002, 1)
-        assert [row[0] for row in events] == list(range(2, 1003))
+        # The publication runs after the compactor committed, so it sees the
+        # retention limit the compactor persisted (P1-2) and keeps 1000 events.
+        assert state[1:] == (1002, 2)
+        assert [row[0] for row in events] == list(range(3, 1003))
         assert profiles == ["branch-after-compaction"]
     finally:
         release_compact.set()
@@ -615,8 +636,8 @@ def test_actual_upsert_rolls_back_at_each_publication_boundary(
         "after_profile": f"INSERT INTO {PUBLISHED}".lower(),
         "after_event": f"INSERT INTO {CHANGES}".lower(),
         "after_head": f"UPDATE {STATE}".lower(),
-        "after_compaction": f"DELETE FROM {CHANGES}".lower(),
     }
+    _fail_after_compaction(monkeypatch, fault)
 
     class FailingCursor:
         def __init__(self, cursor):
@@ -693,8 +714,9 @@ def test_old_unlocked_allocator_collides_then_new_writer_succeeds(edge_publicati
             started.set()
             cur.execute(
                 f"INSERT INTO {CHANGES} "
-                "(catalog_instance_id, epoch, seq, track_id, operation, payload) "
-                "VALUES (%s, %s, %s, %s, 'upsert', %s::jsonb)",
+                "(catalog_instance_id, epoch, seq, track_id, operation, payload, "
+                "writer_generation) "
+                "VALUES (%s, %s, %s, %s, 'upsert', %s::jsonb, 2)",
                 (SOURCE, epoch, head + 1, "branch-old",
                  json.dumps({"track_id": "branch-old"})),
             )
@@ -848,7 +870,7 @@ def test_actual_upsert_and_edge_publishers_share_one_order(
     ],
 )
 def test_edge_publisher_rolls_back_every_boundary(
-    edge_publication_db, fault
+    edge_publication_db, monkeypatch, fault
 ):
     jobs, _ = edge_profile_store.claim_edge_jobs(edge_publication_db, SOURCE, ["track-a"])
     job = jobs[0]
@@ -859,7 +881,6 @@ def test_edge_publisher_rolls_back_every_boundary(
         "after_edge_row": "insert into plugin_lumae_analysis__edge_profiles",
         "after_event": f"insert into {CHANGES}",
         "after_head": f"update {STATE}",
-        "after_compaction": f"delete from {CHANGES}",
         "after_job_ready": "update plugin_lumae_analysis__edge_profile_jobs set status='ready'",
     }
 
@@ -887,6 +908,7 @@ def test_edge_publisher_rolls_back_every_boundary(
         def rollback(self):
             first.rollback()
 
+    _fail_after_compaction(monkeypatch, fault)
     try:
         with pytest.raises(RuntimeError, match=f"fault {fault}"):
             edge_profile_store.publish_edge_profile(
