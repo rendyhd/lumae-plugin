@@ -74,6 +74,7 @@ from .catalog_enrichment import (
     serialize_profile,
 )
 from .catalog_readiness import CONTRACT_REVISION, v3_release_readiness
+from . import status_model
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .database_state import collect_database_state, render_database_state, safe_snapshot_error
 from .settings_ui import SETTINGS_STATUS_SCRIPT
@@ -555,6 +556,9 @@ def catalog_refresh_task(server_id=None):
     except Exception:
         _rollback_if_possible(get_db())
         logger.exception("Optional measurement retention will retry on the next catalogue refresh")
+    # The publication may have withdrawn profiles; /settings/status reads
+    # these counts (P2-1).
+    refresh_status_snapshot(get_db(), result.get("catalog_instance_id"))
     return result
 
 
@@ -957,6 +961,11 @@ def catalog_reconcile_task():
         }
     finally:
         _safe_reconcile_schedule(db)
+        # The tick ran at most one action (a profile batch, a finalization, a
+        # catalogue publication); the waveform counts that /settings/status
+        # reads follow it, and a publication left without a summary gets one
+        # (P2-1).
+        refresh_status_snapshot(db, publications=True)
 
 
 def analysis_projection_task(server_id=None):
@@ -1130,6 +1139,20 @@ def observe_provider_identities_on_start():
     except Exception:
         _rollback_if_possible(db)
         logger.exception("lumae_analysis could not ensure reconcile schema")
+    try:
+        # The P2-1 status summary, repaired the same way. Only generations
+        # without a summary are counted, so this is normally a few lookups.
+        cur = db.cursor()
+        try:
+            status_model.migrate_status_summary(cur)
+            db.commit()
+            status_model.backfill_publication_summaries(cur, commit=db.commit)
+        finally:
+            cur.close()
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not ensure the status summary")
     try:
         log_integrity_on_start(db)
     except Exception:
@@ -1424,6 +1447,7 @@ def migrate(db):
     compact_enrichment_storage(db)
     migrate_collections(db)
     refresh_integrity_snapshot(db)
+    refresh_status_summaries(db)
     migrate_shelves(db)
     personal_discovery.migrate(db)
     music_metadata.migrate(db)
@@ -2172,13 +2196,24 @@ def catalog_health():
                 bridge = ProviderCatalogBridge()
                 for candidate in bridge.list_servers():
                     if candidate.get("supported"):
-                        observe_provider_version(
+                        # Pinged on every request, written only when the state
+                        # or version changed (P2-1). An applied transition's
+                        # AudioMuse health is refreshed by the
+                        # provider_identity_recheck cron, not by this GET.
+                        observation = observe_provider_version(
                             db,
                             bridge,
                             candidate["server_id"],
-                            commit=True,
+                            commit=False,
+                            refresh_health=False,
                         )
+                        if (observation or {}).get("written"):
+                            # The route owns its transaction: a changed
+                            # identity is durable before the next server or
+                            # the readiness below is read.
+                            db.commit()
             except Exception:
+                _rollback_if_possible(db)
                 logger.exception("lumae_analysis could not observe provider identity")
         try:
             if db is not None:
@@ -3555,6 +3590,12 @@ def analyze_song_hook(song):
             catalog_instance_id=catalog_instance_id, attempt_token=token,
             **({"failure_code": failure_code} if failure_code else {}),
         )
+        # An AudioMuse run completes profiles song by song. Keep the settings
+        # counts moving without counting the library for every song (P2-1).
+        refresh_status_snapshot(
+            catalog_instance_id=catalog_instance_id,
+            min_age_seconds=status_model.PROFILE_COUNTS_MIN_AGE_SECONDS,
+        )
         return {"track_id": track_id, "status": status if applied else "superseded"}
 
     if not audio_path or not os.path.exists(audio_path):
@@ -3712,6 +3753,11 @@ def analyze_tracks_task(
     }
     if catalog_instance_id:
         finalize_preparation_if_settled(catalog_instance_id)
+        if priority != "background":
+            # Background batches run inside a watchdog tick, which refreshes
+            # the settings counts when it ends; an interactive batch refreshes
+            # them itself (P2-1).
+            refresh_status_snapshot(catalog_instance_id=catalog_instance_id)
     return summary
 
 
@@ -3939,9 +3985,12 @@ def find_all_backfill_ids(catalog_instance_id=None, server_id=None, include_fail
     return ids
 
 
-def analysis_status_counts(catalog_instance_id=None, server_id=None):
-    db = get_db()
-    cur = db.cursor()
+def _analysis_status_counts_query(catalog_instance_id=None, server_id=None):
+    """The waveform status aggregate. Its sixth column is the counted generation.
+
+    ``analysis_status_counts`` runs it live; ``refresh_status_snapshot`` stores
+    its result for ``/settings/status`` (P2-1).
+    """
     profile_table = source_profiles_table() if catalog_instance_id else profiles_table()
     profile_source_join = (
         "AND p.catalog_instance_id=source.catalog_instance_id" if catalog_instance_id else ""
@@ -3959,8 +4008,7 @@ def analysis_status_counts(catalog_instance_id=None, server_id=None):
     # the legacy global MEDIASERVER_* configuration fields.
     retry_skipped = True
     params.extend((ANALYZER_VERSION, retry_skipped))
-    cur.execute(
-        f"""
+    sql = f"""
         WITH source AS (
             SELECT s.catalog_instance_id, c.published_generation
               FROM {table('catalog_sources')} s
@@ -3984,7 +4032,8 @@ def analysis_status_counts(catalog_instance_id=None, server_id=None):
             COUNT(*) FILTER (WHERE p.status='failed')::BIGINT,
             COUNT(*) FILTER (
                 WHERE p.status='skipped_no_file' AND NOT %s
-            )::BIGINT
+            )::BIGINT,
+            (SELECT published_generation FROM source)
           FROM source
           JOIN {table('catalog_tracks')} t
             ON t.catalog_instance_id=source.catalog_instance_id
@@ -3992,12 +4041,17 @@ def analysis_status_counts(catalog_instance_id=None, server_id=None):
           LEFT JOIN {profile_table} p ON p.track_id=t.track_id
                {profile_source_join}
          WHERE t.available=TRUE AND t.analysis_eligible=TRUE
-        """,
-        tuple(params),
-    )
+        """
+    return sql, tuple(params)
+
+
+def analysis_status_counts(catalog_instance_id=None, server_id=None):
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(*_analysis_status_counts_query(catalog_instance_id, server_id))
     row = cur.fetchone() or (0, 0, 0, 0, 0)
     cur.close()
-    total, ready, pending, failed, skipped = (int(value or 0) for value in row)
+    total, ready, pending, failed, skipped = (int(value or 0) for value in row[:5])
     return {
         "total_with_files": total,
         "ready_current": ready,
@@ -4006,6 +4060,100 @@ def analysis_status_counts(catalog_instance_id=None, server_id=None):
         "skipped": skipped,
         "needs_analysis": max(0, total - ready - pending - failed - skipped),
     }
+
+
+def _store_profile_snapshots(cur, catalog_instance_id=None, min_age_seconds=0,
+                             missing_only=False):
+    if catalog_instance_id:
+        targets = [str(catalog_instance_id)]
+    else:
+        cur.execute(
+            f"""
+            SELECT s.catalog_instance_id
+              FROM {table('catalog_sources')} s
+              JOIN {table('catalog_state')} c USING (catalog_instance_id)
+              LEFT JOIN {table('status_summary')} ss USING (catalog_instance_id)
+             WHERE NOT %s OR ss.profile_generation IS DISTINCT FROM c.published_generation
+             ORDER BY s.catalog_instance_id
+            """,
+            (bool(missing_only),),
+        )
+        targets = [str(row[0]) for row in cur.fetchall()]
+    stored = 0
+    for target in targets:
+        if min_age_seconds:
+            age = status_model.profile_counts_age_seconds(cur, target)
+            if age is not None and age < min_age_seconds:
+                continue
+        sql, params = _analysis_status_counts_query(catalog_instance_id=target)
+        status_model.store_profile_counts(cur, target, sql, params)
+        stored += 1
+    return stored
+
+
+def refresh_status_snapshot(db=None, catalog_instance_id=None, min_age_seconds=0,
+                            publications=False):
+    """Refresh the waveform counts that ``/settings/status`` reads (P2-1).
+
+    Background work calls this after it changed profile state; the GET route
+    only reads the snapshot. With ``min_age_seconds`` a snapshot younger than
+    that is kept. ``publications`` first summarizes any published generation
+    that has no summary (a failed post-commit refresh, a rebound source, an
+    older worker's publication). Never raises: a failed refresh keeps the
+    previous snapshot, and the route counts live when the snapshot describes
+    another generation.
+    """
+    try:
+        db = db or get_db()
+    except Exception:
+        db = None
+    if db is None:
+        return 0
+    try:
+        cur = db.cursor()
+        try:
+            if publications:
+                # Committed per source and before the waveform count, so no
+                # analysis_state row lock is held while counting.
+                status_model.backfill_publication_summaries(cur, commit=db.commit)
+                db.commit()
+            stored = _store_profile_snapshots(cur, catalog_instance_id, min_age_seconds)
+        finally:
+            cur.close()
+        db.commit()
+        return stored
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning(
+            "lumae_analysis could not refresh the settings status counts", exc_info=True
+        )
+        return 0
+
+
+def refresh_status_summaries(db):
+    """Install and upgrade: summarize what is already published (P2-1).
+
+    Runs in the install transaction; the caller commits. Only what has no
+    summary yet is counted, so a re-run writes nothing.
+    """
+    cur = db.cursor()
+    try:
+        status_model.backfill_publication_summaries(cur)
+        _store_profile_snapshots(cur, missing_only=True)
+    finally:
+        cur.close()
+
+
+def _committed_profile_counts(source):
+    """The committed waveform counts of a source, or None to count live."""
+    db = None
+    try:
+        db = get_db()
+        return status_model.profile_counts(db, source) if db is not None else None
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not read the settings status counts", exc_info=True)
+        return None
 
 
 def queue_backfill_batch(
@@ -5291,7 +5439,9 @@ def render_source_preparation_sections(batch_size):
     for source in sources:
         catalog_instance_id = source["catalog_instance_id"]
         server_id = source["server_id"]
-        counts = analysis_status_counts(
+        # The settings poll reads the committed snapshot (P2-1). The live
+        # aggregate runs only when no snapshot describes this generation.
+        counts = _committed_profile_counts(source) or analysis_status_counts(
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
         )

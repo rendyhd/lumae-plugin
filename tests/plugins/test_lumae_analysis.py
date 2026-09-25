@@ -7251,7 +7251,15 @@ class ReadinessCursor:
 
     def execute(self, sql, params=None):
         self.db.executed.append((sql, params))
-        if "FROM plugin_lumae_analysis__catalog_tracks" in sql:
+        if "plugin_lumae_analysis__status_summary" in sql:
+            # The committed status summary (P2-1) for readiness_source():
+            # analysis generation 0, catalogue generation 4.
+            ready, pending, suspect, missing, verified, _provisional = self.db.link_counts
+            self.rows = [
+                (0, ready + pending + missing, ready, pending, suspect, missing, verified,
+                 4, "server-a", *self.db.coverage, None, None, None, None, None, None, None)
+            ]
+        elif "FROM plugin_lumae_analysis__catalog_tracks" in sql:
             self.rows = [self.db.coverage]
         elif "FROM plugin_lumae_analysis__track_analysis_links" in sql:
             self.rows = [self.db.link_counts]
@@ -7412,12 +7420,15 @@ def test_v3_readiness_keeps_incomplete_evidence_progressively_usable():
         "analysis_links_missing",
         "provisional_links_remaining",
     ]
-    link_query = next(
-        sql
+    # P2-1: the counts come from the committed summary, not a library scan;
+    # the summary is written with the same repair definition.
+    assert not any(
+        "track_analysis_links" in sql or "catalog_tracks" in sql
         for sql, _params in db.executed
-        if "track_analysis_links" in sql
     )
-    assert "review_state IN ('needs_repair', 'needs_review')" in link_query
+    from plugins.LumaeAnalysis import status_model
+
+    assert "review_state IN ('needs_repair', 'needs_review')" in status_model.link_counts_sql()
 
 
 def test_v3_historical_upgrade_sequence_is_diagnostic_only():
