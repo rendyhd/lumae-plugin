@@ -28,6 +28,34 @@ def ignore_term_and_sleep(path, pid_file=None):
     time.sleep(3600)
 
 
+OLD_DEFAULT_DEADLINE = 2.0  # stands in for the analyzers' former fixed 900 s
+PROGRESS_SECONDS = 3.0
+
+
+def progressing(path, deadline_seconds=OLD_DEFAULT_DEADLINE, work_seconds=PROGRESS_SECONDS):
+    """A slow analysis that keeps making progress: the real ``analyze_blocks``
+    over a 440 Hz tone delivered in blocks for ``work_seconds``. Only the
+    soft deadline (``deadline_seconds``) can stop it early."""
+    import sys
+
+    import numpy as np
+
+    loudness = sys.modules.get("_lumae_analysis_child.loudness")
+    if loudness is None:
+        from plugins.LumaeAnalysis import loudness
+    tone = (0.1 * np.sin(2 * np.pi * 440 * np.arange(4800) / 48000)).astype(np.float32)[None, :]
+
+    def blocks():
+        end = time.monotonic() + work_seconds
+        while time.monotonic() < end:
+            time.sleep(0.05)
+            yield tone
+
+    return loudness.analyze_blocks(
+        blocks(), 48000, channel_count=1, deadline=time.monotonic() + deadline_seconds,
+    )
+
+
 def raise_invalid_data(path):
     import av
 

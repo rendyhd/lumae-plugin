@@ -33,14 +33,19 @@ Design:
 * Only the path and keyword arguments go to the child, and only the result
   comes back, as one JSON line (bytes, tuples and dataclasses are tagged). No
   audio crosses the process boundary, so nothing is held twice.
-* The analyzers keep their soft deadline (default 15 minutes). The hard limit
-  kills the child ``HARD_LIMIT_HEADROOM_SECONDS`` after ``limit_seconds``, with
-  SIGTERM and then SIGKILL after ``TERM_GRACE_SECONDS``, so an analysis that is
-  still making progress stops at its soft deadline first.
+* ``limit_seconds`` is also the analyzer's soft deadline: it is passed with
+  each request as ``deadline_seconds`` to a target that takes that argument,
+  so a changed setting applies to the next file without restarting the pooled
+  worker. The soft deadline is checked between decoded frames and ends an
+  analysis that is still making progress (``analysis_timeout``). The child is
+  killed ``HARD_LIMIT_HEADROOM_SECONDS`` later, with SIGTERM and then SIGKILL
+  after ``TERM_GRACE_SECONDS``: only a call that never returns to Python
+  reaches the kill.
 * A target the child cannot import by name (a closure, as tests inject), a
   frozen build (``sys.executable`` is the application, not Python), a
-  non-POSIX platform and a worker that cannot start run in-process: soft
-  deadline only, no hard limit. The last case is logged.
+  non-POSIX platform and a worker that cannot start run in-process: the soft
+  deadline (still ``limit_seconds``) only, no hard limit and no failure
+  diagnostics. The last case is logged.
 
 Failures carry a LUM-007 retry category (``failure_category``) and safe
 diagnostics (``DIAGNOSTIC_FIELDS``): container, codec, sample rate, channel
@@ -772,6 +777,21 @@ def _identifier_or(value, default):
     return value if isinstance(value, str) and _IDENTIFIER.fullmatch(value) else default
 
 
+def with_deadline(target, kwargs, deadline_seconds):
+    """``kwargs`` plus ``deadline_seconds`` when ``target`` takes that argument.
+
+    An explicit ``deadline_seconds`` in ``kwargs`` wins. Targets without the
+    argument (test doubles) are called exactly as before.
+    """
+    if (
+        deadline_seconds is None
+        or "deadline_seconds" in kwargs
+        or not _accepts(target, "deadline_seconds")
+    ):
+        return kwargs
+    return {**kwargs, "deadline_seconds": deadline_seconds}
+
+
 def _byte_size(path):
     try:
         return os.stat(path).st_size
@@ -783,8 +803,10 @@ def run_isolated(target, path, *, limit_seconds, headroom_seconds=None,
                  term_grace_seconds=None, startup_timeout_seconds=None, **kwargs):
     """``target(path, **kwargs)`` in the worker, killed after the hard limit.
 
-    Returns the target's result. A failure in the child raises
-    ``IsolatedAnalysisError`` with its category (``failure_category``):
+    ``limit_seconds`` is the soft deadline (``deadline_seconds``, for a target
+    that takes it); the hard limit is ``limit_seconds`` plus
+    ``headroom_seconds``. Returns the target's result. A failure in the child
+    raises ``IsolatedAnalysisError`` with its category (``failure_category``):
     exceptions keep their category, the hard limit is ``analysis_timeout``, and
     a worker that dies without answering (non-zero exit, a signal, a
     MemoryError) is ``analysis_crash``. Targets that cannot run in the child run
@@ -792,6 +814,7 @@ def run_isolated(target, path, *, limit_seconds, headroom_seconds=None,
     ``kwargs`` must be JSON-serializable.
     """
     global _unavailable
+    kwargs = with_deadline(target, kwargs, limit_seconds)
     plugin_package = __package__ or ""
     reference = _child_target(target, plugin_package) if plugin_package else None
     if reference is None or not _isolation_available():

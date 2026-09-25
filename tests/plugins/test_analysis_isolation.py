@@ -321,6 +321,88 @@ def test_child_has_no_parent_descriptor_or_credentials(tmp_path, monkeypatch):
     assert "DATABASE_URL" not in seen["environment"]
 
 
+# ------------------------------------------- the setting is the soft deadline
+
+
+@pytest.fixture
+def small_limits(monkeypatch):
+    """The real setting path, in seconds instead of minutes.
+
+    ``fakes.OLD_DEFAULT_DEADLINE`` (2 s) stands in for the analyzers' former
+    fixed 900 s; a setting of 5 s stands in for raising it to 1,200 s.
+    """
+    mod = load_plugin()
+    settings = {}
+    monkeypatch.setattr(iso, "MIN_LIMIT_SECONDS", 1)
+    monkeypatch.setattr(iso, "HARD_LIMIT_HEADROOM_SECONDS", 1)
+    monkeypatch.setattr(iso, "TERM_GRACE_SECONDS", 1)
+    monkeypatch.setattr(mod, "get_setting",
+                        lambda key, default=None: settings.get(key, default))
+
+    def set_limit(seconds):
+        settings["analysis_time_limit_seconds"] = str(seconds)
+        assert mod.analysis_time_limit_seconds() == seconds
+
+    return mod, set_limit
+
+
+def test_raised_setting_gives_a_progressing_analysis_more_time(small_limits, tmp_path):
+    mod, set_limit = small_limits
+    media = tmp_path / "a.flac"
+    media.write_bytes(b"x")
+    set_limit(1)
+    worker = mod.run_file_analysis(fakes.describe_process, media)["pid"]
+    set_limit(5)  # above the old default: 3 s of work now completes
+    result = mod.run_file_analysis(fakes.progressing, media)
+    assert isinstance(result, loudness.AnalysisResult)
+    assert result.duration_ms >= fakes.PROGRESS_SECONDS * 1000 * 0.5
+    # The setting travels with each request: the pooled worker was not restarted.
+    assert mod.run_file_analysis(fakes.describe_process, media)["pid"] == worker
+
+
+def test_lowered_setting_stops_a_progressing_analysis_at_the_soft_deadline(small_limits, tmp_path):
+    mod, set_limit = small_limits
+    media = tmp_path / "a.flac"
+    media.write_bytes(b"x")
+    set_limit(1)  # below the old default: 1.8 s of work no longer fits
+    with pytest.raises(iso.IsolatedAnalysisError) as raised:
+        mod.run_file_analysis(fakes.progressing, media, work_seconds=1.8)
+    error = raised.value
+    assert error.category == "analysis_timeout"
+    assert error.error_type == "ProfileAnalysisTimeout"  # the soft deadline, not the kill
+    assert "limit_seconds" not in error.diagnostics
+    assert mod.run_file_analysis(fakes.describe_process, media)["pid"] == error.pid
+
+
+def test_lowered_setting_kills_a_hung_analysis_after_the_headroom(small_limits, tmp_path):
+    mod, set_limit = small_limits
+    media = tmp_path / "a.flac"
+    media.write_bytes(b"x")
+    set_limit(1)
+    with pytest.raises(iso.IsolatedAnalysisError) as raised:
+        mod.run_file_analysis(fakes.sleep_forever, media)
+    error = raised.value
+    assert error.category == "analysis_timeout" and error.error_type is None
+    assert error.diagnostics["limit_seconds"] == 1
+    assert 1 + 1 <= error.diagnostics["elapsed_seconds"] < 1 + 1 + 3
+    assert _gone(error.pid)
+
+
+def test_with_deadline_only_for_targets_that_take_one():
+    def takes(path, deadline_seconds=900):
+        return deadline_seconds
+
+    assert iso.with_deadline(takes, {}, 60) == {"deadline_seconds": 60}
+    assert iso.with_deadline(takes, {"deadline_seconds": 5}, 60) == {"deadline_seconds": 5}
+    assert iso.with_deadline(lambda path: None, {"a": 1}, 60) == {"a": 1}
+    assert iso.with_deadline(takes, {}, None) == {}
+    assert iso.run_isolated(takes, "unused", limit_seconds=42) == 42  # in-process path too
+    # The real analyzers take it, so production files get the configured deadline.
+    assert iso.with_deadline(loudness.analyze_file, {}, 1200) == {"deadline_seconds": 1200}
+    assert iso.with_deadline(edge.analyze_edge_file, EDGE_ARGS, 1200) == {
+        **EDGE_ARGS, "deadline_seconds": 1200}
+
+
 def test_worker_pipes_above_fd_setsize_work(tmp_path):
     """A busy host process can hold 1024+ descriptors; select() fails there."""
     resource = pytest.importorskip("resource")
@@ -556,6 +638,30 @@ def test_task_records_a_child_crash_as_analysis_crash(task_db, monkeypatch, tmp_
     assert response.get_json()["failed"] == [{"track_id": "track-a", "reason": "analysis_error"}]
     _make_due(task_db, "track-a")
     assert _eligible(mod, "track-a")
+
+
+@pytest.mark.parametrize("limit,status,category", [
+    (5, "ready", None),               # raised: more time than the old default
+    (1, "failed", "analysis_timeout"),  # lowered: stopped by the soft deadline
+])
+def test_task_soft_deadline_follows_the_setting(task_db, small_limits, monkeypatch, tmp_path,
+                                                limit, status, category):
+    mod, set_limit = small_limits
+    media = tmp_path / "a.flac"
+    media.write_bytes(b"x")
+    _serve_file(mod, monkeypatch, media)
+    monkeypatch.setattr(mod, "analyze_file", fakes.progressing)
+    set_limit(limit)
+    token = publication.admit_attempts(task_db, SOURCE, ["track-a"])["track-a"]
+
+    assert mod.analyze_one_track("track-a", SOURCE, SERVER, token)["status"] == status
+
+    row = _row(task_db, "track-a")
+    assert (row[0], row[2]) == (status, category)
+    if category:
+        assert row[5]["error_type"] == "ProfileAnalysisTimeout"
+    else:
+        assert row[5] is None
 
 
 @pytest.mark.parametrize("code", sorted(publication.SAFE_FAILURES))

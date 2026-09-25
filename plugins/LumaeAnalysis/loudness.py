@@ -285,7 +285,9 @@ def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS, ob
 
     ``observer`` (``analysis_isolation.DecodeProbe``) records the stream and the
     decode position for failure diagnostics. The deadline is checked between
-    decoded frames only; ``analysis_isolation`` adds the hard limit (LUM-018).
+    decoded frames only. The plugin's tasks pass the configured limit as
+    ``deadline_seconds``, and ``analysis_isolation`` adds the hard limit
+    (LUM-018).
     """
     try:
         import av

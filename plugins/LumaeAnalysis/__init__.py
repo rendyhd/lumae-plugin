@@ -421,8 +421,9 @@ def run_file_analysis(analyzer, path, **kwargs):
 
     The host puts no timeout on the task (see ``enqueue_bounded``), and the
     analyzer's soft deadline cannot interrupt a decoder hung in native code.
-    The child is killed 30 s after the limit, so a progressing analysis stops
-    at its own soft deadline first. Failures raise with a LUM-007 category.
+    The setting is the analyzer's soft deadline, passed with each file, and
+    the child is killed 30 s after it, so a progressing analysis stops at the
+    soft deadline first. Failures raise with a LUM-007 category.
     """
     return analysis_isolation.run_isolated(
         analyzer, path, limit_seconds=analysis_time_limit_seconds(), **kwargs

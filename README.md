@@ -81,20 +81,24 @@ replaced RQ in August 2026 has no per-task timeout. The `timeout` the plugin
 passes when it queues work is not enforced by anyone.
 
 Each waveform and edge analysis therefore runs in a separate worker process
-with a hard wall-clock limit. The analyzers' own deadline, checked between
-decoded blocks, still ends a slow analysis first. A decoder stuck inside native
-code is killed 30 seconds after the limit (SIGTERM, then SIGKILL 5 seconds
+with a wall-clock limit. The limit is also the analyzers' own deadline,
+checked between decoded blocks: an analysis that is still making progress stops
+there. A decoder stuck inside native code never reaches that check, so the
+worker is killed 30 seconds after the limit (SIGTERM, then SIGKILL 5 seconds
 later), and a new worker replaces it. The worker starts once per AudioMuse job
 (about 1 second) and is reused for the job's files. It receives only the file
 path, so audio is never held in two processes, and it holds no database
 connection or credentials. Cancelling the AudioMuse job also stops the worker.
-Frozen native builds and non-POSIX platforms analyze in-process, with the
-analyzers' deadline only.
+Frozen native builds and non-POSIX platforms analyze in-process: the limit still
+applies as the analyzers' deadline, but nothing is killed and no failure
+diagnostics are recorded.
 
-The limit is the plugin setting `analysis_time_limit_seconds`: 900 by default,
-clamped to 60–86400. Set it through AudioMuse's plugin settings API: `GET
-/api/plugins/settings/lumae_analysis`, add the key to `settings`, and `POST` the
-whole object back. The POST replaces every stored setting.
+The limit is the plugin setting `analysis_time_limit_seconds`: 900 by default
+(the fixed deadline of earlier releases), clamped to 60–86400. A new value
+applies to the next analyzed file; the worker is not restarted. Set it through
+AudioMuse's plugin settings API: `GET /api/plugins/settings/lumae_analysis`, add
+the key to `settings`, and `POST` the whole object back. The POST replaces every
+stored setting.
 
 Failures get their own retry categories:
 
