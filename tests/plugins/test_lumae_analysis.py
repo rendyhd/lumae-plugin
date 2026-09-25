@@ -6613,7 +6613,9 @@ def test_refresh_catalog_publishes_complete_generation_and_coverage():
     assert result["field_coverage"]["track_number"]["ratio"] == 1.0
     assert "replay_gain" in result["field_coverage"]
     assert "sample_rate" in result["field_coverage"]
-    assert db.commits == 2
+    # The scan start, the publication and, after it (P2-3), the edge sweep
+    # and the prune of superseded generations.
+    assert db.commits == 4
     assert db.rollbacks == 0
     assert any("catalog_changes" in sql for sql, _params in db.executed)
 
