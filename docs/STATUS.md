@@ -31,3 +31,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P1-6 v2 operability | merged | rendyhd/lumae-plugin#6 | 9552f43 | 737 passed; create@94k 2.87 s, global lock 5.1 ms (same fixture before: 2.95 s, 2946 ms); page p95 31.0 ms |
 | P2-7 FederatedAlbums proxy timeouts | on phase/2-performance | Phase 2 PR | | 598 passed |
 | P2-2 incremental projection | on phase/2-performance | Phase 2 PR | | 613 passed, 1 xfailed; no-change 30.5→4.0 s (1,596→356 MB), delta 65.0→5.8 s |
+| P2-1 committed status summary | on phase/2-performance | Phase 2 PR | | 790 passed, 1 xfailed; health 349→4.2 ms, settings 496→6.9 ms (p95); no-change projection 2.45→2.7 s |

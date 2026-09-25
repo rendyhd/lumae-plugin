@@ -139,6 +139,20 @@ The client uses v2 only when all of these hold: `status == "ok"`, `profile_boots
 
 Every profile route is scoped by `catalog_instance_id`. Clients get it from `GET /api/catalog/health` → `servers[].catalog_instance_id` (`__init__.py:1867` onwards).
 
+### `GET /api/catalog/health` is read-only from 1.3.0 (unreleased, P2-1)
+
+The response shape and values are unchanged. What changed is when its values are computed:
+- The route still pings the provider on every request. It writes the provider-identity observation only when a stored field of it would change, and then commits that change itself, per server, before reading on. That is the case when:
+  - the transition state, provider version, detection reason or required action changes;
+  - a failed ping reports an error text different from the stored one (a ping that keeps failing the same way writes once);
+  - while the state is `normal`, the observation's baseline follows the published catalogue and projection generations. So the first request after either publishes writes once.
+- The route no longer re-inspects an applied transition's AudioMuse migration (`audiomuse_health`); the `provider_identity_recheck` cron refreshes it at minutes 2 and 32 of every hour.
+- The counts behind `servers[].v3_readiness` (eligible, mapped and fingerprinted tracks, link counts) and therefore its `blockers` and `admission` come from a committed summary. It holds exactly what the former live query returned when it was taken:
+  - link counts are written in the transaction that publishes a projection generation;
+  - catalogue coverage is recounted right after every catalogue refresh and every projection, including one that publishes nothing.
+  So an AudioMuse mapping or Chromaprint change appears with the next catalogue refresh or projection; every analysis run and every provider-migration recheck ends with one. For the moment between a publication and its recount, or when no summary describes the published generation and server, the route counts live, read-only, as 1.2.5 did.
+- 1.2.5 answered in about 0.4 s p95 at 94k tracks, and the route wrote to the database on every request. 1.3.0 answers in about 5 ms p95, excluding the provider ping, and performs no write when nothing changed.
+
 ---
 
 ## 3. Profile endpoints

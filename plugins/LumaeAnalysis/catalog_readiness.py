@@ -3,11 +3,15 @@
 Core versions are diagnostic inputs, never allow-list decisions. Catalogue and
 analysis are admitted independently from observable source, projection, policy,
 and per-link evidence. V2 never executes these queries.
+
+Coverage and link counts come from the committed status summary
+(``status_model``), written when the catalogue or projection is published; a
+request never scans the library for them (P2-1).
 """
 
 import json
 
-from plugin.api import table
+from . import status_model
 
 
 CONTRACT_REVISION = 1
@@ -22,10 +26,6 @@ ANALYSIS_SEMANTIC_CONTRACTS = [
     "clap_f32le_512_v1",
     "audiomuse_musicnn_scalars_v1",
 ]
-
-
-def t(name):
-    return table(name)
 
 
 def _detected_core_version(compatibility):
@@ -120,36 +120,9 @@ def _task_evidence(db):
     }
 
 
-def _coverage(db, source):
-    cur = db.cursor()
-    try:
-        cur.execute(
-            f"""
-            SELECT count(*) AS eligible_tracks,
-                   count(m.provider_track_id) AS mapped_tracks,
-                   count(CASE WHEN cp.fingerprint IS NOT NULL THEN 1 END)
-                     AS fingerprinted_tracks,
-                   max(EXTRACT(EPOCH FROM cp.updated_at)) AS latest_chromaprint_at
-              FROM {t("catalog_tracks")} ct
-              LEFT JOIN track_server_map m
-                ON m.server_id=%s AND m.provider_track_id=ct.track_id
-              LEFT JOIN chromaprint cp
-                ON cp.server_id=m.server_id
-               AND cp.provider_track_id=m.provider_track_id
-             WHERE ct.catalog_instance_id=%s
-               AND ct.published_generation=%s
-               AND ct.available=TRUE
-               AND ct.analysis_eligible=TRUE
-            """,
-            (
-                source["server_id"],
-                source["catalog_instance_id"],
-                source["catalog"]["generation"],
-            ),
-        )
-        row = cur.fetchone() or (0, 0, 0, None)
-    finally:
-        cur.close()
+def _coverage(db, source, summary=None):
+    summary = status_model.read_summary(db, source) if summary is None else summary
+    row = status_model.coverage_counts(db, source, summary)
     eligible = int(row[0] or 0)
     mapped = int(row[1] or 0)
     fingerprinted = int(row[2] or 0)
@@ -165,45 +138,22 @@ def _coverage(db, source):
     }
 
 
-def _link_coverage(db, source, eligible_track_count=0):
-    cur = db.cursor()
-    try:
-        cur.execute(
-            f"""
-            SELECT count(*) FILTER (WHERE status='ready') AS ready_links,
-                   count(*) FILTER (WHERE status='pending') AS pending_links,
-                   count(*) FILTER (
-                     WHERE status='suspect'
-                        OR review_state IN ('needs_repair', 'needs_review')
-                   ) AS suspect_links,
-                   count(*) FILTER (WHERE status='missing') AS missing_links,
-                   count(*) FILTER (
-                     WHERE status='ready' AND evidence_complete=TRUE
-                   ) AS verified_links,
-                   count(*) FILTER (
-                     WHERE status='ready' AND evidence_complete=FALSE
-                   ) AS provisional_links
-              FROM {t("track_analysis_links")}
-             WHERE catalog_instance_id=%s AND projection_generation=%s
-            """,
-            (
-                source["catalog_instance_id"],
-                source.get("analysis", {}).get("generation", 0),
-            ),
-        )
-        row = cur.fetchone() or (0, 0, 0, 0, 0, 0)
-    finally:
-        cur.close()
+def _link_coverage(db, source, eligible_track_count=0, summary=None):
+    summary = status_model.read_summary(db, source) if summary is None else summary
+    _links, ready, pending, suspect, missing, verified = status_model.link_counts(
+        db, source, summary
+    )
     eligible = int(eligible_track_count or 0)
-    ready = int(row[0] or 0)
     return {
         "ready_link_count": ready,
-        "pending_link_count": int(row[1] or 0),
-        "suspect_link_count": int(row[2] or 0),
-        "missing_link_count": int(row[3] or 0),
-        "evidence_complete_link_count": int(row[4] or 0),
-        "verified_link_count": int(row[4] or 0),
-        "provisional_link_count": int(row[5] or 0),
+        "pending_link_count": pending,
+        "suspect_link_count": suspect,
+        "missing_link_count": missing,
+        "evidence_complete_link_count": verified,
+        "verified_link_count": verified,
+        # evidence_complete is NOT NULL, so ready links split exactly into
+        # verified and provisional ones.
+        "provisional_link_count": ready - verified,
         "usable_analysis_coverage": ready / eligible if eligible else 0.0,
     }
 
@@ -307,11 +257,13 @@ def v3_release_readiness(
         }
 
     try:
-        coverage = _coverage(db, source)
+        summary = status_model.read_summary(db, source)
+        coverage = _coverage(db, source, summary)
         link_coverage = _link_coverage(
             db,
             source,
             coverage["eligible_track_count"],
+            summary,
         )
     except Exception:
         analysis_admission = _stream_admission(

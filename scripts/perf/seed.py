@@ -345,6 +345,14 @@ def seed(args):
     s.timings["vacuum_analyze"] = round(time.perf_counter() - t0, 2)
     db.autocommit = False
 
+    # The bulk load bypasses publication, so summarize it the way the install
+    # hook summarizes existing data (P2-1 committed status summary).
+    t0 = time.perf_counter()
+    stub_host.load_plugin().refresh_status_summaries(db)
+    db.commit()
+    s.timings["status_summaries"] = round(time.perf_counter() - t0, 2)
+    log(f"status_summaries: {s.timings['status_summaries']:.1f}s")
+
     projection = None
     if not args.no_project:
         projection = initial_projection()

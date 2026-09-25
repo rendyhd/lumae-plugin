@@ -16,6 +16,7 @@ from plugin.api import table
 
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .provider_identity_guard import inspect_catalog_identity, observe_provider_version
+from .status_model import migrate_status_summary, refresh_status_summary
 
 
 CATALOG_SCHEMA_VERSION = 3
@@ -1360,6 +1361,8 @@ def migrate_catalog(db):
         """,
         (CATALOG_BUILDER_VERSION,),
     )
+    # P2-1: committed status summary (analysis_state counts, status_summary).
+    migrate_status_summary(cur)
     cur.close()
 
 
@@ -1962,6 +1965,9 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             )
             cur.close()
             db.commit()
+            # P2-1: the catalogue is unchanged, but AudioMuse may have mapped
+            # or fingerprinted tracks since (an analysis run ends here).
+            refresh_status_summary(db, catalog_instance_id, getattr(provider_bridge, "core", None))
             return {
                 "catalog_instance_id": catalog_instance_id,
                 "server_id": server_id,
@@ -2114,6 +2120,9 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         refresh_profile_retention(cur, catalog_instance_id, counts["track"])
         cur.close()
         db.commit()
+        # P2-1: readiness reads these counts instead of scanning the library.
+        # Counted after the commit, so catalog_state is not held meanwhile.
+        refresh_status_summary(db, catalog_instance_id, getattr(provider_bridge, "core", None))
         return {
             "catalog_instance_id": catalog_instance_id,
             "server_id": server_id,

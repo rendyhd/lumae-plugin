@@ -35,6 +35,7 @@ from .provider_identity_guard import (
     ProviderIdentityTransitionPending,
     assert_analysis_projection_allowed,
 )
+from .status_model import persist_analysis_summary, refresh_status_summary
 
 
 def t(name):
@@ -944,6 +945,7 @@ def _project_analysis(server_id=None, db=None, adapter=None):
     ):
         cur.close()
         db.commit()
+        refresh_status_summary(db, catalog_instance_id, adapter)  # P2-1, after commit
         return {
             "catalog_instance_id": catalog_instance_id,
             "server_id": server_id,
@@ -1062,6 +1064,8 @@ def _project_analysis(server_id=None, db=None, adapter=None):
         (generation, next_seq, item_count, len(links), catalog_instance_id),
     )
     prune_snapshot_generations(cur, catalog_instance_id, "analysis", generation)
+    # P2-1: readiness reads these counts, exact for the published generation.
+    persist_analysis_summary(cur, catalog_instance_id, generation)
     compact_change_journal(
         cur,
         catalog_instance_id=catalog_instance_id,
@@ -1082,6 +1086,7 @@ def _project_analysis(server_id=None, db=None, adapter=None):
     _analyze_generation_keys(cur)
     cur.close()
     db.commit()
+    refresh_status_summary(db, catalog_instance_id, adapter)  # P2-1, after commit
     return {
         "catalog_instance_id": catalog_instance_id,
         "server_id": server_id,
