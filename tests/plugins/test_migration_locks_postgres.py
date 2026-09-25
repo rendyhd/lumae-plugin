@@ -254,6 +254,8 @@ UNDO_TO_OLDER_SCHEMA = (
     f"ALTER TABLE {P}profile_backfill_state DROP COLUMN refresh_wake_pending",
     f"ALTER TABLE {P}edge_profiles DROP COLUMN orphaned_at",
     f"ALTER TABLE {P}collection_mutations DROP COLUMN fingerprint_version",
+    # K8 floor_seq (P3-4a): re-added, backfilled to the head, then NOT NULL
+    f"ALTER TABLE {P}collection_feed_state DROP COLUMN floor_seq",
     # P2-1 status summary columns (status_model.migrate_status_summary)
     f"ALTER TABLE {P}analysis_state DROP COLUMN summary_updated_at",
     f"ALTER TABLE {P}analysis_state DROP COLUMN summary_generation",

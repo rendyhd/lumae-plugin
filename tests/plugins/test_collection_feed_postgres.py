@@ -124,7 +124,12 @@ def test_multi_event_restore_pagination_tombstone_and_receipt_replay(collection_
         pages.extend(page["changes"])
         cursor = page["next_cursor"]
     assert [r["entity_kind"] for r in pages] == ["collection", "item", "item", "collection", "item"]
-    assert _page(call, cursor, 1) == {"changes": [], "next_cursor": cursor}
+    # 1.2.5 keys are unchanged; K8 (1.3.0) only adds epoch, head_seq,
+    # floor_seq and has_more.
+    end = _page(call, cursor, 1)
+    assert {key: end[key] for key in ("changes", "next_cursor")} == {
+        "changes": [], "next_cursor": cursor}
+    assert end["has_more"] is False and end["head_seq"] == cursor
     cid = first.get_json()["collections"][0]["id"]
     deleted = call("DELETE", f"/api/collections/{cid}", {})
     assert deleted.status_code == 200

@@ -2153,6 +2153,7 @@ def health():
                     "backup_version": COLLECTIONS_BACKUP_VERSION,
                     "enabled": collections_enabled(),
                     "scope": current_collection_scope()["mode"],
+                    "feed_epoch": True,
                 },
                 "catalog_mirror": catalog_capability(),
                 "credits": credits_service.capability(),

@@ -227,6 +227,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "backup_version": 1,
                 "enabled": False,
                 "scope": "shared",
+                "feed_epoch": True,
             },
             "catalog_mirror": mod.catalog_capability(),
             "credits": mod.credits_service.capability(),
@@ -1941,10 +1942,8 @@ def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(
     )
     monkeypatch.setattr(
         collections,
-        "_record_change",
-        lambda cur, principal, collection_id, entity_kind, entity_id, operation, payload: changes.append(
-            (principal, collection_id, entity_kind, entity_id, operation, payload)
-        ),
+        "_record_changes",
+        lambda cur, staged: changes.extend(staged),
     )
     payload = collections._normalize_backup_document(_collection_backup_fixture(collections))
 
@@ -2156,7 +2155,7 @@ def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch
 
         def execute(self, sql, params=None):
             if "UPDATE" in sql and "collection_feed_state" in sql:
-                self.feed_head += 1
+                self.feed_head += params[0]
                 self.rows = [(self.feed_head,)]
             elif "SHOW transaction_isolation" in sql:
                 self.rows = [("read committed",)]
@@ -2192,6 +2191,10 @@ def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch
             elif "DELETE FROM" in sql and "id = ANY" in sql:
                 self.rows = [("item-1",), ("item-2",)]
                 self.description = [("id",)]
+            elif "INSERT INTO" in sql and "collection_changes" in sql:
+                # One block insert per mutation (P3-4a): report its rows.
+                self.rowcount = len(params[1])
+                self.rows = []
             else:
                 self.rows = []
 
