@@ -2105,8 +2105,11 @@ def health():
                     "protocol_version": 2,
                     "schema_version": 1,
                     "auth": "host_authenticated",
+                    "auth_enabled": _host_auth_enabled(),
                     "transfer_contract": profile_bootstrap.TRANSFER_CONTRACT,
-                    "available": bool(getattr(host_api.config, "DATABASE_URL", None)),
+                    "available": profile_bootstrap.availability(),
+                    "sliding_expiry": True,
+                    "idempotent_create": True,
                 },
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
@@ -2866,25 +2869,92 @@ def profile_changes_api():
         return _catalog_error("invalid_cursor", str(exc), 400)
 
 
-def _profile_bootstrap_v2(operation):
-    if not getattr(host_api.config, "DATABASE_URL", None):
-        return _catalog_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
+def _host_auth_enabled():
+    """The host's live AUTH_ENABLED (K4); health ``auth`` stays the design string."""
+    value = getattr(host_api.config, "AUTH_ENABLED", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _bootstrap_caller():
+    """Who a v2 create counts against for the per-source rate limit."""
+    username = getattr(g, "auth_user", None)
+    if username:
+        return f"user:{username}"
+    if getattr(g, "auth_method", None) == "bearer":
+        return "bearer"
+    return profile_bootstrap.ANONYMOUS_CALLER
+
+
+V2_BODY_MAX_BYTES = 16_384
+
+
+def _v2_body(max_bytes=V2_BODY_MAX_BYTES):
+    """The v2 JSON body, reading at most ``max_bytes`` + 1 bytes from the stream.
+
+    ``Content-Length`` is checked first; a chunked body has none, so the read
+    itself is bounded too. Non-JSON content types read as an empty body, like
+    ``request.get_json(silent=True)``.
+    """
+    if request.content_length is not None and request.content_length > max_bytes:
+        raise ValueError("Request body is too large")
+    # A host hook may already have read (and cached) the body.
+    raw = getattr(request, "_cached_data", None)
+    if raw is None:
+        # Read until EOF or one byte past the cap: a stream may return short reads.
+        chunks, size = [], 0
+        while size <= max_bytes:
+            chunk = request.stream.read(max_bytes + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        raw = b"".join(chunks)
+    if len(raw) > max_bytes:
+        raise ValueError("Request body is too large")
+    if not request.is_json or not raw:
+        return {}
     try:
-        body = _json_body(max_bytes=16_384)
+        body = json.loads(raw)
     except ValueError:
-        return _catalog_error("invalid_profile_bootstrap", "Invalid bootstrap request.", 400)
+        return {}
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise ValueError("JSON body must be an object")
+    return body
+
+
+def _bootstrap_error(code, message, status, retry_after=None):
+    response = _catalog_error(code, message, status)
+    if status == 503:
+        retry_after = retry_after or profile_bootstrap.UNAVAILABLE_RETRY_AFTER_S
+    if status in (429, 503) and retry_after:
+        response.headers["Retry-After"] = str(int(retry_after))
+    return response
+
+
+def _profile_bootstrap_v2(operation, **options):
+    if not getattr(host_api.config, "DATABASE_URL", None):
+        return _bootstrap_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
     try:
-        result = operation(body)
+        body = _v2_body()
+    except ValueError:
+        return _bootstrap_error("invalid_profile_bootstrap", "Invalid bootstrap request.", 400)
+    try:
+        result = operation(body, **options)
         return _private_json(result)
     except profile_bootstrap.BootstrapError as exc:
-        return _catalog_error(exc.code, exc.code, exc.status)
-    except Exception:
-        return _catalog_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
+        return _bootstrap_error(exc.code, exc.code, exc.status, exc.retry_after)
+    except Exception as exc:
+        logger.exception("lumae_analysis profile bootstrap route failed (%s)", type(exc).__name__)
+        return _bootstrap_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
 
 
 @bp.post("/api/profiles/bootstrap/sessions")
 def profile_bootstrap_sessions_api():
-    return _profile_bootstrap_v2(profile_bootstrap.create_session)
+    return _profile_bootstrap_v2(profile_bootstrap.create_session, caller=_bootstrap_caller())
 
 
 @bp.post("/api/profiles/bootstrap/sessions/page")

@@ -1,8 +1,10 @@
-"""Diagnostic: two concurrent v2 creators against the global creator lock.
+"""Diagnostic: two concurrent v2 creators for the same source.
 
 The first creator starts at t=0, the second after ``DELAY`` seconds (default
-0.5). With a global advisory lock held for the whole snapshot copy, the second
-creator waits for (or fails behind) the first. Usage:
+0.5). Before P1-6 a global advisory lock was held for the whole snapshot copy
+and the second creator failed with 503 after the 5 s lock timeout; from P1-6
+admission holds the global lock only briefly and the second creator waits for
+the first capture on the per-source lock. Usage:
 ``boot_concurrency.py [DELAY] [PAGE_SIZE]``.
 """
 import os
@@ -24,6 +26,7 @@ def main():
     aux = stub_host.aux_cursor()
     src = stub_host.default_source(aux)
     aux.execute(f"DELETE FROM {T}profile_bootstrap_sessions")
+    aux.execute(f"DELETE FROM {T}profile_bootstrap_creates")
 
     def body(**kw):
         return {"protocol_version": 2, "schema_version": 1,
