@@ -68,7 +68,11 @@ full production schema. After migrating, `seed.py` bulk-loads the following:
   events, which stay at the production retention of 50k. The publication
   budget is defined at 50k events.
 - Other options: `--no-project` skips the first projection, and `--seed N` sets
-  the random seed.
+  the random seed. `--host-schema existing` seeds a database whose host tables
+  the stock AudioMuse host already created (no `host_schema.sql`, no reset),
+  and `--item-ids canonical` gives the analysis items AudioMuse 3.6 content
+  ids (`fp_4<hex>`) so that host does not relabel them at start. The P2-6 gate
+  uses both through `scripts/e2e/seed_representative.py`.
 - The table `lumae_perf_fixture` records scale, counts and seed, and
   `run_baseline.py` copies that into its results.
 
@@ -82,6 +86,7 @@ Each bench prints one JSON line. You can run any of them on its own.
 | `pub_bench.py [N]` | Publication critical section: `complete_attempt` from an admitted attempt to the committed publication, which holds the `catalog_state` row lock throughout and includes the journal append and compaction at 50k retained events. It also times `record_profile_change` with and without commit, and the compaction `DELETE` alone. | `publication` |
 | `proj_bench.py full\|nochange\|delta` | One `project_analysis` run: elapsed time, statements, WAL, peak RSS (`VmHWM`) and table sizes. `delta` changes one `score` row first. | `projection_nochange`, `projection_delta` |
 | `boot_bench.py [--page-size 50] [--max-pages N] [--no-lift]` | v2 `create_session`: time, WAL, snapshot size, and the longest hold of the global creator advisory lock (110094, 10), sampled from `pg_locks` every ~2 ms. Then `snapshot_page` for every page, and the setup cost of the plugin-owned connection. | `bootstrap_create`, `bootstrap_page` |
+| `catalog_lock_bench.py [--changed 20000] [--runs 3]` | Catalogue publication lock (P2-3): how long `refresh_catalog` holds the source's `catalog_state` row, probed every ~1 ms with `SELECT ... FOR UPDATE NOWAIT` (the lock an admission waits for) and timed from the publisher's side, plus the statements run while it is held and the refresh time. A setup refresh publishes a synthetic catalogue of every fixture track once; each run then changes the media of `--changed` more published tracks, which withdraws their profiles. | — (P2-3: <=1 s at 20k changed tracks) |
 | `route_floor.py [N]` | Diagnostic: `/api/catalog/health` with its coverage SQL stubbed, i.e. the route's fixed cost | — |
 | `boot_concurrency.py [DELAY] [PAGE_SIZE]` | Diagnostic: a second v2 creator started while the first holds the global lock | — |
 | `feed_contention.py [N]` | Diagnostic: collections feed append using a sequence vs. the singleton head row, at 1 and 8 writers | — |
@@ -99,8 +104,11 @@ numbers came from.
 **Side effects.** Some benches mutate the fixture, as the real operations
 would. `proj_bench.py delta` writes a new projection generation.
 `pub_bench.py` republishes N tracks, and those tracks lose their edge
-payloads. `feed_contention.py` appends collection-change rows. Re-seed for a
-pristine fixture.
+payloads. `feed_contention.py` appends collection-change rows.
+`catalog_lock_bench.py` publishes new catalogue generations and withdraws
+`--changed` x `--runs` profiles, so it needs a fresh fixture each time. Re-seed
+for a pristine fixture, or copy one first
+(`CREATE DATABASE copy TEMPLATE seeded`, with nothing connected to `seeded`).
 
 ## `run_baseline.py`
 

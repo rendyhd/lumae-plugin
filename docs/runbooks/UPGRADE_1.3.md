@@ -61,6 +61,15 @@ is safe to run again. On success it has:
   `1.3.0`;
 - recounted ready-but-unpublished profiles into `integrity_state`.
 
+Each schema change runs only when it is still missing, so re-running the
+migration on an up-to-date database takes no exclusive table lock. A change
+that is needed waits at most 5 s for its table lock, and is tried 3 times (1 s
+and 2 s apart), about 18 s per needed change. If a long query keeps the table
+busy, the install fails at the first change that can't get its lock, with
+`canceling statement due to lock timeout` (SQLSTATE `55P03`). Find the
+blocking session with `pg_blocking_pids()`, let it finish or end it, and
+re-run the install.
+
 **If the install hook fails**, the host still activates the new code, but the
 transaction rolled back: none of the fences exist. Starting the web server
 does **not** repair this. Its start hook re-runs only the provider-identity and

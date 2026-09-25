@@ -25,6 +25,7 @@ import numpy as np
 
 from plugin.api import get_db, table
 
+from . import migrations
 from .reconcile import arm_reconcile
 from .edge_profiles import opaque_revision
 from .edge_profile_store import edge_join
@@ -255,7 +256,15 @@ def _profile_floor_hold(cur, catalog_instance_id, epoch):
 
 
 def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
-    """Bound profile and relationship journals during upgrades and maintenance."""
+    """Bound profile and relationship journals during upgrades and maintenance.
+
+    Also sweeps edge payloads that no published profile reaches: a catalogue
+    publication deletes the edges of the profiles it withdraws only after it
+    commits (P2-3), so a failed purge leaves them behind until the next
+    publication or this sweep.
+    """
+    from .profile_publication import purge_withdrawn_edges
+
     cur = cursor or db.cursor()
     cur.execute(
         f"""
@@ -269,6 +278,9 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
         (catalog_instance_id, catalog_instance_id),
     )
     rows = cur.fetchall()
+    # Before any stream-state row is locked below, so no publisher waits on it.
+    for row in rows:
+        purge_withdrawn_edges(cur, str(row[0]))
     for row in rows:
         source_id = str(row[0])
         epoch, head_seq, _floor_seq = _profile_stream_state(
@@ -339,11 +351,10 @@ def migrate_enrichment(db):
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
-        f"""
-        ALTER TABLE {t("profile_stream_state")}
-        ADD COLUMN IF NOT EXISTS retention_limit BIGINT NOT NULL
-            DEFAULT {PROFILE_CHANGE_RETENTION_EVENTS}
-        """,
+        lambda cur: migrations.ensure_columns(
+            cur, t("profile_stream_state"),
+            f"retention_limit BIGINT NOT NULL DEFAULT {PROFILE_CHANGE_RETENTION_EVENTS}",
+        ),
         f"""
         CREATE TABLE IF NOT EXISTS {t("profile_changes")} (
             catalog_instance_id TEXT NOT NULL,
@@ -359,15 +370,11 @@ def migrate_enrichment(db):
         # AUD-05 fence: a 1.2.5 worker writes source_profiles 'ready' without a
         # published row, then journals it in the same transaction. Its journal
         # insert omits this column, fails, and rolls the source row back too.
-        f"""
-        ALTER TABLE {t("profile_changes")}
-        ADD COLUMN IF NOT EXISTS writer_generation SMALLINT NOT NULL
-            DEFAULT {JOURNAL_WRITER_GENERATION}
-        """,
-        f"""
-        ALTER TABLE {t("profile_changes")}
-        ALTER COLUMN writer_generation DROP DEFAULT
-        """,
+        lambda cur: migrations.ensure_columns(
+            cur, t("profile_changes"),
+            f"writer_generation SMALLINT NOT NULL DEFAULT {JOURNAL_WRITER_GENERATION}",
+        ),
+        lambda cur: migrations.ensure_no_default(cur, t("profile_changes"), "writer_generation"),
         f"""
         CREATE TABLE IF NOT EXISTS {t("profile_bootstrap_sessions")} (
             session_id UUID PRIMARY KEY,
@@ -388,40 +395,25 @@ def migrate_enrichment(db):
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
-        f"""
-        ALTER TABLE {t('profile_bootstrap_sessions')}
-        ADD COLUMN IF NOT EXISTS source_scope TEXT
-        """,
-        f"""
-        ALTER TABLE {t('profile_bootstrap_sessions')}
-        ADD COLUMN IF NOT EXISTS transfer_contract_version INTEGER NOT NULL DEFAULT 0
-        """,
+        lambda cur: migrations.ensure_columns(
+            cur, t('profile_bootstrap_sessions'),
+            "source_scope TEXT",
+            "transfer_contract_version INTEGER NOT NULL DEFAULT 0",
+        ),
         f"""
         DELETE FROM {t('profile_bootstrap_sessions')}
         WHERE transfer_contract_version <> 3 OR source_scope IS NULL
         """,
-        f"""
-        DO $$ BEGIN
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                 WHERE table_schema=current_schema()
-                   AND table_name='{t('profile_bootstrap_sessions')}'
-                   AND column_name='principal'
-            ) THEN
-                ALTER TABLE {t('profile_bootstrap_sessions')}
-                    ALTER COLUMN principal DROP NOT NULL;
-            END IF;
-        END $$
-        """,
-        f"""
-        ALTER TABLE {t('profile_bootstrap_sessions')}
-        ALTER COLUMN source_scope SET NOT NULL,
-        ALTER COLUMN transfer_contract_version SET DEFAULT 3
-        """,
-        f"""
+        # Account-era sessions had a NOT NULL principal; relax it if present.
+        lambda cur: migrations.ensure_nullable(cur, t('profile_bootstrap_sessions'), "principal"),
+        lambda cur: migrations.ensure_not_null(cur, t('profile_bootstrap_sessions'), "source_scope"),
+        lambda cur: migrations.ensure_default(
+            cur, t('profile_bootstrap_sessions'), "transfer_contract_version", "3",
+        ),
+        lambda cur: migrations.ensure_index(cur, f"""
         CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_source_idx')}
         ON {t('profile_bootstrap_sessions')} (source_scope, expires_at)
-        """,
+        """),
         f"""
         CREATE TABLE IF NOT EXISTS {t('profile_bootstrap_snapshot')} (
             session_id UUID NOT NULL REFERENCES {t('profile_bootstrap_sessions')}(session_id)
@@ -445,31 +437,25 @@ def migrate_enrichment(db):
         # K2 (P1-5): captures store the waveform payload plus an edge
         # reference {media_revision, profile_digest}, resolved at page read.
         # Rows captured before 1.3.0 keep their embedded edge and a NULL ref.
-        f"""
-        ALTER TABLE {t('profile_bootstrap_snapshot')}
-        ADD COLUMN IF NOT EXISTS edge_ref JSONB
-        """,
-        f"""
-        ALTER TABLE {t('profile_bootstrap_catchup')}
-        ADD COLUMN IF NOT EXISTS edge_ref JSONB
-        """,
+        lambda cur: migrations.ensure_columns(cur, t('profile_bootstrap_snapshot'), "edge_ref JSONB"),
+        lambda cur: migrations.ensure_columns(cur, t('profile_bootstrap_catchup'), "edge_ref JSONB"),
         # P1-6 (K3/K5, AUD-11): a session is admitted as 'capturing' and
         # becomes 'ready' when its capture commits; rows from before 1.3.0 are
         # ready. expiry_mode 'sliding' extends expires_at on every page;
         # client_request_id and pages_served let a retried create replace its
         # unclaimed session. Additive, metadata-only defaults.
-        f"""
-        ALTER TABLE {t('profile_bootstrap_sessions')}
-        ADD COLUMN IF NOT EXISTS state TEXT NOT NULL DEFAULT 'ready',
-        ADD COLUMN IF NOT EXISTS expiry_mode TEXT NOT NULL DEFAULT 'absolute',
-        ADD COLUMN IF NOT EXISTS client_request_id UUID,
-        ADD COLUMN IF NOT EXISTS pages_served INTEGER NOT NULL DEFAULT 0
-        """,
-        f"""
+        lambda cur: migrations.ensure_columns(
+            cur, t('profile_bootstrap_sessions'),
+            "state TEXT NOT NULL DEFAULT 'ready'",
+            "expiry_mode TEXT NOT NULL DEFAULT 'absolute'",
+            "client_request_id UUID",
+            "pages_served INTEGER NOT NULL DEFAULT 0",
+        ),
+        lambda cur: migrations.ensure_index(cur, f"""
         CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_request_idx')}
         ON {t('profile_bootstrap_sessions')} (source_scope, client_request_id)
         WHERE client_request_id IS NOT NULL
-        """,
+        """),
         # Admitted creates per (source, caller) for the create rate limit;
         # rows older than the window are purged by the next create.
         f"""
@@ -479,14 +465,14 @@ def migrate_enrichment(db):
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
-        f"""
+        lambda cur: migrations.ensure_index(cur, f"""
         CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_creates_caller_idx')}
         ON {t('profile_bootstrap_creates')} (catalog_instance_id, caller_key, created_at)
-        """,
-        f"""
+        """),
+        lambda cur: migrations.ensure_index(cur, f"""
         CREATE INDEX IF NOT EXISTS {t("profile_changes_track_idx")}
         ON {t("profile_changes")} (catalog_instance_id, track_id)
-        """,
+        """),
         f"""
         CREATE TABLE IF NOT EXISTS {t("relationship_state")} (
             catalog_instance_id TEXT PRIMARY KEY
@@ -536,8 +522,7 @@ def migrate_enrichment(db):
         )
         """,
     ]
-    for statement in statements:
-        cur.execute(statement)
+    migrations.apply(cur, statements)
 
     from .relationship_build import migrate_relationship_builds
     migrate_relationship_builds(cur)
@@ -701,6 +686,63 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
         hold_floor_seq=_profile_floor_hold(cur, catalog_instance_id, epoch),
         current_floor=floor_seq,
         max_advance=PROFILE_COMPACTION_MAX_ADVANCE,
+    )
+    return seq
+
+
+def record_profile_deletions(cur, catalog_instance_id, track_ids):
+    """Append one delete event per track, in order, with one compaction (P2-3).
+
+    Leaves the journal and stream state exactly as ``record_profile_change(...,
+    "deleted")`` called once per track would: the same seqs, rows and head, and
+    the same floor. Per event, compaction may advance the floor by at most
+    ``PROFILE_COMPACTION_MAX_ADVANCE`` towards a target that grows by at most
+    one seq per event, under a hold that cannot change inside the transaction.
+    So n appends reach ``min(target at the last head, floor +
+    n * PROFILE_COMPACTION_MAX_ADVANCE)``, which one compaction with that
+    bound computes, and delete the same rows. Returns the new head, or None
+    when ``track_ids`` is empty (then nothing is read or written).
+    """
+    track_ids = [str(track_id) for track_id in track_ids]
+    if not track_ids:
+        return None
+    epoch, head_seq, floor_seq = _profile_stream_state(
+        cur, catalog_instance_id, for_update=True
+    )
+    seq = head_seq + len(track_ids)
+    cur.execute(
+        f"""
+        INSERT INTO {t("profile_changes")}
+            (catalog_instance_id, epoch, seq, track_id, operation, payload,
+             writer_generation)
+        SELECT %s, %s, %s + event.ordinality, event.track_id, 'delete', NULL, %s
+          FROM unnest(%s::text[]) WITH ORDINALITY AS event(track_id, ordinality)
+        """,
+        (catalog_instance_id, epoch, head_seq, JOURNAL_WRITER_GENERATION, track_ids),
+    )
+    cur.execute(
+        f"UPDATE {t('profile_stream_state')} "
+        "SET head_seq=%s, updated_at=now() "
+        "WHERE catalog_instance_id=%s AND epoch=%s AND head_seq=%s "
+        "RETURNING head_seq, retention_limit",
+        (seq, catalog_instance_id, epoch, head_seq),
+    )
+    advanced = cur.fetchone()
+    if advanced is None:
+        raise RuntimeError("Profile stream head changed during publication")
+    compact_change_journal(
+        cur,
+        catalog_instance_id=catalog_instance_id,
+        state_table="profile_stream_state",
+        changes_table="profile_changes",
+        epoch_column="epoch",
+        floor_column="floor_seq",
+        epoch=epoch,
+        head_seq=seq,
+        retention_limit=max(PROFILE_CHANGE_RETENTION_EVENTS, int(advanced[1] or 0)),
+        hold_floor_seq=_profile_floor_hold(cur, catalog_instance_id, epoch),
+        current_floor=floor_seq,
+        max_advance=PROFILE_COMPACTION_MAX_ADVANCE * len(track_ids),
     )
     return seq
 

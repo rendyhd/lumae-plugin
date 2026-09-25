@@ -7,6 +7,8 @@ bootstrap/history leases are unaffected: this only touches optional results.
 
 from plugin.api import table
 
+from . import migrations
+
 TABLES = (
     "edge_profiles",
     "edge_profile_jobs",
@@ -16,11 +18,10 @@ TABLES = (
 def migrate(db):
     with db.cursor() as cur:
         for name in TABLES:
-            cur.execute(
-                f"ALTER TABLE {table(name)} ADD COLUMN IF NOT EXISTS orphaned_at TIMESTAMPTZ"
-            )
-            cur.execute(
-                f"CREATE INDEX IF NOT EXISTS {table(name)}_orphan_idx ON {table(name)}(orphaned_at) WHERE orphaned_at IS NOT NULL"
+            migrations.ensure_columns(cur, table(name), "orphaned_at TIMESTAMPTZ")
+            migrations.ensure_index(
+                cur,
+                f"CREATE INDEX IF NOT EXISTS {table(name)}_orphan_idx ON {table(name)}(orphaned_at) WHERE orphaned_at IS NOT NULL",
             )
 
 

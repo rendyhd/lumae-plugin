@@ -11,6 +11,7 @@ from flask import Response, abort, current_app, g, jsonify, request
 
 from plugin.api import get_db, get_setting, render_page, table
 
+from . import migrations
 from .collection_library import catalog_track_view_sql, register_collection_library_routes
 from .collection_ui import render_collection_workbench
 
@@ -155,14 +156,16 @@ def migrate_collections(db):
     # The change-table lock itself lasts through the host's outer commit.
     cur.execute("SELECT current_setting('lock_timeout'), current_setting('statement_timeout')")
     prior_timeouts = cur.fetchone()
-    cur.execute("SET LOCAL lock_timeout = '5s'")
     cur.execute("SET LOCAL statement_timeout = '30s'")
-    cur.execute(f"LOCK TABLE {collection_changes_table()} IN ACCESS EXCLUSIVE MODE")
-    # AUD-05 fence: 1.2.5 writers insert without seq and would take the
-    # BIGSERIAL default, a number the frontier later allocates again. Without
-    # a default their insert fails instead. Idempotent; the sequence stays
-    # owned by the column.
-    cur.execute(f"ALTER TABLE {collection_changes_table()} ALTER COLUMN seq DROP DEFAULT")
+    if not _feed_fence_installed(cur):
+        # Seeding the frontier needs the change table to itself. The lock
+        # waits DDL_LOCK_TIMEOUT per attempt, with bounded retries (P2-5).
+        migrations.lock_table(cur, collection_changes_table())
+        # AUD-05 fence: 1.2.5 writers insert without seq and would take the
+        # BIGSERIAL default, a number the frontier later allocates again.
+        # Without a default their insert fails instead. Idempotent; the
+        # sequence stays owned by the column.
+        migrations.ensure_no_default(cur, collection_changes_table(), "seq")
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {collection_feed_state_table()} (
@@ -205,44 +208,65 @@ def migrate_collections(db):
         )
         """
     )
-    cur.execute(f"ALTER TABLE {collection_mutations_table()} ADD COLUMN IF NOT EXISTS request_fingerprint TEXT")
-    cur.execute(f"ALTER TABLE {collection_mutations_table()} ADD COLUMN IF NOT EXISTS fingerprint_version INTEGER")
-    cur.execute(
-        "SELECT 1 FROM pg_constraint WHERE conname = %s AND conrelid = %s::regclass",
-        ("lumae_collection_mutation_fingerprint_pair", collection_mutations_table()),
+    migrations.ensure_columns(
+        cur, collection_mutations_table(),
+        "request_fingerprint TEXT",
+        "fingerprint_version INTEGER",
     )
-    if cur.fetchone() is None:
-        cur.execute(
-            f"ALTER TABLE {collection_mutations_table()} "
-            "ADD CONSTRAINT lumae_collection_mutation_fingerprint_pair "
-            "CHECK ((request_fingerprint IS NULL AND fingerprint_version IS NULL) OR "
-            "(request_fingerprint IS NOT NULL AND fingerprint_version IS NOT NULL "
-            "AND fingerprint_version > 0))"
-        )
-    cur.execute(
+    migrations.ensure_constraint(
+        cur, collection_mutations_table(),
+        "lumae_collection_mutation_fingerprint_pair",
+        "CHECK ((request_fingerprint IS NULL AND fingerprint_version IS NULL) OR "
+        "(request_fingerprint IS NOT NULL AND fingerprint_version IS NOT NULL "
+        "AND fingerprint_version > 0))",
+    )
+    migrations.ensure_index(
+        cur,
         f"CREATE INDEX IF NOT EXISTS lumae_collections_changed_idx "
-        f"ON {collection_changes_table()} (principal, seq)"
+        f"ON {collection_changes_table()} (principal, seq)",
     )
-    cur.execute(
+    migrations.ensure_index(
+        cur,
         f"CREATE INDEX IF NOT EXISTS lumae_collection_items_order_idx "
-        f"ON {collection_items_table()} (principal, collection_id, kind, position)"
+        f"ON {collection_items_table()} (principal, collection_id, kind, position)",
     )
-    cur.execute(
+    migrations.ensure_index(
+        cur,
         f"CREATE UNIQUE INDEX IF NOT EXISTS lumae_collection_track_unique_idx "
         f"ON {collection_items_table()} (principal, collection_id, track_id) "
-        "WHERE kind = 'track'"
+        "WHERE kind = 'track'",
     )
-    cur.execute(
+    migrations.ensure_index(
+        cur,
         f"CREATE UNIQUE INDEX IF NOT EXISTS lumae_collection_album_provider_unique_idx "
         f"ON {collection_items_table()} (principal, collection_id, provider_album_id) "
-        "WHERE kind = 'album' AND provider_album_id IS NOT NULL"
+        "WHERE kind = 'album' AND provider_album_id IS NOT NULL",
     )
-    cur.execute(
+    migrations.ensure_index(
+        cur,
         f"CREATE UNIQUE INDEX IF NOT EXISTS lumae_collection_album_key_unique_idx "
         f"ON {collection_items_table()} (principal, collection_id, album_key) "
-        "WHERE kind = 'album' AND provider_album_id IS NULL"
+        "WHERE kind = 'album' AND provider_album_id IS NULL",
     )
     cur.close()
+
+
+def _feed_fence_installed(cur):
+    """The seq default is gone and the feed frontier is seeded (AUD-05).
+
+    Then the migration has nothing to change on the change table and takes
+    no lock on it: 1.2.5 writers already fail without a default, and 1.3.0
+    writers allocate from the frontier.
+    """
+    seq = migrations.column_info(cur, collection_changes_table(), "seq")
+    if seq is None or seq[1] is not None:
+        return False
+    cur.execute("SELECT to_regclass(%s) IS NOT NULL", (collection_feed_state_table(),))
+    row = cur.fetchone()
+    if not row or row[0] is not True:
+        return False
+    cur.execute(f"SELECT 1 FROM {collection_feed_state_table()} WHERE singleton = 1")
+    return cur.fetchone() is not None
 
 
 def _json_value(value):

@@ -137,20 +137,20 @@ def _raiser(error):
 
 
 class _Blocker:
-    """Hold the first capture that serializes a row of ``source`` until released."""
+    """Hold the first capture of ``source`` at its first batch until released."""
 
     def __init__(self, monkeypatch, source):
         self.capturing = threading.Event()
         self.release = threading.Event()
         self._source = source
-        self._original = profile_bootstrap.serialize_profile
-        monkeypatch.setattr(profile_bootstrap, "serialize_profile", self)
+        self._original = profile_bootstrap._snapshot_batch
+        monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", self)
 
-    def __call__(self, *row):
-        if str(row[0]).startswith(self._source) and not self.capturing.is_set():
+    def __call__(self, cur, source, *args):
+        if source == self._source and not self.capturing.is_set():
             self.capturing.set()
             assert self.release.wait(20)
-        return self._original(*row)
+        return self._original(cur, source, *args)
 
 
 def _in_thread(function, *args):
@@ -183,6 +183,8 @@ def _await_capture_lock_waiter(connection, source, timeout=20):
     while time.monotonic() < deadline:
         with connection.cursor() as cur:
             cur.execute("SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                        "AND database=(SELECT oid FROM pg_database "
+                        "WHERE datname=current_database()) "
                         "AND NOT granted AND classid=110094 AND objid=hashtext(%s)::oid "
                         "AND objsubid=2", (source,))
             waiting = cur.fetchone()[0]
@@ -254,9 +256,9 @@ def test_capture_holds_only_its_source_lock_and_always_releases_it(
         cur.execute("SELECT pg_backend_pid(), txid_current()")
         request_pid, request_txid = cur.fetchone()
     observed = []
-    original = profile_bootstrap.serialize_profile
+    original = profile_bootstrap._snapshot_batch
 
-    def inspect_capture(*row):
+    def inspect_capture(*args):
         with second_connection.cursor() as cur:
             cur.execute("SELECT pg_try_advisory_lock(110094, 10)")
             global_free = cur.fetchone()[0]
@@ -267,10 +269,12 @@ def test_capture_holds_only_its_source_lock_and_always_releases_it(
             cur.execute(
                 "SELECT l.pid, a.application_name FROM pg_locks l "
                 "JOIN pg_stat_activity a USING (pid) WHERE l.locktype='advisory' "
+                "AND l.database=(SELECT oid FROM pg_database "
+                "WHERE datname=current_database()) "
                 "AND l.classid=110094 AND l.objid<>10 AND l.granted")
             observed.append((global_free, source_free, cur.fetchall()))
         second_connection.rollback()
-        return original(*row)
+        return original(*args)
 
     # Right after each capture, while the owned connection is still open (so
     # its backend exit cannot be what frees the lock), the source lock must
@@ -292,7 +296,7 @@ def test_capture_holds_only_its_source_lock_and_always_releases_it(
             free_after_capture.append(acquired)
 
     monkeypatch.setattr(profile_bootstrap, "_capture", checked_capture)
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile", inspect_capture)
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", inspect_capture)
     profile_bootstrap.create_session(body())
     assert free_after_capture == [True]
     (global_free, source_free, holders), = observed
@@ -315,7 +319,7 @@ def test_capture_holds_only_its_source_lock_and_always_releases_it(
                         (SOURCE,) if "%s" in key else ())
         second_connection.commit()
 
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile",
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch",
                         _raiser(RuntimeError("capture failed")))
     with pytest.raises(profile_bootstrap.BootstrapError):
         profile_bootstrap.create_session(body())
@@ -339,10 +343,10 @@ def test_admitted_session_holds_the_floor_during_capture(db, second_connection, 
     _execute(db, f"INSERT INTO {CHANGES} (catalog_instance_id, epoch, seq, track_id, "
                  "operation, writer_generation) SELECT %s, %s, n, 'track-' || n, 'delete', 2 "
                  "FROM generate_series(1, 5) n", (SOURCE, epoch))
-    original = profile_bootstrap.serialize_profile
+    original = profile_bootstrap._snapshot_batch
     seen = {}
 
-    def publish_during_capture(*row):
+    def publish_during_capture(*args):
         if not seen:
             with second_connection.cursor() as cur:
                 cur.execute(f"SELECT state, snapshot_seq FROM {SESSIONS}")
@@ -360,9 +364,9 @@ def test_admitted_session_holds_the_floor_during_capture(db, second_connection, 
                             (SOURCE,))
                 seen["floor"] = cur.fetchone()[0]
             second_connection.commit()
-        return original(*row)
+        return original(*args)
 
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile", publish_during_capture)
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", publish_during_capture)
     created = profile_bootstrap.create_session(body(page_size=500))
     assert seen["rows"] == [("capturing", 5)]
     assert seen["floor"] <= 5
@@ -748,7 +752,7 @@ class _Log:
 def test_unexpected_error_is_logged_with_its_class_and_no_secrets(db, monkeypatch):
     """Inverts probe ``test_probe_serializer_valueerror_unlogged``."""
     log = _Log(monkeypatch)
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile",
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch",
                         _raiser(ValueError("bad ramp")))
     app = _app()
     with app.test_client() as client:
@@ -784,7 +788,7 @@ def test_failed_rollback_never_masks_the_original_error(db, monkeypatch):
     monkeypatch.setattr(profile_bootstrap.psycopg2, "connect",
                         lambda dsn, **options: actual_connect(
                             dsn, connection_factory=_BrokenRollback, **options))
-    monkeypatch.setattr(profile_bootstrap, "serialize_profile",
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch",
                         _raiser(ValueError("bad ramp")))
     with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.create_session(body())

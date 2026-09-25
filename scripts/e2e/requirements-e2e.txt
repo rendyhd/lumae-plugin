@@ -1,0 +1,4 @@
+# P2-6 end-to-end gate (scripts/e2e), in addition to requirements-dev.txt.
+# The same gunicorn release as the pinned AudioMuse image (25.3.0), which the
+# local runner starts with the image's supervisord topology.
+gunicorn==25.3.0

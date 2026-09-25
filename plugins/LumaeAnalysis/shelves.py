@@ -9,6 +9,7 @@ import json
 import math
 from flask import jsonify, request
 from plugin.api import get_db, table
+from . import migrations
 from .collection_manager import current_principal, require_collections_enabled
 
 SHELVES_SCHEMA_VERSION = 1
@@ -25,7 +26,7 @@ def migrate_shelves(db):
             type TEXT NOT NULL CHECK (type IN ('member','order','evidence')),
             id TEXT NOT NULL, value JSONB NOT NULL, seq BIGINT NOT NULL,
             PRIMARY KEY (principal,catalog_id,type,id))""")
-        cur.execute(f"""CREATE INDEX IF NOT EXISTS lumae_shelf_changes_idx
+        migrations.ensure_index(cur, f"""CREATE INDEX IF NOT EXISTS lumae_shelf_changes_idx
             ON {table('shelf_records')} (principal,catalog_id,seq)""")
         cur.execute(f"""CREATE TABLE IF NOT EXISTS {table('shelf_mutations')} (
             principal TEXT NOT NULL, catalog_id TEXT NOT NULL, id TEXT NOT NULL,
