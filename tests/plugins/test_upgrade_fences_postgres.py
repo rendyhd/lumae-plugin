@@ -646,3 +646,96 @@ def test_health_integrity_is_null_without_a_database(monkeypatch):
         "profiles_checked_at": None,
         "fences_installed": None,
     }
+
+
+# -- 4. P2-3: the edge sweep runs after the published-profile seed -----------
+
+
+@pytest.fixture
+def unmigrated_db():
+    """A fresh schema without any plugin migration, for a real 1.2.5 install."""
+    import uuid
+
+    from pg_helpers import connect, drop_schema
+
+    schema = f"lumae_upgrade_{uuid.uuid4().hex}"
+    db = connect("public")
+    try:
+        with db.cursor() as cur:
+            cur.execute(f"CREATE SCHEMA {schema}")
+            cur.execute(f"SET search_path TO {schema}, public")
+            cur.execute("CREATE TABLE cron (name TEXT, task_type TEXT UNIQUE, "
+                        "cron_expr TEXT, enabled BOOLEAN)")
+        db.commit()
+        yield db
+    finally:
+        db.rollback()
+        db.close()
+        drop_schema(schema)
+
+
+def _rows(db, sql):
+    with db.cursor() as cur:
+        cur.execute(sql)
+        rows = cur.fetchall()
+    db.rollback()
+    return rows
+
+
+def test_1_2_5_upgrade_keeps_the_edges_of_seeded_publications(
+    unmigrated_db, plugin_125, run_plugin_migration, monkeypatch
+):
+    """A 1.2.5 install has edges for its ready profiles but no published rows:
+    migrate seeds those rows from the ready profiles, and only then may the
+    maintenance sweep (compact_enrichment_storage) delete edges no published
+    profile reaches. Swept: a failed profile's edge and an older revision's."""
+    from test_lumae_analysis import RefreshBridge
+
+    db, old = unmigrated_db, plugin_125
+    monkeypatch.setattr(old, "enqueue_required_catalog_preparations", lambda **_kw: 0)
+    monkeypatch.setattr(old, "_safe_reconcile_schedule", lambda *_a, **_kw: None)
+    monkeypatch.setattr(old, "get_db", lambda: db)
+    old.migrate(db)
+    db.commit()
+    with db.cursor() as cur:
+        # 1.2.5 created the legacy-default source; its catalogue is server-a.
+        for name in ("catalog_sources", "catalog_state"):
+            cur.execute(f"UPDATE {P}{name} SET current_core_server_id='server-a' "
+                        "WHERE current_core_server_id='legacy-default'")
+    db.commit()
+    tracks = [{"id": f"t{index}", "title": f"Song {index}", "duration": 100 + index}
+              for index in range(4)]
+    source = old.catalog.refresh_catalog(
+        "server-a", db=db, bridge=RefreshBridge({"tracks": tracks})
+    )["catalog_instance_id"]
+    revisions = dict(_rows(db, f"SELECT track_id, 'catalog-media:' || media_fp "
+                               f"FROM {P}catalog_tracks WHERE catalog_instance_id='{source}'"))
+    for track, status in (("t0", "ready"), ("t1", "ready"), ("t2", "ready"), ("t3", "failed")):
+        old.upsert_profile(track, _result(), status, media_sig=revisions[track],
+                           catalog_instance_id=source)
+    with db.cursor() as cur:
+        edges = [(track, revisions[track]) for track in ("t0", "t1", "t2", "t3")]
+        edges.append(("t0", "catalog-media:older-revision"))
+        for track, signature in edges:
+            cur.execute(
+                f"""INSERT INTO {P}edge_profiles
+                    (catalog_instance_id, track_id, media_revision, representation_id,
+                     media_signature, profile_digest, payload)
+                    VALUES (%s, %s, %s, 'rep', %s, 'digest', '{{}}'::jsonb)""",
+                (source, track, "rev:" + signature, signature),
+            )
+    db.commit()
+    edge_sql = f"SELECT track_id, media_signature FROM {P}edge_profiles ORDER BY 1, 2"
+    assert len(_rows(db, edge_sql)) == 5
+    assert _rows(db, f"SELECT to_regclass('{P}published_source_profiles')") == [(None,)]
+
+    run_plugin_migration(db)
+    published_sql = (f"SELECT track_id, media_signature FROM {P}published_source_profiles "
+                     "ORDER BY 1")
+    ready = [(track, revisions[track]) for track in ("t0", "t1", "t2")]
+    assert _rows(db, published_sql) == ready
+    assert _rows(db, edge_sql) == ready
+    journal_sql = f"SELECT * FROM {P}profile_changes ORDER BY epoch, seq"
+    before = (_rows(db, published_sql), _rows(db, edge_sql), _rows(db, journal_sql))
+    run_plugin_migration(db)
+    assert (_rows(db, published_sql), _rows(db, edge_sql), _rows(db, journal_sql)) == before
