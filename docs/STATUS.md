@@ -28,3 +28,4 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 | P1-7 single-snapshot /changes reader | on phase/1-stop-the-bleeding | Phase 1 PR | | 674 passed |
 | P1-3 fences and 1.3.0 | on phase/1-stop-the-bleeding | Phase 1 PR | | 696 passed |
 | P1-5 v2 snapshots store edge references | on phase/1-stop-the-bleeding | Phase 1 PR | | 705 passed; create@94k 8.42 s (413; 115.7 s / 2720 MB WAL with limits lifted) → 3.0–4.3 s / 73–75 MB WAL; page p95 31.4→24.8 ms (50 rows); global lock hold 3–4.3 s left for P1-6 |
+| P3-13 LUM-001 concurrency test strength | on phase/3 (pending) | Phase 3 PR | | 710 passed; with the stream-state `FOR UPDATE` removed, 5 of 5 new tests fail (before: 1 of 705) |
