@@ -32,7 +32,7 @@ from plugin.api import config, enqueue, get_db, logger, render_page, table
 from tasks.mediaserver import get_all_songs
 from tasks.sonic_fingerprint_manager import calculate_sonic_fingerprint_vector
 
-from . import catalog_store, sync_jobs, source_projection
+from . import catalog_store, migrations, sync_jobs, source_projection
 
 from .album_dynamics import (
     EMBEDDING_FAMILY,
@@ -173,9 +173,12 @@ def migrate(db=None):
             )
             """
         )
-        cur.execute(
+        # CREATE TABLE IF NOT EXISTS on an existing table takes no table lock;
+        # CREATE INDEX IF NOT EXISTS would take SHARE, so check first (P2-8).
+        migrations.ensure_index(
+            cur,
             f"CREATE INDEX IF NOT EXISTS {names['remote']}_instance_idx "
-            f"ON {names['remote']} (remote_instance_id, album_key)"
+            f"ON {names['remote']} (remote_instance_id, album_key)",
         )
         cur.execute(
             f"INSERT INTO {names['meta']} (key, value) VALUES ('instance_id', %s) "

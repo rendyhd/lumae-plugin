@@ -183,6 +183,8 @@ def _await_capture_lock_waiter(connection, source, timeout=20):
     while time.monotonic() < deadline:
         with connection.cursor() as cur:
             cur.execute("SELECT count(*) FROM pg_locks WHERE locktype='advisory' "
+                        "AND database=(SELECT oid FROM pg_database "
+                        "WHERE datname=current_database()) "
                         "AND NOT granted AND classid=110094 AND objid=hashtext(%s)::oid "
                         "AND objsubid=2", (source,))
             waiting = cur.fetchone()[0]
