@@ -310,6 +310,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
      - Admission runs in a short transaction under `pg_advisory_xact_lock(110094,10)`: purge expired **and identity-stale** rows (core server, epochs, inactive source); count slots; insert a session in state `capturing`.
      - Capture then runs under a **per-source** `pg_advisory_lock(110094, hashtext(source))`.
      - `capturing` rows older than 10 minutes are purged.
+     - **Decision (P1-6 implementation, review-accepted):** the purge runs right after admission in its own best-effort transaction, not under the global admission lock. Admission counts only live sessions, so stale rows never occupy a slot. Deleting a stale 94k-row session under the lock would break the 50 ms global-lock budget. The purge uses `SKIP LOCKED`, is capped per call, and a failed purge never fails the create.
      - The floor hold (P1-2) ignores sessions whose catalogue epoch or core server no longer matches: they would 410 anyway (P1-2 review F3). The session row for the hold is committed at admission, before capture, so the hold covers the capture window (F2).
   2. **Release** deletes any row matching token hash and source, even if identity-stale, and always returns 200 `released`.
   3. **K5:** optional `client_request_id` (UUID). An unexpired session with the same (source, id) and `pages_served=0` is deleted before a new one is created. New columns `client_request_id` and `pages_served`.
@@ -388,6 +389,16 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - Measure the time `catalog_state` is held.
   - Evaluate `FOR SHARE` instead of `FOR UPDATE` for attempt admission and completion, which need only fence against publication. Adopt it only with a concurrency test proving LUM-008 invariants.
 - Budget: a full reconcile of 20k changed tracks holds `catalog_state` for ≤1 s (currently about 8 s).
+- **Outcome (merged, review PASS after 3 rounds).**
+  - The build runs before the lock. The publication then takes an advisory publisher lock, re-reads `catalog_state` as its base and re-checks it under `FOR UPDATE`.
+  - Withdrawals are set-based (`record_profile_deletions`) under the lock.
+  - Edge rows of withdrawn tracks are purged after the commit by a whole-source sweep (`purge_withdrawn_edges`). The sweep runs after each publication and in `compact_enrichment_storage`, and in `migrate` it must run **after** the 1.2.5 published-profile seed; a test pins that order.
+  - Hold at 20k changed of 132k: 147 s → 0.68 s median (0.73 s max); statements run under the lock: 672k → 12.
+- **Decision.** `FOR SHARE` was evaluated and not adopted. An admission batch and a completion both lock `source_profiles`/`published_source_profiles` rows and then `profile_stream_state`, so under `FOR SHARE` they deadlock (reproduced by `test_admission_batch_and_completion_serialize_without_deadlock`). They serialize on `profile_stream_state` anyway, and F4 is fixed by shortening the hold instead.
+- **Follow-ups (not blocking).**
+  - (L4) `inspect_catalog_identity` still takes `FOR UPDATE OF c` on `catalog_state` during a provider-identity transition. That path builds under the lock; drop `c` from that lock now that the publisher lock excludes a second publisher.
+  - The hold of a fingerprint-schema rebase is unmeasured.
+  - Overlapping refreshes publish in fetch-completion order, so a removed track can briefly reappear until the next refresh. A possible mitigation: skip as superseded when the generation published in the meantime came from a later scan.
 
 **P2-4 — v2 capture off the request thread (conditional).**
 - After P1-5 and P1-6, measure create p95 at 94k with edges on gunicorn gthread×4 (P2-6).
@@ -398,6 +409,30 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   The 1 KiB-per-event catch-up byte cap never binds in practice.
 - If create is ≤5 s, no 503s occur under 2 concurrent creators, and the capped catch-up is acceptable, **close as not needed**.
 - Otherwise implement create → 202 `{status_url}` with the capture as an RQ task, add a new capability flag and a contract entry, and add client support through §H C-3.
+- **Decision (after P2-6, `docs/perf/E2E-2026-09-25.md`): implement, but server-internal and not 202 + RQ.**
+  - Measured at 94k with edges on gthread 1×4:
+    - a single create takes 4.0–4.3 s;
+    - two concurrent creators take p95 6.7–8.0 s on different sources (GIL contention) and 8.7–9.7 s on the same source (serialized on the per-source capture lock), with 1 of 40 returning 503 on the stock host;
+    - the capped catch-up (1,056,000 events) takes 48 s with flat memory and recovers through `Retry-After`, which is acceptable, so option (a) is not needed.
+  - P2-4 builds the snapshot and first catch-up rows in PostgreSQL with bounded `INSERT … SELECT` batches: byte-identical output, proven by an equivalence test against the old path. It also fixes the page query, which applies `ORDER BY ordinal LIMIT` before the lateral edge join; without statistics, the current plan does one edge lookup per remaining row.
+  - Acceptance is the P2-6 `creators` scenario: two-creator create p95 ≤5 s and no 503. On the same source, that requires one 94k capture in about 2.5 s or less.
+  - If SQL capture cannot reach that, the orchestrator decides between accepting a same-source wait (two devices of one library starting a first sync at once) and the 202 path.
+- **Outcome (P2-4 and P2-4b merged, reviews PASS).**
+  - Single create at 94k: 3.6–4.0 s → 2.0–2.2 s.
+  - Different-source two-creator p95: 6.3–6.6 s → 2.4–3.3 s.
+  - Status routes are back within budget during creates.
+  - A page query on a table without statistics does 50 edge lookups instead of one per remaining row.
+  - **Same-source two-creator p95 does not reliably meet 5 s.** Across 10 full-scale runs it was 4.58–6.12 s, with 0 × 503 in every run. The two creates serialize on the per-source capture lock, so the second waits for the whole first capture. The runs also churn about 3.8M snapshot rows, which triggers autovacuum.
+- **Decision (orchestrator): accept the same-source wait, and do not build the 202 + RQ path.**
+  - The case needs two devices of one library to start a first sync within about 2 s of each other.
+  - The second create still succeeds, well inside the client's 10 s create timeout and the 5 s lock timeout (the lock is held for about 2 s).
+  - No 503 occurred in any post-P2-4 run.
+  - The 202 path would add a capability flag, a contract entry and client work (C-3) for this case alone.
+  - The budget now reads: single create ≤5 s; two creators on **different** sources p95 ≤5 s; two creators on the **same** source no 503 and p95 ≤10 s.
+  - Re-check at P4-2 qualification on the stock host.
+- **Follow-ups (low, not blocking).**
+  - If every row's `ref_lufs` is non-plain (NaN, infinite, or within 1e-4 of 0), a 94k create takes 5.6–6.2 s because the Python fallback is slow. Fix it with COPY or `page_size=len(values)`, and a track-range predicate on the fallback SELECT.
+  - Compute the float4 text once in `_PLAIN_LUFS`: +6% create time was measured.
 
 **P2-5 — Migration and lock hygiene (P3 migration items).**
 - Files: `migrate_attempts` and the other `ADD COLUMN IF NOT EXISTS` sequences; `collection_manager.py:147-151`.
@@ -426,6 +461,8 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 - Files: `plugins/FederatedAlbums/__init__.py` (650-662).
 - Change: connect timeout 3 s, read timeout 5 s, a response size cap, and a short negative cache for failing friends. This keeps one slow friend server from pinning the 4 host threads.
 - Test: a mocked slow upstream returns within 6 s.
+
+**P2-8 — FederatedAlbums migration lock hygiene (follow-up found in P2-5).** FederatedAlbums still runs raw `ALTER`/`CREATE INDEX` on every migrate, which takes ACCESS EXCLUSIVE or SHARE locks each time: `catalog_store.py` ~43-55, `sync_jobs.py` ~20, `__init__.py` ~177. It is packaged separately, so it needs its own copy of the P2-5 helpers (`ensure_columns`/`ensure_index` with a bounded `lock_timeout` and retry). The plugin is private, not published, so this is low priority; it can run in any phase. Done: `plugins/FederatedAlbums/migrations.py` copies `run_ddl`, `ensure_columns` and `ensure_index`, and every per-migrate `ADD COLUMN` and `CREATE INDEX` now goes through them, so a no-op re-migrate takes no lock above ROW EXCLUSIVE and needed DDL waits boundedly (`tests/plugins/test_federated_albums_migration_locks_postgres.py`).
 
 ### Phase 3 — Semantics, product and structure
 

@@ -1,0 +1,251 @@
+{
+  "benches": {
+    "bootstrap": {
+      "bench": "bootstrap",
+      "conn_setup_ms": {
+        "max_ms": 4.41,
+        "n": 30,
+        "p50_ms": 3.04,
+        "p95_ms": 3.96
+      },
+      "create": {
+        "elapsed_s": 2.1,
+        "error": null,
+        "global_lock_max_hold_ms": 5.2,
+        "snapshot_rows": 94000,
+        "snapshot_table_mb": 73.9,
+        "wal_mb": 76.9
+      },
+      "page_size": 50,
+      "pages": {
+        "first_pages_avg_bytes": 1003298,
+        "max_ms": 147.19,
+        "n": 1880,
+        "p50_ms": 24.24,
+        "p95_ms": 32.34,
+        "pages": 1880
+      },
+      "pages_from": "create",
+      "profiles": 94000
+    },
+    "projection_delta": {
+      "analysis_items_mb": 294.7,
+      "bench": "projection",
+      "changes": 1,
+      "elapsed_s": 6.18,
+      "generation": 2,
+      "items": 69000,
+      "links": 132000,
+      "links_mb": 61.6,
+      "peak_rss_mb": 356.5,
+      "ready": 76000,
+      "rss_growth_mb": 233.7,
+      "scenario": "delta",
+      "statements": 27,
+      "unchanged": false,
+      "wal_mb": 317.5
+    },
+    "projection_nochange": {
+      "analysis_items_mb": 147.4,
+      "bench": "projection",
+      "changes": 0,
+      "elapsed_s": 3.04,
+      "generation": 1,
+      "items": 69000,
+      "links": 132000,
+      "links_mb": 30.8,
+      "peak_rss_mb": 356.8,
+      "ready": 76000,
+      "rss_growth_mb": 233.8,
+      "scenario": "nochange",
+      "statements": 11,
+      "unchanged": true,
+      "wal_mb": 0.0
+    },
+    "publication": {
+      "bench": "publication",
+      "compaction_delete_ms": {
+        "max_ms": 13.39,
+        "n": 40,
+        "p50_ms": 12.03,
+        "p95_ms": 12.85
+      },
+      "complete_attempt_ms": {
+        "max_ms": 8.2,
+        "n": 40,
+        "p50_ms": 4.97,
+        "p95_ms": 5.99
+      },
+      "iterations": 40,
+      "record_profile_change_commit_ms": {
+        "max_ms": 1.97,
+        "n": 40,
+        "p50_ms": 1.39,
+        "p95_ms": 1.61
+      },
+      "record_profile_change_ms": {
+        "max_ms": 1.63,
+        "n": 40,
+        "p50_ms": 1.07,
+        "p95_ms": 1.23
+      },
+      "retained_events_after": 50000,
+      "retained_events_before": 50000,
+      "retention_limit": 50000
+    },
+    "routes": {
+      "bench": "routes",
+      "ping_delay_s": 0.0,
+      "routes": {
+        "/api/catalog/health": {
+          "bytes": 6950,
+          "eligible": 132000,
+          "http": 200,
+          "logged_errors": [],
+          "max_ms": 3.71,
+          "mean_ms": 3.19,
+          "n": 30,
+          "p50_ms": 3.19,
+          "p95_ms": 3.62,
+          "readiness_status": "progressive",
+          "ready_links": 76000,
+          "stmts_per_req": 6,
+          "upstream_pings": 1
+        },
+        "/api/health": {
+          "bytes": 3431,
+          "http": 200,
+          "logged_errors": [],
+          "max_ms": 2.34,
+          "mean_ms": 1.45,
+          "n": 30,
+          "p50_ms": 1.32,
+          "p95_ms": 2.05,
+          "stmts_per_req": 5,
+          "upstream_pings": 0
+        },
+        "/settings/status": {
+          "bytes": 12978,
+          "http": 200,
+          "logged_errors": [],
+          "max_ms": 6.81,
+          "mean_ms": 5.03,
+          "n": 30,
+          "p50_ms": 5.0,
+          "p95_ms": 6.45,
+          "stmts_per_req": 15,
+          "upstream_pings": 0
+        }
+      }
+    }
+  },
+  "budgets": {
+    "bootstrap_create": {
+      "budget": "v2 create at 94k <=5 s, no global lock held >50 ms",
+      "measured": {
+        "elapsed_s": 2.1,
+        "error": null,
+        "global_lock_max_hold_ms": 5.2,
+        "profiles": 94000,
+        "wal_mb": 76.9
+      },
+      "met": true
+    },
+    "bootstrap_page": {
+      "budget": "v2 snapshot page <=50 ms p95 server-side",
+      "measured": {
+        "p95_ms": 32.34,
+        "page_size": 50,
+        "pages": 1880,
+        "pages_from": "create"
+      },
+      "met": true
+    },
+    "health": {
+      "budget": "/api/catalog/health <=50 ms p95 (provider ping excluded)",
+      "measured": {
+        "api_health_p95_ms": 2.05,
+        "http": 200,
+        "p95_ms": 3.62
+      },
+      "met": true
+    },
+    "projection_delta": {
+      "budget": "projection with a 1-row delta <=10 s",
+      "measured": {
+        "changes": 1,
+        "elapsed_s": 6.18,
+        "peak_rss_mb": 356.5,
+        "wal_mb": 317.5
+      },
+      "met": true
+    },
+    "projection_nochange": {
+      "budget": "projection with no change <=5 s and <=400 MB peak RSS",
+      "measured": {
+        "elapsed_s": 3.04,
+        "peak_rss_mb": 356.8,
+        "unchanged": true
+      },
+      "met": true
+    },
+    "publication": {
+      "budget": "publication critical section (complete_attempt) <=5 ms p95 at 50k retained events",
+      "measured": {
+        "p95_ms": 5.99,
+        "record_profile_change_commit_p95_ms": 1.61,
+        "retained_events": 50000
+      },
+      "met": false
+    },
+    "settings_status": {
+      "budget": "/settings/status <=100 ms p95",
+      "measured": {
+        "http": 200,
+        "p95_ms": 6.45
+      },
+      "met": true
+    }
+  },
+  "environment": {
+    "cpu_model": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpus": 4,
+    "git_sha": "66ec4c3641826bdab39767c10f4bc5a9e661f495",
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "postgres": "PostgreSQL 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+    "postgres_settings": {
+      "effective_cache_size": "5242888kB",
+      "fsync": "on",
+      "max_wal_size": "1024MB",
+      "shared_buffers": "163848kB",
+      "synchronous_commit": "on",
+      "wal_level": "replica",
+      "work_mem": "4096kB"
+    },
+    "python": "3.11.15",
+    "ram_gb": 15.7,
+    "timestamp": "2026-09-25T19:52:36+00:00"
+  },
+  "fixture": {
+    "counts": {
+      "albums": 12000,
+      "artists": 6000,
+      "items": 69000,
+      "pairs": 7000,
+      "profiles": 94000,
+      "tasks": 150000,
+      "tracks": 132000
+    },
+    "edge_template": "docs/audit/2026-09-24/probes/lum010/edge.json",
+    "events": 50000,
+    "scale": 1.0,
+    "seed": 1
+  },
+  "options": {
+    "max_pages": 0,
+    "page_size": 50,
+    "ping_delay_s": 0.0,
+    "pub_n": 40,
+    "route_n": 30
+  }
+}

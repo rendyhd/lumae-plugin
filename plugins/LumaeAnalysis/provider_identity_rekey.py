@@ -900,8 +900,14 @@ def _publish_provider_identity_rekey(
                 scan_id,
             ),
         )
+    # P2-1: the link counts of the carried analysis generation, exact for it;
+    # the catalogue coverage is counted after the commit.
+    from .status_model import persist_analysis_summary, refresh_status_summary
+
+    persist_analysis_summary(cur, catalog_instance_id, next_analysis_generation)
     cur.close()
     db.commit()
+    refresh_status_summary(db, catalog_instance_id, adapter)
     return {
         "catalog_instance_id": catalog_instance_id,
         "server_id": server_id,

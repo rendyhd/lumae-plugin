@@ -444,21 +444,10 @@ AWKWARD_IDS = [
 ]
 
 
-def test_copy_value_escapes_copy_text_format():
-    copy_value = profile_bootstrap._copy_value
-    assert copy_value(None) == "\\N"
-    assert copy_value("\\N") == "\\\\N"
-    assert copy_value("a\tb\nc\rd\\e") == "a\\tb\\nc\\rd\\\\e"
-    # The backslash is doubled first, so an escaped tab is not re-escaped.
-    assert copy_value("\\\t") == "\\\\\\t"
-    assert copy_value("\\.") == "\\\\."
-    assert copy_value(12) == "12"
-    assert copy_value("plain 曲 \U0001F3B5") == "plain 曲 \U0001F3B5"
-
-
 def test_awkward_track_ids_round_trip_through_copy_capture(db):
-    """Snapshot and catch-up rows go in with COPY: every id round-trips and the
-    pages equal the pre-K2 wire output, with and without edges."""
+    """Snapshot and catch-up rows are built in SQL (P2-4; COPY before it):
+    every id round-trips and the pages equal the pre-K2 wire output, with and
+    without edges."""
     with db.cursor() as cur:
         for index, track_id in enumerate(AWKWARD_IDS):
             _profile(cur, track_id, f"awkward-{index}")

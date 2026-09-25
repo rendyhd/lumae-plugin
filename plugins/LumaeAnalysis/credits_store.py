@@ -8,6 +8,7 @@ import json
 import uuid
 
 from plugin.api import table
+from . import migrations
 from .catalog import canonical_json, opaque_cursor, parse_opaque_cursor, resolve_catalog_source, _external_ids
 from .credits_matching import MATCHING_VERSION
 
@@ -32,7 +33,7 @@ def migrate(db):
             lease_token TEXT, lease_until TIMESTAMPTZ, attempts INTEGER NOT NULL DEFAULT 0,
             last_error TEXT, PRIMARY KEY(catalog_instance_id,album_id),
             CHECK(status IN('pending','running','complete','unresolved','empty','failed')))""",
-        f"CREATE INDEX IF NOT EXISTS {table('credits_jobs_ready')} ON {table('credits_jobs')}(not_before,priority DESC,requested_at)",
+        lambda cur: migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS {table('credits_jobs_ready')} ON {table('credits_jobs')}(not_before,priority DESC,requested_at)"),
         f"""CREATE TABLE IF NOT EXISTS {table('credits_results')} (
             catalog_instance_id TEXT NOT NULL REFERENCES {table('catalog_sources')}(catalog_instance_id) ON DELETE CASCADE,
             album_id TEXT NOT NULL,input_fp TEXT NOT NULL,seq BIGINT NOT NULL,payload JSONB NOT NULL,
@@ -41,15 +42,14 @@ def migrate(db):
             catalog_instance_id TEXT NOT NULL REFERENCES {table('catalog_sources')}(catalog_instance_id) ON DELETE CASCADE,
             seq BIGINT NOT NULL,album_id TEXT NOT NULL,payload JSONB,
             created_at TIMESTAMPTZ NOT NULL DEFAULT now(),PRIMARY KEY(catalog_instance_id,seq))""",
-        f"CREATE INDEX IF NOT EXISTS {table('credits_versions_subject')} ON {table('credits_versions')}(catalog_instance_id,album_id,seq DESC)",
+        lambda cur: migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS {table('credits_versions_subject')} ON {table('credits_versions')}(catalog_instance_id,album_id,seq DESC)"),
         f"""CREATE TABLE IF NOT EXISTS {table('credits_http_cache')} (
             request_key TEXT PRIMARY KEY,payload JSONB NOT NULL,expires_at TIMESTAMPTZ NOT NULL)""",
         f"""CREATE TABLE IF NOT EXISTS {table('credits_http_control')} (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),next_request_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
         f"INSERT INTO {table('credits_http_control')}(singleton) VALUES(1) ON CONFLICT DO NOTHING",
     ]
-    for sql in statements:
-        cur.execute(sql)
+    migrations.apply(cur, statements)
     cur.close()
 
 

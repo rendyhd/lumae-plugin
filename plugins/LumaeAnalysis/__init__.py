@@ -25,6 +25,7 @@ from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
     publish_edge_profile, edge_backfill_candidates,
 )
+from . import migrations
 from . import optional_storage
 from . import credits_service, credits_store, personal_discovery, music_metadata
 from .shelves import SHELVES_SCHEMA_VERSION, migrate_shelves, register_shelf_routes
@@ -74,6 +75,7 @@ from .catalog_enrichment import (
     serialize_profile,
 )
 from .catalog_readiness import CONTRACT_REVISION, v3_release_readiness
+from . import status_model
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .database_state import collect_database_state, render_database_state, safe_snapshot_error
 from .settings_ui import SETTINGS_STATUS_SCRIPT
@@ -555,6 +557,9 @@ def catalog_refresh_task(server_id=None):
     except Exception:
         _rollback_if_possible(get_db())
         logger.exception("Optional measurement retention will retry on the next catalogue refresh")
+    # The publication may have withdrawn profiles; /settings/status reads
+    # these counts (P2-1).
+    refresh_status_snapshot(get_db(), result.get("catalog_instance_id"))
     return result
 
 
@@ -957,6 +962,11 @@ def catalog_reconcile_task():
         }
     finally:
         _safe_reconcile_schedule(db)
+        # The tick ran at most one action (a profile batch, a finalization, a
+        # catalogue publication); the waveform counts that /settings/status
+        # reads follow it, and a publication left without a summary gets one
+        # (P2-1).
+        refresh_status_snapshot(db, publications=True)
 
 
 def analysis_projection_task(server_id=None):
@@ -1131,6 +1141,20 @@ def observe_provider_identities_on_start():
         _rollback_if_possible(db)
         logger.exception("lumae_analysis could not ensure reconcile schema")
     try:
+        # The P2-1 status summary, repaired the same way. Only generations
+        # without a summary are counted, so this is normally a few lookups.
+        cur = db.cursor()
+        try:
+            status_model.migrate_status_summary(cur)
+            db.commit()
+            status_model.backfill_publication_summaries(cur, commit=db.commit)
+        finally:
+            cur.close()
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not ensure the status summary")
+    try:
         log_integrity_on_start(db)
     except Exception:
         logger.exception("lumae_analysis could not check upgrade integrity")
@@ -1220,9 +1244,10 @@ def migrate(db):
         )
         """
     )
-    cur.execute(
+    migrations.ensure_index(
+        cur,
         f"CREATE INDEX IF NOT EXISTS {table('source_profiles_status_idx')} "
-        f"ON {source_profiles_table()} (catalog_instance_id, status)"
+        f"ON {source_profiles_table()} (catalog_instance_id, status)",
     )
     migrate_attempts(cur)
     migrate_edge_profiles(db)
@@ -1334,16 +1359,13 @@ def migrate(db):
         )
         """
     )
-    for column in (
+    migrations.ensure_columns(
+        cur, preparation_state_table(),
         "target_plugin_version TEXT",
         "target_catalog_builder_version INTEGER",
         "worker_plugin_version TEXT",
         "worker_catalog_builder_version INTEGER",
-    ):
-        cur.execute(
-            f"ALTER TABLE {preparation_state_table()} "
-            f"ADD COLUMN IF NOT EXISTS {column}"
-        )
+    )
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {profile_backfill_state_table()} (
@@ -1360,9 +1382,9 @@ def migrate(db):
         )
         """
     )
-    cur.execute(
-        f"ALTER TABLE {profile_backfill_state_table()} "
-        "ADD COLUMN IF NOT EXISTS refresh_wake_pending BOOLEAN NOT NULL DEFAULT FALSE"
+    migrations.ensure_columns(
+        cur, profile_backfill_state_table(),
+        "refresh_wake_pending BOOLEAN NOT NULL DEFAULT FALSE",
     )
     cur.execute(
         f"""
@@ -1386,9 +1408,10 @@ def migrate(db):
         )
         """
     )
-    cur.execute(
+    migrations.ensure_index(
+        cur,
         f"CREATE INDEX IF NOT EXISTS {table('analysis_runs_status_idx')} "
-        f"ON {analysis_runs_table()} (status, updated_at)"
+        f"ON {analysis_runs_table()} (status, updated_at)",
     )
     # Releases through 1.1.6 could strand rows while importing AudioMuse/RQ
     # queue internals. Re-admit them to the database-driven reconciler.
@@ -1421,9 +1444,14 @@ def migrate(db):
     migrate_enrichment(db)
     credits_store.migrate(db)
     prune_catalog_storage(db)
+    # Must run after the published-profile seed above (marker
+    # published_source_profiles_seed_v1): its edge sweep deletes every edge
+    # no published profile reaches, which before the seed is every edge of a
+    # 1.2.5 install (P2-3).
     compact_enrichment_storage(db)
     migrate_collections(db)
     refresh_integrity_snapshot(db)
+    refresh_status_summaries(db)
     migrate_shelves(db)
     personal_discovery.migrate(db)
     music_metadata.migrate(db)
@@ -2105,8 +2133,11 @@ def health():
                     "protocol_version": 2,
                     "schema_version": 1,
                     "auth": "host_authenticated",
+                    "auth_enabled": _host_auth_enabled(),
                     "transfer_contract": profile_bootstrap.TRANSFER_CONTRACT,
-                    "available": bool(getattr(host_api.config, "DATABASE_URL", None)),
+                    "available": profile_bootstrap.availability(),
+                    "sliding_expiry": True,
+                    "idempotent_create": True,
                 },
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
@@ -2169,13 +2200,24 @@ def catalog_health():
                 bridge = ProviderCatalogBridge()
                 for candidate in bridge.list_servers():
                     if candidate.get("supported"):
-                        observe_provider_version(
+                        # Pinged on every request, written only when the state
+                        # or version changed (P2-1). An applied transition's
+                        # AudioMuse health is refreshed by the
+                        # provider_identity_recheck cron, not by this GET.
+                        observation = observe_provider_version(
                             db,
                             bridge,
                             candidate["server_id"],
-                            commit=True,
+                            commit=False,
+                            refresh_health=False,
                         )
+                        if (observation or {}).get("written"):
+                            # The route owns its transaction: a changed
+                            # identity is durable before the next server or
+                            # the readiness below is read.
+                            db.commit()
             except Exception:
+                _rollback_if_possible(db)
                 logger.exception("lumae_analysis could not observe provider identity")
         try:
             if db is not None:
@@ -2866,25 +2908,92 @@ def profile_changes_api():
         return _catalog_error("invalid_cursor", str(exc), 400)
 
 
-def _profile_bootstrap_v2(operation):
-    if not getattr(host_api.config, "DATABASE_URL", None):
-        return _catalog_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
+def _host_auth_enabled():
+    """The host's live AUTH_ENABLED (K4); health ``auth`` stays the design string."""
+    value = getattr(host_api.config, "AUTH_ENABLED", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _bootstrap_caller():
+    """Who a v2 create counts against for the per-source rate limit."""
+    username = getattr(g, "auth_user", None)
+    if username:
+        return f"user:{username}"
+    if getattr(g, "auth_method", None) == "bearer":
+        return "bearer"
+    return profile_bootstrap.ANONYMOUS_CALLER
+
+
+V2_BODY_MAX_BYTES = 16_384
+
+
+def _v2_body(max_bytes=V2_BODY_MAX_BYTES):
+    """The v2 JSON body, reading at most ``max_bytes`` + 1 bytes from the stream.
+
+    ``Content-Length`` is checked first; a chunked body has none, so the read
+    itself is bounded too. Non-JSON content types read as an empty body, like
+    ``request.get_json(silent=True)``.
+    """
+    if request.content_length is not None and request.content_length > max_bytes:
+        raise ValueError("Request body is too large")
+    # A host hook may already have read (and cached) the body.
+    raw = getattr(request, "_cached_data", None)
+    if raw is None:
+        # Read until EOF or one byte past the cap: a stream may return short reads.
+        chunks, size = [], 0
+        while size <= max_bytes:
+            chunk = request.stream.read(max_bytes + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        raw = b"".join(chunks)
+    if len(raw) > max_bytes:
+        raise ValueError("Request body is too large")
+    if not request.is_json or not raw:
+        return {}
     try:
-        body = _json_body(max_bytes=16_384)
+        body = json.loads(raw)
     except ValueError:
-        return _catalog_error("invalid_profile_bootstrap", "Invalid bootstrap request.", 400)
+        return {}
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise ValueError("JSON body must be an object")
+    return body
+
+
+def _bootstrap_error(code, message, status, retry_after=None):
+    response = _catalog_error(code, message, status)
+    if status == 503:
+        retry_after = retry_after or profile_bootstrap.UNAVAILABLE_RETRY_AFTER_S
+    if status in (429, 503) and retry_after:
+        response.headers["Retry-After"] = str(int(retry_after))
+    return response
+
+
+def _profile_bootstrap_v2(operation, **options):
+    if not getattr(host_api.config, "DATABASE_URL", None):
+        return _bootstrap_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
     try:
-        result = operation(body)
+        body = _v2_body()
+    except ValueError:
+        return _bootstrap_error("invalid_profile_bootstrap", "Invalid bootstrap request.", 400)
+    try:
+        result = operation(body, **options)
         return _private_json(result)
     except profile_bootstrap.BootstrapError as exc:
-        return _catalog_error(exc.code, exc.code, exc.status)
-    except Exception:
-        return _catalog_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
+        return _bootstrap_error(exc.code, exc.code, exc.status, exc.retry_after)
+    except Exception as exc:
+        logger.exception("lumae_analysis profile bootstrap route failed (%s)", type(exc).__name__)
+        return _bootstrap_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
 
 
 @bp.post("/api/profiles/bootstrap/sessions")
 def profile_bootstrap_sessions_api():
-    return _profile_bootstrap_v2(profile_bootstrap.create_session)
+    return _profile_bootstrap_v2(profile_bootstrap.create_session, caller=_bootstrap_caller())
 
 
 @bp.post("/api/profiles/bootstrap/sessions/page")
@@ -3485,6 +3594,12 @@ def analyze_song_hook(song):
             catalog_instance_id=catalog_instance_id, attempt_token=token,
             **({"failure_code": failure_code} if failure_code else {}),
         )
+        # An AudioMuse run completes profiles song by song. Keep the settings
+        # counts moving without counting the library for every song (P2-1).
+        refresh_status_snapshot(
+            catalog_instance_id=catalog_instance_id,
+            min_age_seconds=status_model.PROFILE_COUNTS_MIN_AGE_SECONDS,
+        )
         return {"track_id": track_id, "status": status if applied else "superseded"}
 
     if not audio_path or not os.path.exists(audio_path):
@@ -3642,6 +3757,11 @@ def analyze_tracks_task(
     }
     if catalog_instance_id:
         finalize_preparation_if_settled(catalog_instance_id)
+        if priority != "background":
+            # Background batches run inside a watchdog tick, which refreshes
+            # the settings counts when it ends; an interactive batch refreshes
+            # them itself (P2-1).
+            refresh_status_snapshot(catalog_instance_id=catalog_instance_id)
     return summary
 
 
@@ -3869,9 +3989,12 @@ def find_all_backfill_ids(catalog_instance_id=None, server_id=None, include_fail
     return ids
 
 
-def analysis_status_counts(catalog_instance_id=None, server_id=None):
-    db = get_db()
-    cur = db.cursor()
+def _analysis_status_counts_query(catalog_instance_id=None, server_id=None):
+    """The waveform status aggregate. Its sixth column is the counted generation.
+
+    ``analysis_status_counts`` runs it live; ``refresh_status_snapshot`` stores
+    its result for ``/settings/status`` (P2-1).
+    """
     profile_table = source_profiles_table() if catalog_instance_id else profiles_table()
     profile_source_join = (
         "AND p.catalog_instance_id=source.catalog_instance_id" if catalog_instance_id else ""
@@ -3889,8 +4012,7 @@ def analysis_status_counts(catalog_instance_id=None, server_id=None):
     # the legacy global MEDIASERVER_* configuration fields.
     retry_skipped = True
     params.extend((ANALYZER_VERSION, retry_skipped))
-    cur.execute(
-        f"""
+    sql = f"""
         WITH source AS (
             SELECT s.catalog_instance_id, c.published_generation
               FROM {table('catalog_sources')} s
@@ -3914,7 +4036,8 @@ def analysis_status_counts(catalog_instance_id=None, server_id=None):
             COUNT(*) FILTER (WHERE p.status='failed')::BIGINT,
             COUNT(*) FILTER (
                 WHERE p.status='skipped_no_file' AND NOT %s
-            )::BIGINT
+            )::BIGINT,
+            (SELECT published_generation FROM source)
           FROM source
           JOIN {table('catalog_tracks')} t
             ON t.catalog_instance_id=source.catalog_instance_id
@@ -3922,12 +4045,17 @@ def analysis_status_counts(catalog_instance_id=None, server_id=None):
           LEFT JOIN {profile_table} p ON p.track_id=t.track_id
                {profile_source_join}
          WHERE t.available=TRUE AND t.analysis_eligible=TRUE
-        """,
-        tuple(params),
-    )
+        """
+    return sql, tuple(params)
+
+
+def analysis_status_counts(catalog_instance_id=None, server_id=None):
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(*_analysis_status_counts_query(catalog_instance_id, server_id))
     row = cur.fetchone() or (0, 0, 0, 0, 0)
     cur.close()
-    total, ready, pending, failed, skipped = (int(value or 0) for value in row)
+    total, ready, pending, failed, skipped = (int(value or 0) for value in row[:5])
     return {
         "total_with_files": total,
         "ready_current": ready,
@@ -3936,6 +4064,100 @@ def analysis_status_counts(catalog_instance_id=None, server_id=None):
         "skipped": skipped,
         "needs_analysis": max(0, total - ready - pending - failed - skipped),
     }
+
+
+def _store_profile_snapshots(cur, catalog_instance_id=None, min_age_seconds=0,
+                             missing_only=False):
+    if catalog_instance_id:
+        targets = [str(catalog_instance_id)]
+    else:
+        cur.execute(
+            f"""
+            SELECT s.catalog_instance_id
+              FROM {table('catalog_sources')} s
+              JOIN {table('catalog_state')} c USING (catalog_instance_id)
+              LEFT JOIN {table('status_summary')} ss USING (catalog_instance_id)
+             WHERE NOT %s OR ss.profile_generation IS DISTINCT FROM c.published_generation
+             ORDER BY s.catalog_instance_id
+            """,
+            (bool(missing_only),),
+        )
+        targets = [str(row[0]) for row in cur.fetchall()]
+    stored = 0
+    for target in targets:
+        if min_age_seconds:
+            age = status_model.profile_counts_age_seconds(cur, target)
+            if age is not None and age < min_age_seconds:
+                continue
+        sql, params = _analysis_status_counts_query(catalog_instance_id=target)
+        status_model.store_profile_counts(cur, target, sql, params)
+        stored += 1
+    return stored
+
+
+def refresh_status_snapshot(db=None, catalog_instance_id=None, min_age_seconds=0,
+                            publications=False):
+    """Refresh the waveform counts that ``/settings/status`` reads (P2-1).
+
+    Background work calls this after it changed profile state; the GET route
+    only reads the snapshot. With ``min_age_seconds`` a snapshot younger than
+    that is kept. ``publications`` first summarizes any published generation
+    that has no summary (a failed post-commit refresh, a rebound source, an
+    older worker's publication). Never raises: a failed refresh keeps the
+    previous snapshot, and the route counts live when the snapshot describes
+    another generation.
+    """
+    try:
+        db = db or get_db()
+    except Exception:
+        db = None
+    if db is None:
+        return 0
+    try:
+        cur = db.cursor()
+        try:
+            if publications:
+                # Committed per source and before the waveform count, so no
+                # analysis_state row lock is held while counting.
+                status_model.backfill_publication_summaries(cur, commit=db.commit)
+                db.commit()
+            stored = _store_profile_snapshots(cur, catalog_instance_id, min_age_seconds)
+        finally:
+            cur.close()
+        db.commit()
+        return stored
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning(
+            "lumae_analysis could not refresh the settings status counts", exc_info=True
+        )
+        return 0
+
+
+def refresh_status_summaries(db):
+    """Install and upgrade: summarize what is already published (P2-1).
+
+    Runs in the install transaction; the caller commits. Only what has no
+    summary yet is counted, so a re-run writes nothing.
+    """
+    cur = db.cursor()
+    try:
+        status_model.backfill_publication_summaries(cur)
+        _store_profile_snapshots(cur, missing_only=True)
+    finally:
+        cur.close()
+
+
+def _committed_profile_counts(source):
+    """The committed waveform counts of a source, or None to count live."""
+    db = None
+    try:
+        db = get_db()
+        return status_model.profile_counts(db, source) if db is not None else None
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not read the settings status counts", exc_info=True)
+        return None
 
 
 def queue_backfill_batch(
@@ -5221,7 +5443,9 @@ def render_source_preparation_sections(batch_size):
     for source in sources:
         catalog_instance_id = source["catalog_instance_id"]
         server_id = source["server_id"]
-        counts = analysis_status_counts(
+        # The settings poll reads the committed snapshot (P2-1). The live
+        # aggregate runs only when no snapshot describes this generation.
+        counts = _committed_profile_counts(source) or analysis_status_counts(
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
         )

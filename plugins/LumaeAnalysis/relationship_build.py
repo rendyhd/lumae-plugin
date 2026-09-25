@@ -1,8 +1,9 @@
 """Checkpointed relationship preparation with a short atomic publication.
 
 The session advisory lock owns computation, including across checkpoint commits.
-Published rows are never used as scratch space. Input generations AND epochs pin
-all checkpoints; the final transaction locks and revalidates their source rows.
+Published rows are never used as scratch space. The catalogue generation, a
+digest of the analysis rows the build reads, AND both epochs pin all
+checkpoints; the final transaction locks and revalidates their source rows.
 """
 
 from contextlib import contextmanager
@@ -113,7 +114,50 @@ def unpack_entity(blob):
         return decode(json.loads(archive["metadata"].tobytes().decode("utf-8")))
 
 
+def analysis_inputs_digest(cur, source_id, generation):
+    """Digest of the sonic analysis inputs a relationship build reads.
+
+    ``_load_relationship_inputs`` uses only ready links, and from their items
+    the MusicNN vector and the scalar payload (energy and mood). The UMAP
+    coordinates stored in the same payload are not used. A new projection
+    generation that carries these rows unchanged keeps the same digest, so it
+    neither restarts a running build nor requires a rebuild.
+    """
+    # One MD5 per input row, then one SHA-256 over them in track order. OFFSET 0
+    # keeps the sort on (track, digest) pairs instead of whole item rows.
+    cur.execute(f"""
+        SELECT encode(sha256(convert_to(COALESCE(
+                   string_agg(row_digest, '' ORDER BY provider_track_id), ''), 'UTF8')), 'hex'),
+               count(*)
+          FROM (
+            SELECT ln.provider_track_id,
+                   md5(ROW(ln.provider_track_id, ai.musicnn_dimensions,
+                           COALESCE(ai.musicnn_fp, encode(sha256(ai.musicnn_vector), 'hex')),
+                           ai.scalar_payload - 'umap')::text) AS row_digest
+              FROM {t('track_analysis_links')} ln
+              JOIN {t('analysis_items')} ai
+                ON ai.catalog_instance_id=ln.catalog_instance_id
+               AND ai.projection_generation=ln.projection_generation
+               AND ai.analysis_id=ln.analysis_id
+             WHERE ln.catalog_instance_id=%s AND ln.projection_generation=%s
+               AND ln.status='ready'
+            OFFSET 0
+          ) inputs
+    """, (source_id, generation))
+    digest, count = cur.fetchone()
+    return f"{int(count)}:{digest}"
+
+
 def input_identity(cur, source_id, lock=False):
+    return input_state(cur, source_id, lock=lock)[0]
+
+
+def input_state(cur, source_id, lock=False):
+    """Return ``(identity, analysis_generation)``.
+
+    The identity pins the catalogue by generation and the analysis by a digest
+    of the rows the build reads, not by the projection generation number.
+    """
     from .catalog_enrichment import RELATIONSHIP_ALGORITHM_VERSION
     cur.execute(f"""
         SELECT s.current_core_server_id, s.rebind_status,
@@ -129,12 +173,14 @@ def input_identity(cur, source_id, lock=False):
     if (not row or row[1] != 'active' or row[4] != 'complete'
             or row[7] != 'complete' or int(row[2]) <= 0 or int(row[5]) <= 0):
         raise InputsChanged("Waiting for published catalogue and sonic analysis inputs")
+    analysis_generation = int(row[5])
     return {
         "server_id": row[0], "catalog_generation": int(row[2]), "catalog_epoch": row[3],
-        "analysis_generation": int(row[5]), "analysis_epoch": row[6],
+        "analysis_inputs": analysis_inputs_digest(cur, source_id, analysis_generation),
+        "analysis_epoch": row[6],
         "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
         "build_format_version": BUILD_FORMAT_VERSION,
-    }
+    }, analysis_generation
 
 
 class Build:
@@ -186,11 +232,14 @@ class Build:
                  self.diagnostics['timings_ms'], self.diagnostics['counts'])
 
     def verify_inputs(self, cur, lock=False):
-        if input_identity(cur, self.source_id, lock=lock) != self.identity:
+        identity, analysis_generation = input_state(cur, self.source_id, lock=lock)
+        if identity != self.identity:
             raise InputsChanged("Catalogue or sonic analysis changed; restarting relationship build")
+        # An equal digest means the current generation holds the same inputs.
+        self.analysis_generation = analysis_generation
 
     def initialize(self, cur):
-        self.identity = input_identity(cur, self.source_id)
+        self.identity, self.analysis_generation = input_state(cur, self.source_id)
         cur.execute(f"SELECT build_id, input_identity, phase, progress FROM {t('relationship_builds')} "
                     "WHERE catalog_instance_id=%s", (self.source_id,))
         old = cur.fetchone()
@@ -227,12 +276,18 @@ class Build:
                           for payload, blob in cur.fetchall()]
         else:
             with self.timed("input_loading"):
+                loaded_generation = self.analysis_generation
                 tracks = e._load_relationship_inputs(cur, {
                     "catalog_instance_id": self.source_id,
                     "catalog": {"generation": self.identity["catalog_generation"]},
-                    "analysis": {"generation": self.identity["analysis_generation"]},
+                    "analysis": {"generation": loaded_generation},
                 })
                 self.verify_inputs(cur)
+                # The digest describes the current generation. If a projection
+                # published an identical one and pruned the loaded generation
+                # meanwhile, the load may have read nothing; load again.
+                if self.analysis_generation != loaded_generation:
+                    raise InputsChanged("Sonic analysis generation advanced while loading inputs")
         self.db.commit()
         album_keys = {f"{r['artist'].lower()}::{r['album'].lower()}" for r in tracks if r['album']}
         artist_keys = {r['artist'].lower() for r in tracks}
@@ -408,7 +463,7 @@ class Build:
                     completed_at=now(), last_error=NULL, updated_at=now()
                  WHERE catalog_instance_id=%s
             """, (e.RELATIONSHIP_SCHEMA_VERSION, e.RELATIONSHIP_ALGORITHM_VERSION,
-                  self.identity['catalog_generation'], self.identity['analysis_generation'],
+                  self.identity['catalog_generation'], self.analysis_generation,
                   generation, head_seq + changes, counts['albums'], counts['artists'], self.source_id))
             e.compact_change_journal(
                 cur, catalog_instance_id=self.source_id, state_table='relationship_state',
@@ -457,7 +512,12 @@ def run_relationship_build(source_id, *, db, candidate_lookup, progress=None,
         if build.phase == 'complete':
             # Scratch storage is bounded to the active build, not a history of
             # full-library embeddings. Retain only counts/timings after success.
-            cur.execute(f"UPDATE {t('relationship_state')} SET status='complete' WHERE catalog_instance_id=%s", (source_id,))
+            # A completed build whose input digest still matches is current for
+            # the present analysis generation too: record that generation
+            # instead of recomputing identical relationships.
+            cur.execute(f"UPDATE {t('relationship_state')} SET status='complete', "
+                        "source_analysis_generation=%s WHERE catalog_instance_id=%s",
+                        (build.analysis_generation, source_id))
             db.commit()
             try:
                 cur.execute(f"DELETE FROM {t('relationship_build_entities')} WHERE catalog_instance_id=%s", (source_id,))

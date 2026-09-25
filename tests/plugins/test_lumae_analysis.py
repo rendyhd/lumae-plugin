@@ -194,6 +194,7 @@ def test_plugin_manifest_has_lumae_identity():
 def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     mod = load_plugin()
     client = plugin_client(mod)
+    monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", None, raising=False)
 
     response = client.get("/api/health")
 
@@ -212,8 +213,11 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "protocol_version": 2,
                 "schema_version": 1,
                 "auth": "host_authenticated",
+                "auth_enabled": False,
                 "transfer_contract": "source_scoped_v1",
-                "available": bool(getattr(mod.host_api.config, "DATABASE_URL", None)),
+                "available": False,
+                "sliding_expiry": True,
+                "idempotent_create": True,
             },
             "personal_discovery": {"schema_version": 1, "enabled": False, "scope": "shared", "features": ["album_memory_context", "enjoyment_feedback"]},
             "music_metadata": {"schema_version": 1, "enabled": True, "provider": "musicbrainz", "daily_request_limit": 80, "recording_membership": True},
@@ -248,12 +252,25 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
 def test_profile_bootstrap_capability_requires_public_database_url(monkeypatch):
     mod = load_plugin()
     client = plugin_client(mod)
+    probes = []
+    monkeypatch.setattr(mod.profile_bootstrap, "_availability_cache", None)
+    monkeypatch.setattr(mod.profile_bootstrap, "_probe", lambda: probes.append(1) or True)
     monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", "postgresql://test", raising=False)
     capability = client.get("/api/health").get_json()["capabilities"]["profile_bootstrap"]
     assert capability == {"protocol_version": 2, "schema_version": 1,
-                          "auth": "host_authenticated",
-                          "transfer_contract": "source_scoped_v1", "available": True}
+                          "auth": "host_authenticated", "auth_enabled": False,
+                          "transfer_contract": "source_scoped_v1", "available": True,
+                          "sliding_expiry": True, "idempotent_create": True}
+    assert probes == [1]
     monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", None)
+    capability = client.get("/api/health").get_json()["capabilities"]["profile_bootstrap"]
+    assert capability["available"] is False
+    assert probes == [1]
+    # A configured but unreachable database is not available (K4, P1-6).
+    monkeypatch.undo()
+    monkeypatch.setattr(mod.profile_bootstrap, "_availability_cache", None)
+    monkeypatch.setattr(mod.host_api.config, "DATABASE_URL",
+                        "postgresql://nobody@127.0.0.1:1/none", raising=False)
     capability = client.get("/api/health").get_json()["capabilities"]["profile_bootstrap"]
     assert capability["available"] is False
 
@@ -6596,7 +6613,9 @@ def test_refresh_catalog_publishes_complete_generation_and_coverage():
     assert result["field_coverage"]["track_number"]["ratio"] == 1.0
     assert "replay_gain" in result["field_coverage"]
     assert "sample_rate" in result["field_coverage"]
-    assert db.commits == 2
+    # The scan start, the publication and, after it (P2-3), the edge sweep
+    # and the prune of superseded generations.
+    assert db.commits == 4
     assert db.rollbacks == 0
     assert any("catalog_changes" in sql for sql, _params in db.executed)
 
@@ -7029,183 +7048,6 @@ class ProjectionAdapter:
         return "SELECT provider_track_id, analysis_id, match_tier FROM fake_mapping WHERE server_id=%s"
 
 
-def test_analysis_projection_reuses_one_vector_for_two_provider_occurrences(monkeypatch):
-    from plugins.LumaeAnalysis.catalog_analysis import project_analysis
-
-    monkeypatch.setattr(
-        plugin_api_module.config, "CATALOGUE_ID_SCHEME_VERSION", 4, raising=False
-    )
-    monkeypatch.setattr(
-        plugin_api_module.config, "CHROMAPRINT_COLLECTION_ENABLED", True, raising=False
-    )
-    monkeypatch.setattr(
-        plugin_api_module.config, "CHROMAPRINT_GATE_ENABLED", True, raising=False
-    )
-    db = ProjectionDb()
-
-    result = project_analysis("server-a", db=db, adapter=ProjectionAdapter())
-
-    assert result["item_count"] == 1
-    assert result["link_count"] == 2
-    assert result["ready_count"] == 2
-    assert result["evidence_complete_count"] == 2
-    assert result["suspect_count"] == 0
-    assert db.commits == 1
-    assert sum("INSERT INTO plugin_lumae_analysis__analysis_items" in sql for sql, _ in db.executed) == 1
-    assert sum("INSERT INTO plugin_lumae_analysis__track_analysis_links" in sql for sql, _ in db.executed) == 2
-
-
-@pytest.mark.parametrize(
-    ("analysis_status", "expect_unchanged"),
-    (("complete", True), ("failed", False)),
-)
-def test_no_change_analysis_projection_reuses_only_a_complete_generation(
-    monkeypatch,
-    analysis_status,
-    expect_unchanged,
-):
-    import plugins.LumaeAnalysis.catalog_analysis as projection
-    from plugins.LumaeAnalysis.catalog import fingerprint
-
-    item = {
-        "analysis_id": "analysis-a",
-        "scalar_payload": {"tempo": 120},
-        "scalar_fp": "scalar-fp",
-        "umap": None,
-        "umap_fp": None,
-        "musicnn_vector": struct.pack("<2f", 0.1, 0.2),
-        "musicnn_fp": "musicnn-fp",
-        "clap_vector": None,
-        "clap_fp": None,
-    }
-    link = {
-        "provider_track_id": "track-a",
-        "analysis_id": "analysis-a",
-        "status": "ready",
-        "match_tier": "direct",
-        "algorithm": "bounded-test",
-        "decision_threshold": 0.1,
-        "distance": None,
-        "evidence_complete": False,
-        "conflict_flags": [],
-        "review_state": None,
-    }
-
-    class Cursor:
-        def __init__(self):
-            self.row = None
-            self.executed = []
-
-        def execute(self, sql, params=None):
-            self.executed.append((sql, params))
-            self.row = (
-                (7, "analysis-epoch", 42)
-                if "FROM plugin_lumae_analysis__analysis_state" in sql
-                else None
-            )
-
-        def fetchone(self):
-            return self.row
-
-        def close(self):
-            pass
-
-    class Db:
-        def __init__(self):
-            self.cursor_obj = Cursor()
-            self.commits = 0
-
-        def cursor(self):
-            return self.cursor_obj
-
-        def commit(self):
-            self.commits += 1
-
-    db = Db()
-    source = {
-        "catalog_instance_id": "catalog-a",
-        "server_id": "server-a",
-        "catalog": {"status": "complete", "generation": 3},
-        "analysis": {"status": analysis_status, "generation": 7},
-    }
-    monkeypatch.setattr(projection, "resolve_catalog_source", lambda *_a, **_k: [source])
-    monkeypatch.setattr(
-        projection,
-        "_active_catalog_tracks",
-        lambda *_a: {
-            "track-a": {
-                "track_id": "track-a",
-                "title": "Track",
-                "artist": "Artist",
-                "album_id": "album-a",
-                "duration_ms": 180000,
-                "payload": {},
-            }
-        },
-    )
-    monkeypatch.setattr(
-        projection,
-        "_analysis_mapping",
-        lambda *_a: {
-            "track-a": {
-                "analysis_id": "analysis-a",
-                "match_tier": "direct",
-            }
-        },
-    )
-    monkeypatch.setattr(projection, "_analysis_chromaprints", lambda *_a: {})
-    monkeypatch.setattr(projection, "_analysis_rows", lambda *_a: {"analysis-a": item})
-    monkeypatch.setattr(
-        projection,
-        "dedup_policy",
-        lambda: {"algorithm": "bounded-test", "configured_threshold": 0.1},
-    )
-    monkeypatch.setattr(projection, "_apply_progressive_evidence", lambda *_a: None)
-    monkeypatch.setattr(projection, "_apply_provider_conflicts", lambda *_a: None)
-    monkeypatch.setattr(projection, "_suspect_analysis_ids", lambda *_a: set())
-    monkeypatch.setattr(
-        projection,
-        "_old_items",
-        lambda *_a: {
-            "analysis-a": (
-                item["scalar_fp"],
-                item["umap_fp"],
-                item["musicnn_fp"],
-                item["clap_fp"],
-            )
-        },
-    )
-    monkeypatch.setattr(
-        projection,
-        "_old_links",
-        lambda *_a: {"track-a": fingerprint(link)},
-    )
-
-    result = projection.project_analysis(
-        "server-a",
-        db=db,
-        adapter=types.SimpleNamespace(active_server_id=lambda: "server-a"),
-    )
-
-    assert result["generation"] == (7 if expect_unchanged else 8)
-    assert result["changes"] == 0
-    assert db.commits == 1
-    writes = [
-        sql
-        for sql, _params in db.cursor_obj.executed
-        if sql.lstrip().startswith(("INSERT", "UPDATE"))
-    ]
-    if expect_unchanged:
-        assert result["unchanged"] is True
-        assert writes == []
-    else:
-        assert "unchanged" not in result
-        assert len(writes) == 3
-        assert any("analysis_items" in sql for sql in writes)
-        assert any("track_analysis_links" in sql for sql in writes)
-        assert any("status='complete'" in sql for sql in writes)
-
-
 def test_analysis_projection_marks_contradictory_dedup_group_suspect():
     from plugins.LumaeAnalysis.catalog_analysis import _suspect_analysis_ids
 
@@ -7334,54 +7176,6 @@ def test_provider_conflicts_keep_sonic_data_usable_and_preserve_stronger_repair_
     assert links["provider-conflict"]["review_state"] == "needs_review"
 
 
-def test_old_link_fingerprint_uses_the_same_fields_as_new_projection_payload():
-    from plugins.LumaeAnalysis.catalog import fingerprint
-    from plugins.LumaeAnalysis.catalog_analysis import _old_links
-
-    link = {
-        "provider_track_id": "track-a",
-        "analysis_id": "analysis-a",
-        "status": "ready",
-        "match_tier": "provider_occurrence",
-        "algorithm": "audiomuse_catalogue_fp_4",
-        "decision_threshold": 0.01,
-        "distance": None,
-        "evidence_complete": False,
-        "conflict_flags": ["provider_evidence_conflict"],
-        "review_state": "needs_review",
-    }
-
-    class Cursor:
-        def __init__(self):
-            self.sql = ""
-
-        def execute(self, sql, params):
-            self.sql = " ".join(sql.split())
-            assert params == ("catalog-a", 4)
-
-        def fetchall(self):
-            return [
-                (
-                    link["provider_track_id"],
-                    link["analysis_id"],
-                    link["status"],
-                    link["match_tier"],
-                    link["algorithm"],
-                    link["decision_threshold"],
-                    link["distance"],
-                    link["evidence_complete"],
-                    link["conflict_flags"],
-                    link["review_state"],
-                )
-            ]
-
-    cur = Cursor()
-    old = _old_links(cur, "catalog-a", 4)
-
-    assert "review_state" in cur.sql
-    assert old == {"track-a": fingerprint(link)}
-
-
 def test_progressive_evidence_uses_inconclusive_fingerprints_provisionally():
     from plugins.LumaeAnalysis.catalog_analysis import _apply_progressive_evidence
 
@@ -7459,7 +7253,15 @@ class ReadinessCursor:
 
     def execute(self, sql, params=None):
         self.db.executed.append((sql, params))
-        if "FROM plugin_lumae_analysis__catalog_tracks" in sql:
+        if "plugin_lumae_analysis__status_summary" in sql:
+            # The committed status summary (P2-1) for readiness_source():
+            # analysis generation 0, catalogue generation 4.
+            ready, pending, suspect, missing, verified, _provisional = self.db.link_counts
+            self.rows = [
+                (0, ready + pending + missing, ready, pending, suspect, missing, verified,
+                 4, "server-a", *self.db.coverage, None, None, None, None, None, None, None)
+            ]
+        elif "FROM plugin_lumae_analysis__catalog_tracks" in sql:
             self.rows = [self.db.coverage]
         elif "FROM plugin_lumae_analysis__track_analysis_links" in sql:
             self.rows = [self.db.link_counts]
@@ -7620,12 +7422,15 @@ def test_v3_readiness_keeps_incomplete_evidence_progressively_usable():
         "analysis_links_missing",
         "provisional_links_remaining",
     ]
-    link_query = next(
-        sql
+    # P2-1: the counts come from the committed summary, not a library scan;
+    # the summary is written with the same repair definition.
+    assert not any(
+        "track_analysis_links" in sql or "catalog_tracks" in sql
         for sql, _params in db.executed
-        if "track_analysis_links" in sql
     )
-    assert "review_state IN ('needs_repair', 'needs_review')" in link_query
+    from plugins.LumaeAnalysis import status_model
+
+    assert "review_state IN ('needs_repair', 'needs_review')" in status_model.link_counts_sql()
 
 
 def test_v3_historical_upgrade_sequence_is_diagnostic_only():

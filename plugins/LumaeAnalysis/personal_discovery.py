@@ -4,6 +4,7 @@ import json
 import uuid
 from flask import abort, g, jsonify, request
 from plugin.api import get_db, table
+from . import migrations
 from .collection_manager import current_principal, collections_enabled
 
 SCHEMA_VERSION = 1
@@ -119,7 +120,7 @@ def migrate(db):
             principal TEXT NOT NULL, kind TEXT NOT NULL, id TEXT NOT NULL,
             payload JSONB NOT NULL, seq BIGINT NOT NULL,
             PRIMARY KEY(principal,kind,id))""")
-        cur.execute(f"CREATE INDEX IF NOT EXISTS lumae_discovery_changes ON {table('discovery_records')}(principal,seq)")
+        migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS lumae_discovery_changes ON {table('discovery_records')}(principal,seq)")
         cur.execute(f"""CREATE TABLE IF NOT EXISTS {table('discovery_receipts')} (
             principal TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL,
             payload JSONB NOT NULL, status INTEGER NOT NULL, PRIMARY KEY(principal,id))""")

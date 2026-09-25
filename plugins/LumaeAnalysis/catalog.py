@@ -12,10 +12,12 @@ import time
 import unicodedata
 import uuid
 
-from plugin.api import table
+from plugin.api import logger, table
 
+from . import migrations
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .provider_identity_guard import inspect_catalog_identity, observe_provider_version
+from .status_model import migrate_status_summary, refresh_status_summary
 
 
 CATALOG_SCHEMA_VERSION = 3
@@ -31,6 +33,8 @@ MAX_HELD_RETENTION_MULTIPLIER = 4
 # no default, so a 1.2.5 worker's insert (which omits it) fails and rolls back
 # its whole publication. Keep it at 2 until a later release needs a new fence.
 JOURNAL_WRITER_GENERATION = 2
+# P2-3: advisory lock namespace (hashtext) serializing catalogue publishers.
+CATALOG_PUBLICATION_LOCK = "lumae.catalog_publication"
 
 CATALOG_GENERATION_TABLES = (
     "catalog_libraries",
@@ -1036,11 +1040,11 @@ def migrate_catalog(db):
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
-        f"""
+        lambda cur: migrations.ensure_index(cur, f"""
         CREATE UNIQUE INDEX IF NOT EXISTS {t("idx_catalog_source_core")}
         ON {t("catalog_sources")} (current_core_server_id)
         WHERE current_core_server_id IS NOT NULL AND rebind_status = 'active'
-        """,
+        """),
         f"""
         CREATE TABLE IF NOT EXISTS {t("catalog_state")} (
             catalog_instance_id TEXT PRIMARY KEY,
@@ -1195,59 +1199,41 @@ def migrate_catalog(db):
             PRIMARY KEY (catalog_instance_id, epoch, seq)
         )
         """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS fingerprint_schema_version INTEGER NOT NULL DEFAULT 1
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ALTER COLUMN fingerprint_schema_version
-        SET DEFAULT {CATALOG_FINGERPRINT_SCHEMA_VERSION}
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS snapshot_estimated_bytes BIGINT NOT NULL DEFAULT 0
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS last_scan_change_counts JSONB NOT NULL DEFAULT '{{}}'::jsonb
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS last_scan_change_reason TEXT
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS last_scan_duration_ms BIGINT
-        """,
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ADD COLUMN IF NOT EXISTS change_reason TEXT NOT NULL DEFAULT 'provider_diff'
-        """,
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ADD COLUMN IF NOT EXISTS old_entity_id TEXT
-        """,
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ADD COLUMN IF NOT EXISTS evidence JSONB
-        """,
+        # P2-5: each ALTER below runs only when the schema differs (an
+        # up-to-date database takes no ACCESS EXCLUSIVE lock) and waits for
+        # its lock boundedly (migrations.py).
+        lambda cur: migrations.ensure_columns(
+            cur, t("catalog_state"),
+            "fingerprint_schema_version INTEGER NOT NULL DEFAULT 1",
+        ),
+        lambda cur: migrations.ensure_default(
+            cur, t("catalog_state"), "fingerprint_schema_version",
+            str(CATALOG_FINGERPRINT_SCHEMA_VERSION),
+        ),
+        lambda cur: migrations.ensure_columns(
+            cur, t("catalog_state"),
+            "snapshot_estimated_bytes BIGINT NOT NULL DEFAULT 0",
+            "last_scan_change_counts JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "last_scan_change_reason TEXT",
+            "last_scan_duration_ms BIGINT",
+        ),
+        lambda cur: migrations.ensure_columns(
+            cur, t("catalog_changes"),
+            "change_reason TEXT NOT NULL DEFAULT 'provider_diff'",
+            "old_entity_id TEXT",
+            "evidence JSONB",
+        ),
         # AUD-05: 1.2.5 publication does not withdraw profiles of changed
         # media and 1.2.5 rekey does not move published profiles. Their
         # catalog_changes insert omits this column and now fails closed.
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ADD COLUMN IF NOT EXISTS writer_generation SMALLINT NOT NULL
-            DEFAULT {JOURNAL_WRITER_GENERATION}
-        """,
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ALTER COLUMN writer_generation DROP DEFAULT
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ALTER COLUMN catalog_schema_version SET DEFAULT {CATALOG_SCHEMA_VERSION}
-        """,
+        lambda cur: migrations.ensure_columns(
+            cur, t("catalog_changes"),
+            f"writer_generation SMALLINT NOT NULL DEFAULT {JOURNAL_WRITER_GENERATION}",
+        ),
+        lambda cur: migrations.ensure_no_default(cur, t("catalog_changes"), "writer_generation"),
+        lambda cur: migrations.ensure_default(
+            cur, t("catalog_state"), "catalog_schema_version", str(CATALOG_SCHEMA_VERSION),
+        ),
         f"""
         UPDATE {t("catalog_state")}
            SET catalog_schema_version={CATALOG_SCHEMA_VERSION}
@@ -1336,19 +1322,12 @@ def migrate_catalog(db):
         )
         """,
     ]
-    for statement in statements:
-        cur.execute(statement)
-    cur.execute(
-        f"ALTER TABLE {t('catalog_state')} "
-        "ADD COLUMN IF NOT EXISTS catalog_builder_version INTEGER NOT NULL DEFAULT 0"
-    )
-    cur.execute(
-        f"ALTER TABLE {t('catalog_state')} "
-        "ADD COLUMN IF NOT EXISTS refresh_required BOOLEAN NOT NULL DEFAULT TRUE"
-    )
-    cur.execute(
-        f"ALTER TABLE {t('catalog_state')} "
-        "ADD COLUMN IF NOT EXISTS refresh_reason TEXT"
+    migrations.apply(cur, statements)
+    migrations.ensure_columns(
+        cur, t("catalog_state"),
+        "catalog_builder_version INTEGER NOT NULL DEFAULT 0",
+        "refresh_required BOOLEAN NOT NULL DEFAULT TRUE",
+        "refresh_reason TEXT",
     )
     cur.execute(
         f"""
@@ -1360,6 +1339,8 @@ def migrate_catalog(db):
         """,
         (CATALOG_BUILDER_VERSION,),
     )
+    # P2-1: committed status summary (analysis_state counts, status_summary).
+    migrate_status_summary(cur)
     cur.close()
 
 
@@ -1650,6 +1631,92 @@ def _change_counts(changes, snapshot_counts):
     }
 
 
+def _lock_catalog_publication(cur, catalog_instance_id):
+    """Serialize the catalogue publishers of one source (P2-3).
+
+    A transaction-scoped advisory lock that refresh_catalog takes before any
+    catalogue row lock, for both of its publication paths (ordinary and
+    provider-identity rekey). Admission, completion, edge publication and
+    bootstrap creation never take it, so waiting for it blocks none of them.
+    """
+    cur.execute(
+        "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+        (CATALOG_PUBLICATION_LOCK, str(catalog_instance_id)),
+    )
+
+
+def _lock_publication_state(cur, catalog_instance_id, expected):
+    """Lock the catalog_state row and check it is still the publication base.
+
+    Takes the row lock (``FOR UPDATE``) that admission, completion and edge
+    publication wait for, and raises when (generation, epoch, head,
+    fingerprint schema) differ from ``expected``.
+    """
+    cur.execute(
+        f"SELECT published_generation, catalog_epoch, catalog_head_seq, "
+        f"fingerprint_schema_version "
+        f"FROM {t('catalog_state')} WHERE catalog_instance_id=%s FOR UPDATE",
+        (catalog_instance_id,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        raise CatalogScanError("Catalogue state is missing")
+    state = (int(row[0]), str(row[1]), int(row[2]), int(row[3] or 1))
+    if state != tuple(expected):
+        raise CatalogScanError("Catalogue publication moved while this scan was running")
+    return state
+
+
+def _after_publication(db, catalog_instance_id, generation):
+    """Storage work of a publication, after it commits (P2-3).
+
+    Each step is its own short transaction, so catalog_state is not held while
+    old rows are deleted:
+
+    * edge payloads that no published profile reaches, for the whole source:
+      those of the profiles this publication withdrew, and any an earlier
+      purge left (see purge_withdrawn_edges);
+    * superseded generations. Bootstrap leases are created under the
+      catalog_state row lock, so every lease on an older generation committed
+      before the publication took that lock, and later leases pin the new
+      generation.
+
+    Best effort, like the status summary. What a failure leaves goes with the
+    next publication, or with maintenance: compact_enrichment_storage sweeps
+    the edges and prune_catalog_storage the generations at install.
+    """
+    from .profile_publication import purge_withdrawn_edges
+
+    steps = (
+        (
+            "purge unpublished edge payloads",
+            lambda cur: purge_withdrawn_edges(cur, catalog_instance_id),
+        ),
+        (
+            "prune superseded catalogue generations",
+            lambda cur: prune_snapshot_generations(cur, catalog_instance_id, "catalog", generation),
+        ),
+    )
+    for label, step in steps:
+        try:
+            cur = db.cursor()
+            try:
+                step(cur)
+            finally:
+                cur.close()
+            db.commit()
+        except Exception:
+            try:
+                rollback = getattr(db, "rollback", None)
+                if callable(rollback):
+                    rollback()
+            except Exception:
+                pass
+            logger.warning(
+                "lumae_analysis could not %s of %s", label, catalog_instance_id, exc_info=True,
+            )
+
+
 def refresh_catalog(server_id=None, db=None, bridge=None):
     """Fetch, validate, and atomically publish one provider catalogue generation."""
     scan_started = time.monotonic()
@@ -1758,6 +1825,34 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                     "Libraries if the repair keeps failing."
                 )
 
+        # P2-3: one publisher per source at a time, before any catalogue lock.
+        # The generation is built below before catalog_state is locked, so two
+        # publishers must not both write it, and each waits here without
+        # blocking admissions and completions.
+        cur = db.cursor()
+        _lock_catalog_publication(cur, catalog_instance_id)
+        # The base is what is published once this publisher holds the lock: a
+        # refresh that waited for another one's publication diffs against it
+        # instead of failing as "moved". Only publishers change these fields,
+        # and they hold the lock, so they stay fixed until the row lock
+        # re-checks them. The fetch happened before the lock, so publications
+        # apply in the order their fetches finished; a publication from an
+        # older fetch is corrected by the next refresh.
+        cur.execute(
+            f"SELECT published_generation, catalog_epoch, catalog_head_seq, entity_counts, "
+            f"fingerprint_schema_version "
+            f"FROM {t('catalog_state')} WHERE catalog_instance_id=%s",
+            (catalog_instance_id,),
+        )
+        state = cur.fetchone()
+        cur.close()
+        if state is None:
+            raise CatalogScanError("Catalogue state is missing")
+        previous_generation, epoch, head_seq, previous_counts, previous_fingerprint_schema = state
+        previous_generation = int(previous_generation)
+        head_seq = int(head_seq)
+        previous_fingerprint_schema = int(previous_fingerprint_schema or 1)
+
         identity_state = (
             identity_observation.get("state") if identity_observation else None
         )
@@ -1849,19 +1944,13 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 )
 
         cur = db.cursor()
-        cur.execute(
-            f"SELECT published_generation, catalog_epoch, catalog_head_seq, "
-            f"fingerprint_schema_version "
-            f"FROM {t('catalog_state')} WHERE catalog_instance_id=%s FOR UPDATE",
-            (catalog_instance_id,),
-        )
-        locked_generation, locked_epoch, locked_head, locked_fingerprint_schema = cur.fetchone()
-        if (
-            int(locked_generation) != previous_generation
-            or str(locked_epoch) != str(epoch)
-            or int(locked_fingerprint_schema or 1) != previous_fingerprint_schema
-        ):
-            raise CatalogScanError("Catalogue publication moved while this scan was running")
+        # P2-3: the diff, the generation rows and the catalogue journal are
+        # written before catalog_state is locked. The publisher lock keeps the
+        # published generation and head fixed meanwhile; they are checked
+        # again under the row lock, which is then held only to publish and
+        # withdraw.
+        base_state = (previous_generation, str(epoch), head_seq, previous_fingerprint_schema)
+        locked_epoch, locked_head = str(epoch), head_seq
         generation = previous_generation + 1
         now = utc_now()
         changes = []
@@ -1919,6 +2008,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         }
 
         if change_reason == "no_change":
+            _lock_publication_state(cur, catalog_instance_id, base_state)
             duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))
             cur.execute(
                 f"""
@@ -1962,6 +2052,9 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             )
             cur.close()
             db.commit()
+            # P2-1: the catalogue is unchanged, but AudioMuse may have mapped
+            # or fingerprinted tracks since (an analysis run ends here).
+            refresh_status_summary(db, catalog_instance_id, getattr(provider_bridge, "core", None))
             return {
                 "catalog_instance_id": catalog_instance_id,
                 "server_id": server_id,
@@ -1992,16 +2085,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         ordered_changes.extend(deletes)
         publication_epoch = str(uuid.uuid4()) if fingerprint_rebase else str(locked_epoch)
         next_seq = 0 if fingerprint_rebase else int(locked_head)
-        if fingerprint_rebase:
-            cur.execute(
-                f"DELETE FROM {t('catalog_changes')} WHERE catalog_instance_id=%s",
-                (catalog_instance_id,),
-            )
-            cur.execute(
-                f"UPDATE {t('stream_bootstrap_sessions')} SET completed_at=now() "
-                "WHERE catalog_instance_id=%s AND completed_at IS NULL",
-                (catalog_instance_id,),
-            )
+        # A rebase skips the diff, so it journals nothing here; its old epoch
+        # is deleted under the row lock below.
         for entity_type, entity_id, operation, payload, _reactivated in ordered_changes:
             next_seq += 1
             cur.execute(
@@ -2024,6 +2109,31 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                     _json_param(payload) if payload is not None else None,
                     JOURNAL_WRITER_GENERATION,
                 ),
+            )
+        from .profile_publication import (
+            plan_catalog_invalidation,
+            withdraw_catalog_changes,
+        )
+
+        # What the new generation says about each changed track, read from
+        # its own (still unpublished) rows.
+        invalidation = plan_catalog_invalidation(
+            cur, catalog_instance_id, generation, ordered_changes,
+            full_reconcile=fingerprint_rebase,
+        )
+        # Lock catalog_state only now. Admissions and completions that ran
+        # meanwhile used the previous generation; the withdrawal below sees
+        # what they committed.
+        _lock_publication_state(cur, catalog_instance_id, base_state)
+        if fingerprint_rebase:
+            cur.execute(
+                f"DELETE FROM {t('catalog_changes')} WHERE catalog_instance_id=%s",
+                (catalog_instance_id,),
+            )
+            cur.execute(
+                f"UPDATE {t('stream_bootstrap_sessions')} SET completed_at=now() "
+                "WHERE catalog_instance_id=%s AND completed_at IS NULL",
+                (catalog_instance_id,),
             )
         duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))
         cur.execute(
@@ -2065,11 +2175,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         )
         # The catalog state row is still locked. Withdraw public profiles for
         # known new media revisions and deleted occurrences in this publication.
-        from .profile_publication import invalidate_catalog_changes
-        invalidate_catalog_changes(
-            cur, catalog_instance_id, generation, ordered_changes,
-            full_reconcile=fingerprint_rebase,
-        )
+        withdraw_catalog_changes(cur, invalidation)
         progress = {
             "input_counts": counts,
             "change_counts": change_counts,
@@ -2094,7 +2200,6 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             "progress=%s::jsonb WHERE scan_id=%s",
             (_json_param(progress), scan_id),
         )
-        prune_snapshot_generations(cur, catalog_instance_id, "catalog", generation)
         compact_change_journal(
             cur,
             catalog_instance_id=catalog_instance_id,
@@ -2114,6 +2219,10 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         refresh_profile_retention(cur, catalog_instance_id, counts["track"])
         cur.close()
         db.commit()
+        _after_publication(db, catalog_instance_id, generation)
+        # P2-1: readiness reads these counts instead of scanning the library.
+        # Counted after the commit, so catalog_state is not held meanwhile.
+        refresh_status_summary(db, catalog_instance_id, getattr(provider_bridge, "core", None))
         return {
             "catalog_instance_id": catalog_instance_id,
             "server_id": server_id,

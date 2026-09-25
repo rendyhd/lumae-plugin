@@ -5,8 +5,9 @@ scale 1):
 
 ``create``      ``profile_bootstrap.create_session`` wall time, WAL written,
                 snapshot table size, and the longest time the global creator
-                advisory lock ``pg_advisory_lock(110094, 10)`` was held (sampled
-                from ``pg_locks`` every ~2 ms by a side connection);
+                advisory lock (110094, 10) was held (sampled from ``pg_locks``
+                every ~2 ms by a side connection; a session lock for the whole
+                capture before P1-6, the admission transaction lock since);
 ``pages``       ``snapshot_page`` wall time for every page of that session
                 (server-side: includes the plugin-owned connection setup, not HTTP);
 ``conn_setup``  cost of the plugin-owned connection alone.
@@ -118,6 +119,7 @@ def main():
     aux = stub_host.aux_cursor()
     src = stub_host.default_source(aux)
     aux.execute(f"DELETE FROM {T}profile_bootstrap_sessions")  # stale sessions from earlier runs
+    aux.execute(f"DELETE FROM {T}profile_bootstrap_creates")  # and their create rate limit
 
     def body(**kw):
         return {"protocol_version": 2, "schema_version": 1,

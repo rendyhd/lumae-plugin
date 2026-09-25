@@ -155,24 +155,28 @@ def seed(args):
 
     db = stub_host.connect()
     cur = db.cursor()
-    cur.execute(
-        "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"
-    )
-    if cur.fetchone()[0] and not args.reset:
-        sys.exit("database is not empty; pass --reset to drop and recreate schema public")
-    db.rollback()
-    if args.reset:
-        reset_schema(db)
+    stub_schema = getattr(args, "host_schema", "stub") == "stub"
+    if stub_schema:
+        cur.execute(
+            "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'"
+        )
+        if cur.fetchone()[0] and not args.reset:
+            sys.exit("database is not empty; pass --reset to drop and recreate schema public")
+        db.rollback()
+        if args.reset:
+            reset_schema(db)
 
     s = Seeder(db)
-    with open(os.path.join(stub_host.HERE, "host_schema.sql")) as handle:
-        s.run("host_schema", handle.read())
+    if stub_schema:
+        with open(os.path.join(stub_host.HERE, "host_schema.sql")) as handle:
+            s.run("host_schema", handle.read())
     t0 = time.perf_counter()
     stub_host.run_plugin_migration(db)
     s.timings["plugin_migrate"] = round(time.perf_counter() - t0, 2)
     log(f"plugin_migrate: {s.timings['plugin_migrate']:.1f}s")
     cur = s.cur
-    cur.execute(f"SELECT catalog_instance_id, current_core_server_id FROM {T}catalog_sources")
+    cur.execute(f"SELECT catalog_instance_id, current_core_server_id FROM {T}catalog_sources "
+                "WHERE current_core_server_id=%s", (stub_host.SERVER_ID,))
     src, server = cur.fetchone()
     db.commit()
     from plugins.LumaeAnalysis.catalog import CATALOG_BUILDER_VERSION
@@ -220,36 +224,48 @@ def seed(args):
         (src, n["albums"], n["artists"], n["artists"], n["tracks"]))
 
     # ---- AudioMuse host analysis tables ---------------------------------------
+    canonical = getattr(args, "item_ids", "legacy") == "canonical"
+
+    def item_sql(expr):
+        # --item-ids canonical: AudioMuse 3.6 content ids (fp_<scheme 4><200-bit
+        # hex>). The stock host relabels any other shape at its first start
+        # (tasks/fingerprint_canonicalize.py), which these synthetic embeddings
+        # make quadratic; the plugin never depends on the id shape.
+        if canonical:
+            return f"'fp_4' || lpad(to_hex({expr}), 50, '0')"
+        return f"'it-'||lpad(({expr})::text,7,'0')"
+
     s.run("score", """INSERT INTO score (item_id, title, author, album, tempo, key, scale,
         mood_vector, energy, other_features)
-        SELECT 'it-'||lpad(g::text,7,'0'), 'Song', 'Artist', 'Album', 90 + g % 60, 'C', 'major',
+        SELECT """ + item_sql("g") + """, 'Song', 'Artist', 'Album', 90 + g % 60, 'C', 'major',
                'rock:0.51,pop:0.32,electronic:0.11,jazz:0.05,classical:0.03,metal:0.02,folk:0.02,soul:0.01',
                0.1 + (g % 50)/100.0,
                'danceable:0.61,aggressive:0.12,happy:0.4,party:0.3,relaxed:0.5,sad:0.2'
           FROM generate_series(1, %s) g""".replace("%", "%%").replace("%%s", "%s"),
         (n["items"],))
     s.run("embedding", """INSERT INTO embedding (item_id, embedding)
-        SELECT 'it-'||lpad(g::text,7,'0'), decode(repeat(substr(md5(g::text),1,16), 100), 'hex')
+        SELECT """ + item_sql("g") + """, decode(repeat(substr(md5(g::text),1,16), 100), 'hex')
           FROM generate_series(1, %s) g""", (n["items"],))  # 800 bytes = 200 f32
     s.run("clap_embedding", """INSERT INTO clap_embedding (item_id, embedding)
-        SELECT 'it-'||lpad(g::text,7,'0'), decode(repeat(md5(g::text), 128), 'hex')
+        SELECT """ + item_sql("g") + """, decode(repeat(md5(g::text), 128), 'hex')
           FROM generate_series(1, %s) g""", (n["items"],))  # 2048 bytes = 512 f32
     # Singleton items map to tracks 1..single; each paired item maps to two tracks.
     single = n["items"] - n["pairs"]
     s.run("track_server_map_single", """INSERT INTO track_server_map
         (item_id, server_id, provider_track_id, match_tier)
-        SELECT 'it-'||lpad(g::text,7,'0'), %s, 'tr-'||lpad(g::text,7,'0'), 'direct'
+        SELECT """ + item_sql("g") + """, %s, 'tr-'||lpad(g::text,7,'0'), 'direct'
           FROM generate_series(1, %s) g""", (server, single))
     s.run("track_server_map_pairs", """INSERT INTO track_server_map
         (item_id, server_id, provider_track_id, match_tier)
-        SELECT 'it-'||lpad((%s + (g+1)/2)::text,7,'0'), %s, 'tr-'||lpad((%s+g)::text,7,'0'),
+        SELECT """ + item_sql("%s + (g+1)/2") + """, %s, 'tr-'||lpad((%s+g)::text,7,'0'),
                'fingerprint'
           FROM generate_series(1, %s) g""", (single, server, single, 2 * n["pairs"]))
     s.run("chromaprint", """INSERT INTO chromaprint (server_id, provider_track_id, fingerprint, updated_at)
         SELECT %s, provider_track_id, decode(repeat(md5(provider_track_id), 96), 'hex'),
                now() - interval '2 days'
           FROM track_server_map""", (server,))
-    ids = json.dumps([f"it-{g:07d}" for g in range(1, n["items"] + 1)])
+    ids = json.dumps([f"fp_4{g:050x}" if canonical else f"it-{g:07d}"
+                      for g in range(1, n["items"] + 1)])
     proj = struct.pack(f"<{n['items'] * 2}f", *[rng.random() for _ in range(n["items"] * 2)])
     s.run("map_projection_data", "INSERT INTO map_projection_data (index_name, projection_data, "
           "id_map_json, embedding_dimension) VALUES ('main_map', %s, %s, 2)", (proj, ids))
@@ -345,6 +361,14 @@ def seed(args):
     s.timings["vacuum_analyze"] = round(time.perf_counter() - t0, 2)
     db.autocommit = False
 
+    # The bulk load bypasses publication, so summarize it the way the install
+    # hook summarizes existing data (P2-1 committed status summary).
+    t0 = time.perf_counter()
+    stub_host.load_plugin().refresh_status_summaries(db)
+    db.commit()
+    s.timings["status_summaries"] = round(time.perf_counter() - t0, 2)
+    log(f"status_summaries: {s.timings['status_summaries']:.1f}s")
+
     projection = None
     if not args.no_project:
         projection = initial_projection()
@@ -393,6 +417,13 @@ def main():
     parser.add_argument("--no-project", action="store_true",
                         help="skip the initial analysis projection")
     parser.add_argument("--seed", type=int, default=1, help="random seed (default 1)")
+    parser.add_argument("--item-ids", choices=("legacy", "canonical"), default="legacy",
+                        help="'canonical': AudioMuse 3.6 content ids (fp_4<hex>), so a stock "
+                             "host does not relabel the synthetic items at start")
+    parser.add_argument("--host-schema", choices=("stub", "existing"), default="stub",
+                        help="'existing': the real AudioMuse host already created its tables "
+                             "(scripts/e2e real-host fixture); skip host_schema.sql, the "
+                             "empty-database check and --reset")
     args = parser.parse_args()
     if args.scale <= 0:
         parser.error("--scale must be positive")
