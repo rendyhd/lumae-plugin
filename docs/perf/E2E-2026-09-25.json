@@ -156,6 +156,10 @@
    }
   }
  },
+ "notes": {
+  "fixtures": "Both full-scale fixtures: host schema created by the stock host's `lumae-install init`, then `seed_representative.py --host-schema audiomuse` (host_schema 'audiomuse'). local_runner used the P0-3 `it-` item ids; stock_host was re-seeded with `fp_4` content ids (seed.py --item-ids canonical).",
+  "review_follow_up": "Runs named local_runner_scale_0_02_* and mutation_* were made at scale 0.02 with the review-fixed harness (8 kill points, direct re-analysis checks, fixture guard, --explain-analyze). The mutation runs apply a plugin mutation (silent edge DELETE on an identical completion) or an emptied edge table and are expected to FAIL. All other runs used the harness at 928e52d."
+ },
  "plugin_code": "phase/2-performance cd298d7 (LumaeAnalysis 1.3.0, unreleased)",
  "runs": {
   "capped_catchup_full_scale": {
@@ -2002,12 +2006,12 @@
     "reanalysis_noop": "PASS"
    }
   },
-  "local_runner_scale_0_02_no_snapshot_statistics": {
+  "local_runner_scale_0_02_analyzed_snapshot_statistics": {
    "bench": "e2e_server_matrix",
    "environment": {
-    "cpu": "Intel(R) Xeon(R) Processor @ 2.80GHz",
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
     "cpus": 4,
-    "database_mb": 126.4,
+    "database_mb": 103.9,
     "fixture": {
      "counts": {
       "albums": 240,
@@ -2023,7 +2027,7 @@
      "scale": 0.02,
      "seed": 1
     },
-    "git_sha": "cd298d7",
+    "git_sha": "928e52d",
     "mem_total_gb": 15.7,
     "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
     "postgres": {
@@ -2035,19 +2039,60 @@
     "python": "3.11.15",
     "server": {
      "app": "scripts/e2e/host_app.py (plugin blueprint, stub host)",
-     "command": "-m gunicorn --chdir <repo>/scripts/e2e --bind 127.0.0.1:18082 --worker-class gthread --workers 1 --threads 4 --keep-alive 5 --timeout 300 --error-logfile <scratch>/gunicorn_18082.log host_app:app",
+     "command": "-m gunicorn --chdir <repo>/scripts/e2e --bind 127.0.0.1:18807 --worker-class gthread --workers 1 --threads 4 --keep-alive 5 --timeout 300 --no-control-socket --error-logfile <scratch>/gunicorn_18807.log host_app:app",
      "gunicorn": "25.3.0",
      "kind": "local",
      "topology": "gthread, 1 worker x 4 threads"
     }
    },
-   "finished_at": "2026-09-25T09:43:42Z",
+   "finished_at": "2026-09-25T14:28:57Z",
    "scenarios": [
     {
      "assertions": [
       {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
        "check": "sync reached current",
        "detail": "current",
+       "ok": true
+      },
+      {
+       "check": "no connection error or retried request",
+       "detail": {
+        "conn_errors": 0,
+        "events": {}
+       },
        "ok": true
       },
       {
@@ -2055,9 +2100,18 @@
        "detail": {
         "catchup_pages_fetched": 1,
         "creates": 1,
-        "expiry_extensions": 38,
+        "expiry_extensions": 39,
         "releases": 1,
-        "snapshot_pages_fetched": 37
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "one create request and one request per snapshot page",
+       "detail": {
+        "create_requests": 1,
+        "page_requests": 38,
+        "pages": 38
        },
        "ok": true
       },
@@ -2066,17 +2120,17 @@
        "detail": {
         "catchup_pages_fetched": 1,
         "creates": 1,
-        "expiry_extensions": 38,
+        "expiry_extensions": 39,
         "releases": 1,
-        "snapshot_pages_fetched": 37
+        "snapshot_pages_fetched": 38
        },
        "ok": true
       },
       {
        "check": "every snapshot page fetched once",
        "detail": {
-        "expected": 37,
-        "fetched": 37
+        "expected": 38,
+        "fetched": 38
        },
        "ok": true
       },
@@ -2085,18 +2139,18 @@
        "detail": {
         "catchup_pages_fetched": 1,
         "creates": 1,
-        "expiry_extensions": 38,
+        "expiry_extensions": 39,
         "releases": 1,
-        "snapshot_pages_fetched": 37
+        "snapshot_pages_fetched": 38
        },
        "ok": true
       },
       {
        "check": "sliding expiry advanced",
        "detail": [
-        "2026-09-25T10:43:25.741482Z",
-        "2026-09-25T10:43:25.880085Z",
-        "2026-09-25T10:43:25.994820Z"
+        "2026-09-25T15:28:55.036201Z",
+        "2026-09-25T15:28:55.145091Z",
+        "2026-09-25T15:28:55.211876Z"
        ],
        "ok": true
       },
@@ -2106,26 +2160,26 @@
        "ok": true
       },
       {
-       "check": "every edge stored",
-       "detail": {
-        "edges_stored": 1830,
-        "upserts_without_edge": 20
-       },
-       "ok": false
-      },
-      {
        "check": "local dataset equals the server's",
        "detail": {
         "local": {
-         "edges": 1830,
-         "profiles": 1850,
-         "sha256": "e75f40d05292fd7e525fc2a590bf82b2be75441963e8341c7d38c3627d8ed2e1"
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "39df9b3e6eadbc2b67e7d2c485aefbd7a95d7b3d8c243c4c7c19acf8b4d9ac2b"
         },
         "server": {
-         "edges": 1830,
-         "profiles": 1850,
-         "sha256": "e75f40d05292fd7e525fc2a590bf82b2be75441963e8341c7d38c3627d8ed2e1"
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "39df9b3e6eadbc2b67e7d2c485aefbd7a95d7b3d8c243c4c7c19acf8b4d9ac2b"
         }
+       },
+       "ok": true
+      },
+      {
+       "check": "every edge the server publishes is on the device",
+       "detail": {
+        "device": 1880,
+        "server": 1880
        },
        "ok": true
       },
@@ -2144,50 +2198,402 @@
       },
       {
        "check": "/api/health p95 <= 50 ms during load",
-       "detail": 13.9,
+       "detail": 15.6,
        "ok": true
       },
       {
        "check": "/api/catalog/health p95 <= 50 ms during load",
-       "detail": 21.3,
+       "detail": 28.2,
        "ok": true
       },
       {
        "check": "/settings/status p95 <= 100 ms during load",
-       "detail": 23.7,
+       "detail": 24.2,
        "ok": true
       }
      ],
      "description": "Fresh first load of every waveform + edge profile over the v2 bootstrap path, then /profiles/changes; completes once, in one run.",
-     "elapsed_s": 8.8,
+     "elapsed_s": 6.4,
      "metrics": {
       "conn_errors": 0,
       "counters": {
        "catchup_pages_fetched": 1,
        "creates": 1,
-       "expiry_extensions": 38,
+       "expiry_extensions": 39,
        "releases": 1,
-       "snapshot_pages_fetched": 37
+       "snapshot_pages_fetched": 38
       },
-      "create_ms": 103.6,
+      "create_ms": 84.5,
       "dataset": {
        "local": {
-        "edges": 1830,
-        "profiles": 1850,
-        "sha256": "e75f40d05292fd7e525fc2a590bf82b2be75441963e8341c7d38c3627d8ed2e1"
+        "edges": 1880,
+        "profiles": 1880,
+        "sha256": "39df9b3e6eadbc2b67e7d2c485aefbd7a95d7b3d8c243c4c7c19acf8b4d9ac2b"
        },
        "server": {
-        "edges": 1830,
-        "profiles": 1850,
-        "sha256": "e75f40d05292fd7e525fc2a590bf82b2be75441963e8341c7d38c3627d8ed2e1"
+        "edges": 1880,
+        "profiles": 1880,
+        "sha256": "39df9b3e6eadbc2b67e7d2c485aefbd7a95d7b3d8c243c4c7c19acf8b4d9ac2b"
        }
       },
-      "decoded_bytes": 36736321,
-      "decoded_mb": 36.7,
+      "decoded_bytes": 37736313,
+      "decoded_mb": 37.7,
+      "fixture": {
+       "edges": 1880,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
       "http_429": 0,
       "http_503": 0,
       "invalid_edges": {},
-      "max_request_ms": 357.5,
+      "max_request_ms": 84.5,
+      "page_latency": {
+       "changes": {
+        "first10_p50_ms": 7.1,
+        "last10_p50_ms": 7.1,
+        "max_ms": 7.1,
+        "n": 1,
+        "p50_ms": 7.1,
+        "p95_ms": 7.1
+       },
+       "v2_catchup": {
+        "first10_p50_ms": 12.0,
+        "last10_p50_ms": 12.0,
+        "max_ms": 12.0,
+        "n": 1,
+        "p50_ms": 12.0,
+        "p95_ms": 12.0
+       },
+       "v2_page": {
+        "first10_p50_ms": 58.3,
+        "last10_p50_ms": 58.5,
+        "max_ms": 79.2,
+        "n": 38,
+        "p50_ms": 59.1,
+        "p95_ms": 73.7
+       }
+      },
+      "page_query_plan": {
+       "ordinal_0": {
+        "analyzed": true,
+        "edge_lookups": 50,
+        "execution_ms": 6.5,
+        "snapshot_rows_estimated": 1,
+        "snapshot_rows_read": 50,
+        "snapshot_scan": "Index Scan",
+        "sort_after_join": false
+       },
+       "ordinal_950": {
+        "analyzed": true,
+        "edge_lookups": 50,
+        "execution_ms": 6.5,
+        "snapshot_rows_estimated": 1,
+        "snapshot_rows_read": 50,
+        "snapshot_scan": "Index Scan",
+        "sort_after_join": false
+       }
+      },
+      "peak_server_rss_mb": 174.1,
+      "peak_worker_rss_mb": 150.6,
+      "profiles": 1880,
+      "rss_samples": 44,
+      "sqlite_file_mb": 25.8,
+      "sqlite_longest_tx_ms": 68.9,
+      "status_routes": {
+       "errors": {},
+       "routes": {
+        "/api/catalog/health": {
+         "max_ms": 28.2,
+         "n": 3,
+         "p50_ms": 16.5,
+         "p95_ms": 28.2
+        },
+        "/api/health": {
+         "max_ms": 15.6,
+         "n": 3,
+         "p50_ms": 13.9,
+         "p95_ms": 15.6
+        },
+        "/settings/status": {
+         "max_ms": 24.2,
+         "n": 3,
+         "p50_ms": 20.6,
+         "p95_ms": 24.2
+        }
+       }
+      },
+      "store": {
+       "edges_stored": 1880
+      },
+      "timings": {
+       "catchup_s": 0.02,
+       "client_cpu_s": 2.23,
+       "create_ms": 84.6,
+       "deltas_s": 0.01,
+       "publish_ms": 7.1,
+       "snapshot_s": 4.51,
+       "total_s": 4.65
+      },
+      "wall_s": 4.65,
+      "wire_bytes": 15702572,
+      "wire_mb": 15.7
+     },
+     "name": "first_load_v2",
+     "notes": [],
+     "status": "PASS"
+    }
+   ],
+   "source": "02172c76-6dac-4d87-af53-3b46d77fbbb5",
+   "started_at": "2026-09-25T14:28:50Z",
+   "summary": {
+    "first_load_v2": "PASS"
+   }
+  },
+  "local_runner_scale_0_02_no_snapshot_statistics": {
+   "bench": "e2e_server_matrix",
+   "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpus": 4,
+    "database_mb": 100.9,
+    "fixture": {
+     "counts": {
+      "albums": 240,
+      "artists": 120,
+      "items": 1380,
+      "pairs": 140,
+      "profiles": 1880,
+      "tasks": 3000,
+      "tracks": 2640
+     },
+     "edge_template": "docs/audit/2026-09-24/probes/lum010/edge.json",
+     "events": 50000,
+     "scale": 0.02,
+     "seed": 1
+    },
+    "git_sha": "928e52d",
+    "mem_total_gb": 15.7,
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "postgres": {
+     "max_wal_size": "1GB",
+     "shared_buffers": "128MB",
+     "version": "PostgreSQL 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+     "work_mem": "4MB"
+    },
+    "python": "3.11.15",
+    "server": {
+     "app": "scripts/e2e/host_app.py (plugin blueprint, stub host)",
+     "command": "-m gunicorn --chdir <repo>/scripts/e2e --bind 127.0.0.1:18806 --worker-class gthread --workers 1 --threads 4 --keep-alive 5 --timeout 300 --no-control-socket --error-logfile <scratch>/gunicorn_18806.log host_app:app",
+     "gunicorn": "25.3.0",
+     "kind": "local",
+     "topology": "gthread, 1 worker x 4 threads"
+    }
+   },
+   "finished_at": "2026-09-25T14:28:46Z",
+   "scenarios": [
+    {
+     "assertions": [
+      {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "sync reached current",
+       "detail": "current",
+       "ok": true
+      },
+      {
+       "check": "no connection error or retried request",
+       "detail": {
+        "conn_errors": 0,
+        "events": {}
+       },
+       "ok": true
+      },
+      {
+       "check": "exactly one v2 create",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "one create request and one request per snapshot page",
+       "detail": {
+        "create_requests": 1,
+        "page_requests": 38,
+        "pages": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "no v2 restart (410/400) and no legacy fallback",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "every snapshot page fetched once",
+       "detail": {
+        "expected": 38,
+        "fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "session released",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "sliding expiry advanced",
+       "detail": [
+        "2026-09-25T15:28:44.456544Z",
+        "2026-09-25T15:28:44.567124Z",
+        "2026-09-25T15:28:44.633071Z"
+       ],
+       "ok": true
+      },
+      {
+       "check": "no invalid edge",
+       "detail": {},
+       "ok": true
+      },
+      {
+       "check": "local dataset equals the server's",
+       "detail": {
+        "local": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "39df9b3e6eadbc2b67e7d2c485aefbd7a95d7b3d8c243c4c7c19acf8b4d9ac2b"
+        },
+        "server": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "39df9b3e6eadbc2b67e7d2c485aefbd7a95d7b3d8c243c4c7c19acf8b4d9ac2b"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "every edge the server publishes is on the device",
+       "detail": {
+        "device": 1880,
+        "server": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "no 503 during the load",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "no leaked live session",
+       "detail": {
+        "before": 0,
+        "live": 0
+       },
+       "ok": true
+      },
+      {
+       "check": "/api/health p95 <= 50 ms during load",
+       "detail": 15.2,
+       "ok": true
+      },
+      {
+       "check": "/api/catalog/health p95 <= 50 ms during load",
+       "detail": 17.3,
+       "ok": true
+      },
+      {
+       "check": "/settings/status p95 <= 100 ms during load",
+       "detail": 26.5,
+       "ok": true
+      }
+     ],
+     "description": "Fresh first load of every waveform + edge profile over the v2 bootstrap path, then /profiles/changes; completes once, in one run.",
+     "elapsed_s": 9.9,
+     "metrics": {
+      "conn_errors": 0,
+      "counters": {
+       "catchup_pages_fetched": 1,
+       "creates": 1,
+       "expiry_extensions": 39,
+       "releases": 1,
+       "snapshot_pages_fetched": 38
+      },
+      "create_ms": 87.6,
+      "dataset": {
+       "local": {
+        "edges": 1880,
+        "profiles": 1880,
+        "sha256": "39df9b3e6eadbc2b67e7d2c485aefbd7a95d7b3d8c243c4c7c19acf8b4d9ac2b"
+       },
+       "server": {
+        "edges": 1880,
+        "profiles": 1880,
+        "sha256": "39df9b3e6eadbc2b67e7d2c485aefbd7a95d7b3d8c243c4c7c19acf8b4d9ac2b"
+       }
+      },
+      "decoded_bytes": 37736313,
+      "decoded_mb": 37.7,
+      "fixture": {
+       "edges": 1880,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
+      "http_429": 0,
+      "http_503": 0,
+      "invalid_edges": {},
+      "max_request_ms": 241.2,
       "page_latency": {
        "changes": {
         "first10_p50_ms": 6.9,
@@ -2198,20 +2604,365 @@
         "p95_ms": 6.9
        },
        "v2_catchup": {
-        "first10_p50_ms": 12.5,
-        "last10_p50_ms": 12.5,
-        "max_ms": 12.5,
+        "first10_p50_ms": 12.4,
+        "last10_p50_ms": 12.4,
+        "max_ms": 12.4,
         "n": 1,
-        "p50_ms": 12.5,
-        "p95_ms": 12.5
+        "p50_ms": 12.4,
+        "p95_ms": 12.4
        },
        "v2_page": {
-        "first10_p50_ms": 231.2,
-        "last10_p50_ms": 57.1,
-        "max_ms": 357.5,
-        "n": 37,
-        "p50_ms": 61.1,
-        "p95_ms": 267.6
+        "first10_p50_ms": 205.0,
+        "last10_p50_ms": 75.6,
+        "max_ms": 241.2,
+        "n": 38,
+        "p50_ms": 148.3,
+        "p95_ms": 233.5
+       }
+      },
+      "page_query_plan": {
+       "ordinal_0": {
+        "analyzed": true,
+        "edge_lookups": 1880,
+        "execution_ms": 201.4,
+        "snapshot_rows_estimated": 21,
+        "snapshot_rows_read": 1880,
+        "snapshot_scan": "Bitmap Heap Scan",
+        "sort_after_join": true
+       },
+       "ordinal_950": {
+        "analyzed": true,
+        "edge_lookups": 930,
+        "execution_ms": 88.5,
+        "snapshot_rows_estimated": 21,
+        "snapshot_rows_read": 930,
+        "snapshot_scan": "Bitmap Heap Scan",
+        "sort_after_join": true
+       }
+      },
+      "peak_server_rss_mb": 174.1,
+      "peak_worker_rss_mb": 150.5,
+      "profiles": 1880,
+      "rss_samples": 80,
+      "sqlite_file_mb": 25.8,
+      "sqlite_longest_tx_ms": 85.6,
+      "status_routes": {
+       "errors": {},
+       "routes": {
+        "/api/catalog/health": {
+         "max_ms": 17.3,
+         "n": 5,
+         "p50_ms": 11.2,
+         "p95_ms": 17.3
+        },
+        "/api/health": {
+         "max_ms": 15.2,
+         "n": 6,
+         "p50_ms": 8.7,
+         "p95_ms": 15.2
+        },
+        "/settings/status": {
+         "max_ms": 26.5,
+         "n": 5,
+         "p50_ms": 16.6,
+         "p95_ms": 26.5
+        }
+       }
+      },
+      "store": {
+       "edges_stored": 1880
+      },
+      "timings": {
+       "catchup_s": 0.02,
+       "client_cpu_s": 2.35,
+       "create_ms": 87.8,
+       "deltas_s": 0.01,
+       "publish_ms": 7.4,
+       "snapshot_s": 8.16,
+       "total_s": 8.31
+      },
+      "wall_s": 8.31,
+      "wire_bytes": 15702546,
+      "wire_mb": 15.7
+     },
+     "name": "first_load_v2",
+     "notes": [],
+     "status": "PASS"
+    }
+   ],
+   "source": "02172c76-6dac-4d87-af53-3b46d77fbbb5",
+   "started_at": "2026-09-25T14:28:36Z",
+   "summary": {
+    "first_load_v2": "PASS"
+   }
+  },
+  "local_runner_scale_0_02_review_fixes": {
+   "bench": "e2e_server_matrix",
+   "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpus": 4,
+    "database_mb": 100.8,
+    "fixture": {
+     "counts": {
+      "albums": 240,
+      "artists": 120,
+      "items": 1380,
+      "pairs": 140,
+      "profiles": 1880,
+      "tasks": 3000,
+      "tracks": 2640
+     },
+     "edge_template": "docs/audit/2026-09-24/probes/lum010/edge.json",
+     "events": 50000,
+     "scale": 0.02,
+     "seed": 1
+    },
+    "git_sha": "928e52d",
+    "mem_total_gb": 15.7,
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "postgres": {
+     "max_wal_size": "1GB",
+     "shared_buffers": "128MB",
+     "version": "PostgreSQL 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+     "work_mem": "4MB"
+    },
+    "python": "3.11.15",
+    "server": {
+     "app": "scripts/e2e/host_app.py (plugin blueprint, stub host)",
+     "command": "-m gunicorn --chdir <repo>/scripts/e2e --bind 127.0.0.1:18808 --worker-class gthread --workers 1 --threads 4 --keep-alive 5 --timeout 300 --no-control-socket --error-logfile <scratch>/gunicorn_18808.log host_app:app",
+     "gunicorn": "25.3.0",
+     "kind": "local",
+     "topology": "gthread, 1 worker x 4 threads"
+    }
+   },
+   "finished_at": "2026-09-25T14:33:11Z",
+   "scenarios": [
+    {
+     "assertions": [
+      {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "sync reached current",
+       "detail": "current",
+       "ok": true
+      },
+      {
+       "check": "no connection error or retried request",
+       "detail": {
+        "conn_errors": 0,
+        "events": {}
+       },
+       "ok": true
+      },
+      {
+       "check": "exactly one v2 create",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "one create request and one request per snapshot page",
+       "detail": {
+        "create_requests": 1,
+        "page_requests": 38,
+        "pages": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "no v2 restart (410/400) and no legacy fallback",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "every snapshot page fetched once",
+       "detail": {
+        "expected": 38,
+        "fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "session released",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "sliding expiry advanced",
+       "detail": [
+        "2026-09-25T15:32:19.995461Z",
+        "2026-09-25T15:32:20.108744Z",
+        "2026-09-25T15:32:20.187001Z"
+       ],
+       "ok": true
+      },
+      {
+       "check": "no invalid edge",
+       "detail": {},
+       "ok": true
+      },
+      {
+       "check": "local dataset equals the server's",
+       "detail": {
+        "local": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+        },
+        "server": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "every edge the server publishes is on the device",
+       "detail": {
+        "device": 1880,
+        "server": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "no 503 during the load",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "no leaked live session",
+       "detail": {
+        "before": 0,
+        "live": 0
+       },
+       "ok": true
+      },
+      {
+       "check": "/api/health p95 <= 50 ms during load",
+       "detail": 12.9,
+       "ok": true
+      },
+      {
+       "check": "/api/catalog/health p95 <= 50 ms during load",
+       "detail": 12.9,
+       "ok": true
+      },
+      {
+       "check": "/settings/status p95 <= 100 ms during load",
+       "detail": 20.9,
+       "ok": true
+      }
+     ],
+     "description": "Fresh first load of every waveform + edge profile over the v2 bootstrap path, then /profiles/changes; completes once, in one run.",
+     "elapsed_s": 9.7,
+     "metrics": {
+      "conn_errors": 0,
+      "counters": {
+       "catchup_pages_fetched": 1,
+       "creates": 1,
+       "expiry_extensions": 39,
+       "releases": 1,
+       "snapshot_pages_fetched": 38
+      },
+      "create_ms": 101.4,
+      "dataset": {
+       "local": {
+        "edges": 1880,
+        "profiles": 1880,
+        "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+       },
+       "server": {
+        "edges": 1880,
+        "profiles": 1880,
+        "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+       }
+      },
+      "decoded_bytes": 37736313,
+      "decoded_mb": 37.7,
+      "fixture": {
+       "edges": 1880,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
+      "http_429": 0,
+      "http_503": 0,
+      "invalid_edges": {},
+      "max_request_ms": 248.8,
+      "page_latency": {
+       "changes": {
+        "first10_p50_ms": 7.8,
+        "last10_p50_ms": 7.8,
+        "max_ms": 7.8,
+        "n": 1,
+        "p50_ms": 7.8,
+        "p95_ms": 7.8
+       },
+       "v2_catchup": {
+        "first10_p50_ms": 11.8,
+        "last10_p50_ms": 11.8,
+        "max_ms": 11.8,
+        "n": 1,
+        "p50_ms": 11.8,
+        "p95_ms": 11.8
+       },
+       "v2_page": {
+        "first10_p50_ms": 221.1,
+        "last10_p50_ms": 75.6,
+        "max_ms": 248.8,
+        "n": 38,
+        "p50_ms": 146.3,
+        "p95_ms": 231.4
        }
       },
       "page_query_plan": {
@@ -2223,120 +2974,133 @@
         "snapshot_scan": "Bitmap Heap Scan",
         "sort_after_join": true
        },
-       "ordinal_900": {
+       "ordinal_950": {
         "analyzed": false,
         "edge_lookups": null,
-        "snapshot_rows_estimated": 950,
+        "snapshot_rows_estimated": 21,
         "snapshot_rows_read": null,
-        "snapshot_scan": "Index Scan",
-        "sort_after_join": false
+        "snapshot_scan": "Bitmap Heap Scan",
+        "sort_after_join": true
        }
       },
-      "peak_server_rss_mb": 175.9,
-      "peak_worker_rss_mb": 150.7,
-      "profiles": 1850,
-      "rss_samples": 65,
-      "sqlite_file_mb": 25.2,
-      "sqlite_longest_tx_ms": 68.2,
+      "peak_server_rss_mb": 174.0,
+      "peak_worker_rss_mb": 150.5,
+      "profiles": 1880,
+      "rss_samples": 78,
+      "sqlite_file_mb": 25.8,
+      "sqlite_longest_tx_ms": 83.5,
       "status_routes": {
        "errors": {},
        "routes": {
         "/api/catalog/health": {
-         "max_ms": 21.3,
-         "n": 4,
-         "p50_ms": 11.5,
-         "p95_ms": 21.3
+         "max_ms": 12.9,
+         "n": 5,
+         "p50_ms": 11.2,
+         "p95_ms": 12.9
         },
         "/api/health": {
-         "max_ms": 13.9,
-         "n": 5,
-         "p50_ms": 8.5,
-         "p95_ms": 13.9
+         "max_ms": 12.9,
+         "n": 6,
+         "p50_ms": 8.7,
+         "p95_ms": 12.9
         },
         "/settings/status": {
-         "max_ms": 23.7,
-         "n": 4,
-         "p50_ms": 18.9,
-         "p95_ms": 23.7
+         "max_ms": 20.9,
+         "n": 5,
+         "p50_ms": 15.9,
+         "p95_ms": 20.9
         }
        }
       },
       "store": {
-       "edges_stored": 1830,
-       "upserts_without_edge": 20
+       "edges_stored": 1880
       },
       "timings": {
        "catchup_s": 0.02,
-       "client_cpu_s": 2.13,
-       "create_ms": 103.7,
+       "client_cpu_s": 2.28,
+       "create_ms": 101.5,
        "deltas_s": 0.01,
-       "publish_ms": 8.2,
-       "snapshot_s": 6.62,
-       "total_s": 6.78
+       "publish_ms": 8.1,
+       "snapshot_s": 7.88,
+       "total_s": 8.05
       },
-      "wall_s": 6.78,
-      "wire_bytes": 15291806,
-      "wire_mb": 15.3
+      "wall_s": 8.05,
+      "wire_bytes": 15702573,
+      "wire_mb": 15.7
      },
      "name": "first_load_v2",
      "notes": [],
-     "status": "FAIL"
+     "status": "PASS"
     },
     {
      "assertions": [
+      {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
       {
        "check": "sync reached current",
        "detail": "current",
        "ok": true
       },
       {
-       "check": "exactly one v2 create",
+       "check": "no connection error or retried request",
        "detail": {
-        "catchup_pages_fetched": 1,
-        "creates": 1,
-        "expiry_extensions": 38,
-        "releases": 1,
-        "snapshot_pages_fetched": 37
+        "conn_errors": 0,
+        "events": {}
        },
        "ok": true
       },
       {
-       "check": "no v2 restart (410/400) and no legacy fallback",
+       "check": "every legacy page fetched once",
        "detail": {
-        "catchup_pages_fetched": 1,
-        "creates": 1,
-        "expiry_extensions": 38,
-        "releases": 1,
-        "snapshot_pages_fetched": 37
+        "expected": 38,
+        "fetched": 38
        },
        "ok": true
       },
       {
-       "check": "every snapshot page fetched once",
+       "check": "no legacy restart",
        "detail": {
-        "expected": 37,
-        "fetched": 37
+        "legacy_pages_fetched": 38
        },
        "ok": true
       },
       {
-       "check": "session released",
+       "check": "one request per legacy page",
        "detail": {
-        "catchup_pages_fetched": 1,
-        "creates": 1,
-        "expiry_extensions": 38,
-        "releases": 1,
-        "snapshot_pages_fetched": 37
+        "page_requests": 38,
+        "pages": 38
        },
-       "ok": true
-      },
-      {
-       "check": "sliding expiry advanced",
-       "detail": [
-        "2026-09-25T10:43:32.383084Z",
-        "2026-09-25T10:43:32.532764Z",
-        "2026-09-25T10:43:32.662271Z"
-       ],
        "ok": true
       },
       {
@@ -2345,26 +3109,26 @@
        "ok": true
       },
       {
-       "check": "every edge stored",
-       "detail": {
-        "edges_stored": 1830,
-        "upserts_without_edge": 20
-       },
-       "ok": false
-      },
-      {
        "check": "local dataset equals the server's",
        "detail": {
         "local": {
-         "edges": 1830,
-         "profiles": 1850,
-         "sha256": "e75f40d05292fd7e525fc2a590bf82b2be75441963e8341c7d38c3627d8ed2e1"
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
         },
         "server": {
-         "edges": 1830,
-         "profiles": 1850,
-         "sha256": "e75f40d05292fd7e525fc2a590bf82b2be75441963e8341c7d38c3627d8ed2e1"
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
         }
+       },
+       "ok": true
+      },
+      {
+       "check": "every edge the server publishes is on the device",
+       "detail": {
+        "device": 1880,
+        "server": 1880
        },
        "ok": true
       },
@@ -2383,193 +3147,2119 @@
       },
       {
        "check": "/api/health p95 <= 50 ms during load",
-       "detail": 21.4,
+       "detail": 10.9,
        "ok": true
       },
       {
        "check": "/api/catalog/health p95 <= 50 ms during load",
-       "detail": 14.3,
+       "detail": 14.0,
        "ok": true
       },
       {
        "check": "/settings/status p95 <= 100 ms during load",
-       "detail": 28.0,
+       "detail": 29.4,
        "ok": true
       }
      ],
+     "description": "Fresh first load of every waveform + edge profile over the legacy bootstrap path, then /profiles/changes; completes once, in one run.",
+     "elapsed_s": 5.9,
+     "metrics": {
+      "conn_errors": 0,
+      "counters": {
+       "legacy_pages_fetched": 38
+      },
+      "create_ms": null,
+      "dataset": {
+       "local": {
+        "edges": 1880,
+        "profiles": 1880,
+        "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+       },
+       "server": {
+        "edges": 1880,
+        "profiles": 1880,
+        "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+       }
+      },
+      "decoded_bytes": 37720217,
+      "decoded_mb": 37.7,
+      "fixture": {
+       "edges": 1880,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
+      "http_429": 0,
+      "http_503": 0,
+      "invalid_edges": {},
+      "max_request_ms": 67.2,
+      "page_latency": {
+       "changes": {
+        "first10_p50_ms": 8.6,
+        "last10_p50_ms": 8.6,
+        "max_ms": 8.6,
+        "n": 1,
+        "p50_ms": 8.6,
+        "p95_ms": 8.6
+       },
+       "legacy_page": {
+        "first10_p50_ms": 51.6,
+        "last10_p50_ms": 51.6,
+        "max_ms": 67.2,
+        "n": 38,
+        "p50_ms": 53.1,
+        "p95_ms": 58.7
+       }
+      },
+      "peak_server_rss_mb": 174.4,
+      "peak_worker_rss_mb": 150.9,
+      "profiles": 1880,
+      "rss_samples": 40,
+      "sqlite_file_mb": 25.8,
+      "sqlite_longest_tx_ms": 67.8,
+      "status_routes": {
+       "errors": {},
+       "routes": {
+        "/api/catalog/health": {
+         "max_ms": 14.0,
+         "n": 3,
+         "p50_ms": 11.6,
+         "p95_ms": 14.0
+        },
+        "/api/health": {
+         "max_ms": 10.9,
+         "n": 3,
+         "p50_ms": 10.1,
+         "p95_ms": 10.9
+        },
+        "/settings/status": {
+         "max_ms": 29.4,
+         "n": 2,
+         "p50_ms": 25.5,
+         "p95_ms": 29.4
+        }
+       }
+      },
+      "store": {
+       "edges_stored": 1880
+      },
+      "timings": {
+       "client_cpu_s": 2.15,
+       "deltas_s": 0.01,
+       "legacy_bootstrap_s": 4.16,
+       "publish_ms": 7.6,
+       "total_s": 4.19
+      },
+      "wall_s": 4.19,
+      "wire_bytes": 15688321,
+      "wire_mb": 15.7
+     },
+     "name": "first_load_legacy",
+     "notes": [],
+     "status": "PASS"
+    },
+    {
+     "assertions": [
+      {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "there are songs to re-analyse",
+       "detail": {
+        "forced_sample": 1880,
+        "songs": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "hook pass appended 0 events",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "every song short-circuited as current",
+       "detail": {
+        "current": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "hook pass left every edge row untouched",
+       "detail": {
+        "after": {
+         "rows": 1880,
+         "sha256": "9ddbb594105530b520e05e3f6f89c8a3ca41040a86dbef2b6192683d65c3d672"
+        },
+        "before": {
+         "rows": 1880,
+         "sha256": "9ddbb594105530b520e05e3f6f89c8a3ca41040a86dbef2b6192683d65c3d672"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "forced identical completions appended 0 events",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "forced identical completions all applied",
+       "detail": 1880,
+       "ok": true
+      },
+      {
+       "check": "every edge row untouched (keys and updated_at)",
+       "detail": {
+        "after": {
+         "rows": 1880,
+         "sha256": "9ddbb594105530b520e05e3f6f89c8a3ca41040a86dbef2b6192683d65c3d672"
+        },
+        "before": {
+         "rows": 1880,
+         "sha256": "9ddbb594105530b520e05e3f6f89c8a3ca41040a86dbef2b6192683d65c3d672"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "every published profile and served edge unchanged",
+       "detail": {
+        "after": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+        },
+        "before": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "no edge job scheduled or touched",
+       "detail": {
+        "after": {
+         "max_updated_at": null,
+         "rows": 0
+        },
+        "before": {
+         "max_updated_at": null,
+         "rows": 0
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "the device's next delta downloads nothing",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "device dataset still equals the server's",
+       "detail": {
+        "local": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+        },
+        "server": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+        }
+       },
+       "ok": true
+      }
+     ],
+     "description": "An AudioMuse re-analysis pass fires the analysis hook for every song; nothing changed, so it must append no journal event, leave every published row and edge row untouched, schedule no edge job, and a device's next delta downloads nothing.",
+     "elapsed_s": 14.2,
+     "metrics": {
+      "edge_jobs_after": {
+       "max_updated_at": null,
+       "rows": 0
+      },
+      "edge_jobs_before": {
+       "max_updated_at": null,
+       "rows": 0
+      },
+      "edge_rows_after": {
+       "rows": 1880,
+       "sha256": "9ddbb594105530b520e05e3f6f89c8a3ca41040a86dbef2b6192683d65c3d672"
+      },
+      "edge_rows_before": {
+       "rows": 1880,
+       "sha256": "9ddbb594105530b520e05e3f6f89c8a3ca41040a86dbef2b6192683d65c3d672"
+      },
+      "fixture": {
+       "edges": 1880,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
+      "forced_identical_completions": 1880,
+      "forced_s": 5.0,
+      "forced_sample": 1880,
+      "head_after": 51880,
+      "head_after_hook": 51880,
+      "head_before": 51880,
+      "hook_ms_per_song": 3.16,
+      "hook_pass_s": 5.9,
+      "hook_statuses": {
+       "current": 1880
+      },
+      "next_delta": {
+       "events": 0,
+       "wire_bytes": 632
+      },
+      "published_after": {
+       "edges": 1880,
+       "profiles": 1880,
+       "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+      },
+      "published_before": {
+       "edges": 1880,
+       "profiles": 1880,
+       "sha256": "43bd0df8a9fdf209ac357461f22ade953e11bfeb036c5bdf671ff78a5a5d86f8"
+      },
+      "songs": 1880
+     },
+     "name": "reanalysis_noop",
+     "notes": [],
+     "status": "PASS"
+    },
+    {
+     "assertions": [
+      {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "all 8 kill points fired and killed",
+       "detail": {
+        "fired": [
+         "create_capture",
+         "after_create",
+         "mid_snapshot",
+         "snapshot_end",
+         "catchup_capture",
+         "mid_catchup",
+         "before_release",
+         "during_deltas"
+        ],
+        "killed": [
+         "create_capture",
+         "after_create",
+         "mid_snapshot",
+         "snapshot_end",
+         "catchup_capture",
+         "mid_catchup",
+         "before_release",
+         "during_deltas"
+        ]
+       },
+       "ok": true
+      },
+      {
+       "check": "every in-flight and in-capture kill cut a request off",
+       "detail": [
+        [
+         "create_capture",
+         "v2_create"
+        ],
+        [
+         "mid_snapshot",
+         "v2_page"
+        ],
+        [
+         "catchup_capture",
+         "v2_catchup"
+        ],
+        [
+         "mid_catchup",
+         "v2_catchup"
+        ],
+        [
+         "during_deltas",
+         "changes"
+        ]
+       ],
+       "ok": true
+      },
+      {
+       "check": "both capture kills landed inside the capture transaction",
+       "detail": [
+        [
+         "create_capture",
+         true
+        ],
+        [
+         "catchup_capture",
+         true
+        ]
+       ],
+       "ok": true
+      },
+      {
+       "check": "the client saw each cut-off request fail",
+       "detail": {
+        "conn_errors": 5,
+        "cut_off": 5
+       },
+       "ok": true
+      },
+      {
+       "check": "the lost create was retried with the same client_request_id (K5)",
+       "detail": {
+        "create_retries": 1,
+        "orphan_after_retry": "deleted",
+        "orphan_session": "5caca852-49c5-4e3a-b971-7fc5a8134425",
+        "request_id": "52d51b71-7986-4d94-aaf8-53b6ce8f77ae",
+        "request_id_after": "52d51b71-7986-4d94-aaf8-53b6ce8f77ae"
+       },
+       "ok": true
+      },
+      {
+       "check": "the orphaned capture's session was replaced, not leaked",
+       "detail": {
+        "orphan_after_retry": "deleted",
+        "orphan_session": "5caca852-49c5-4e3a-b971-7fc5a8134425",
+        "request_id": "52d51b71-7986-4d94-aaf8-53b6ce8f77ae",
+        "request_id_after": "52d51b71-7986-4d94-aaf8-53b6ce8f77ae"
+       },
+       "ok": true
+      },
+      {
+       "check": "sync reached current",
+       "detail": "current",
+       "ok": true
+      },
+      {
+       "check": "one create for the whole run (never restarted from zero)",
+       "detail": {
+        "catchup_pages_fetched": 4,
+        "creates": 1,
+        "delta_events": 225,
+        "delta_pages_fetched": 3,
+        "expiry_extensions": 42,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "each snapshot page committed once; at most one re-request per kill",
+       "detail": {
+        "committed": 38,
+        "kills": 8,
+        "requests": 39
+       },
+       "ok": true
+      },
+      {
+       "check": "catch-up carried the changes made during the snapshot",
+       "detail": {
+        "catchup_pages_fetched": 4,
+        "creates": 1,
+        "delta_events": 225,
+        "delta_pages_fetched": 3,
+        "expiry_extensions": 42,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "deltas carried the changes made after the catch-up",
+       "detail": {
+        "catchup_pages_fetched": 4,
+        "creates": 1,
+        "delta_events": 225,
+        "delta_pages_fetched": 3,
+        "expiry_extensions": 42,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "no invalid edge",
+       "detail": {},
+       "ok": true
+      },
+      {
+       "check": "local dataset equals the server's",
+       "detail": {
+        "local": {
+         "edges": 1855,
+         "profiles": 1865,
+         "sha256": "f60d5043826d62ab23e633976ab56137c3a6bcb2038f571d9787c05c68642c5f"
+        },
+        "server": {
+         "edges": 1855,
+         "profiles": 1865,
+         "sha256": "f60d5043826d62ab23e633976ab56137c3a6bcb2038f571d9787c05c68642c5f"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "no leaked live session",
+       "detail": {
+        "before": 0,
+        "live": 0
+       },
+       "ok": true
+      }
+     ],
+     "description": "kill -9 and restart gunicorn at 8 points (during the create's snapshot capture, after create, mid-snapshot, snapshot end, during the first catch-up capture, mid-catch-up, before release, during deltas) while the library changes; the client resumes from its checkpoint, retries the lost create with the same client_request_id, and ends with the server's dataset.",
+     "elapsed_s": 23.4,
+     "metrics": {
+      "client_runs": 4,
+      "conn_errors": 5,
+      "counters": {
+       "catchup_pages_fetched": 4,
+       "creates": 1,
+       "delta_events": 225,
+       "delta_pages_fetched": 3,
+       "expiry_extensions": 42,
+       "releases": 1,
+       "snapshot_pages_fetched": 38
+      },
+      "create_ms": 317.0,
+      "dataset": {
+       "local": {
+        "edges": 1855,
+        "profiles": 1865,
+        "sha256": "f60d5043826d62ab23e633976ab56137c3a6bcb2038f571d9787c05c68642c5f"
+       },
+       "server": {
+        "edges": 1855,
+        "profiles": 1865,
+        "sha256": "f60d5043826d62ab23e633976ab56137c3a6bcb2038f571d9787c05c68642c5f"
+       }
+      },
+      "decoded_bytes": 43628646,
+      "decoded_mb": 43.6,
+      "events_during_sync": 395,
+      "fixture": {
+       "edges": 1880,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
+      "http_429": 0,
+      "http_503": 0,
+      "invalid_edges": {},
+      "k5": {
+       "orphan_after_retry": "deleted",
+       "orphan_session": "5caca852-49c5-4e3a-b971-7fc5a8134425",
+       "request_id": "52d51b71-7986-4d94-aaf8-53b6ce8f77ae",
+       "request_id_after": "52d51b71-7986-4d94-aaf8-53b6ce8f77ae"
+      },
+      "kills": [
+       {
+        "blocked_capture": true,
+        "kind": "in_capture",
+        "point": "create_capture",
+        "request_in_flight": "v2_create",
+        "restart_s": 1.28
+       },
+       {
+        "kind": "between_requests",
+        "point": "after_create",
+        "request_in_flight": null,
+        "restart_s": 1.22
+       },
+       {
+        "kind": "in_flight",
+        "point": "mid_snapshot",
+        "request_in_flight": "v2_page",
+        "restart_s": 1.23
+       },
+       {
+        "kind": "between_requests",
+        "point": "snapshot_end",
+        "request_in_flight": null,
+        "restart_s": 1.42
+       },
+       {
+        "blocked_capture": true,
+        "kind": "in_capture",
+        "point": "catchup_capture",
+        "request_in_flight": "v2_catchup",
+        "restart_s": 1.32
+       },
+       {
+        "kind": "in_flight",
+        "point": "mid_catchup",
+        "request_in_flight": "v2_catchup",
+        "restart_s": 1.3
+       },
+       {
+        "kind": "between_requests",
+        "point": "before_release",
+        "request_in_flight": null,
+        "restart_s": 1.31
+       },
+       {
+        "kind": "in_flight",
+        "point": "during_deltas",
+        "request_in_flight": "changes",
+        "restart_s": 1.34
+       }
+      ],
+      "max_request_ms": 909.7,
+      "mutations": {
+       "edges": 20,
+       "media": 30,
+       "waveform": 300,
+       "withdraw": 15
+      },
+      "page_latency": {
+       "changes": {
+        "first10_p50_ms": 94.2,
+        "last10_p50_ms": 94.2,
+        "max_ms": 908.5,
+        "n": 4,
+        "p50_ms": 94.2,
+        "p95_ms": 908.5
+       },
+       "v2_catchup": {
+        "first10_p50_ms": 27.0,
+        "last10_p50_ms": 27.0,
+        "max_ms": 868.6,
+        "n": 6,
+        "p50_ms": 27.0,
+        "p95_ms": 868.6
+       },
+       "v2_page": {
+        "first10_p50_ms": 210.4,
+        "last10_p50_ms": 85.9,
+        "max_ms": 909.7,
+        "n": 39,
+        "p50_ms": 164.5,
+        "p95_ms": 223.3
+       }
+      },
+      "peak_server_rss_mb": 175.1,
+      "peak_worker_rss_mb": 151.6,
+      "points_fired": [
+       "create_capture",
+       "after_create",
+       "mid_snapshot",
+       "snapshot_end",
+       "catchup_capture",
+       "mid_catchup",
+       "before_release",
+       "during_deltas"
+      ],
+      "profiles_after": 1865,
+      "rss_samples": 208,
+      "sqlite_file_mb": 25.8,
+      "sqlite_longest_tx_ms": 120.6,
+      "status_routes": {
+       "errors": {
+        "/api/health conn_error": 2,
+        "/settings/status conn_error": 1
+       },
+       "routes": {
+        "/api/catalog/health": {
+         "max_ms": 977.8,
+         "n": 10,
+         "p50_ms": 14.7,
+         "p95_ms": 977.8
+        },
+        "/api/health": {
+         "max_ms": 1234.8,
+         "n": 8,
+         "p50_ms": 9.3,
+         "p95_ms": 1234.8
+        },
+        "/settings/status": {
+         "max_ms": 1026.8,
+         "n": 8,
+         "p50_ms": 17.8,
+         "p95_ms": 1026.8
+        }
+       }
+      },
+      "store": {
+       "deletes": 15,
+       "edges_stored": 200,
+       "upserts_without_edge": 10
+      },
+      "timings": {
+       "client_cpu_s": 0.29,
+       "deltas_s": 1.73,
+       "total_s": 1.74
+      },
+      "wall_s": 21.7,
+      "wire_bytes": 18131608,
+      "wire_mb": 18.1
+     },
+     "name": "kill_restart",
+     "notes": [],
+     "status": "PASS"
+    },
+    {
+     "assertions": [
+      {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 1855,
+        "head_seq": 52275,
+        "profiles": 1865,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 1855,
+        "head_seq": 52275,
+        "profiles": 1865,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "at least 90% of the published profiles carry an edge",
+       "detail": {
+        "edges": 1855,
+        "head_seq": 52275,
+        "profiles": 1865,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "device 1 reached current once",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "device 1 dataset equals the server's",
+       "detail": {
+        "device": {
+         "edges": 1855,
+         "profiles": 1865,
+         "sha256": "f60d5043826d62ab23e633976ab56137c3a6bcb2038f571d9787c05c68642c5f"
+        },
+        "server": {
+         "edges": 1855,
+         "profiles": 1865,
+         "sha256": "f60d5043826d62ab23e633976ab56137c3a6bcb2038f571d9787c05c68642c5f"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "device 1 saw no 503",
+       "detail": {
+        "200": 43
+       },
+       "ok": true
+      },
+      {
+       "check": "device 2 reached current once",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "device 2 dataset equals the server's",
+       "detail": {
+        "device": {
+         "edges": 1855,
+         "profiles": 1865,
+         "sha256": "f60d5043826d62ab23e633976ab56137c3a6bcb2038f571d9787c05c68642c5f"
+        },
+        "server": {
+         "edges": 1855,
+         "profiles": 1865,
+         "sha256": "f60d5043826d62ab23e633976ab56137c3a6bcb2038f571d9787c05c68642c5f"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "device 2 saw no 503",
+       "detail": {
+        "200": 43
+       },
+       "ok": true
+      },
+      {
+       "check": "no leaked live session",
+       "detail": {
+        "before": 0,
+        "live": 0
+       },
+       "ok": true
+      },
+      {
+       "check": "/api/health p95 <= 50 ms during load",
+       "detail": 17.4,
+       "ok": true
+      },
+      {
+       "check": "/api/catalog/health p95 <= 50 ms during load",
+       "detail": 13.6,
+       "ok": true
+      },
+      {
+       "check": "/settings/status p95 <= 100 ms during load",
+       "detail": 21.5,
+       "ok": true
+      }
+     ],
+     "description": "Two devices do their own v2 first load at the same time (separate processes and SQLite files).",
+     "elapsed_s": 6.4,
+     "metrics": {
+      "device1": {
+       "conn_errors": 0,
+       "counters": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "create_ms": 101.6,
+       "decoded_bytes": 37233412,
+       "decoded_mb": 37.2,
+       "http_429": 0,
+       "http_503": 0,
+       "invalid_edges": {},
+       "max_request_ms": 101.6,
+       "page_latency": {
+        "changes": {
+         "first10_p50_ms": 12.8,
+         "last10_p50_ms": 12.8,
+         "max_ms": 12.8,
+         "n": 1,
+         "p50_ms": 12.8,
+         "p95_ms": 12.8
+        },
+        "v2_catchup": {
+         "first10_p50_ms": 14.3,
+         "last10_p50_ms": 14.3,
+         "max_ms": 14.3,
+         "n": 1,
+         "p50_ms": 14.3,
+         "p95_ms": 14.3
+        },
+        "v2_page": {
+         "first10_p50_ms": 60.2,
+         "last10_p50_ms": 64.0,
+         "max_ms": 79.4,
+         "n": 38,
+         "p50_ms": 61.9,
+         "p95_ms": 74.5
+        }
+       },
+       "sqlite_longest_tx_ms": 64.7,
+       "store": {
+        "edges_stored": 1855,
+        "upserts_without_edge": 10
+       },
+       "timings": {
+        "catchup_s": 0.02,
+        "client_cpu_s": 1.98,
+        "create_ms": 101.7,
+        "deltas_s": 0.01,
+        "publish_ms": 7.3,
+        "snapshot_s": 4.48,
+        "total_s": 4.64
+       },
+       "wire_bytes": 15501707,
+       "wire_mb": 15.5
+      },
+      "device2": {
+       "conn_errors": 0,
+       "counters": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "create_ms": 157.2,
+       "decoded_bytes": 37233412,
+       "decoded_mb": 37.2,
+       "http_429": 0,
+       "http_503": 0,
+       "invalid_edges": {},
+       "max_request_ms": 157.2,
+       "page_latency": {
+        "changes": {
+         "first10_p50_ms": 6.1,
+         "last10_p50_ms": 6.1,
+         "max_ms": 6.1,
+         "n": 1,
+         "p50_ms": 6.1,
+         "p95_ms": 6.1
+        },
+        "v2_catchup": {
+         "first10_p50_ms": 10.0,
+         "last10_p50_ms": 10.0,
+         "max_ms": 10.0,
+         "n": 1,
+         "p50_ms": 10.0,
+         "p95_ms": 10.0
+        },
+        "v2_page": {
+         "first10_p50_ms": 60.5,
+         "last10_p50_ms": 59.6,
+         "max_ms": 79.8,
+         "n": 38,
+         "p50_ms": 61.5,
+         "p95_ms": 75.9
+        }
+       },
+       "sqlite_longest_tx_ms": 62.6,
+       "store": {
+        "edges_stored": 1855,
+        "upserts_without_edge": 10
+       },
+       "timings": {
+        "catchup_s": 0.02,
+        "client_cpu_s": 1.98,
+        "create_ms": 157.3,
+        "deltas_s": 0.01,
+        "publish_ms": 7.0,
+        "snapshot_s": 4.46,
+        "total_s": 4.67
+       },
+       "wire_bytes": 15501650,
+       "wire_mb": 15.5
+      },
+      "fixture": {
+       "edges": 1855,
+       "head_seq": 52275,
+       "profiles": 1865,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
+      "peak_server_rss_mb": 184.7,
+      "peak_worker_rss_mb": 161.2,
+      "rss_samples": 54,
+      "status_routes": {
+       "errors": {},
+       "routes": {
+        "/api/catalog/health": {
+         "max_ms": 13.6,
+         "n": 4,
+         "p50_ms": 12.0,
+         "p95_ms": 13.6
+        },
+        "/api/health": {
+         "max_ms": 17.4,
+         "n": 4,
+         "p50_ms": 11.6,
+         "p95_ms": 17.4
+        },
+        "/settings/status": {
+         "max_ms": 21.5,
+         "n": 3,
+         "p50_ms": 20.0,
+         "p95_ms": 21.5
+        }
+       }
+      },
+      "wall_s": 5.57
+     },
+     "name": "concurrent_devices",
+     "notes": [],
+     "status": "PASS"
+    }
+   ],
+   "source": "f1ad7bb1-09a9-45ff-b46d-5828685c236f",
+   "started_at": "2026-09-25T14:32:12Z",
+   "summary": {
+    "concurrent_devices": "PASS",
+    "first_load_legacy": "PASS",
+    "first_load_v2": "PASS",
+    "kill_restart": "PASS",
+    "reanalysis_noop": "PASS"
+   }
+  },
+  "mutation_empty_edge_fixture": {
+   "bench": "e2e_server_matrix",
+   "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpus": 4,
+    "database_mb": 100.8,
+    "fixture": {
+     "counts": {
+      "albums": 240,
+      "artists": 120,
+      "items": 1380,
+      "pairs": 140,
+      "profiles": 1880,
+      "tasks": 3000,
+      "tracks": 2640
+     },
+     "edge_template": "docs/audit/2026-09-24/probes/lum010/edge.json",
+     "events": 50000,
+     "scale": 0.02,
+     "seed": 1
+    },
+    "git_sha": "928e52d",
+    "mem_total_gb": 15.7,
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "postgres": {
+     "max_wal_size": "1GB",
+     "shared_buffers": "128MB",
+     "version": "PostgreSQL 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+     "work_mem": "4MB"
+    },
+    "python": "3.11.15",
+    "server": {
+     "app": "scripts/e2e/host_app.py (plugin blueprint, stub host)",
+     "command": "-m gunicorn --chdir <repo>/scripts/e2e --bind 127.0.0.1:18805 --worker-class gthread --workers 1 --threads 4 --keep-alive 5 --timeout 300 --no-control-socket --error-logfile <scratch>/gunicorn_18805.log host_app:app",
+     "gunicorn": "25.3.0",
+     "kind": "local",
+     "topology": "gthread, 1 worker x 4 threads"
+    }
+   },
+   "finished_at": "2026-09-25T14:27:38Z",
+   "scenarios": [
+    {
+     "assertions": [
+      {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 0,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 0,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": false
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 0,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": false
+      },
+      {
+       "check": "sync reached current",
+       "detail": "current",
+       "ok": true
+      },
+      {
+       "check": "no connection error or retried request",
+       "detail": {
+        "conn_errors": 0,
+        "events": {}
+       },
+       "ok": true
+      },
+      {
+       "check": "exactly one v2 create",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "one create request and one request per snapshot page",
+       "detail": {
+        "create_requests": 1,
+        "page_requests": 38,
+        "pages": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "no v2 restart (410/400) and no legacy fallback",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "every snapshot page fetched once",
+       "detail": {
+        "expected": 38,
+        "fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "session released",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "sliding expiry advanced",
+       "detail": [
+        "2026-09-25T15:27:36.614175Z",
+        "2026-09-25T15:27:36.625750Z",
+        "2026-09-25T15:27:36.637618Z"
+       ],
+       "ok": true
+      },
+      {
+       "check": "no invalid edge",
+       "detail": {},
+       "ok": true
+      },
+      {
+       "check": "local dataset equals the server's",
+       "detail": {
+        "local": {
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
+        },
+        "server": {
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "every edge the server publishes is on the device",
+       "detail": {
+        "device": 0,
+        "server": 0
+       },
+       "ok": true
+      },
+      {
+       "check": "no 503 during the load",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "no leaked live session",
+       "detail": {
+        "before": 0,
+        "live": 0
+       },
+       "ok": true
+      },
+      {
+       "check": "/api/health p95 <= 50 ms during load",
+       "detail": 15.2,
+       "ok": true
+      },
+      {
+       "check": "/api/catalog/health p95 <= 50 ms during load",
+       "detail": 12.9,
+       "ok": true
+      },
+      {
+       "check": "/settings/status p95 <= 100 ms during load",
+       "ok": false
+      }
+     ],
      "description": "Fresh first load of every waveform + edge profile over the v2 bootstrap path, then /profiles/changes; completes once, in one run.",
-     "elapsed_s": 6.6,
+     "elapsed_s": 0.8,
      "metrics": {
       "conn_errors": 0,
       "counters": {
        "catchup_pages_fetched": 1,
        "creates": 1,
-       "expiry_extensions": 38,
+       "expiry_extensions": 39,
        "releases": 1,
-       "snapshot_pages_fetched": 37
+       "snapshot_pages_fetched": 38
       },
-      "create_ms": 92.7,
+      "create_ms": 75.3,
       "dataset": {
        "local": {
-        "edges": 1830,
-        "profiles": 1850,
-        "sha256": "e75f40d05292fd7e525fc2a590bf82b2be75441963e8341c7d38c3627d8ed2e1"
+        "edges": 0,
+        "profiles": 1880,
+        "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
        },
        "server": {
-        "edges": 1830,
-        "profiles": 1850,
-        "sha256": "e75f40d05292fd7e525fc2a590bf82b2be75441963e8341c7d38c3627d8ed2e1"
+        "edges": 0,
+        "profiles": 1880,
+        "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
        }
       },
-      "decoded_bytes": 36736321,
-      "decoded_mb": 36.7,
+      "decoded_bytes": 976673,
+      "decoded_mb": 1.0,
+      "fixture": {
+       "edges": 0,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
       "http_429": 0,
       "http_503": 0,
       "invalid_edges": {},
-      "max_request_ms": 98.9,
+      "max_request_ms": 75.3,
       "page_latency": {
        "changes": {
-        "first10_p50_ms": 9.1,
-        "last10_p50_ms": 9.1,
-        "max_ms": 9.1,
+        "first10_p50_ms": 9.5,
+        "last10_p50_ms": 9.5,
+        "max_ms": 9.5,
         "n": 1,
-        "p50_ms": 9.1,
-        "p95_ms": 9.1
+        "p50_ms": 9.5,
+        "p95_ms": 9.5
        },
        "v2_catchup": {
-        "first10_p50_ms": 17.9,
-        "last10_p50_ms": 17.9,
-        "max_ms": 17.9,
+        "first10_p50_ms": 11.7,
+        "last10_p50_ms": 11.7,
+        "max_ms": 11.7,
         "n": 1,
-        "p50_ms": 17.9,
-        "p95_ms": 17.9
+        "p50_ms": 11.7,
+        "p95_ms": 11.7
        },
        "v2_page": {
-        "first10_p50_ms": 61.6,
-        "last10_p50_ms": 56.1,
-        "max_ms": 98.9,
-        "n": 37,
-        "p50_ms": 59.9,
-        "p95_ms": 75.4
+        "first10_p50_ms": 11.8,
+        "last10_p50_ms": 10.9,
+        "max_ms": 14.4,
+        "n": 38,
+        "p50_ms": 11.2,
+        "p95_ms": 13.6
        }
       },
       "page_query_plan": {
        "ordinal_0": {
         "analyzed": false,
         "edge_lookups": null,
-        "snapshot_rows_estimated": 1,
+        "snapshot_rows_estimated": 18,
         "snapshot_rows_read": null,
-        "snapshot_scan": "Index Scan",
-        "sort_after_join": false
+        "snapshot_scan": "Bitmap Heap Scan",
+        "sort_after_join": true
        },
-       "ordinal_900": {
+       "ordinal_950": {
         "analyzed": false,
         "edge_lookups": null,
-        "snapshot_rows_estimated": 1,
+        "snapshot_rows_estimated": 18,
         "snapshot_rows_read": null,
-        "snapshot_scan": "Index Scan",
-        "sort_after_join": false
+        "snapshot_scan": "Bitmap Heap Scan",
+        "sort_after_join": true
        }
       },
-      "peak_server_rss_mb": 176.0,
-      "peak_worker_rss_mb": 150.8,
-      "profiles": 1850,
-      "rss_samples": 45,
-      "sqlite_file_mb": 25.2,
-      "sqlite_longest_tx_ms": 82.5,
+      "peak_server_rss_mb": 167.9,
+      "peak_worker_rss_mb": 144.4,
+      "profiles": 1880,
+      "rss_samples": 7,
+      "sqlite_file_mb": 2.7,
+      "sqlite_longest_tx_ms": 36.0,
       "status_routes": {
        "errors": {},
        "routes": {
         "/api/catalog/health": {
-         "max_ms": 14.3,
-         "n": 3,
+         "max_ms": 12.9,
+         "n": 1,
          "p50_ms": 12.9,
-         "p95_ms": 14.3
+         "p95_ms": 12.9
         },
         "/api/health": {
-         "max_ms": 21.4,
-         "n": 3,
-         "p50_ms": 10.2,
-         "p95_ms": 21.4
-        },
-        "/settings/status": {
-         "max_ms": 28.0,
-         "n": 3,
-         "p50_ms": 23.8,
-         "p95_ms": 28.0
+         "max_ms": 15.2,
+         "n": 1,
+         "p50_ms": 15.2,
+         "p95_ms": 15.2
         }
        }
       },
       "store": {
-       "edges_stored": 1830,
-       "upserts_without_edge": 20
+       "upserts_without_edge": 1880
       },
       "timings": {
-       "catchup_s": 0.03,
-       "client_cpu_s": 2.16,
-       "create_ms": 92.8,
+       "catchup_s": 0.05,
+       "client_cpu_s": 0.1,
+       "create_ms": 75.4,
        "deltas_s": 0.01,
-       "publish_ms": 7.9,
-       "snapshot_s": 4.55,
-       "total_s": 4.7
+       "publish_ms": 3.9,
+       "snapshot_s": 0.49,
+       "total_s": 0.66
       },
-      "wall_s": 4.7,
-      "wire_bytes": 15291719,
-      "wire_mb": 15.3
+      "wall_s": 0.66,
+      "wire_bytes": 177349,
+      "wire_mb": 0.2
      },
-     "name": "first_load_v2#warm",
+     "name": "first_load_v2",
      "notes": [],
      "status": "FAIL"
     },
     {
      "assertions": [
       {
-       "check": "device dataset equals the server's after the republish",
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 0,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 0,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": false
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 0,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": false
+      },
+      {
+       "check": "sync reached current",
+       "detail": "current",
+       "ok": true
+      },
+      {
+       "check": "no connection error or retried request",
+       "detail": {
+        "conn_errors": 0,
+        "events": {}
+       },
+       "ok": true
+      },
+      {
+       "check": "every legacy page fetched once",
+       "detail": {
+        "expected": 38,
+        "fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "no legacy restart",
+       "detail": {
+        "legacy_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "one request per legacy page",
+       "detail": {
+        "page_requests": 38,
+        "pages": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "no invalid edge",
+       "detail": {},
+       "ok": true
+      },
+      {
+       "check": "local dataset equals the server's",
        "detail": {
         "local": {
-         "edges": 1830,
-         "profiles": 1850,
-         "sha256": "1be9e8a4ccca31d090f5e32089a62c351ab34c6d6dc624c13c231bc9c6736ed2"
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
         },
         "server": {
-         "edges": 1830,
-         "profiles": 1850,
-         "sha256": "1be9e8a4ccca31d090f5e32089a62c351ab34c6d6dc624c13c231bc9c6736ed2"
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
         }
        },
        "ok": true
       },
       {
-       "check": "<= 1024 B/track on the wire (pending P3-2)",
-       "detail": 8243,
+       "check": "every edge the server publishes is on the device",
+       "detail": {
+        "device": 0,
+        "server": 0
+       },
+       "ok": true
+      },
+      {
+       "check": "no 503 during the load",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "no leaked live session",
+       "detail": {
+        "before": 0,
+        "live": 0
+       },
+       "ok": true
+      },
+      {
+       "check": "/api/health p95 <= 50 ms during load",
+       "detail": 9.5,
+       "ok": true
+      },
+      {
+       "check": "/api/catalog/health p95 <= 50 ms during load",
+       "ok": false
+      },
+      {
+       "check": "/settings/status p95 <= 100 ms during load",
        "ok": false
       }
      ],
-     "description": "LUM-005-style full republish (every waveform changes, same media) must reach a device at <= 1 KB per track with K6 edge references (P3-2).",
-     "elapsed_s": 7.3,
+     "description": "Fresh first load of every waveform + edge profile over the legacy bootstrap path, then /profiles/changes; completes once, in one run.",
+     "elapsed_s": 0.6,
      "metrics": {
-      "capability_profile_stream_edge_refs": false,
-      "decoded_bytes_per_track": 20167,
-      "delta_wire_bytes": 824312,
-      "edge_fetches": 0,
-      "edge_refs_kept": 0,
-      "extrapolated_full_republish_wire_mb": 15.1,
-      "republished": 100,
-      "wire_bytes_per_track_without_k6": 8243
+      "conn_errors": 0,
+      "counters": {
+       "legacy_pages_fetched": 38
+      },
+      "create_ms": null,
+      "dataset": {
+       "local": {
+        "edges": 0,
+        "profiles": 1880,
+        "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
+       },
+       "server": {
+        "edges": 0,
+        "profiles": 1880,
+        "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
+       }
+      },
+      "decoded_bytes": 960577,
+      "decoded_mb": 1.0,
+      "fixture": {
+       "edges": 0,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
+      "http_429": 0,
+      "http_503": 0,
+      "invalid_edges": {},
+      "max_request_ms": 15.7,
+      "page_latency": {
+       "changes": {
+        "first10_p50_ms": 9.8,
+        "last10_p50_ms": 9.8,
+        "max_ms": 9.8,
+        "n": 1,
+        "p50_ms": 9.8,
+        "p95_ms": 9.8
+       },
+       "legacy_page": {
+        "first10_p50_ms": 8.5,
+        "last10_p50_ms": 8.3,
+        "max_ms": 15.7,
+        "n": 38,
+        "p50_ms": 8.5,
+        "p95_ms": 11.5
+       }
+      },
+      "peak_server_rss_mb": 168.0,
+      "peak_worker_rss_mb": 144.5,
+      "profiles": 1880,
+      "rss_samples": 5,
+      "sqlite_file_mb": 2.7,
+      "sqlite_longest_tx_ms": 27.8,
+      "status_routes": {
+       "errors": {},
+       "routes": {
+        "/api/health": {
+         "max_ms": 9.5,
+         "n": 1,
+         "p50_ms": 9.5,
+         "p95_ms": 9.5
+        }
+       }
+      },
+      "store": {
+       "upserts_without_edge": 1880
+      },
+      "timings": {
+       "client_cpu_s": 0.08,
+       "deltas_s": 0.01,
+       "legacy_bootstrap_s": 0.41,
+       "publish_ms": 3.2,
+       "total_s": 0.44
+      },
+      "wall_s": 0.44,
+      "wire_bytes": 166577,
+      "wire_mb": 0.2
      },
-     "name": "lum005_k6",
-     "notes": [
-      "capabilities.profile_stream.edge_refs is absent: K6 (P3-2) is not built. The measured delta above is the no-K6 baseline; the <= 1 KB/track criterion cannot pass until P3-2 ships."
+     "name": "first_load_legacy",
+     "notes": [],
+     "status": "FAIL"
+    },
+    {
+     "assertions": [
+      {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 0,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 0,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": false
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 0,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": false
+      },
+      {
+       "check": "device 1 reached current once",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "device 1 dataset equals the server's",
+       "detail": {
+        "device": {
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
+        },
+        "server": {
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "device 1 saw no 503",
+       "detail": {
+        "200": 43
+       },
+       "ok": true
+      },
+      {
+       "check": "device 2 reached current once",
+       "detail": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "ok": true
+      },
+      {
+       "check": "device 2 dataset equals the server's",
+       "detail": {
+        "device": {
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
+        },
+        "server": {
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "52c805590202604d5cb7ea1f8c78dbcfb6072e019f99a4ef63dcbcbeb8e4bedf"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "device 2 saw no 503",
+       "detail": {
+        "200": 43
+       },
+       "ok": true
+      },
+      {
+       "check": "no leaked live session",
+       "detail": {
+        "before": 0,
+        "live": 0
+       },
+       "ok": true
+      },
+      {
+       "check": "/api/health p95 <= 50 ms during load",
+       "detail": 9.8,
+       "ok": true
+      },
+      {
+       "check": "/api/catalog/health p95 <= 50 ms during load",
+       "detail": 10.2,
+       "ok": true
+      },
+      {
+       "check": "/settings/status p95 <= 100 ms during load",
+       "ok": false
+      }
      ],
-     "status": "PENDING"
+     "description": "Two devices do their own v2 first load at the same time (separate processes and SQLite files).",
+     "elapsed_s": 0.9,
+     "metrics": {
+      "device1": {
+       "conn_errors": 0,
+       "counters": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "create_ms": 142.3,
+       "decoded_bytes": 970057,
+       "decoded_mb": 1.0,
+       "http_429": 0,
+       "http_503": 0,
+       "invalid_edges": {},
+       "max_request_ms": 142.3,
+       "page_latency": {
+        "changes": {
+         "first10_p50_ms": 6.4,
+         "last10_p50_ms": 6.4,
+         "max_ms": 6.4,
+         "n": 1,
+         "p50_ms": 6.4,
+         "p95_ms": 6.4
+        },
+        "v2_catchup": {
+         "first10_p50_ms": 10.0,
+         "last10_p50_ms": 10.0,
+         "max_ms": 10.0,
+         "n": 1,
+         "p50_ms": 10.0,
+         "p95_ms": 10.0
+        },
+        "v2_page": {
+         "first10_p50_ms": 12.4,
+         "last10_p50_ms": 10.9,
+         "max_ms": 13.9,
+         "n": 38,
+         "p50_ms": 11.0,
+         "p95_ms": 13.7
+        }
+       },
+       "sqlite_longest_tx_ms": 22.7,
+       "store": {
+        "upserts_without_edge": 1880
+       },
+       "timings": {
+        "catchup_s": 0.03,
+        "client_cpu_s": 0.07,
+        "create_ms": 142.4,
+        "deltas_s": 0.01,
+        "publish_ms": 3.7,
+        "snapshot_s": 0.48,
+        "total_s": 0.68
+       },
+       "wire_bytes": 174864,
+       "wire_mb": 0.2
+      },
+      "device2": {
+       "conn_errors": 0,
+       "counters": {
+        "catchup_pages_fetched": 1,
+        "creates": 1,
+        "expiry_extensions": 39,
+        "releases": 1,
+        "snapshot_pages_fetched": 38
+       },
+       "create_ms": 81.1,
+       "decoded_bytes": 970057,
+       "decoded_mb": 1.0,
+       "http_429": 0,
+       "http_503": 0,
+       "invalid_edges": {},
+       "max_request_ms": 81.1,
+       "page_latency": {
+        "changes": {
+         "first10_p50_ms": 6.1,
+         "last10_p50_ms": 6.1,
+         "max_ms": 6.1,
+         "n": 1,
+         "p50_ms": 6.1,
+         "p95_ms": 6.1
+        },
+        "v2_catchup": {
+         "first10_p50_ms": 10.3,
+         "last10_p50_ms": 10.3,
+         "max_ms": 10.3,
+         "n": 1,
+         "p50_ms": 10.3,
+         "p95_ms": 10.3
+        },
+        "v2_page": {
+         "first10_p50_ms": 13.2,
+         "last10_p50_ms": 11.3,
+         "max_ms": 27.9,
+         "n": 38,
+         "p50_ms": 11.5,
+         "p95_ms": 17.0
+        }
+       },
+       "sqlite_longest_tx_ms": 20.5,
+       "store": {
+        "upserts_without_edge": 1880
+       },
+       "timings": {
+        "catchup_s": 0.03,
+        "client_cpu_s": 0.07,
+        "create_ms": 81.2,
+        "deltas_s": 0.01,
+        "publish_ms": 3.3,
+        "snapshot_s": 0.51,
+        "total_s": 0.65
+       },
+       "wire_bytes": 174818,
+       "wire_mb": 0.2
+      },
+      "fixture": {
+       "edges": 0,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
+      "peak_server_rss_mb": 172.4,
+      "peak_worker_rss_mb": 148.9,
+      "rss_samples": 8,
+      "status_routes": {
+       "errors": {},
+       "routes": {
+        "/api/catalog/health": {
+         "max_ms": 10.2,
+         "n": 1,
+         "p50_ms": 10.2,
+         "p95_ms": 10.2
+        },
+        "/api/health": {
+         "max_ms": 9.8,
+         "n": 1,
+         "p50_ms": 9.8,
+         "p95_ms": 9.8
+        }
+       }
+      },
+      "wall_s": 0.81
+     },
+     "name": "concurrent_devices",
+     "notes": [],
+     "status": "FAIL"
     }
    ],
-   "source": "e2463ff5-5290-43f5-b99d-c69370f8c455",
-   "started_at": "2026-09-25T09:43:19Z",
+   "source": "8a4e2d4f-f832-457e-bcb7-c474a8736f1b",
+   "started_at": "2026-09-25T14:27:36Z",
    "summary": {
-    "first_load_v2": "FAIL",
-    "first_load_v2#warm": "FAIL",
-    "lum005_k6": "PENDING"
+    "concurrent_devices": "FAIL",
+    "first_load_legacy": "FAIL",
+    "first_load_v2": "FAIL"
+   }
+  },
+  "mutation_silent_edge_delete": {
+   "bench": "e2e_server_matrix",
+   "environment": {
+    "cpu": "Intel(R) Xeon(R) Processor @ 2.10GHz",
+    "cpus": 4,
+    "database_mb": 100.8,
+    "fixture": {
+     "counts": {
+      "albums": 240,
+      "artists": 120,
+      "items": 1380,
+      "pairs": 140,
+      "profiles": 1880,
+      "tasks": 3000,
+      "tracks": 2640
+     },
+     "edge_template": "docs/audit/2026-09-24/probes/lum010/edge.json",
+     "events": 50000,
+     "scale": 0.02,
+     "seed": 1
+    },
+    "git_sha": "928e52d",
+    "mem_total_gb": 15.7,
+    "platform": "Linux-6.18.44-fc-v37-x86_64-with-glibc2.39",
+    "postgres": {
+     "max_wal_size": "1GB",
+     "shared_buffers": "128MB",
+     "version": "PostgreSQL 16.13 (Ubuntu 16.13-0ubuntu0.24.04.1) on x86_64-pc-linux-gnu, compiled by gcc (Ubuntu 13.3.0-6ubuntu2~24.04.1) 13.3.0, 64-bit",
+     "work_mem": "4MB"
+    },
+    "python": "3.11.15",
+    "server": {
+     "app": "scripts/e2e/host_app.py (plugin blueprint, stub host)",
+     "command": "-m gunicorn --chdir <repo>/scripts/e2e --bind 127.0.0.1:18804 --worker-class gthread --workers 1 --threads 4 --keep-alive 5 --timeout 300 --no-control-socket --error-logfile <scratch>/gunicorn_18804.log host_app:app",
+     "gunicorn": "25.3.0",
+     "kind": "local",
+     "topology": "gthread, 1 worker x 4 threads"
+    }
+   },
+   "finished_at": "2026-09-25T14:27:11Z",
+   "scenarios": [
+    {
+     "assertions": [
+      {
+       "check": "the server publishes profiles",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "the server publishes edges",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "pristine fixture: every seeded profile is published with its edge",
+       "detail": {
+        "edges": 1880,
+        "head_seq": 51880,
+        "profiles": 1880,
+        "seeded_head": 51880,
+        "seeded_profiles": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "device loaded before the pass",
+       "detail": "current",
+       "ok": true
+      },
+      {
+       "check": "there are songs to re-analyse",
+       "detail": {
+        "forced_sample": 1880,
+        "songs": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "hook pass appended 0 events",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "every song short-circuited as current",
+       "detail": {
+        "current": 1880
+       },
+       "ok": true
+      },
+      {
+       "check": "hook pass left every edge row untouched",
+       "detail": {
+        "after": {
+         "rows": 1880,
+         "sha256": "1be1a0718c73058314b65e488b0117f7be8371bd8d79820273526aeec632eb58"
+        },
+        "before": {
+         "rows": 1880,
+         "sha256": "1be1a0718c73058314b65e488b0117f7be8371bd8d79820273526aeec632eb58"
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "forced identical completions appended 0 events",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "forced identical completions all applied",
+       "detail": 1880,
+       "ok": true
+      },
+      {
+       "check": "every edge row untouched (keys and updated_at)",
+       "detail": {
+        "after": {
+         "rows": 0,
+         "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+        },
+        "before": {
+         "rows": 1880,
+         "sha256": "1be1a0718c73058314b65e488b0117f7be8371bd8d79820273526aeec632eb58"
+        }
+       },
+       "ok": false
+      },
+      {
+       "check": "every published profile and served edge unchanged",
+       "detail": {
+        "after": {
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "a790f35ede3613751d563d2c6eb0e1b5ab402eaf34c9f7999e8460d156e58323"
+        },
+        "before": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "567349d7ef69e75155eb1a0d72d0595097de7125ba68f3608839a60404a9305f"
+        }
+       },
+       "ok": false
+      },
+      {
+       "check": "no edge job scheduled or touched",
+       "detail": {
+        "after": {
+         "max_updated_at": null,
+         "rows": 0
+        },
+        "before": {
+         "max_updated_at": null,
+         "rows": 0
+        }
+       },
+       "ok": true
+      },
+      {
+       "check": "the device's next delta downloads nothing",
+       "detail": 0,
+       "ok": true
+      },
+      {
+       "check": "device dataset still equals the server's",
+       "detail": {
+        "differing_tracks": 1880,
+        "first_differences": [
+         "tr-0000001",
+         "tr-0000002",
+         "tr-0000003",
+         "tr-0000004",
+         "tr-0000005",
+         "tr-0000006",
+         "tr-0000007",
+         "tr-0000008",
+         "tr-0000009",
+         "tr-0000010"
+        ],
+        "local": {
+         "edges": 1880,
+         "profiles": 1880,
+         "sha256": "567349d7ef69e75155eb1a0d72d0595097de7125ba68f3608839a60404a9305f"
+        },
+        "server": {
+         "edges": 0,
+         "profiles": 1880,
+         "sha256": "a790f35ede3613751d563d2c6eb0e1b5ab402eaf34c9f7999e8460d156e58323"
+        }
+       },
+       "ok": false
+      }
+     ],
+     "description": "An AudioMuse re-analysis pass fires the analysis hook for every song; nothing changed, so it must append no journal event, leave every published row and edge row untouched, schedule no edge job, and a device's next delta downloads nothing.",
+     "elapsed_s": 20.4,
+     "metrics": {
+      "edge_jobs_after": {
+       "max_updated_at": null,
+       "rows": 0
+      },
+      "edge_jobs_before": {
+       "max_updated_at": null,
+       "rows": 0
+      },
+      "edge_rows_after": {
+       "rows": 0,
+       "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
+      },
+      "edge_rows_before": {
+       "rows": 1880,
+       "sha256": "1be1a0718c73058314b65e488b0117f7be8371bd8d79820273526aeec632eb58"
+      },
+      "fixture": {
+       "edges": 1880,
+       "head_seq": 51880,
+       "profiles": 1880,
+       "seeded_head": 51880,
+       "seeded_profiles": 1880
+      },
+      "forced_identical_completions": 1880,
+      "forced_s": 5.4,
+      "forced_sample": 1880,
+      "head_after": 51880,
+      "head_after_hook": 51880,
+      "head_before": 51880,
+      "hook_ms_per_song": 3.06,
+      "hook_pass_s": 5.8,
+      "hook_statuses": {
+       "current": 1880
+      },
+      "next_delta": {
+       "events": 0,
+       "wire_bytes": 632
+      },
+      "published_after": {
+       "edges": 0,
+       "profiles": 1880,
+       "sha256": "a790f35ede3613751d563d2c6eb0e1b5ab402eaf34c9f7999e8460d156e58323"
+      },
+      "published_before": {
+       "edges": 1880,
+       "profiles": 1880,
+       "sha256": "567349d7ef69e75155eb1a0d72d0595097de7125ba68f3608839a60404a9305f"
+      },
+      "songs": 1880
+     },
+     "name": "reanalysis_noop",
+     "notes": [
+      "first_load_v2 did not run first; loaded a device for the delta check"
+     ],
+     "status": "FAIL"
+    }
+   ],
+   "source": "b806135f-ac27-41fd-a73c-58477dbd5dda",
+   "started_at": "2026-09-25T14:26:50Z",
+   "summary": {
+    "reanalysis_noop": "FAIL"
    }
   },
   "stock_host_bundled_pg15_scale_0_05": {

@@ -3,6 +3,7 @@
 # It keeps its own volume, so the PostgreSQL 15 data directory is untouched.
 services:
   postgres:
-    image: postgres:17
+    # postgres:17 (17.11) as pulled for the 2026-09-25 run, pinned by index digest.
+    image: postgres:17@sha256:d74eeac9a635390a49bc21bd49fccd973de707e2a53a76ac49b552b8712ec46f
     volumes: !override
       - pgdata17:/var/lib/postgresql/data

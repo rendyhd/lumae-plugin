@@ -35,7 +35,9 @@ CLI::
 
     client_sim.py sync   --base-url http://127.0.0.1:18080 --db dev1.sqlite [--mode v2|legacy|auto]
     client_sim.py digest --db dev1.sqlite
-    client_sim.py poll   --base-url ... --seconds 60
+
+``poll_routes`` (the status-route poller) is used by ``run_server_matrix.py``;
+it has no subcommand.
 """
 import argparse
 import collections
@@ -216,6 +218,9 @@ class Transport:
         self.user = user
         self.accept_gzip = accept_gzip
         self.conn = None
+        # The kind of the request on the wire right now (None when idle), so a
+        # harness can tell whether a server kill cut a request off.
+        self.inflight_kind = None
 
     def close(self):
         if self.conn is not None:
@@ -238,26 +243,32 @@ class Transport:
         if self.user:
             headers["X-E2E-User"] = self.user
         started = time.perf_counter()
-        for attempt in (0, 1):
-            reused = self.conn is not None
-            try:
-                if self.conn is None:
-                    self.conn = http.client.HTTPConnection(self.host, self.port, timeout=timeout)
-                self.conn.timeout = timeout
-                if self.conn.sock is not None:
-                    self.conn.sock.settimeout(timeout)
-                self.conn.request(method, url, body=data, headers=headers)
-                resp = self.conn.getresponse()
-                raw = resp.read()
-                break
-            except (http.client.RemoteDisconnected, BrokenPipeError, ConnectionResetError) as exc:
-                self.close()
-                if reused and attempt == 0:
-                    continue  # the server closed an idle kept-alive socket
-                self._failed(kind, started, exc)
-            except (OSError, http.client.HTTPException) as exc:
-                self.close()
-                self._failed(kind, started, exc)
+        self.inflight_kind = kind
+        try:
+            for attempt in (0, 1):
+                reused = self.conn is not None
+                try:
+                    if self.conn is None:
+                        self.conn = http.client.HTTPConnection(self.host, self.port,
+                                                               timeout=timeout)
+                    self.conn.timeout = timeout
+                    if self.conn.sock is not None:
+                        self.conn.sock.settimeout(timeout)
+                    self.conn.request(method, url, body=data, headers=headers)
+                    resp = self.conn.getresponse()
+                    raw = resp.read()
+                    break
+                except (http.client.RemoteDisconnected, BrokenPipeError,
+                        ConnectionResetError) as exc:
+                    self.close()
+                    if reused and attempt == 0:
+                        continue  # the server closed an idle kept-alive socket
+                    self._failed(kind, started, exc)
+                except (OSError, http.client.HTTPException) as exc:
+                    self.close()
+                    self._failed(kind, started, exc)
+        finally:
+            self.inflight_kind = None
         ms = (time.perf_counter() - started) * 1000
         header_list = resp.getheaders()
         head_bytes = 17 + sum(len(k) + len(v) + 4 for k, v in header_list) + 2
@@ -444,6 +455,22 @@ class SyncClient:
         self.transport.close()
         self.store.close()
 
+    def abandon(self):
+        """Best-effort release of a v2 session this device still holds, then close.
+
+        What the app does before it drops local v2 state (hand-off C-3 item 5);
+        the harness calls it when a scenario fails, so no session leaks.
+        """
+        token = (self.state.get("session") or {}).get("token")
+        if token and self.state.get("catalog_instance_id"):
+            try:
+                self.transport.request("POST", "/api/profiles/bootstrap/sessions/release",
+                                       body=self.envelope(session_token=token), timeout=5,
+                                       kind="v2_release")
+            except TransportError:
+                pass
+        self.close()
+
     # -- HTTP with the client's retry policy (C-3) --------------------------
     def call(self, kind, method, path, *, body=None, query=None, timeout=None):
         timeout = timeout or self.page_timeout
@@ -575,6 +602,7 @@ class SyncClient:
         if self.state.get("idempotent"):
             body["client_request_id"] = self.state["client_request_id"]
         t0 = time.perf_counter()
+        self.hook("create_sending", client=self)
         while True:
             try:
                 resp = self.transport.request("POST", "/api/profiles/bootstrap/sessions",
@@ -699,6 +727,7 @@ class SyncClient:
         if self.state["catchup_pages"]:
             body["page_token"] = self.state["catchup_token"]
         timeout = 600.0 if not self.state["catchup_pages"] else self.page_timeout
+        self.hook("catchup_sending", client=self, index=self.state["catchup_pages"])
         resp = self.call("v2_catchup", "POST", "/api/profiles/bootstrap/sessions/catchup",
                          body=body, timeout=timeout)
         if resp.status == 413:

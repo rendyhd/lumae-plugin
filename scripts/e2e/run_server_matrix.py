@@ -8,13 +8,15 @@ gate scenarios with the protocol-faithful client in ``client_sim.py``.
 
 Every scenario records wall time, bytes on the wire, peak server RSS, the
 longest request, per-page p95 and the 429/503 counts, asserts its criteria,
-and ends with PASS, FAIL, SKIP or PENDING (a criterion whose server work has not
-been built yet, e.g. K6/P3-2). Results go to ``--out`` as JSON.
+and ends with PASS, FAIL or PENDING (only a criterion whose server work has not
+been built yet, e.g. K6/P3-2, failed), or ERROR when it raised. No check is ever
+skipped silently: a scenario that needs a synced device loads one itself.
+Results go to ``--out`` as JSON.
 
 Usage::
 
     export LUMAE_E2E_DSN=postgresql://lumae_test@127.0.0.1:55432/e2e_rep
-    python3 scripts/e2e/seed_representative.py --reset             # once, ~10 min at scale 1
+    python3 scripts/e2e/seed_representative.py --reset             # once, ~4 min at scale 1
     python3 scripts/e2e/run_server_matrix.py --out e2e.json        # all scenarios
     python3 scripts/e2e/run_server_matrix.py --scenarios first_load_v2,kill_restart
 
@@ -124,6 +126,9 @@ class LocalServer:
         return [sys.executable, "-m", "gunicorn", "--chdir", HERE,
                 "--bind", f"127.0.0.1:{self.port}", "--worker-class", "gthread",
                 "--workers", "1", "--threads", "4", "--keep-alive", "5", "--timeout", "300",
+                # gunicorn >= 25 opens ~/.gunicorn/gunicorn.ctl by default; several
+                # runners on one machine would share it.
+                "--no-control-socket",
                 "--error-logfile", self.log_path, "host_app:app"]
 
     def start(self):
@@ -143,9 +148,12 @@ class LocalServer:
             os.killpg(self.proc.pid, signal.SIGKILL)
         self.proc.wait()
 
-    def restart(self):
+    def restart(self, between=None):
+        """kill -9, run ``between()`` while the server is down, start again."""
         self.kill9()
         self.restarts += 1
+        if between is not None:
+            between()
         self.start()
 
     def stop(self):
@@ -213,10 +221,12 @@ class DockerServer:
             with contextlib.suppress(ProcessLookupError):
                 os.kill(pid, signal.SIGKILL)
 
-    def restart(self):
+    def restart(self, between=None):
         old = set(self.gunicorn_pids())
         self.kill9()
         self.restarts += 1
+        if between is not None:
+            between()
         deadline = time.monotonic() + 600
         while time.monotonic() < deadline:
             now = set(self.gunicorn_pids())
@@ -318,16 +328,25 @@ class Scenario:
         self.status = None
         self.notes = []
 
-    def check(self, label, ok, detail=None):
+    def check(self, label, ok, detail=None, pending=None):
+        """Record an assertion. ``pending`` names the unbuilt work (e.g. "P3-2")
+        a criterion waits for: its failure makes the scenario PENDING, not FAIL."""
         self.assertions.append({"check": label, "ok": bool(ok),
-                                **({"detail": detail} if detail is not None else {})})
+                                **({"detail": detail} if detail is not None else {}),
+                                **({"pending": pending} if pending else {})})
         if not ok:
-            log(f"  FAIL {self.name}: {label} ({detail})")
+            log(f"  {'PENDING' if pending else 'FAIL'} {self.name}: {label} ({detail})")
         return ok
 
-    def finish(self, status=None):
-        if status is None:
-            status = "PASS" if all(a["ok"] for a in self.assertions) else "FAIL"
+    def finish(self):
+        """FAIL if any assertion failed, else PENDING if a pending one did, else PASS."""
+        failed = [a for a in self.assertions if not a["ok"]]
+        if any(not a.get("pending") for a in failed):
+            status = "FAIL"
+        elif failed:
+            status = "PENDING"
+        else:
+            status = "PASS"
         self.status = status
         return {"name": self.name, "description": self.description, "status": status,
                 "assertions": self.assertions, "metrics": self.metrics, "notes": self.notes}
@@ -502,6 +521,86 @@ class Plugin:
         self.db.commit()
         return {"profiles": count, "edges": edges, "sha256": hasher.hexdigest(),
                 **({"tracks": tracks} if tracks is not None else {})}
+
+    def edge_rows(self, source):
+        """Every stored edge row of the source (not only the ones a read serves).
+
+        Returns the row count and a digest of the sorted keys plus
+        ``updated_at``, so a deleted, added, duplicated or rewritten edge row
+        changes it even when no event is journalled.
+        """
+        import hashlib
+
+        hasher = hashlib.sha256()
+        count = 0
+        cur = self.db.cursor(name=f"edges_{uuid.uuid4().hex}")
+        cur.itersize = 2000
+        cur.execute(
+            f"""SELECT track_id, media_revision, representation_id, profile_digest,
+                       updated_at::text
+                  FROM {self.T}edge_profiles WHERE catalog_instance_id=%s
+                 ORDER BY track_id COLLATE "C", media_revision COLLATE "C",
+                          representation_id COLLATE "C" """, (source,))
+        for row in cur:
+            hasher.update(("\t".join(row) + "\n").encode("utf-8"))
+            count += 1
+        cur.close()
+        self.db.commit()
+        return {"rows": count, "sha256": hasher.hexdigest()}
+
+    def edge_jobs(self):
+        row = self.query(f"SELECT count(*), max(updated_at)::text FROM {self.T}edge_profile_jobs",
+                         one=True)
+        return {"rows": row[0], "max_updated_at": row[1]}
+
+    def fixture_counts(self, source):
+        """Published profiles, and how many of them a read serves with an edge."""
+        row = self.query(
+            f"""SELECT count(*), count(edge.profile_digest)
+                  FROM {self.T}published_source_profiles p
+                  {self.edges.edge_join(columns='e.profile_digest')}
+                 WHERE p.catalog_instance_id=%s""", (source,), one=True)
+        fixture = None
+        if self.query("SELECT to_regclass('lumae_perf_fixture') IS NOT NULL", one=True)[0]:
+            fixture = self.query("SELECT value FROM lumae_perf_fixture WHERE key='fixture'",
+                                 one=True)
+        record = fixture[0] if fixture else {}
+        seeded = (record.get("counts") or {}).get("profiles")
+        seeded_head = seeded + int(record.get("events") or 0) if seeded is not None else None
+        return {"profiles": int(row[0]), "edges": int(row[1]), "seeded_profiles": seeded,
+                "seeded_head": seeded_head, "head_seq": self.stream(source)["head_seq"]}
+
+    def block_capture(self, table):
+        """Hold ACCESS EXCLUSIVE on ``table`` until the returned release() runs.
+
+        A v2 capture that reads (published profiles) or journal-scans
+        (``profile_changes``) that table waits inside its capture transaction,
+        so a kill lands during the capture deterministically at any scale.
+        """
+        conn = self.stub.connect()
+        conn.autocommit = False
+        with conn.cursor() as cur:
+            cur.execute("SET lock_timeout = '30s'")
+            cur.execute(f"LOCK TABLE {self.T}{table} IN ACCESS EXCLUSIVE MODE")
+            cur.execute("SELECT pg_backend_pid()")
+            pid = cur.fetchone()[0]
+
+        def blocked_captures():
+            with conn.cursor() as cur:
+                # pg_stat_activity is snapshotted once per transaction, and this
+                # connection stays in the transaction that holds the lock.
+                cur.execute("SELECT pg_stat_clear_snapshot()")
+                cur.execute("""SELECT count(*) FROM pg_stat_activity
+                                WHERE application_name=%s AND %s = ANY(pg_blocking_pids(pid))""",
+                            (self.pb.APPLICATION_NAME, pid))
+                return cur.fetchone()[0]
+
+        def release():
+            with contextlib.suppress(Exception):
+                conn.rollback()
+            with contextlib.suppress(Exception):
+                conn.close()
+        return blocked_captures, release
 
     def published_ids(self, source, limit=None, offset=0, with_edge=None):
         edge_filter = ""
@@ -734,6 +833,45 @@ class Context:
         self.scratch = args.scratch
         self.keep = {}
         self.sessions_before = 0
+        self.open_clients = []  # (client, sqlite path) created by the running scenario
+        self.scratch_paths = []  # other SQLite files of the running scenario
+
+    def cleanup(self):
+        """After every scenario, also a failed one: release any v2 session a device
+        still holds, close it, and delete its SQLite file unless it is kept."""
+        kept = {self.keep.get("v2_db")}
+        for client, path in self.open_clients:
+            with contextlib.suppress(Exception):
+                client.abandon()
+            if path not in kept:
+                self.drop_db(path)
+        for path in self.scratch_paths:
+            if path not in kept:
+                self.drop_db(path)
+                with contextlib.suppress(FileNotFoundError):
+                    os.remove(path + ".json")
+        self.open_clients = []
+        self.scratch_paths = []
+
+    def fixture_guard(self, scenario):
+        """The server has profiles with edges to sync (0 == 0 proves nothing).
+
+        On a pristine fixture (journal head as seeded) every seeded profile is
+        published with its edge; after scenarios that change the library a few
+        edges may be pending again, but never most of them.
+        """
+        counts = self.plugin.fixture_counts(self.source)
+        scenario.metrics["fixture"] = counts
+        ok = scenario.check("the server publishes profiles", counts["profiles"] > 0, counts)
+        ok = scenario.check("the server publishes edges", counts["edges"] > 0, counts) and ok
+        if counts["seeded_head"] is not None and counts["head_seq"] == counts["seeded_head"]:
+            ok = scenario.check("pristine fixture: every seeded profile is published with its edge",
+                                counts["profiles"] == counts["seeded_profiles"]
+                                and counts["edges"] == counts["profiles"], counts) and ok
+        else:
+            ok = scenario.check("at least 90% of the published profiles carry an edge",
+                                counts["edges"] >= 0.9 * counts["profiles"], counts) and ok
+        return ok
 
     def no_leak(self, scenario):
         live = self.plugin.live_sessions()
@@ -759,8 +897,10 @@ class Context:
         # The source is discovered like the app does (/api/catalog/health).
         kwargs.setdefault("server_id", "server-a")
         kwargs.setdefault("token", self.args.auth_token)
-        return SyncClient(self.server.base_url, db_path, log=lambda m: log("  client: " + m),
-                          **kwargs)
+        client = SyncClient(self.server.base_url, db_path, log=lambda m: log("  client: " + m),
+                            **kwargs)
+        self.open_clients.append((client, db_path))
+        return client
 
     def compare(self, scenario, client, label="local dataset equals the server's"):
         local = client.store.digest(per_track=True)
@@ -783,18 +923,20 @@ def run_first_load(ctx, mode):
                               f"{'v2 bootstrap' if mode == 'v2' else 'legacy bootstrap'} path, "
                               "then /profiles/changes; completes once, in one run.")
     ctx.plugin.reset_rate_limit()
+    ctx.fixture_guard(scenario)
     path = ctx.db_path(name)
     plans = {}
 
     def hook(point, client=None, index=None, total=None, **_info):
         # Diagnostic: the planner's choice for the page query at the start of
-        # the snapshot and in the middle (EXPLAIN only; nothing is executed).
+        # the snapshot and in the middle (EXPLAIN only, unless --explain-analyze).
         if point == "after_create" or (point == "snapshot_page" and total and
                                         index == total // 2):
             ordinal = 0 if point == "after_create" else index * client.page_size
             with contextlib.suppress(Exception):
                 plans[f"ordinal_{ordinal}"] = ctx.plugin.page_plan(
-                    client.state["session"]["token"], ordinal, client.page_size)
+                    client.state["session"]["token"], ordinal, client.page_size,
+                    analyze=ctx.args.explain_analyze)
     client = ctx.client(path, mode=mode, hook=hook if mode == "v2" else None)
     with Measure(ctx) as measure:
         result = client.run()
@@ -807,9 +949,22 @@ def run_first_load(ctx, mode):
                              "WHERE catalog_instance_id=%s", (ctx.source,), one=True)[0]
     scenario.metrics["profiles"] = total
     scenario.check("sync reached current", result["phase"] == "current", result["phase"])
+    requests = result["stats"]["requests"]
+    scenario.check("no connection error or retried request",
+                   scenario.metrics["conn_errors"] == 0
+                   and not result["stats"]["events"].get("connection_retries")
+                   and not result["stats"]["events"].get("create_retries"),
+                   {"conn_errors": scenario.metrics["conn_errors"],
+                    "events": result["stats"]["events"]})
     if mode == "v2":
         pages = math.ceil(total / client.page_size)
         scenario.check("exactly one v2 create", counters.get("creates") == 1, counters)
+        scenario.check("one create request and one request per snapshot page",
+                       requests.get("v2_create", {}).get("n") == 1
+                       and requests.get("v2_page", {}).get("n") == pages,
+                       {"create_requests": requests.get("v2_create", {}).get("n"),
+                        "page_requests": requests.get("v2_page", {}).get("n"),
+                        "pages": pages})
         scenario.check("no v2 restart (410/400) and no legacy fallback",
                        not counters.get("v2_restarts") and not counters.get("v2_413_fallbacks"),
                        counters)
@@ -825,6 +980,11 @@ def run_first_load(ctx, mode):
                        counters.get("legacy_pages_fetched") in (pages, pages + 1),
                        {"fetched": counters.get("legacy_pages_fetched"), "expected": pages})
         scenario.check("no legacy restart", not counters.get("legacy_restarts"), counters)
+        scenario.check("one request per legacy page",
+                       requests.get("legacy_page", {}).get("n")
+                       == counters.get("legacy_pages_fetched"),
+                       {"page_requests": requests.get("legacy_page", {}).get("n"),
+                        "pages": counters.get("legacy_pages_fetched")})
     scenario.check("no invalid edge", not result["invalid_edges"], result["invalid_edges"])
     scenario.metrics["dataset"] = ctx.compare(scenario, client)
     scenario.check("every edge the server publishes is on the device",
@@ -865,55 +1025,79 @@ def run_idle_routes(ctx):
 def run_reanalysis(ctx):
     scenario = Scenario("reanalysis_noop", "An AudioMuse re-analysis pass fires the analysis "
                                            "hook for every song; nothing changed, so it must "
-                                           "append no journal event, and a device's next delta "
-                                           "downloads nothing.")
+                                           "append no journal event, leave every published row "
+                                           "and edge row untouched, schedule no edge job, and a "
+                                           "device's next delta downloads nothing.")
     plugin = ctx.plugin
+    ctx.fixture_guard(scenario)
+    path = ctx.keep.get("v2_db")
+    if path is None:
+        # No device from first_load_v2: load one first, so the device check
+        # always runs (a skipped check must never read as PASS).
+        path = ctx.db_path("reanalysis_device")
+        device = ctx.client(path, mode="v2")
+        loaded = device.run()
+        device.close()
+        ctx.keep["v2_db"] = path
+        scenario.notes.append("first_load_v2 did not run first; loaded a device for the "
+                              "delta check")
+        scenario.check("device loaded before the pass", loaded["phase"] == "current",
+                       loaded["phase"])
     ids = plugin.published_ids(ctx.source)
     before = plugin.stream(ctx.source)
-    jobs_before = plugin.query(f"SELECT count(*), max(updated_at) FROM {plugin.T}edge_profile_jobs",
-                               one=True)
+    jobs_before = plugin.edge_jobs()
+    edges_before = plugin.edge_rows(ctx.source)
+    data_before = plugin.digest(ctx.source)
     started = time.perf_counter()
     statuses = plugin.hook_pass(ctx.source, ids)
     hook_s = time.perf_counter() - started
     after_hook = plugin.stream(ctx.source)
+    edges_after_hook = plugin.edge_rows(ctx.source)
     sample = ids[:: max(1, len(ids) // ctx.args.forced_sample)][: ctx.args.forced_sample]
     started = time.perf_counter()
     forced = plugin.noop_complete(ctx.source, sample)
     forced_s = time.perf_counter() - started
     after = plugin.stream(ctx.source)
-    jobs_after = plugin.query(f"SELECT count(*), max(updated_at) FROM {plugin.T}edge_profile_jobs",
-                              one=True)
+    jobs_after = plugin.edge_jobs()
+    edges_after = plugin.edge_rows(ctx.source)
+    data_after = plugin.digest(ctx.source)
     scenario.metrics.update({
         "songs": len(ids), "hook_statuses": statuses, "hook_pass_s": round(hook_s, 1),
         "hook_ms_per_song": round(hook_s * 1000 / max(1, len(ids)), 2),
         "forced_identical_completions": forced, "forced_sample": len(sample),
         "forced_s": round(forced_s, 1), "head_before": before["head_seq"],
         "head_after_hook": after_hook["head_seq"], "head_after": after["head_seq"],
-        "edge_jobs_before": jobs_before[0], "edge_jobs_after": jobs_after[0]})
+        "edge_jobs_before": jobs_before, "edge_jobs_after": jobs_after,
+        "edge_rows_before": edges_before, "edge_rows_after": edges_after,
+        "published_before": data_before, "published_after": data_after})
+    scenario.check("there are songs to re-analyse", len(ids) > 0 and len(sample) > 0,
+                   {"songs": len(ids), "forced_sample": len(sample)})
     scenario.check("hook pass appended 0 events", after_hook["head_seq"] == before["head_seq"],
                    after_hook["head_seq"] - before["head_seq"])
     scenario.check("every song short-circuited as current",
                    statuses.get("current") == len(ids), statuses)
+    scenario.check("hook pass left every edge row untouched", edges_after_hook == edges_before,
+                   {"before": edges_before, "after": edges_after_hook})
     scenario.check("forced identical completions appended 0 events",
                    after["head_seq"] == after_hook["head_seq"],
                    after["head_seq"] - after_hook["head_seq"])
     scenario.check("forced identical completions all applied", forced == len(sample), forced)
-    scenario.check("no edge job scheduled for current edges", jobs_after[0] == jobs_before[0],
-                   {"before": jobs_before[0], "after": jobs_after[0]})
-    path = ctx.keep.get("v2_db")
-    if path:
-        client = ctx.client(path, mode="v2")
-        before_events = client.state.get("counters", {}).get("delta_events", 0)
-        result = client.run()
-        downloaded = result["counters"].get("delta_events", 0) - before_events
-        scenario.metrics["next_delta"] = {
-            "events": downloaded,
-            "wire_bytes": result["stats"]["requests"].get("changes", {}).get("wire_bytes")}
-        scenario.check("the device's next delta downloads nothing", downloaded == 0, downloaded)
-        ctx.compare(scenario, client, "device dataset still equals the server's")
-        client.close()
-    else:
-        scenario.notes.append("first_load_v2 did not run; delta check skipped")
+    scenario.check("every edge row untouched (keys and updated_at)",
+                   edges_after == edges_before, {"before": edges_before, "after": edges_after})
+    scenario.check("every published profile and served edge unchanged",
+                   data_after == data_before, {"before": data_before, "after": data_after})
+    scenario.check("no edge job scheduled or touched", jobs_after == jobs_before,
+                   {"before": jobs_before, "after": jobs_after})
+    client = ctx.client(path, mode="v2")
+    before_events = client.state.get("counters", {}).get("delta_events", 0)
+    result = client.run()
+    downloaded = result["counters"].get("delta_events", 0) - before_events
+    scenario.metrics["next_delta"] = {
+        "events": downloaded,
+        "wire_bytes": result["stats"]["requests"].get("changes", {}).get("wire_bytes")}
+    scenario.check("the device's next delta downloads nothing", downloaded == 0, downloaded)
+    ctx.compare(scenario, client, "device dataset still equals the server's")
+    client.close()
     return scenario.finish()
 
 
@@ -924,10 +1108,10 @@ def _device_proc(base_url, db_path, user, source, token, out_path):
     try:
         result = client.run()
         result["digest"] = client.store.digest()
-    except Exception as exc:  # noqa: BLE001
-        result = {"error": f"{type(exc).__name__}: {exc}"}
-    finally:
         client.close()
+    except BaseException as exc:  # noqa: BLE001
+        result = {"error": f"{type(exc).__name__}: {exc}"}
+        client.abandon()  # release the session this device still holds
     with open(out_path, "w") as handle:
         json.dump(result, handle)
 
@@ -936,6 +1120,7 @@ def run_concurrent_devices(ctx):
     scenario = Scenario("concurrent_devices", "Two devices do their own v2 first load at the "
                                               "same time (separate processes and SQLite files).")
     ctx.plugin.reset_rate_limit()
+    ctx.fixture_guard(scenario)
     mp = multiprocessing.get_context("spawn")
     procs, outs, paths = [], [], []
     with Measure(ctx) as measure:
@@ -943,6 +1128,7 @@ def run_concurrent_devices(ctx):
             path = ctx.db_path(f"device{index}")
             out = path + ".json"
             paths.append(path)
+            ctx.scratch_paths.append(path)
             outs.append(out)
             proc = mp.Process(target=_device_proc, args=(ctx.server.base_url, path,
                                                          f"device-{index}", ctx.source,
@@ -954,6 +1140,10 @@ def run_concurrent_devices(ctx):
     scenario.metrics.update(measure.result)
     truth = ctx.plugin.digest(ctx.source)
     for index, out in enumerate(outs, start=1):
+        if not os.path.exists(out):
+            scenario.check(f"device {index} reported a result", False,
+                           f"exit code {procs[index - 1].exitcode}")
+            continue
         with open(out) as handle:
             result = json.load(handle)
         os.remove(out)
@@ -1053,67 +1243,137 @@ def run_creators(ctx):
     return scenario.finish()
 
 
+KILL_POINTS = ("create_capture", "after_create", "mid_snapshot", "snapshot_end",
+               "catchup_capture", "mid_catchup", "before_release", "during_deltas")
+
+
 def run_kill_restart(ctx):
-    scenario = Scenario("kill_restart", "kill -9 and restart gunicorn at 6 points (after create, "
-                                        "mid-snapshot, snapshot end, mid-catch-up, before "
-                                        "release, during deltas) while the library changes; the "
-                                        "client resumes from its checkpoint and ends with the "
-                                        "server's dataset.")
+    scenario = Scenario("kill_restart", "kill -9 and restart gunicorn at 8 points (during the "
+                                        "create's snapshot capture, after create, mid-snapshot, "
+                                        "snapshot end, during the first catch-up capture, "
+                                        "mid-catch-up, before release, during deltas) while the "
+                                        "library changes; the client resumes from its "
+                                        "checkpoint, retries the lost create with the same "
+                                        "client_request_id, and ends with the server's dataset.")
     plugin = ctx.plugin
     ctx.plugin.reset_rate_limit()
+    ctx.fixture_guard(scenario)
     ids = plugin.published_ids(ctx.source, with_edge=True)
     rng = random.Random(626)
     pool = rng.sample(ids, min(len(ids), 1200))
     fired = []
     kills = []
+    threads = []
     mutations = collections.Counter()
+    k5 = {}
 
-    def kill(label, crash, inflight=False):
-        started = time.perf_counter()
-        if inflight:
-            def later():
-                time.sleep(0.03)
-                ctx.server.restart()
-                kills.append({"point": label, "inflight": True,
-                              "restart_s": round(time.perf_counter() - started, 2)})
-            thread = threading.Thread(target=later, daemon=True)
-            thread.start()
-            ctx.inflight_thread = thread
-            return
-        ctx.server.restart()
-        kills.append({"point": label, "inflight": False,
-                      "restart_s": round(time.perf_counter() - started, 2)})
-        if crash:
-            raise SimulatedCrash(label)
+    def restart(entry, started, between=None):
+        log(f"  kill -9 at {entry['point']} ({entry['kind']}, in flight: "
+            f"{entry.get('request_in_flight')})")
+        ctx.server.restart(between=between)
+        entry["restart_s"] = round(time.perf_counter() - started, 2)
+        kills.append(entry)
+
+    def kill_between(label):
+        # The hook runs between two requests: nothing is in flight. The client
+        # process "dies" too (SimulatedCrash) and a new one resumes.
+        restart({"point": label, "kind": "between_requests", "request_in_flight": None},
+                time.perf_counter())
+        raise SimulatedCrash(label)
+
+    def kill_in_flight(label, client):
+        # Kill while the client's next request is on the wire (not a timer:
+        # wait until the transport has sent it).
+        def run():
+            started = time.perf_counter()
+            deadline = started + 10
+            while client.transport.inflight_kind is None and time.perf_counter() < deadline:
+                time.sleep(0.0005)
+            time.sleep(0.002)
+            restart({"point": label, "kind": "in_flight",
+                     "request_in_flight": client.transport.inflight_kind}, started)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        threads.append(thread)
+
+    def kill_in_capture(label, client, table):
+        # Hold a lock the capture needs, wait until the capture's backend waits
+        # on it (inside its capture transaction), then kill the server and
+        # release the lock while it is down.
+        blocked, release = plugin.block_capture(table)
+
+        def run():
+            started = time.perf_counter()
+            # The capture waits at most its 5 s lock_timeout, then answers 503.
+            deadline = started + 4
+            waiting = 0
+            while time.perf_counter() < deadline:
+                waiting = blocked()
+                if waiting:
+                    break
+                time.sleep(0.005)
+            if not waiting:
+                release()
+                kills.append({"point": label, "kind": "in_capture", "blocked_capture": False,
+                              "request_in_flight": client.transport.inflight_kind})
+                return
+            if label == "create_capture":
+                row = plugin.query(
+                    f"SELECT session_id::text FROM {plugin.T}profile_bootstrap_sessions "
+                    "WHERE client_request_id=%s AND state='capturing'",
+                    (client.state["client_request_id"],), one=True)
+                k5["orphan_session"] = row[0] if row else None
+            restart({"point": label, "kind": "in_capture", "blocked_capture": True,
+                     "request_in_flight": client.transport.inflight_kind}, started,
+                    between=release)
+        thread = threading.Thread(target=run, daemon=True)
+        thread.start()
+        threads.append(thread)
 
     def hook(point, client=None, index=None, total=None, **_info):
-        if point == "after_create" and "after_create" not in fired:
+        if point == "create_sending" and "create_capture" not in fired:
+            fired.append("create_capture")
+            k5["request_id"] = client.state.get("client_request_id")
+            kill_in_capture("create_capture", client, "published_source_profiles")
+        elif point == "after_create" and "after_create" not in fired:
             fired.append("after_create")
+            for thread in threads:
+                thread.join()
+            k5["request_id_after"] = client.state.get("client_request_id")
+            if k5.get("orphan_session"):
+                row = plugin.query(
+                    f"SELECT expires_at <= now(), state FROM {plugin.T}profile_bootstrap_sessions "
+                    "WHERE session_id=%s", (k5["orphan_session"],), one=True)
+                k5["orphan_after_retry"] = ("deleted" if row is None else
+                                            "expired" if row[0] else f"live ({row[1]})")
             mutations["waveform"] += plugin.republish_waveform(ctx.source, pool[0:100])
             mutations["media"] += plugin.change_media(ctx.source, pool[100:120])
             mutations["withdraw"] += plugin.withdraw(ctx.source, pool[120:130])
-            kill("after_create", crash=True)
+            kill_between("after_create")
         elif point == "snapshot_page" and "mid_snapshot" not in fired and total and \
                 index == max(1, total // 2):
             fired.append("mid_snapshot")
-            kill("mid_snapshot", crash=False, inflight=True)
+            kill_in_flight("mid_snapshot", client)
         elif point == "snapshot_end" and "snapshot_end" not in fired:
             fired.append("snapshot_end")
             mutations["edges"] += plugin.publish_edges(ctx.source, pool[100:120])
-            kill("snapshot_end", crash=True)
+            kill_between("snapshot_end")
+        elif point == "catchup_sending" and index == 0 and "catchup_capture" not in fired:
+            fired.append("catchup_capture")
+            kill_in_capture("catchup_capture", client, "profile_changes")
         elif point == "catchup_page" and "mid_catchup" not in fired and index == 1 and \
                 client.state.get("phase") == "catchup":
             fired.append("mid_catchup")
-            kill("mid_catchup", crash=False, inflight=True)
+            kill_in_flight("mid_catchup", client)
         elif point == "before_release" and "before_release" not in fired:
             fired.append("before_release")
             mutations["waveform"] += plugin.republish_waveform(ctx.source, pool[200:400], 0.2)
             mutations["media"] += plugin.change_media(ctx.source, pool[400:410])
             mutations["withdraw"] += plugin.withdraw(ctx.source, pool[410:415])
-            kill("before_release", crash=True)
+            kill_between("before_release")
         elif point == "delta_page" and "during_deltas" not in fired and index == 1:
             fired.append("during_deltas")
-            kill("during_deltas", crash=False, inflight=True)
+            kill_in_flight("during_deltas", client)
 
     path = ctx.db_path("kill")
     head_before = plugin.stream(ctx.source)["head_seq"]
@@ -1133,18 +1393,40 @@ def run_kill_restart(ctx):
                 client.close()
             if runs > 20:
                 raise RuntimeError("kill_restart: too many resumes")
-        if getattr(ctx, "inflight_thread", None):
-            ctx.inflight_thread.join()
+        for thread in threads:
+            thread.join()
     scenario.metrics.update(measure.result)
     scenario.metrics.update(client_metrics(result))
     counters = result["counters"]
+    events = result["stats"]["events"]
     total = plugin.query(f"SELECT count(*) FROM {plugin.T}published_source_profiles "
                          "WHERE catalog_instance_id=%s", (ctx.source,), one=True)[0]
     scenario.metrics["profiles_after"] = total
     scenario.metrics.update({"kills": kills, "client_runs": runs, "mutations": dict(mutations),
                              "events_during_sync": plugin.stream(ctx.source)["head_seq"] -
-                             head_before, "points_fired": fired})
-    scenario.check("all 6 kill points fired", len(fired) == 6, fired)
+                             head_before, "points_fired": fired, "k5": k5})
+    scenario.check(f"all {len(KILL_POINTS)} kill points fired and killed",
+                   sorted(fired) == sorted(KILL_POINTS)
+                   and sorted(k["point"] for k in kills) == sorted(KILL_POINTS),
+                   {"fired": fired, "killed": [k["point"] for k in kills]})
+    cut = [k for k in kills if k["kind"] != "between_requests"]
+    scenario.check("every in-flight and in-capture kill cut a request off",
+                   all(k.get("request_in_flight") for k in cut),
+                   [(k["point"], k.get("request_in_flight")) for k in cut])
+    scenario.check("both capture kills landed inside the capture transaction",
+                   all(k.get("blocked_capture") for k in kills if k["kind"] == "in_capture"),
+                   [(k["point"], k.get("blocked_capture")) for k in kills
+                    if k["kind"] == "in_capture"])
+    scenario.check("the client saw each cut-off request fail",
+                   scenario.metrics["conn_errors"] >= len(cut),
+                   {"conn_errors": scenario.metrics["conn_errors"], "cut_off": len(cut)})
+    scenario.check("the lost create was retried with the same client_request_id (K5)",
+                   bool(events.get("create_retries", 0) >= 1 and k5.get("request_id")
+                        and k5.get("request_id") == k5.get("request_id_after")),
+                   {"create_retries": events.get("create_retries"), **k5})
+    scenario.check("the orphaned capture's session was replaced, not leaked",
+                   bool(k5.get("orphan_session"))
+                   and k5.get("orphan_after_retry") in ("deleted", "expired"), k5)
     scenario.check("sync reached current", result["phase"] == "current", result["phase"])
     scenario.check("one create for the whole run (never restarted from zero)",
                    counters.get("creates") == 1 and not counters.get("v2_restarts"), counters)
@@ -1179,6 +1461,7 @@ def run_lum005(ctx):
                                                timeout=30).read())
     edge_refs = ((health.get("capabilities") or {}).get("profile_stream") or {}).get("edge_refs")
     plugin = ctx.plugin
+    ctx.fixture_guard(scenario)
     ids = plugin.published_ids(ctx.source, with_edge=True)
     # With K6 the criterion is about a full republish; without it the no-K6
     # baseline is measured on a sample (per-track bytes do not depend on N).
@@ -1207,6 +1490,9 @@ def run_lum005(ctx):
         "edge_refs_kept": result["store"].get("edge_refs_kept", 0),
         "edge_fetches": result["counters"].get("edge_fetches", 0),
         "extrapolated_full_republish_wire_mb": round(per_track * len(ids) / 1e6, 1)})
+    scenario.check("every sampled track was republished",
+                   republished == len(sample) > 0,
+                   {"republished": republished, "sample": len(sample)})
     ctx.compare(scenario, client, "device dataset equals the server's after the republish")
     client.close()
     if fresh:
@@ -1216,8 +1502,8 @@ def run_lum005(ctx):
                               "built. The measured delta above is the no-K6 baseline; the "
                               "<= 1 KB/track criterion cannot pass until P3-2 ships.")
         scenario.check(f"<= {BUDGET_K6_BYTES_PER_TRACK} B/track on the wire (pending P3-2)",
-                       per_track <= BUDGET_K6_BYTES_PER_TRACK, round(per_track))
-        return scenario.finish("PENDING")
+                       per_track <= BUDGET_K6_BYTES_PER_TRACK, round(per_track), pending="P3-2")
+        return scenario.finish()
     scenario.check(f"<= {BUDGET_K6_BYTES_PER_TRACK} B/track on the wire",
                    per_track <= BUDGET_K6_BYTES_PER_TRACK, round(per_track))
     return scenario.finish()
@@ -1321,7 +1607,7 @@ def run_capped_catchup(ctx):
                    all(m["status"] == 200 for m in measurements),
                    [m["status"] for m in measurements])
     ctx.no_leak(scenario)
-    return scenario.finish("PASS" if all(a["ok"] for a in scenario.assertions) else "FAIL")
+    return scenario.finish()
 
 
 SCENARIOS = collections.OrderedDict([
@@ -1388,6 +1674,9 @@ def main():
     parser.add_argument("--catchup-sizes", default="100000,cap,10000e",
                         help="first catch-up sizes: counts, 'cap' (4 x retention), suffix e = "
                              "events embedding their edge")
+    parser.add_argument("--explain-analyze", action="store_true",
+                        help="first loads record EXPLAIN ANALYZE (not just EXPLAIN) of the v2 "
+                             "page query at ordinal 0 and mid-snapshot; runs it once more")
     parser.add_argument("--catchup-client-timeout-s", type=float, default=0.0,
                         help="if set, the capped catch-up client uses this request timeout")
     args = parser.parse_args()
@@ -1430,6 +1719,8 @@ def main():
                            "traceback": traceback.format_exc()[-4000:]}
                 if not server.alive():
                     server.start()
+            finally:
+                ctx.cleanup()
             outcome["elapsed_s"] = round(time.perf_counter() - started, 1)
             report["scenarios"].append(outcome)
             log(f"scenario {name}: {outcome['status']} in {outcome['elapsed_s']} s")

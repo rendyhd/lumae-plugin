@@ -36,6 +36,15 @@ python3 scripts/e2e/run_server_matrix.py --scratch /var/tmp/e2e --out e2e.json
 
 `--scenarios a,b` selects scenarios; `name#label` runs one again (for example
 `first_load_v2#warm`). `--scale 0.02` seeds a quick fixture for development.
+`--explain-analyze` records `EXPLAIN ANALYZE` (instead of `EXPLAIN`) of the v2
+page query in each first load. The local gunicorn runs with
+`--no-control-socket`, so several runners can share a machine.
+
+A scenario ends PASS, FAIL, PENDING (only a criterion that waits for unbuilt
+server work failed, e.g. K6/P3-2) or ERROR (it raised; its devices' v2
+sessions are released and their SQLite files removed). Every data scenario
+first asserts that the server publishes profiles and edges, so an empty
+fixture cannot pass as 0 = 0.
 
 ## Stock host (Docker)
 
@@ -68,10 +77,10 @@ contract §1.2); with `AUTH_ENABLED=true` pass the host's API token as
 | Scenario | Asserts |
 |---|---|
 | `idle_routes` | Status routes over HTTP with nothing running (reference). |
-| `first_load_v2`, `first_load_legacy` | A fresh device loads every waveform and edge profile once, in one run: one create, every page once, no restart, no 503, no invalid edge, the device dataset equals the server's (canonical digest of every profile and edge), health <= 50 ms and `/settings/status` <= 100 ms p95 while it runs. |
-| `reanalysis_noop` | The analysis hook for every song (an AudioMuse re-analysis pass) and identical forced completions append 0 events and schedule no edge job; the device's next delta downloads nothing. |
+| `first_load_v2`, `first_load_legacy` | A fresh device loads every waveform and edge profile once, in one run: one create request, one request per page, no restart, no retry or connection error, no 503, no invalid edge, the device dataset equals the server's (canonical digest of every profile and edge), health <= 50 ms and `/settings/status` <= 100 ms p95 while it runs. |
+| `reanalysis_noop` | The analysis hook for every song (an AudioMuse re-analysis pass) and identical forced completions append 0 events, leave every stored edge row (keys and `updated_at`) and every published profile unchanged, and schedule or touch no edge job; the device's next delta downloads nothing. Loads its own device when `first_load_v2` did not run. |
 | `concurrent_devices` | Two devices load at the same time (separate processes); both complete once and match the server. |
 | `creators` | Two concurrent creators, same source and different sources: create p95 <= 5 s, no 503, no client timeout (P2-4). |
-| `kill_restart` | kill -9 + restart at 6 points (after create, mid-snapshot, snapshot end, mid-catch-up, before release, during deltas) while the library changes; the device resumes from its checkpoint, never re-creates, and ends equal to the server. |
+| `kill_restart` | kill -9 + restart at 8 points while the library changes: inside the create's snapshot capture and inside the first catch-up capture (the runner holds a lock the capture needs, waits until the capture blocks on it, then kills), after create, mid-snapshot, snapshot end, mid-catch-up, before release, during deltas. In-flight kills wait until the request is on the wire, and each cut-off request must fail on the client. The lost create is retried with the same `client_request_id` and its orphaned session replaced (K5); the device resumes from its checkpoint, never re-creates, and ends equal to the server. |
 | `lum005_k6` | A full waveform republish reaches a device at <= 1 KB per track with K6 edge references. **Pending P3-2**: without `capabilities.profile_stream.edge_refs` it measures the no-K6 baseline and reports PENDING. |
 | `capped_catchup` | First catch-up capture time, WAL, table size and server memory up to 4 x retention events (P2-4). |

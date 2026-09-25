@@ -49,7 +49,8 @@ x-plugin-mounts: &plugin-mounts
 
 services:
   postgres:
-    image: postgres:15-alpine
+    # postgres:15-alpine (15.19) as pulled for the 2026-09-25 run, pinned by index digest.
+    image: postgres:15-alpine@sha256:f7d23353e1b15400d22ebe31189f4d314b87a4c129cc400c8c2d8d4ca127bf81
     environment:
       TZ: "UTC"
       POSTGRES_USER: ${POSTGRES_USER:-audiomuse}
