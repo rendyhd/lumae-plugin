@@ -30,9 +30,11 @@ def worker(n, singleton, principal, out):
                         "entity_kind, entity_id, operation, payload) "
                         "VALUES (%s, %s, 'c', 'collection', 'c', 'upsert', '{}')", (seq, principal))
         else:
-            cur.execute(f"INSERT INTO {T}collection_changes (principal, collection_id, entity_kind, "
-                        "entity_id, operation, payload) "
-                        "VALUES (%s, 'c', 'collection', 'c', 'upsert', '{}')", (principal,))
+            # The 1.3.0 schema has no seq default (AUD-05): call the sequence.
+            cur.execute(f"INSERT INTO {T}collection_changes (seq, principal, collection_id, "
+                        "entity_kind, entity_id, operation, payload) "
+                        f"VALUES (nextval(pg_get_serial_sequence('{T}collection_changes', 'seq')), "
+                        "%s, 'c', 'collection', 'c', 'upsert', '{}')", (principal,))
         db.commit()
         latencies.append((time.perf_counter() - t0) * 1000)
     out.extend(latencies)

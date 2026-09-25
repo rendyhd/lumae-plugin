@@ -1,4 +1,5 @@
 import base64
+import gzip
 import json
 import os
 import re
@@ -86,7 +87,13 @@ from .provider_identity_guard import (
     require_projection_reconcile,
 )
 from .provider_identity_rekey import read_transition_manifest, refresh_audiomuse_health
-from .profile_publication import admit_attempts, complete_attempt, migrate_attempts, release_attempts
+from .profile_publication import (
+    admit_attempts,
+    complete_attempt,
+    migrate_attempts,
+    published_profile_current,
+    release_attempts,
+)
 from . import profile_bootstrap
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
@@ -114,7 +121,7 @@ from .reconcile import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.2.5"
+PLUGIN_VERSION = "1.3.0"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -209,6 +216,61 @@ register_shelf_routes(bp)
 personal_discovery.register_routes(bp)
 music_metadata.register_routes(bp)
 credits_service.register_routes(bp)
+
+
+GZIP_MIN_BYTES = 1024
+GZIP_LEVEL = 4  # ~99% of level 6 ratio for ~80% of the CPU on edge pages
+
+
+def _accepts_gzip(header):
+    """True when ``Accept-Encoding`` allows gzip. ``q=0`` refuses it (RFC 9110 12.5.3)."""
+    explicit = wildcard = None
+    for item in str(header or "").split(","):
+        name, _, params = item.partition(";")
+        name = name.strip().lower()
+        if not name:
+            continue
+        quality = 1.0
+        for param in params.split(";"):
+            key, _, value = param.partition("=")
+            if key.strip().lower() == "q":
+                try:
+                    quality = float(value.strip())
+                except ValueError:
+                    quality = 0.0
+        if name in ("gzip", "x-gzip"):
+            explicit = quality if explicit is None else max(explicit, quality)
+        elif name == "*":
+            wildcard = quality
+    chosen = explicit if explicit is not None else wildcard
+    return chosen is not None and chosen > 0
+
+
+@bp.after_request
+def _compress_json_response(response):
+    """K1: gzip plugin JSON of at least 1 KiB for clients that accept it.
+
+    Blueprint-scoped, so host routes are never touched. Streamed and
+    passthrough bodies, non-200 statuses and already-encoded bodies are left
+    as they are.
+    """
+    if (response.status_code != 200
+            or response.mimetype != "application/json"
+            or response.direct_passthrough
+            or response.is_streamed
+            or "Content-Encoding" in response.headers):
+        return response
+    body = response.get_data()
+    if len(body) < GZIP_MIN_BYTES:
+        return response
+    response.vary.add("Accept-Encoding")
+    if not _accepts_gzip(request.headers.get("Accept-Encoding")):
+        return response
+    compressed = gzip.compress(body, compresslevel=GZIP_LEVEL, mtime=0)
+    response.set_data(compressed)
+    response.headers["Content-Encoding"] = "gzip"
+    response.headers["Content-Length"] = str(len(compressed))
+    return response
 
 
 def enqueue_bounded(func, *args, queue="default", timeout=None, **kwargs):
@@ -1068,6 +1130,10 @@ def observe_provider_identities_on_start():
     except Exception:
         _rollback_if_possible(db)
         logger.exception("lumae_analysis could not ensure reconcile schema")
+    try:
+        log_integrity_on_start(db)
+    except Exception:
+        logger.exception("lumae_analysis could not check upgrade integrity")
     bridge = ProviderCatalogBridge()
     for server in bridge.list_servers():
         if not server.get("supported"):
@@ -1357,6 +1423,7 @@ def migrate(db):
     prune_catalog_storage(db)
     compact_enrichment_storage(db)
     migrate_collections(db)
+    refresh_integrity_snapshot(db)
     migrate_shelves(db)
     personal_discovery.migrate(db)
     music_metadata.migrate(db)
@@ -1820,6 +1887,206 @@ def resolve_profile_source(catalog_instance_id=None, server_id=None, db=None):
     return source
 
 
+def profiles_unpublished_ready_count(db):
+    """Current 'ready' source profiles that have no published row (AUD-05).
+
+    A 1.2.5 worker wrote 'ready' rows and journal events but never a
+    published_source_profiles row, and 1.3.0 then treats the track as current.
+    "Current" means what ``published_profile_current`` checks: an active
+    source, the track available in the published generation with the same
+    media fingerprint, and the current analyzer and schema versions. An
+    index-driven anti-join; the repair SQL is in docs/runbooks/UPGRADE_1.3.md.
+    Returns None before the publication table exists.
+    """
+    cur = db.cursor()
+    try:
+        cur.execute("SELECT to_regclass(%s)", (table("published_source_profiles"),))
+        exists = cur.fetchone()
+        if not exists or exists[0] is None:
+            return None
+        # Anti-join first (normally empty), then check currency by key.
+        cur.execute(
+            f"""
+            WITH unpublished AS MATERIALIZED (
+                SELECT s.catalog_instance_id, s.track_id, s.media_signature
+                  FROM {source_profiles_table()} s
+                 WHERE s.status='ready'
+                   AND s.analyzer_ver=%s AND s.profile_schema_ver=%s
+                   AND NOT EXISTS (
+                       SELECT 1 FROM {table('published_source_profiles')} p
+                        WHERE p.catalog_instance_id=s.catalog_instance_id
+                          AND p.track_id=s.track_id
+                   )
+            )
+            SELECT count(*)
+              FROM unpublished s
+              JOIN {table('catalog_sources')} src
+                ON src.catalog_instance_id=s.catalog_instance_id
+               AND src.rebind_status='active'
+              JOIN {table('catalog_state')} c
+                ON c.catalog_instance_id=s.catalog_instance_id
+              JOIN {table('catalog_tracks')} t
+                ON t.catalog_instance_id=s.catalog_instance_id
+               AND t.published_generation=c.published_generation
+               AND t.track_id=s.track_id
+             WHERE t.available=TRUE AND COALESCE(t.media_fp, '') <> ''
+               AND s.media_signature='catalog-media:' || t.media_fp
+            """,
+            (ANALYZER_VERSION, SCHEMA_VERSION),
+        )
+        row = cur.fetchone()
+        return int(row[0]) if row and row[0] is not None else None
+    finally:
+        cur.close()
+
+
+def integrity_state_table():
+    return table("integrity_state")
+
+
+def refresh_integrity_snapshot(db):
+    """Recount ``profiles_unpublished_ready`` and persist it (AUD-05).
+
+    The anti-join reads every 'ready' profile (about 80 ms at 94k profiles),
+    so health never runs it: install and web-worker start refresh this row
+    and health reads it by primary key. Runs in the caller's transaction.
+    """
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""
+            CREATE TABLE IF NOT EXISTS {integrity_state_table()} (
+                name TEXT PRIMARY KEY,
+                value BIGINT,
+                checked_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            )
+            """
+        )
+        count = profiles_unpublished_ready_count(db)
+        cur.execute(
+            f"""
+            INSERT INTO {integrity_state_table()} (name, value, checked_at)
+            VALUES ('profiles_unpublished_ready', %s, now())
+            ON CONFLICT (name) DO UPDATE
+               SET value=EXCLUDED.value, checked_at=EXCLUDED.checked_at
+            """,
+            (count,),
+        )
+        return count
+    finally:
+        cur.close()
+
+
+def upgrade_fences_installed(cur):
+    """True when every AUD-05 fence is in the schema (one catalogue lookup).
+
+    ``profile_changes.writer_generation`` and ``catalog_changes.writer_generation``
+    are NOT NULL without a default, and ``collection_changes.seq`` has no
+    default. False means the 1.3.0 migration has not (fully) run, so 1.2.5
+    workers are not fenced.
+    """
+    cur.execute(
+        """
+        SELECT
+          (SELECT count(*) FROM pg_attribute
+            WHERE attrelid IN (to_regclass(%s), to_regclass(%s))
+              AND attname='writer_generation' AND attnotnull
+              AND NOT atthasdef AND NOT attisdropped) = 2
+          AND EXISTS (
+            SELECT 1 FROM pg_attribute
+             WHERE attrelid = to_regclass(%s) AND attname='seq'
+               AND NOT atthasdef AND NOT attisdropped)
+        """,
+        (table("profile_changes"), table("catalog_changes"),
+         table("collection_changes")),
+    )
+    row = cur.fetchone()
+    return bool(row[0]) if row else None
+
+
+def integrity_status(db=None):
+    """Health ``integrity``: fail-closed invariants of the 1.3.0 upgrade (AUD-05).
+
+    ``collections_feed_ok`` is live: False when a collection change row sits
+    past the feed head (collection writes then return 503
+    ``collection_feed_invariant``). ``profiles_unpublished_ready`` is the count
+    persisted by the last install or web-worker start, and
+    ``profiles_checked_at`` is when it was taken. ``fences_installed`` is False
+    until the 1.3.0 migration has installed every old-writer fence. Values are
+    None when unknown. All reads are index or catalogue lookups.
+    """
+    from .collection_manager import collection_feed_integrity
+
+    result = {
+        "collections_feed_ok": None,
+        "profiles_unpublished_ready": None,
+        "profiles_checked_at": None,
+        "fences_installed": None,
+    }
+    try:
+        db = db or get_db()
+    except Exception:
+        db = None
+    if db is None:
+        return result
+    try:
+        cur = db.cursor()
+        try:
+            result["collections_feed_ok"] = collection_feed_integrity(cur)
+            result["fences_installed"] = upgrade_fences_installed(cur)
+            cur.execute("SELECT to_regclass(%s)", (integrity_state_table(),))
+            if cur.fetchone()[0] is not None:
+                cur.execute(
+                    f"SELECT value, checked_at FROM {integrity_state_table()} "
+                    "WHERE name='profiles_unpublished_ready'"
+                )
+                row = cur.fetchone()
+                if row is not None:
+                    result["profiles_unpublished_ready"] = (
+                        int(row[0]) if row[0] is not None else None
+                    )
+                    result["profiles_checked_at"] = (
+                        row[1].astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                        if row[1] is not None else None
+                    )
+        finally:
+            cur.close()
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not read upgrade integrity")
+    return result
+
+
+def log_integrity_on_start(db):
+    """Refresh the persisted profile count and log any violated invariant."""
+    try:
+        refresh_integrity_snapshot(db)
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not refresh upgrade integrity")
+    status = integrity_status(db)
+    _rollback_if_possible(db)
+    if status["fences_installed"] is False:
+        logger.error(
+            "lumae_analysis 1.3.0 migration is incomplete: 1.2.5 writers are not "
+            "fenced. Re-run the plugin install before starting RQ workers "
+            "(docs/runbooks/UPGRADE_1.3.md)"
+        )
+    if status["collections_feed_ok"] is False:
+        logger.error(
+            "lumae_analysis collection feed invariant violated (MAX(seq) > head_seq); "
+            "collection writes return 503 until repaired: docs/runbooks/UPGRADE_1.3.md"
+        )
+    if status["profiles_unpublished_ready"]:
+        logger.warning(
+            "lumae_analysis found %s ready source profiles without a published row; "
+            "repair: docs/runbooks/UPGRADE_1.3.md",
+            status["profiles_unpublished_ready"],
+        )
+    return status
+
+
 @bp.get("/api/health")
 def health():
     compatibility = detect_core()
@@ -1838,8 +2105,11 @@ def health():
                     "protocol_version": 2,
                     "schema_version": 1,
                     "auth": "host_authenticated",
+                    "auth_enabled": _host_auth_enabled(),
                     "transfer_contract": profile_bootstrap.TRANSFER_CONTRACT,
-                    "available": bool(getattr(host_api.config, "DATABASE_URL", None)),
+                    "available": profile_bootstrap.availability(),
+                    "sliding_expiry": True,
+                    "idempotent_create": True,
                 },
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
                                   "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
@@ -1858,7 +2128,9 @@ def health():
                 },
                 "catalog_mirror": catalog_capability(),
                 "credits": credits_service.capability(),
+                "transport": {"gzip": True},
             },
+            "integrity": integrity_status(),
             "status": "ok" if compatibility.supported else compatibility.status,
         }
     )
@@ -2539,7 +2811,7 @@ def profiles():
             })
         else:
             missing.append(track_id)
-    return jsonify(
+    return _private_json(
         {
             "schema_version": SCHEMA_VERSION,
             "analyzer_version": ANALYZER_VERSION,
@@ -2597,25 +2869,92 @@ def profile_changes_api():
         return _catalog_error("invalid_cursor", str(exc), 400)
 
 
-def _profile_bootstrap_v2(operation):
-    if not getattr(host_api.config, "DATABASE_URL", None):
-        return _catalog_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
+def _host_auth_enabled():
+    """The host's live AUTH_ENABLED (K4); health ``auth`` stays the design string."""
+    value = getattr(host_api.config, "AUTH_ENABLED", False)
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
+def _bootstrap_caller():
+    """Who a v2 create counts against for the per-source rate limit."""
+    username = getattr(g, "auth_user", None)
+    if username:
+        return f"user:{username}"
+    if getattr(g, "auth_method", None) == "bearer":
+        return "bearer"
+    return profile_bootstrap.ANONYMOUS_CALLER
+
+
+V2_BODY_MAX_BYTES = 16_384
+
+
+def _v2_body(max_bytes=V2_BODY_MAX_BYTES):
+    """The v2 JSON body, reading at most ``max_bytes`` + 1 bytes from the stream.
+
+    ``Content-Length`` is checked first; a chunked body has none, so the read
+    itself is bounded too. Non-JSON content types read as an empty body, like
+    ``request.get_json(silent=True)``.
+    """
+    if request.content_length is not None and request.content_length > max_bytes:
+        raise ValueError("Request body is too large")
+    # A host hook may already have read (and cached) the body.
+    raw = getattr(request, "_cached_data", None)
+    if raw is None:
+        # Read until EOF or one byte past the cap: a stream may return short reads.
+        chunks, size = [], 0
+        while size <= max_bytes:
+            chunk = request.stream.read(max_bytes + 1 - size)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            size += len(chunk)
+        raw = b"".join(chunks)
+    if len(raw) > max_bytes:
+        raise ValueError("Request body is too large")
+    if not request.is_json or not raw:
+        return {}
     try:
-        body = _json_body(max_bytes=16_384)
+        body = json.loads(raw)
     except ValueError:
-        return _catalog_error("invalid_profile_bootstrap", "Invalid bootstrap request.", 400)
+        return {}
+    if body is None:
+        return {}
+    if not isinstance(body, dict):
+        raise ValueError("JSON body must be an object")
+    return body
+
+
+def _bootstrap_error(code, message, status, retry_after=None):
+    response = _catalog_error(code, message, status)
+    if status == 503:
+        retry_after = retry_after or profile_bootstrap.UNAVAILABLE_RETRY_AFTER_S
+    if status in (429, 503) and retry_after:
+        response.headers["Retry-After"] = str(int(retry_after))
+    return response
+
+
+def _profile_bootstrap_v2(operation, **options):
+    if not getattr(host_api.config, "DATABASE_URL", None):
+        return _bootstrap_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
     try:
-        result = operation(body)
+        body = _v2_body()
+    except ValueError:
+        return _bootstrap_error("invalid_profile_bootstrap", "Invalid bootstrap request.", 400)
+    try:
+        result = operation(body, **options)
         return _private_json(result)
     except profile_bootstrap.BootstrapError as exc:
-        return _catalog_error(exc.code, exc.code, exc.status)
-    except Exception:
-        return _catalog_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
+        return _bootstrap_error(exc.code, exc.code, exc.status, exc.retry_after)
+    except Exception as exc:
+        logger.exception("lumae_analysis profile bootstrap route failed (%s)", type(exc).__name__)
+        return _bootstrap_error("bootstrap_unavailable", "bootstrap_unavailable", 503)
 
 
 @bp.post("/api/profiles/bootstrap/sessions")
 def profile_bootstrap_sessions_api():
-    return _profile_bootstrap_v2(profile_bootstrap.create_session)
+    return _profile_bootstrap_v2(profile_bootstrap.create_session, caller=_bootstrap_caller())
 
 
 @bp.post("/api/profiles/bootstrap/sessions/page")
@@ -3192,6 +3531,15 @@ def analyze_song_hook(song):
     if not catalog_instance_id:
         logger.warning("lumae_analysis song hook skipped %s without an exact source", track_id)
         return {"track_id": track_id, "status": "skipped_source_unresolved"}
+    # An AudioMuse re-analysis pass fires this hook for every song. A current
+    # published profile needs no new attempt (AUD-03); changed media, a new
+    # analyzer or schema, and failed rows still requalify (LUM-007).
+    if published_profile_current(
+        get_db(), catalog_instance_id, track_id, ANALYZER_VERSION, SCHEMA_VERSION
+    ):
+        # Still heal a missing edge; a current edge makes this a no-op.
+        _schedule_edge_upgrade(track_id, catalog_instance_id, source_server_id)
+        return {"track_id": track_id, "status": "current"}
     tokens = mark_pending([track_id], catalog_instance_id, priority="interactive")
     token = tokens.get(track_id)
     if not token:

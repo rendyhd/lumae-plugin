@@ -37,14 +37,14 @@ The plugin has no authentication of its own. Every route is behind the AudioMuse
 | `AUTH_ENABLED=false` | **Anonymous.** Every transfer, including the v2 profile bootstrap, is open to anyone who can reach the host. | `__global__` |
 
 Rules for clients:
-- Health still reports `capabilities.profile_bootstrap.auth: "host_authenticated"` when `AUTH_ENABLED=false` (`__init__.py:1840`). That string describes the design, not the live setting. K4 adds a truthful `auth_enabled`.
+- Health still reports `capabilities.profile_bootstrap.auth: "host_authenticated"` when `AUTH_ENABLED=false` (`__init__.py:1840`). That string describes the design, not the live setting, and it is unchanged in 1.3.0. **From 1.3.0 (K4, P1-6):** `capabilities.profile_bootstrap.auth_enabled` is the host's live `AUTH_ENABLED` (`false` when the host does not set it). With `auth_enabled: false`, every transfer is anonymous (last row above).
 - The host redirects an unauthenticated request for a non-`/api/` host path to `/login` with **HTTP 302** instead of returning 401. This is host behaviour, not visible in this repo; it was *verified in the 2026-09-24 audit* (`docs/audit/2026-09-24/LUMAE_AUDIT_2026-09-24.md`, P3 list under AUD-12). Every plugin path starts with `/plugins/`, so plugin API calls get this redirect too. A client must treat any **3xx response, or any `text/html` body where JSON was expected, as `authentication_required`**. It must never parse the login page as data and must never follow the redirect as success.
 - Profile data (waveform and edge) is shared by everyone who can reach the catalogue source; it is scoped by `catalog_instance_id`, not by user. Collections and shelves are scoped by principal. Shelves are also scoped by catalogue.
 
 ### 1.3 Requests
 
 - JSON request bodies need `Content-Type: application/json`. Every handler uses `request.get_json(silent=True)`, so without that header the body is read as empty. The v2 bootstrap then answers 400, and collection creation answers 400 "Collection name is required."
-- Body size limits: v2 bootstrap 16,384 bytes (`__init__.py:2604`); edge analyze and backfill 64,000 bytes (`__init__.py:2800, 2813`). These limits are checked against `Content-Length` only (`__init__.py:2054-2057`).
+- Body size limits: v2 bootstrap 16,384 bytes (`__init__.py:2604`); edge analyze and backfill 64,000 bytes (`__init__.py:2800, 2813`). These limits are checked against `Content-Length` only (`__init__.py:2054-2057`). **From 1.3.0 (P1-6):** the v2 bootstrap also reads at most 16,384 bytes from the request stream (`_v2_body`), so a chunked body without `Content-Length` that is larger gets the same 400 `invalid_profile_bootstrap` ("Invalid bootstrap request.").
 - Unknown JSON fields and unknown query parameters are **ignored** everywhere, with one exception: v2 `page`/`catchup`/`release` bodies reject `page_size` (`profile_bootstrap.py:119-120`). §8 depends on this.
 
 ### 1.4 Error envelopes
@@ -62,9 +62,23 @@ There are three shapes. Clients must accept all three.
 
 ### 1.5 Response headers
 
-`_private_json` (`__init__.py:2041-2047`) sets `Cache-Control: private, no-store` (the v2 bootstrap, edges and errors) or `private, no-cache` (legacy `/profiles/bootstrap` and `/profiles/changes`), plus `Vary: Authorization, Cookie` and `X-Content-Type-Options: nosniff`. `GET /api/profiles`, health and the collection routes use plain `jsonify`, with no cache headers. Shelves set `private, no-store` on reads (`shelves.py:218`).
+`_private_json` (`__init__.py:2041-2047`) sets `Cache-Control: private, no-store` (the v2 bootstrap, edges and errors) or `private, no-cache` (legacy `/profiles/bootstrap` and `/profiles/changes`), plus `Vary: Authorization, Cookie` and `X-Content-Type-Options: nosniff`. Health and the collection routes use plain `jsonify`, with no cache headers. Shelves set `private, no-store` on reads (`shelves.py:218`).
 
-Responses are **not** compressed today. K1 adds gzip.
+- **1.2.5:** `GET /api/profiles` used plain `jsonify`, with no cache headers.
+- **1.3.0 (unreleased, P1-4):** `GET /api/profiles` uses `_private_json`: `Cache-Control: private, no-store`, `Vary: Authorization, Cookie`, `X-Content-Type-Options: nosniff`.
+
+**`Retry-After` (K4).** 1.2.5 never sends it. From 1.3.0 (unreleased, P1-6) every v2 bootstrap **429** carries `Retry-After: <seconds>` (a whole number, 1–300) and every v2 bootstrap **503** carries `Retry-After: 5` (§3.5). Other routes and statuses do not send it. Clients wait at least that long before retrying, and use their own backoff when the header is absent (1.2.5).
+
+**Compression (K1).** 1.2.5 never compresses. From 1.3.0 a blueprint `after_request` hook (`_compress_json_response`, 1.3.0 `__init__.py:249-273`) gzips a plugin response (level 4) when **all** of these hold:
+- the request's `Accept-Encoding` allows gzip: `gzip` or `x-gzip` with q>0, or, when neither is listed, `*` with q>0. `gzip;q=0` (or `*;q=0` with no explicit gzip) refuses it; names are case-insensitive;
+- the status is 200;
+- the mimetype is `application/json`;
+- the uncompressed body is at least 1,024 bytes;
+- the response has no `Content-Encoding` yet and is neither streamed nor `direct_passthrough`.
+
+A compressed response carries `Content-Encoding: gzip` and `Content-Length` set to the **compressed** size. Every response that meets the last four conditions (whether or not the client accepted gzip) gets `Accept-Encoding` appended to its existing `Vary` (for example `Vary: Authorization, Cookie, Accept-Encoding`), never duplicated. Errors, small bodies, binary vectors and host routes outside the plugin blueprint are never compressed. The two JSON download attachments are also plugin JSON, so they are gzip-eligible like any other route: the collection backup download (`_backup_response`, `collection_manager.py:358`, `application/json; charset=utf-8`) and the provider-identity transition manifest download (`lumae-provider-rekey-<id>.json`, 1.3.0 `__init__.py:2482-2505`). `Content-Disposition` is unchanged; a client or browser saving the file receives the decoded JSON. The JSON after decoding is byte-for-byte the uncompressed body.
+
+Client rules: send `Accept-Encoding: gzip` only when the HTTP stack decodes it (native stacks do this transparently). Never use `Content-Length` as the decoded size: a transparent decoder may drop it or leave the compressed size (C-7). Measured on a 50-row page with real-sized (~20 KB) edges: about 1,002 KB → 372 KB (2.7×, level 4) when the rows' edges differ; pages whose edges repeat compress far more.
 
 ### 1.6 Timestamps
 
@@ -72,12 +86,12 @@ Timestamps are ISO-8601 strings, but the zone varies. Clients must accept every 
 
 | Field | Column type | Wire form |
 |---|---|---|
-| profile `analyzed_at` | `TIMESTAMP` without zone (`__init__.py:1222`) | **no zone designator**, for example `2026-09-24T10:11:12.123456`; wall-clock time in the database session zone (`catalog_enrichment.py:96-99`) |
-| profile change `created_at`, v2 `expires_at` | `TIMESTAMPTZ` | `…Z` when the server runs in UTC, otherwise with a numeric offset such as `+02:00` (`profile_bootstrap.py:209-210`) |
-| collection `created_at`/`updated_at`/`deleted_at`/`added_at`, change `created_at` | `TIMESTAMPTZ` | same as the row above (`collection_manager.py:234-237`) |
+| profile `analyzed_at` | `TIMESTAMP` without zone (`__init__.py:1222`) | **no zone designator**, for example `2026-09-24T10:11:12.123456`; wall-clock time in the database session zone (`catalog_enrichment.py:96-99`). **Unchanged in 1.3.0**: the column has no zone, so the server cannot convert it, and it is part of the stored profile payload that events, snapshots and reads must agree on. |
+| profile change `created_at` (`/profiles/changes` and v2 catch-up), v2 `expires_at`, relationship `computed_at`/`started_at`/`completed_at`/`updated_at` | `TIMESTAMPTZ` | 1.2.5: `…Z` when the server runs in UTC, otherwise with a numeric offset such as `+02:00` (`profile_bootstrap.py:209-210`). **From 1.3.0 (P1-6): always UTC with `Z`**, for example `2026-09-24T08:11:12.123456Z`, whatever the database TimeZone (`_iso` in `profile_bootstrap.py` and `catalog_enrichment.py`). Catch-up events captured by a 1.2.5 server keep the form they were captured with. |
+| collection `created_at`/`updated_at`/`deleted_at`/`added_at`, change `created_at` | `TIMESTAMPTZ` | `…Z` in UTC, otherwise a numeric offset, in 1.2.5 and 1.3.0 (`collection_manager.py:234-237`) |
 | shelf `addedAt`/`at` | client-supplied number | stored and echoed as sent (`shelves.py:41-44`) |
 
-Never compare server timestamps with the device clock. `expires_at` is advisory; the server decides expiry with its own `now()` (`profile_bootstrap.py:195-197`).
+Never compare server timestamps with the device clock. `expires_at` is advisory; the server decides expiry with its own `now()` (`profile_bootstrap.py:195-197`). Parse timestamps as ISO-8601 with an optional zone (`Z` or an offset), and keep accepting offsets from 1.2.5 servers.
 
 ---
 
@@ -85,24 +99,25 @@ Never compare server timestamps with the device clock. `expires_at` is advisory;
 
 ### `GET /api/health` (`__init__.py:1823-1864`)
 
-This route always answers 200 (unless an exception occurs). It has no side effects.
+This route always answers 200 (unless an exception occurs). It has no side effects. From 1.3.0 it also reads the `integrity` object below (two index lookups, well under 1 ms at 94k profiles and 200k collection events).
 
 | Key | Value in 1.2.5 | Source |
 |---|---|---|
 | `plugin` | `"lumae_analysis"` | 1828 |
-| `plugin_version` | `"1.2.5"` | 1829 |
+| `plugin_version` | `"1.2.5"`; `"1.3.0"` from 1.3.0 (unreleased, P1-3) | 1829 |
 | `core_version`, `core_adapter`, `supported_core_range` | host detection; the range is `">=2.6.0,<4.0.0"` | 1830-1832 |
 | `sync_contract` | `{revision, producer, core_api_contract, streams:{catalog, analysis, profiles:{schema_version:1, analyzer_version:1, semantic_contracts:["lumae_playback_profile_v1"]}, credits, relationships}}` | `sync_contract()`, 1765-1801 |
 | `schema_version` | `1` (profile schema) | 1834 |
 | `analyzer_version` | `1` (waveform analyzer) | 1835 |
 | `status` | `"ok"` when the core is supported, otherwise the core compatibility status | 1862 |
 | `capabilities` | the table below | 1836-1861 |
+| `integrity` | absent | **New in 1.3.0 (unreleased, P1-3, AUD-05).** Operator diagnostics, not a client gate: `{collections_feed_ok: bool\|null, profiles_unpublished_ready: int\|null, profiles_checked_at: string\|null, fences_installed: bool\|null}`. `fences_installed` is live (one catalogue lookup): `false` means the 1.3.0 migration has not installed every old-writer fence (`writer_generation` NOT NULL without default on `profile_changes` and `catalog_changes`, no default on `collection_changes.seq`). `collections_feed_ok` is live: `false` means a collection change row sits past the feed head, and every collection mutation then returns 503 `collection_feed_invariant` (§5.3) until an operator repairs it. `profiles_unpublished_ready` counts current `ready` source profiles with no published row; it is recounted at install and at web-worker start, and `profiles_checked_at` (UTC, `Z`) says when. `null` means unknown (no database or an older schema). Repair SQL: `docs/runbooks/UPGRADE_1.3.md`. |
 
 `capabilities`: every key that exists today, with exact names.
 
 | Key | Fields (1.2.5) | Notes |
 |---|---|---|
-| `profile_bootstrap` | `protocol_version: 2`, `schema_version: 1`, `auth: "host_authenticated"`, `transfer_contract: "source_scoped_v1"`, `available: bool` | `available` is only `bool(config.DATABASE_URL)` (1842). It is **not** a probe. |
+| `profile_bootstrap` | `protocol_version: 2`, `schema_version: 1`, `auth: "host_authenticated"`, `transfer_contract: "source_scoped_v1"`, `available: bool`. **1.3.0 adds** `auth_enabled: bool`, `sliding_expiry: true`, `idempotent_create: true` (P1-6). | 1.2.5: `available` is only `bool(config.DATABASE_URL)` (1842). It is **not** a probe. **From 1.3.0 (K4):** `available` is `true` only when `DATABASE_URL` is set, the v2 tables and the 1.3.0 session columns exist, and a probe on the plugin's own connection succeeded; a success is cached for 60 s and a failure for 10 s, and the probe connects with a 2 s timeout (`profile_bootstrap.availability`). `auth_enabled` is the host's live `AUTH_ENABLED` (§1.2); `auth` keeps its 1.2.5 value. `sliding_expiry` gates K3 and `idempotent_create` gates K5 (§3.5). |
 | `edge_profiles` | `schema_version: 2`, `method: "lumae-edge-kweighted-bands-48k-k4-v2"`, `available: bool`, `enabled: bool` | `available`: the PyAV 16.1.0 / libswresample 6.1.100 runtime imports (`edge_profiles.py:86-98`). `enabled`: the setting `edge_profiles_enabled` and `available` (`__init__.py:2762-2763`). |
 | `personal_discovery` | `schema_version: 1`, `enabled`, `scope: "shared"\|"personal"`, `features: ["album_memory_context","enjoyment_feedback"]` | out of scope here; see `docs/discovery-api-v1.md` |
 | `music_metadata` | `schema_version: 1`, `enabled`, `provider: "musicbrainz"`, `daily_request_limit: 80`, `recording_membership: true` | out of scope |
@@ -110,8 +125,9 @@ This route always answers 200 (unless an exception occurs). It has no side effec
 | `collections` | `schema_version: 1`, `backup_version: 1`, `enabled`, `scope` | `collection_manager.py:18-20, 53-57` |
 | `catalog_mirror` | `contract_revision`, `catalog_schema_version: 3`, `analysis_schema_version: 2`, `catalog_builder_version`, `supported_core_range`, `supported_provider_types: ["navidrome"]`, `features: [...]` | `catalog_capability()`, 1753-1762. `features` is the static `CATALOG_FEATURES` list (120-162), which includes `profile_cursor_stream` and `source_scoped_profiles`. |
 | `credits` | `credits_service.capability()` | out of scope |
+| `transport` | `gzip: true` | **New in 1.3.0 (unreleased, K1).** Informational: gzip is negotiated per request through `Accept-Encoding` (§1.5). Absent in 1.2.5. |
 
-**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `transport`, `profile_stream`, `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled`, `edge_profiles.compact_transport`, `collections.feed_epoch`, `collections.contract`, `collections.source_scoped_items`, and `lumae_analysis_profiles`.
+**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream`, `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `collections.feed_epoch`, `collections.contract`, `collections.source_scoped_items`, and `lumae_analysis_profiles`.
 
 > Note: `lumae_analysis_profiles` is a **manifest** capability in `plugin.json` (with `schema_version`, `analyzer_version`, `profile_source`, `features`). It is not part of the health payload. See §9 item 1.
 
@@ -134,7 +150,7 @@ Every profile route is scoped by `catalog_instance_id`. Clients get it from `GET
 | `track_id` | string | provider track id |
 | `source` | `"waveform"` | constant |
 | `sample_rate`, `duration_ms` | int | |
-| `ref_lufs` | number | analyzer v1 reference loudness. Direct reads, bootstraps and v2 snapshots read it from a `REAL` (float4) column. Change events carry the analyzer's float64. The two can differ in low digits. |
+| `ref_lufs` | number or null | analyzer v1 reference loudness at the stored `REAL` (float4) precision, emitted as a decimal that round-trips the float4 value; equal to PostgreSQL's text form for the LUFS range (`catalog_enrichment.float4`). Every path emits the same value since P1-1; events recorded by 1.2.5 still in the journal carry the analyzer's float64, which can differ in low digits. A non-finite value is `null`. |
 | `start_ramp`, `end_ramp` | base64 string | MixRamp blobs |
 | `analyzer_ver` | int | `1` in 1.2.5 |
 | `analyzed_at` | ISO string without a zone (§1.6) | |
@@ -153,6 +169,8 @@ Response 200: `{schema_version:1, analyzer_version:1, catalog_instance_id, profi
 - `profiles`: published rows (`published_source_profiles`), with an edge when one matches (§3.1).
 - `failed`: the latest attempt is `failed` or `skipped_no_file`, with `last_error` as the reason, or serialization failed.
 - `missing`: everything else, including pending work.
+
+Headers: from 1.3.0 the 200 response has private cache headers (§1.5); in 1.2.5 it has none. It is gzipped under K1 when large enough (§1.5).
 
 This route is read-only: it never schedules analysis. Use `POST /api/analyze` (below) for that.
 
@@ -185,12 +203,16 @@ Status codes:
 
 | Status | Code | When |
 |---|---|---|
-| 410 | `bootstrap_required` | the cursor epoch ≠ the current epoch, **or** `cursor.seq < floor_seq` (the journal was compacted past it) (591-593) |
-| 400 | `invalid_cursor` | malformed cursor; the cursor belongs to another source; **the cursor is ahead of head** (594-596) |
+| 410 | `bootstrap_required` | the cursor epoch ≠ the current epoch, **or** `cursor.seq < floor_seq` (the journal was compacted past it) (591-593), **or** (from P1-7) the page is not dense: with `cursor.seq < head_seq` the returned seqs are not exactly `cursor.seq+1 … cursor.seq+min(limit, head_seq − cursor.seq)` (an event is missing) |
+| 400 | `invalid_cursor` | malformed cursor; the cursor belongs to another source; **the cursor is ahead of head** (594-596; unchanged by P1-7) |
+
+From P1-7 (unreleased, ships in 1.3.0): the reader takes the stream state (epoch, head, floor) and the page of events in **one statement** (`catalog.read_change_page`: a CTE over `profile_stream_state` laterally joined with `profile_changes`), so both come from one snapshot. Before, the state and the events were two statements, and a compaction committing between them could return a page that silently started after a deleted event (LUM-001 gap F5). The page is then checked for density as above; a violation is the same 410 `bootstrap_required` the floor and epoch checks return. The response shape is unchanged. The catalogue (`GET /api/catalog/changes`), analysis (`GET /api/catalog/analysis/changes`) and relationship (`GET /api/catalog/relationships/changes`) change readers had the same two-statement pattern and use the same single-snapshot read and density check, with the same 410 `bootstrap_required` and 400 `invalid_cursor` (cursor ahead of head) codes; their `head_cursor`, `has_more` and, for the catalogue, `remaining_events`, `snapshot_generation`, `snapshot_entity_counts`, `snapshot_estimated_bytes` and `fingerprint_schema_version` now come from that same snapshot.
 
 Retention: each publication compacts the journal to its last **50,000** events (`PROFILE_CHANGE_RETENTION_EVENTS`, `catalog_enrichment.py:50, 497`). The maintenance path uses `max(1000, 2 × profile_count)` (`catalog_enrichment.py:158-210`, line 193; `catalog.py:50-55`). A client more than about 50k events behind gets a 410 and must bootstrap again.
 
-Event payloads are stored through `catalog.canonical_json` (`catalog.py:295-319`). That function NFC-normalises and trims strings, turns empty strings into `null`, and drops keys that match private or path patterns. Direct reads, bootstraps and v2 snapshots are **not** sanitised this way.
+From P1-2 (unreleased, ships in 1.3.0): one retention limit per source, `profile_stream_state.retention_limit` = max(50,000, 2 × library), where the library is the larger of the published profiles and the catalogue's tracks. It is refreshed when the catalogue publishes a new generation (from that generation's track count) and by maintenance (`compact_enrichment_storage`, run at plugin start); the limit never drops below 50,000; publication reads it and never counts. Each publication deletes only the expired range of the current epoch; other epochs are purged in maintenance or on catalogue epoch rotation. The floor does not advance past the `snapshot_seq` of an unexpired v2 session whose catch-up has not captured its head, but never keeps more than 4 × the retention limit. So a client is at least one full library of events (and at least 50k) behind before it gets a 410. The client-visible contract (410 `bootstrap_required` when `cursor.seq < floor_seq`) is unchanged.
+
+Since P1-1, event payloads are stored exactly as `serialize_profile` returns them (`catalog_enrichment._profile_json`: sorted keys, compact separators, no NaN), the same serializer that direct reads, bootstraps and v2 snapshots use, so an event and a read of the same row are equal. Events recorded by 1.2.5 went through `catalog.canonical_json` (`catalog.py:295-319`), which NFC-normalises and trims strings and turns empty strings into `null` (for example an empty ramp); such events can stay in the journal until compacted.
 
 ### 3.5 v2 profile bootstrap (`profile_bootstrap.py`; routes at `__init__.py:2600-2633`)
 
@@ -205,7 +227,7 @@ The integers must be JSON integers; `true` or `2.0` is rejected.
 
 | Route | Extra body fields | Success (200) body |
 |---|---|---|
-| `POST /api/profiles/bootstrap/sessions` (create; 220-289) | `page_size`: int **1–500**, default 250. It is fixed for the whole session. | envelope + `session_token` (64 hex), `page_size`, `snapshot_count`, `total_profiles`, `catalog_epoch`, `profile_epoch`, `snapshot_seq`, `expires_at`, `snapshot_cursor`, `cursor` (= `snapshot_cursor`), `next_page_token` (always present, for ordinal 0) |
+| `POST /api/profiles/bootstrap/sessions` (create; 220-289) | `page_size`: int **1–500**, default 250. It is fixed for the whole session. **From 1.3.0 (P1-6), both optional:** `expiry_mode`: `"absolute"` (default) or `"sliding"` (K3); `client_request_id`: a UUID string, at most 64 characters, compared case-insensitively (K5). Any other value of either field is 400. `null` means absent. | envelope + `session_token` (64 hex), `page_size`, `snapshot_count`, `total_profiles`, `catalog_epoch`, `profile_epoch`, `snapshot_seq`, `expires_at`, `snapshot_cursor`, `cursor` (= `snapshot_cursor`), `next_page_token` (always present, for ordinal 0) |
 | `POST …/sessions/page` (292-312) | `session_token`, optional `page_token`; **`page_size` is forbidden** | envelope + `profiles:[…]`, metadata¹, `cursor` (= snapshot cursor), `next_page_token\|null`, `has_more` |
 | `POST …/sessions/catchup` (315-382) | `session_token`, optional `page_token`; `page_size` forbidden | envelope + `changes:[{seq,track_id,operation,payload,created_at}…]`, metadata¹, `cursor` (last seq in this page), `head_cursor`, `next_page_token\|null`, `has_more` |
 | `POST …/sessions/release` (385-397) | `session_token` | **only** `{protocol_version, schema_version, transfer_contract, released: true}`, with **no `catalog_instance_id`** (396-397). Clients must not apply full-envelope validation to the release response. |
@@ -214,10 +236,20 @@ The integers must be JSON integers; `true` or `2.0` is rejected.
 
 **Semantics:**
 - **Create.**
-  - Runs synchronously in the request, on its own connection, under the **global** session advisory lock `pg_advisory_lock(110094, 10)` (142).
+  - 1.2.5: runs synchronously in the request, on its own connection, under the **global** session advisory lock `pg_advisory_lock(110094, 10)` (142), held for the whole capture, so a second create for *any* source waits up to 5 s and then gets 503.
+  - **From 1.3.0 (P1-6, AUD-11)** it still runs synchronously on its own connection (`application_name` `lumae-profile-bootstrap`, TCP keepalives on), in three short steps:
+    1. *Admission*, one transaction under `pg_advisory_xact_lock(110094, 10)` (held for a few statements, not the capture): the rate limit, K5 replacement, the slot check over **live** sessions only (below), and the insert of the session in state `capturing`. It commits before the capture, so the session holds its slot, and with the admission head as a lower bound of `snapshot_seq` it also holds the P1-2 journal floor while the capture runs.
+    2. *Purge* of sessions that are not live, without the global lock: expired, identity-stale (source inactive or rebound, core server, catalogue epoch or profile epoch changed), replaced by K5, or still `capturing` 10 minutes after admission (an abandoned capture). Their snapshot and catch-up rows go with them. Each create purges at most 2 such sessions (oldest expiry first), and a failed purge is logged and never fails the create; dead sessions hold no slot while they wait.
+    3. *Capture* under a **per-source** lock `pg_advisory_lock(110094, hashtext(catalog_instance_id))`, unlocked explicitly afterwards. Creates for different sources capture concurrently. A second create for the same source waits for the first capture for **up to 5 s**, instead of failing at once, and then gets 503 with `Retry-After: 5`. The wait plus a capture (about 3 s at 94k profiles) fits a 10 s client request timeout, so a create does not finish after its client gave up. If the capture fails, its session is deleted.
+  - A session is **live** when it is unexpired, not an abandoned capture, and its source is still `active` with the session's core server, catalogue epoch and profile epoch. Only live sessions count toward the 4-per-source and 32-global limits or hold the journal floor. The rest would answer 410 anyway.
   - Captures every published profile of the source in one REPEATABLE READ snapshot, **with each row's edge embedded at capture time** (250-275), and pins `snapshot_seq` = the profile head at capture.
-  - Deletes expired sessions first (229).
-- **Session lifetime.** Fixed at **60 minutes from creation** (`now() + interval '60 minutes'`, 245). Pages do **not** extend it. (`SESSION_MINUTES` at line 26 is not used.)
+  - From P1-5 (K2, unreleased, ships in 1.3.0): the capture stores each row's waveform payload plus an edge **reference** (column `edge_ref`), instead of a copy of the edge. The reference names the edge row `(media_revision, profile_digest)` that `edge_join()` picks. A snapshot stores a reference only when that edge's `media_revision` equals the row's own (the only case in which an edge is embedded), so snapshot references are always `{"profile_digest": …}` and the row's `media_revision` completes the key. The edge is resolved at page read (below). This is server-internal; the wire format does not change.
+  - 1.2.5 deletes expired sessions first (229); 1.3.0 purges as in step 2.
+  - **Idempotent create (K5, 1.3.0; gate `idempotent_create`).** When the body has a `client_request_id`, an unexpired session of the same source with the same id that has not served a page or catch-up yet (`pages_served = 0`) is **replaced**: it expires at once and is purged, and the new session takes its slot. This also applies while the earlier create is still capturing; that request then ends with 410. A session that has served a page is claimed and never replaced. Send one UUID per logical create and reuse it when retrying a create that timed out.
+  - **Rate limit (K4, 1.3.0).** At most **6 admitted creates per 10 minutes per (source, caller)**. The caller is the host account (`g.auth_user`), else `bearer` for the installation token, else `anonymous` (all anonymous clients share one budget). A create over the limit is 429 `bootstrap_session_limit` with `Retry-After` = the seconds until the oldest counted create leaves the window (capped at 300). Refused creates are not counted.
+- **Session lifetime.**
+  - 1.2.5: fixed at **60 minutes from creation** (`now() + interval '60 minutes'`, 245). Pages do **not** extend it. (`SESSION_MINUTES` at line 26 is not used.)
+  - 1.3.0: one constant, `SESSION_MINUTES = 60`, for both modes. **Absolute** (the default): unchanged, 60 minutes from creation. **Sliding** (K3, `expiry_mode: "sliding"`, gate `sliding_expiry`): every successful page or catch-up sets `expires_at = LEAST(now() + 60 minutes, created_at + 24 hours)` (never earlier than it already was), and that response's `expires_at` shows the new value. A sliding session therefore lives while the client keeps paging at least once an hour, and at most 24 hours in total. Clients must accept a changing `expires_at` in sliding mode.
 - **Tokens.**
   - `session_token` is a bearer secret; the server stores only its SHA-256.
   - A `page_token` is `base64url(json{s,p,o,z}).hex_hmac_sha256`, at most 2,300 characters (77-101). It is bound to the session, the phase (`snapshot`/`catchup`), the ordinal and the page size.
@@ -226,25 +258,28 @@ The integers must be JSON integers; `true` or `2.0` is rejected.
   - Reads the frozen snapshot in ordinal order.
   - The ordinal must be ≤ `snapshot_count` and a multiple of `page_size`, otherwise 400 (298-299).
   - Profiles are the frozen JSON, including an edge that may have been replaced since.
+  - From P1-5 (K2): the page joins each row's reference to `edge_profiles` on `(catalog_instance_id, track_id, media_revision, profile_digest)`. While that edge is still published, the row is **byte-identical** to the pre-K2 frozen JSON with the edge embedded. **If the edge was replaced or withdrawn after capture, the row arrives without `edge_profile`**; the catch-up interval (or `/profiles/changes` after `head_cursor`) contains the replacing event. Clients already treat an upsert without an edge as "no edge". Sessions captured before the upgrade (NULL `edge_ref`) keep paging their frozen JSON unchanged.
 - **Catch-up.**
   - The first call (ordinal 0) materialises the journal from `snapshot_seq` to the **current** head into the session. It returns 410 if `snapshot_seq < floor_seq` or if a seq gap is found (324-360).
   - Later calls page that frozen set.
+  - From P1-5 (K2): an upsert event is stored as its waveform payload plus an edge reference and resolved at page read like the snapshot. The reference also carries `media_revision`, but only when the journalled edge names a different revision than the event payload. So an event whose edge was replaced after it was journalled arrives without `edge_profile`; the later event that replaced it (in the interval or after `head_cursor`) carries the current edge. Delete events are unchanged.
   - The final `cursor` equals `head_cursor`. Continue incremental sync with legacy `/profiles/changes` from it.
-- **Session validity (every page, catch-up and release; `_session`, 181-201).** The token must exist, the body's `catalog_instance_id` must match, the session must not be expired and must be schema 1, and the source must still be `active` with an unchanged core server id, catalog epoch and profile epoch. Otherwise the answer is **410**.
+- **Session validity (every page and catch-up; in 1.2.5 also release; `_session`, 181-201).** The token must exist, the body's `catalog_instance_id` must match, the session must not be expired and must be schema 1, and the source must still be `active` with an unchanged core server id, catalog epoch and profile epoch. Otherwise the answer is **410**.
+- **Release.** 1.2.5 validates the session like a page first, so releasing an expired or stale session returns 410 and **leaves the row**, which keeps its slot until it expires (AUD-11). **From 1.3.0 (P1-6)** release deletes the session matching the token hash **and** `catalog_instance_id`, whether it is live, expired or identity-stale, and always answers 200 `released: true` for a valid request: also for an unknown or already-released token, and for another source's token (which deletes nothing). Release is the way to free a slot at once; always release a session you no longer page.
 
 **Status codes** (the `error` code equals the `message`):
 
 | Status | Code | Cause |
 |---|---|---|
-| 400 | `invalid_profile_bootstrap` | bad envelope; `page_size` outside 1–500 or not an int; `page_size` on page/catchup/release; malformed, forged, wrong-phase or misaligned `page_token`; `session_token` not 64 lowercase hex; body > 16 KiB, not JSON or not an object |
-| 410 | `bootstrap_required` | **create:** the source is unknown, inactive or has no core server id (`_state` 176-177, called at 236). The 429 slot check (233-235) runs first, so a host whose slots are full answers 429 even for an unknown source. **Page/catchup/release:** unknown token (page/catchup), expired session, source inactive or rebound, epoch changed, catch-up floor passed or gap. **Release** of an existing but expired or stale session also returns 410, and the row is **not** deleted: it keeps its slot until it expires (393). |
-| 413 | `bootstrap_snapshot_limit` | create: > **200,000** rows or > **128 MiB** of compact JSON (edges included). The first catch-up: > **50,000** events or > 128 MiB (270-271, 352-353). Nothing is kept, so a retry fails the same way. Fall back to legacy bootstrap. |
-| 429 | `bootstrap_session_limit` | ≥ **4** unexpired sessions for the source or ≥ **32** globally (233-235). There is **no `Retry-After`** in 1.2.5. |
-| 503 | `bootstrap_unavailable` | `config.DATABASE_URL` is unset (2601-2602); any database error, statement timeout (20 s), lock timeout (5 s; a second concurrent create waits up to 5 s for the global lock), or any other unexpected exception (156-157, 2612-2613). Nothing is logged. There is no `Retry-After`. |
+| 400 | `invalid_profile_bootstrap` | bad envelope; `page_size` outside 1–500 or not an int; `page_size` on page/catchup/release; malformed, forged, wrong-phase or misaligned `page_token`; `session_token` not 64 lowercase hex; body > 16 KiB (from 1.3.0 also a chunked body), not JSON or not an object; from 1.3.0 an invalid `expiry_mode` or `client_request_id` on create |
+| 410 | `bootstrap_required` | **create:** the source is unknown, inactive or has no core server id (`_state` 176-177, called at 236). The 429 slot check (233-235) runs first, so a host whose slots are full answers 429 even for an unknown source. From 1.3.0 also: the source's identity changed between admission and capture, or a retried create (K5) replaced this one. **Page/catchup/release:** unknown token (page/catchup), expired session, source inactive or rebound, epoch changed, catch-up floor passed or gap. **Release** in 1.2.5 of an existing but expired or stale session also returns 410, and the row is **not** deleted: it keeps its slot until it expires (393). From 1.3.0 release never returns 410 (see Release above). |
+| 413 | `bootstrap_snapshot_limit` | create: > **200,000** rows or > **128 MiB** of compact JSON (edges included). The first catch-up: > **50,000** events or > 128 MiB (270-271, 352-353). Nothing is kept, so a retry fails the same way. Fall back to legacy bootstrap. **From P1-5 (1.3.0):** both byte caps count waveform JSON only (edges excluded), so a 94k library with edges fits (about 45 MB of waveform JSON). The first catch-up admits `4 × max(50,000, retention_limit)` events, which is the P1-2 floor-hold cap, and `max(128 MiB, 1 KiB × that event limit)` bytes. A session the floor hold kept readable is therefore never refused. |
+| 429 | `bootstrap_session_limit` | ≥ **4** unexpired sessions for the source or ≥ **32** globally (233-235). There is **no `Retry-After`** in 1.2.5. **From 1.3.0 (K4):** only live sessions count (identity-stale and abandoned ones never do), and the same code also answers a create over the rate limit (6 per 10 minutes per source and caller). Every 429 carries `Retry-After`: for a full source or host, the seconds until the earliest counted session expires (an abandoned capture counts until 10 minutes after admission); for the rate limit, until the oldest counted create leaves the window. Always a whole number from 1 to 300. |
+| 503 | `bootstrap_unavailable` | `config.DATABASE_URL` is unset (2601-2602); any database error, statement timeout (20 s), lock timeout (5 s; a second concurrent create waits up to 5 s for the global lock), or any other unexpected exception (156-157, 2612-2613). Nothing is logged. There is no `Retry-After`. **From 1.3.0 (K4, P1-6):** every 503 carries `Retry-After: 5`. The admission lock is held only briefly, and a create waits up to 5 s for another capture of the same source before a 503. Connection failures (including a malformed `DATABASE_URL`) and timeouts are logged as a warning with only the error class; any other exception is logged with its class and traceback (never the session token or the DSN) and is still 503. |
 
 > Note: the v2 routes never return **404** or **409**. A 404 means the route does not exist (the plugin predates v2): treat v2 as unsupported. 409 is not used by v2.
 
-Release is idempotent for tokens the server does not know: it returns 200 `released:true` for an unknown or already-released token.
+Release is idempotent for tokens the server does not know: it returns 200 `released:true` for an unknown or already-released token. From 1.3.0 it also deletes expired and stale sessions and never returns 410 (see Release above).
 
 ### 3.6 Analysis requests
 
@@ -392,6 +427,7 @@ Every mutation runs through `_mutation_response` (546-608).
 **Other errors:**
 - 503 `unsupported_transaction_isolation` (the host connection is not READ COMMITTED);
 - 503 `collection_feed_unavailable`;
+- **503 `collection_feed_invariant`** (new in 1.3.0, P1-3): a committed change row sits past the feed head (`MAX(seq) > head_seq`, for example left by a 1.2.5 worker before the upgrade fence). The check runs inside each mutation against the head it has just locked; the mutation rolls back and nothing is written. Every collection write, for every principal, returns this until an operator runs the repair in `docs/runbooks/UPGRADE_1.3.md`; health reports it as `integrity.collections_feed_ok: false`. There is no `Retry-After`. Clients treat it like `collection_feed_unavailable`: keep the mutation queued and retry later. 1.2.5 instead failed these writes with a 500 (a unique violation) indefinitely (AUD-05);
 - 409 `item_id_collection_conflict` (the item id already belongs to another collection of this principal).
 
 | Route | Body | Success | Notes |
@@ -440,7 +476,7 @@ Read routes:
 These rules hold against 1.2.5 and **must keep holding** for clients that do not opt in to anything.
 
 1. **An upsert without a valid `edge_profile` deletes the local edge.** A profile upsert (bootstrap row, v2 snapshot row, `/changes` or catch-up `upsert` event, or direct fetch) that has no `edge_profile`, or has one that fails validation or digest verification, **removes** the client's stored edge for that track (Auralscape `publishedProfileRepo.ts:266, 351-388`; *verified in the 2026-09-24 audit*, `docs/audit/2026-09-24/LUMAE_AUDIT_2026-09-24.md`, not checkable from this repo). The server relies on this in three places:
-   - **Waveform republish.** When the published 8-tuple (`sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp, analyzer_ver, profile_schema_ver, media_signature`) differs from the stored row, the server deletes the edge and its job and emits an upsert **without** an edge (`profile_publication.py:342-381`). It does not embed the edge. Because `ref_lufs` is compared as float4 against float64, an identical re-analysis almost always counts as "different" (audit AUD-03).
+   - **Waveform republish** (P1-1). The published 8-tuple (`sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp, analyzer_ver, profile_schema_ver, media_signature`) is compared at stored precision (`ref_lufs` as float4). An identical completion is a no-op: no head change, no event, edge rows untouched. If the tuple differs and `media_signature` changed (or there was no published row), the server deletes the edge and its job and emits an upsert **without** an edge; the edge upgrade is then scheduled for the new media. If only the waveform changed on the same media, the edge and its job are kept and the upsert **embeds the current edge** (`serialize_profile(..., edge_profile=<edge_join>)`), so clients keep it. The analysis hook also skips admission when the published row is already current (same media fingerprint, analyzer and schema version, not failed).
    - **Rekey.** A provider-identity rekey emits `delete(old)` + `upsert(new)` without an edge (`profile_publication.py:462-503`).
    - **Edge publication** emits a new `upsert` carrying the waveform fields **and** the edge (`edge_profile_store.py:155`).
 
@@ -461,11 +497,11 @@ Copied from plan §2. **Every server change is additive or opt-in.** Each work p
 
 | ID | Change | Server WP | Client | Gate | Phase | Status |
 |---|---|---|---|---|---|---|
-| K1 | Gzip transport for JSON ≥1 KiB | P1-4 | Verify decoding; fix `Content-Length` guards (C-7) | HTTP `Accept-Encoding` (native stacks send it); informational `capabilities.transport.gzip` | 1 | planned |
-| K2 | v2 snapshots store an edge *reference* and resolve it at page read. Wire format unchanged, except a row whose edge was replaced after capture arrives without `edge_profile` (the catch-up re-supplies it). | P1-5 | None; already handled | None | 1 | planned |
-| K3 | v2 sliding expiry: each page extends `expires_at` to at most `created+24h` | P1-6 | Send `expiry_mode:"sliding"`; accept a changing `expires_at` (C-6) | `capabilities.profile_bootstrap.sliding_expiry:true`; create body field | 1 | planned |
-| K4 | `Retry-After` on 429 and 503; truthful `available`; new `auth_enabled` field (the `auth` string is unchanged) | P1-6 | Back off and honour `Retry-After` (C-3) | Always additive (`capabilities.profile_bootstrap.auth_enabled`) | 1 | planned |
-| K5 | Optional create `client_request_id`; a duplicate unclaimed session is replaced, not leaked | P1-6 | Send a UUID per create attempt (C-3) | `capabilities.profile_bootstrap.idempotent_create:true` | 1 | planned |
+| K1 | Gzip transport for JSON ≥1 KiB | P1-4 | Verify decoding; fix `Content-Length` guards (C-7) | HTTP `Accept-Encoding` (native stacks send it); informational `capabilities.transport.gzip` | 1 | shipped in 1.3.0 (unreleased) |
+| K2 | v2 snapshots store an edge *reference* and resolve it at page read. Wire format unchanged, except a row whose edge was replaced after capture arrives without `edge_profile` (the catch-up re-supplies it). | P1-5 | None; already handled | None | 1 | shipped in 1.3.0 (unreleased): snapshot and catch-up rows store `edge_ref`; a row or event whose edge was replaced or withdrawn after capture arrives without `edge_profile`, and the replacing event re-supplies it (§3.5) |
+| K3 | v2 sliding expiry: each page extends `expires_at` to at most `created+24h` | P1-6 | Send `expiry_mode:"sliding"`; accept a changing `expires_at` (C-6) | `capabilities.profile_bootstrap.sliding_expiry:true`; create body field | 1 | shipped in 1.3.0 (unreleased): each page or catch-up of a sliding session sets `expires_at` to `LEAST(now()+60 min, created_at+24 h)` and returns it; absolute mode unchanged (§3.5) |
+| K4 | `Retry-After` on 429 and 503; truthful `available`; new `auth_enabled` field (the `auth` string is unchanged) | P1-6 | Back off and honour `Retry-After` (C-3) | Always additive (`capabilities.profile_bootstrap.auth_enabled`) | 1 | shipped in 1.3.0 (unreleased): `Retry-After` 1–300 on 429 and 5 on 503; create rate limit 6 per 10 min per (source, caller); release always deletes and answers 200; `available` is a cached probe; `auth_enabled`; UTC timestamps (§1.5, §1.6, §2, §3.5) |
+| K5 | Optional create `client_request_id`; a duplicate unclaimed session is replaced, not leaked | P1-6 | Send a UUID per create attempt (C-3) | `capabilities.profile_bootstrap.idempotent_create:true` | 1 | shipped in 1.3.0 (unreleased): a create with the same `client_request_id` replaces the source's unexpired session with that id that has served no page yet, also while it is still capturing (§3.5) |
 | K6 | **Edge references in events and pages:** with `edge_refs=1` (query) or `edge_refs:true` (v2 body), an upsert whose edge is unchanged carries `edge_profile_ref:{media_revision, profile_digest}` instead of the full edge. Without the opt-in, the server expands to the full edge exactly as today. | P3-2 | Keep the local edge when digest and revision match; fetch misses through `GET /api/profiles?ids=` (C-10) | `capabilities.profile_stream.edge_refs:true` (new `profile_stream` object) | 3; must ship before P3-1 regeneration | planned |
 | K7 | Compact edge transport (optional): with `edge_compact=1` the server omits the derivable `boundaries`, and the client rebuilds them (§4.4) **before** verifying the unchanged v2 digest | P3-3 | Rebuild, then verify (C-12) | `capabilities.edge_profiles.compact_transport:true` | 3, optional | planned |
 | K8 | **Collections feed:** the response adds `epoch`, `head_seq` and `has_more`. 410 `collections_resync_required` is returned **only** when the request echoes `epoch` and it mismatches, or when the cursor is past head. A new snapshot endpoint, **planned path `GET /plugins/lumae_analysis/api/collections/snapshot`** (P3-4 implements exactly this path), returns all of the principal's collections, items and head in one REPEATABLE READ transaction. | P3-4 | Echo the epoch; resync on 410; page by `has_more`/`next_cursor` (C-13) | `capabilities.collections.feed_epoch:true` | 3 | planned |
@@ -496,19 +532,20 @@ Copied from plan §2. **Every server change is additive or opt-in.** Each work p
 The code wins. Each item names the WP expected to act on it.
 
 1. **K11 gate location.** `lumae_analysis_profiles` exists only in `plugin.json` (manifest capabilities). **Health has no such key.** P3-1 must add a new `capabilities.lumae_analysis_profiles` object to `/api/health` (additive) for the gate in plan §2/H.3 to work. Until then the analyzer version is visible only as top-level `analyzer_version` and `sync_contract.streams.profiles.analyzer_version`.
-2. **New capability objects.** `capabilities.transport` (K1) and `capabilities.profile_stream` (K6) do not exist today. They are new objects, not new fields on existing ones.
+2. **New capability objects.** `capabilities.transport` (K1) and `capabilities.profile_stream` (K6) do not exist in 1.2.5. They are new objects, not new fields on existing ones. P1-4 added `capabilities.transport: {gzip: true}` in 1.3.0 (unreleased); `profile_stream` is still planned (P3-2).
 3. **The v2 bootstrap has no 404 or 409.** The only statuses are 200/400/410/413/429/503 (§3.5). A 404 means the route is missing.
-4. **The v2 session is absolute (60 minutes)**, hard-coded in SQL (`profile_bootstrap.py:245`); `SESSION_MINUTES` is unused. Release of an expired or stale session answers 410 and **leaves the row in place**, so it holds one of the 4 per-source slots until it expires (audit AUD-11). K5 alone does not fix this; P1-6 should.
-5. **`profile_bootstrap.available`** is `bool(DATABASE_URL)`, not a probe; `auth` is constant even when `AUTH_ENABLED=false` (K4).
+4. **The v2 session is absolute (60 minutes)**, hard-coded in SQL (`profile_bootstrap.py:245`); `SESSION_MINUTES` is unused. Release of an expired or stale session answers 410 and **leaves the row in place**, so it holds one of the 4 per-source slots until it expires (audit AUD-11). K5 alone does not fix this; P1-6 should. **Fixed in 1.3.0 (P1-6):** `SESSION_MINUTES` is the one lifetime constant for absolute and sliding (K3) sessions; release deletes expired and stale rows and answers 200; stale rows never count toward the slots (§3.5).
+5. **`profile_bootstrap.available`** is `bool(DATABASE_URL)`, not a probe; `auth` is constant even when `AUTH_ENABLED=false` (K4). **Fixed in 1.3.0 (P1-6):** `available` is a cached probe of the migrated tables on the plugin's own connection, and `auth_enabled` reports the live setting; `auth` is unchanged (§2).
 6. **Cursor ahead of head** on `/profiles/changes` is **400 `invalid_cursor`**, not 410. The collections feed returns an empty 200 in the same case. K8 makes collections answer 410; profiles are unchanged.
 7. **The boundaries formula** in plan K7 (`source.sample_rate` + `source.decoded_frames`) and in C-12 (`origin_frame`/`covered_frames`) are equivalent. Both were verified against `edge_profiles.py:146-152` and the golden fixture. §4.4 is the exact statement. `rate` is the **source** rate, not the 48 kHz measurement rate.
 8. **Payloads differ by path.**
-   - `ref_lufs` is float64 in `/changes` and catch-up events but float4-rounded in direct reads, bootstraps and v2 snapshots (AUD-03).
-   - Only event payloads go through the `catalog.canonical_json` sanitizer (NFC, trim, `""`→`null`).
-   - Clients should compare `ref_lufs` with a tolerance and treat `null` ramps like empty ramps.
-9. **Profile journal retention** is a fixed 50,000 events per publication, but `max(1000, 2×count)` in maintenance compaction. At 94k profiles, publication-time compaction is the binding limit.
+   - Fixed for new events by P1-1: every path emits float4 `ref_lufs` and the same serializer (§3.4).
+   - Events recorded by 1.2.5 and still in the journal carry float64 `ref_lufs` and went through the `catalog.canonical_json` sanitizer (NFC, trim, `""`→`null`).
+   - Clients should keep comparing `ref_lufs` with a tolerance and treating `null` ramps like empty ramps, for 1.2.5 servers and old journal entries.
+   - Rows published with a bare `media_fp` signature (no `catalog-media:` prefix) are not "current" for the analysis hook and compare as changed media, so after the upgrade each such row is re-analysed once and loses its edge once (the edge upgrade is then rescheduled for the prefixed signature).
+9. **Profile journal retention** is a fixed 50,000 events per publication, but `max(1000, 2×count)` in maintenance compaction. At 94k profiles, publication-time compaction is the binding limit. P1-2 replaces both with one persisted limit of at least 50k and 2× the library (§3.4).
 10. **`/api/profiles` silently truncates `ids` to 500.** K6 clients fetching misses must batch ≤500 ids and must not treat an unlisted id as "missing".
-11. **Timestamps** mix zone-less (`analyzed_at`) and offset (`expires_at`, `created_at`) forms (§1.6). The audit's "`expires_at` is non-UTC on a non-UTC server" is confirmed.
+11. **Timestamps** mix zone-less (`analyzed_at`) and offset (`expires_at`, `created_at`) forms (§1.6). The audit's "`expires_at` is non-UTC on a non-UTC server" is confirmed. **1.3.0 (P1-6):** the profile and v2 `TIMESTAMPTZ` fields are always UTC with `Z`; `analyzed_at` stays zone-less by design, and collection timestamps are unchanged (§1.6).
 12. **Collections today** (the baseline for K8/K9):
     - creating an existing id returns 201 with the existing (or `null`) collection and no event;
     - a duplicate membership silently remaps the item id;

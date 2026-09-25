@@ -26,6 +26,7 @@ from .catalog import (
     opaque_cursor,
     parse_opaque_cursor,
     prune_snapshot_generations,
+    read_change_page,
     resolve_catalog_source,
 )
 from .core_compat import get_core_adapter
@@ -1205,28 +1206,27 @@ def read_analysis_changes(db, cursor_value, server_id=None, catalog_instance_id=
     source = sources[0]
     if source["catalog_instance_id"] != cursor["catalog_instance_id"]:
         raise ValueError("Cursor belongs to another analysis source")
-    state = source["analysis"]
-    if cursor["epoch"] != state["epoch"] or cursor["seq"] < state["floor_seq"]:
-        raise KeyError("bootstrap_required")
-    if cursor["seq"] > state["head_seq"]:
-        raise ValueError("Cursor is ahead of the analysis head")
     cur = db.cursor()
-    cur.execute(
-        f"""
-        SELECT seq, generation, entity_type, entity_id, operation, payload, created_at
-          FROM {t('analysis_changes')}
-         WHERE catalog_instance_id=%s AND epoch=%s AND seq > %s
-         ORDER BY seq LIMIT %s
-        """,
-        (
-            source["catalog_instance_id"],
-            state["epoch"],
-            cursor["seq"],
-            max(1, min(int(limit), 1000)),
-        ),
-    )
-    rows = cur.fetchall()
-    cur.close()
+    try:
+        # State and events from one snapshot, checked for density (P1-7).
+        epoch, head_seq, rows, _state = read_change_page(
+            cur,
+            catalog_instance_id=source["catalog_instance_id"],
+            cursor=cursor,
+            limit=limit,
+            state_table="analysis_state",
+            epoch_column="analysis_epoch",
+            head_column="analysis_head_seq",
+            floor_column="analysis_floor_seq",
+            changes_table="analysis_changes",
+            columns=(
+                "seq", "generation", "entity_type", "entity_id", "operation",
+                "payload", "created_at",
+            ),
+            ahead_message="Cursor is ahead of the analysis head",
+        )
+    finally:
+        cur.close()
     changes = [
         {
             "seq": int(row[0]),
@@ -1246,9 +1246,7 @@ def read_analysis_changes(db, cursor_value, server_id=None, catalog_instance_id=
         "catalog_instance_id": source["catalog_instance_id"],
         "server_id": source["server_id"],
         "changes": changes,
-        "cursor": opaque_cursor(source["catalog_instance_id"], state["epoch"], next_seq),
-        "head_cursor": opaque_cursor(
-            source["catalog_instance_id"], state["epoch"], state["head_seq"]
-        ),
-        "has_more": next_seq < state["head_seq"],
+        "cursor": opaque_cursor(source["catalog_instance_id"], epoch, next_seq),
+        "head_cursor": opaque_cursor(source["catalog_instance_id"], epoch, head_seq),
+        "has_more": next_seq < head_seq,
     }

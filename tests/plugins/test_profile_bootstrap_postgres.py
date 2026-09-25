@@ -152,9 +152,13 @@ def test_floor_expiry_release_identity_and_tokens(edge_publication_db):
     with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.snapshot_page(body(session_token=expired["session_token"]))
     assert exc.value.status == 410
-    with pytest.raises(profile_bootstrap.BootstrapError) as exc:
-        profile_bootstrap.release_session(body(session_token=expired["session_token"]))
-    assert exc.value.status == 410
+    # P1-6: release deletes an expired session and answers 200.
+    assert profile_bootstrap.release_session(
+        body(session_token=expired["session_token"]))["released"] is True
+    with db.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {SESSIONS}")
+        assert cur.fetchone()[0] == 0
+    db.rollback()
 
 
 def test_tokens_are_opaque_unique_and_only_hashes_are_stored(edge_publication_db):
@@ -182,11 +186,16 @@ def test_contract_and_catalog_epoch_changes_fail_safely(edge_publication_db):
         cur.execute("UPDATE plugin_lumae_analysis__catalog_state SET catalog_epoch='new-epoch' "
                     "WHERE catalog_instance_id=%s", (SOURCE,))
     edge_publication_db.commit()
-    for operation in (profile_bootstrap.snapshot_page,
-                      profile_bootstrap.catchup_page, profile_bootstrap.release_session):
+    for operation in (profile_bootstrap.snapshot_page, profile_bootstrap.catchup_page):
         with pytest.raises(profile_bootstrap.BootstrapError) as exc:
             operation(body(session_token=token))
         assert (exc.value.code, exc.value.status) == ("bootstrap_required", 410)
+    # P1-6: release of a stale session deletes it and answers 200.
+    assert profile_bootstrap.release_session(body(session_token=token))["released"] is True
+    with edge_publication_db.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {SESSIONS}")
+        assert cur.fetchone()[0] == 0
+    edge_publication_db.rollback()
 
 
 def test_empty_snapshot_and_limit_rollback(edge_publication_db, monkeypatch):
@@ -246,7 +255,7 @@ def test_duplicate_concurrent_capture_and_interruption(edge_publication_db, monk
     assert [event["seq"] for event in results[0]["changes"]] == [1]
     before = profile_bootstrap.create_session(body())
     publish(db, "track-d")
-    monkeypatch.setattr(profile_bootstrap, "MAX_CATCHUP_EVENTS", 0)
+    monkeypatch.setattr(profile_bootstrap, "CATCHUP_RETENTION_MULTIPLIER", 0)
     with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.catchup_page(body(session_token=before["session_token"]))
     assert exc.value.status == 413
@@ -255,7 +264,8 @@ def test_duplicate_concurrent_capture_and_interruption(edge_publication_db, monk
             hashlib.sha256(before["session_token"].encode()).hexdigest(),))
         assert cur.fetchone()[0] is None
     db.rollback()
-    monkeypatch.setattr(profile_bootstrap, "MAX_CATCHUP_EVENTS", 50_000)
+    monkeypatch.setattr(profile_bootstrap, "CATCHUP_RETENTION_MULTIPLIER",
+                        profile_bootstrap.MAX_HELD_RETENTION_MULTIPLIER)
     assert [event["seq"] for event in profile_bootstrap.catchup_page(
         body(session_token=before["session_token"]))["changes"]] == [3]
 
@@ -274,12 +284,12 @@ def test_session_limits_epoch_and_rollback(edge_publication_db, monkeypatch):
     with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.snapshot_page(body(session_token=tokens[0]))
     assert exc.value.status == 410
+    # P1-6: releasing the stale sessions frees their slots (no manual cleanup).
     for token in tokens:
-        with pytest.raises(profile_bootstrap.BootstrapError) as exc:
-            profile_bootstrap.release_session(body(session_token=token))
-        assert exc.value.status == 410
+        assert profile_bootstrap.release_session(body(session_token=token))["released"] is True
     with db.cursor() as cur:
-        cur.execute(f"DELETE FROM {SESSIONS}")
+        cur.execute(f"SELECT count(*) FROM {SESSIONS}")
+        assert cur.fetchone()[0] == 0
     db.commit()
     old = profile_bootstrap.serialize_profile
 
@@ -287,8 +297,9 @@ def test_session_limits_epoch_and_rollback(edge_publication_db, monkeypatch):
         raise RuntimeError("injected interruption")
 
     monkeypatch.setattr(profile_bootstrap, "serialize_profile", interrupted)
-    with pytest.raises(RuntimeError, match="injected interruption"):
+    with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.create_session(body())
+    assert (exc.value.code, exc.value.status) == ("bootstrap_unavailable", 503)
     monkeypatch.setattr(profile_bootstrap, "serialize_profile", old)
     with db.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM {SESSIONS}")
@@ -384,7 +395,9 @@ def test_owned_connection_uses_public_finite_limits_and_ignores_request_db(
     page = profile_bootstrap.snapshot_page(
         body(session_token=created["session_token"]))
     assert page["profiles"]
-    assert observed == {"dsn": plugin_api_module.config.DATABASE_URL, "connect_timeout": 5}
+    assert observed == {"dsn": plugin_api_module.config.DATABASE_URL, "connect_timeout": 5,
+                        "application_name": "lumae-profile-bootstrap",
+                        "keepalives": 1, "keepalives_idle": 30}
     with profile_bootstrap._connection(repeatable=True) as owned:
         with owned.cursor() as cur:
             cur.execute("SELECT pg_backend_pid(), current_setting('statement_timeout'), "
@@ -426,11 +439,17 @@ def test_cross_source_token_rejected_on_every_route(edge_publication_db):
         assert first.status_code == 200
         assert client.post("/api/profiles/bootstrap/sessions/page", json=page_request).json == first.json
         assert client.post("/api/profiles/bootstrap/sessions/catchup", json=page_request).status_code == 200
-        for suffix in ("page", "catchup", "release"):
+        for suffix in ("page", "catchup"):
             response = client.post(f"/api/profiles/bootstrap/sessions/{suffix}",
                                    json=body(session_token=token, catalog_instance_id="catalog-b"))
             assert response.status_code == 410
+        # P1-6: release answers 200 but deletes only a session of the named source.
+        response = client.post("/api/profiles/bootstrap/sessions/release",
+                               json=body(session_token=token, catalog_instance_id="catalog-b"))
+        assert (response.status_code, response.json["released"]) == (200, True)
+        assert client.post("/api/profiles/bootstrap/sessions/page", json=page_request).json == first.json
         assert client.post("/api/profiles/bootstrap/sessions/release", json=page_request).status_code == 200
+        assert client.post("/api/profiles/bootstrap/sessions/page", json=page_request).status_code == 410
 
 
 def test_missing_public_database_url_fails_closed_while_legacy_endpoint_imports(monkeypatch):
@@ -471,6 +490,16 @@ def test_provisional_sessions_invalidated_by_idempotent_migration(edge_publicati
 
 
 def test_owned_backend_lock_cleanup_and_request_transaction(edge_publication_db, monkeypatch):
+    """The capture holds its source's lock on the owned backend and unlocks it
+    explicitly before create returns.
+
+    Before P1-6 the capture held the global lock (110094, 10) as a session
+    lock that only the owned backend's exit released. That exit is
+    asynchronous to the client's close(), so under heavy load the check right
+    after create could still find the lock held (an intermittent failure).
+    Admission now takes the global lock per transaction (released by COMMIT)
+    and the per-source lock is unlocked synchronously, so both checks below
+    are deterministic."""
     db = edge_publication_db
     observer = peer(db)
     with db.cursor() as cur:
@@ -481,10 +510,14 @@ def test_owned_backend_lock_cleanup_and_request_transaction(edge_publication_db,
 
     def inspect_capture(*row):
         with observer.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(110094, 10)")
+            cur.execute("SELECT pg_try_advisory_lock(110094, hashtext(%s))", (SOURCE,))
             assert cur.fetchone()[0] is False
-            cur.execute("SELECT pid FROM pg_locks WHERE locktype='advisory' "
-                        "AND classid=110094 AND objid=10 AND granted")
+            cur.execute("SELECT pg_try_advisory_lock(110094, 10)")
+            assert cur.fetchone()[0] is True
+            cur.execute("SELECT pg_advisory_unlock(110094, 10)")
+            cur.execute("SELECT pid FROM pg_locks WHERE locktype='advisory' AND granted "
+                        "AND classid=110094 AND objid=hashtext(%s)::oid AND objsubid=2",
+                        (SOURCE,))
             owned_pid.append(cur.fetchone()[0])
         observer.rollback()
         return original(*row)
@@ -497,9 +530,11 @@ def test_owned_backend_lock_cleanup_and_request_transaction(edge_publication_db,
             cur.execute("SELECT pg_backend_pid(), txid_current()")
             assert cur.fetchone() == (request_pid, request_txid)
         with observer.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(110094, 10)")
-            assert cur.fetchone()[0] is True
-            cur.execute("SELECT pg_advisory_unlock(110094, 10)")
+            for key in ("hashtext(%s)", "10"):
+                params = (SOURCE,) if "%s" in key else ()
+                cur.execute(f"SELECT pg_try_advisory_lock(110094, {key})", params)
+                assert cur.fetchone()[0] is True
+                cur.execute(f"SELECT pg_advisory_unlock(110094, {key})", params)
         observer.commit()
     finally:
         observer.close()
@@ -518,8 +553,9 @@ def test_owned_connection_rolls_back_and_closes_on_capture_error(edge_publicatio
     monkeypatch.setattr(profile_bootstrap.psycopg2, "connect", track_open)
     monkeypatch.setattr(profile_bootstrap, "serialize_profile",
                         lambda *_row: (_ for _ in ()).throw(RuntimeError("capture failed")))
-    with pytest.raises(RuntimeError, match="capture failed"):
+    with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.create_session(body())
+    assert (exc.value.code, exc.value.status) == ("bootstrap_unavailable", 503)
     assert leases and leases[0].closed
     with db.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM {SESSIONS}")

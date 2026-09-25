@@ -194,13 +194,14 @@ def test_plugin_manifest_has_lumae_identity():
 def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
     mod = load_plugin()
     client = plugin_client(mod)
+    monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", None, raising=False)
 
     response = client.get("/api/health")
 
     assert response.status_code == 200
     assert response.get_json() == {
         "plugin": "lumae_analysis",
-        "plugin_version": RELEASE_VERSION,
+        "plugin_version": mod.PLUGIN_VERSION,
         "core_version": "v2.6.2",
         "core_adapter": "v2_single_server",
         "supported_core_range": ">=2.6.0,<4.0.0",
@@ -212,8 +213,11 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "protocol_version": 2,
                 "schema_version": 1,
                 "auth": "host_authenticated",
+                "auth_enabled": False,
                 "transfer_contract": "source_scoped_v1",
-                "available": bool(getattr(mod.host_api.config, "DATABASE_URL", None)),
+                "available": False,
+                "sliding_expiry": True,
+                "idempotent_create": True,
             },
             "personal_discovery": {"schema_version": 1, "enabled": False, "scope": "shared", "features": ["album_memory_context", "enjoyment_feedback"]},
             "music_metadata": {"schema_version": 1, "enabled": True, "provider": "musicbrainz", "daily_request_limit": 80, "recording_membership": True},
@@ -232,6 +236,14 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "available": mod.edge_runtime_available(),
                 "enabled": mod.edge_profiles_enabled(),
             },
+            "transport": {"gzip": True},
+        },
+        # The host stub has no database, so the invariants are unknown.
+        "integrity": {
+            "collections_feed_ok": None,
+            "profiles_unpublished_ready": None,
+            "profiles_checked_at": None,
+            "fences_installed": None,
         },
         "status": "ok",
     }
@@ -240,12 +252,25 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
 def test_profile_bootstrap_capability_requires_public_database_url(monkeypatch):
     mod = load_plugin()
     client = plugin_client(mod)
+    probes = []
+    monkeypatch.setattr(mod.profile_bootstrap, "_availability_cache", None)
+    monkeypatch.setattr(mod.profile_bootstrap, "_probe", lambda: probes.append(1) or True)
     monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", "postgresql://test", raising=False)
     capability = client.get("/api/health").get_json()["capabilities"]["profile_bootstrap"]
     assert capability == {"protocol_version": 2, "schema_version": 1,
-                          "auth": "host_authenticated",
-                          "transfer_contract": "source_scoped_v1", "available": True}
+                          "auth": "host_authenticated", "auth_enabled": False,
+                          "transfer_contract": "source_scoped_v1", "available": True,
+                          "sliding_expiry": True, "idempotent_create": True}
+    assert probes == [1]
     monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", None)
+    capability = client.get("/api/health").get_json()["capabilities"]["profile_bootstrap"]
+    assert capability["available"] is False
+    assert probes == [1]
+    # A configured but unreachable database is not available (K4, P1-6).
+    monkeypatch.undo()
+    monkeypatch.setattr(mod.profile_bootstrap, "_availability_cache", None)
+    monkeypatch.setattr(mod.host_api.config, "DATABASE_URL",
+                        "postgresql://nobody@127.0.0.1:1/none", raising=False)
     capability = client.get("/api/health").get_json()["capabilities"]["profile_bootstrap"]
     assert capability["available"] is False
 
@@ -593,7 +618,7 @@ def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
 
     assert response.status_code == 200
     body = response.get_json()
-    assert body["plugin_version"] == RELEASE_VERSION
+    assert body["plugin_version"] == mod.PLUGIN_VERSION
     assert body["servers"][0]["v3_readiness"]["ready"] is True
     assert captured["db"] is db
     assert captured["core"] == "v3.0.3"
@@ -1052,23 +1077,26 @@ def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch)
     from plugins.LumaeAnalysis.catalog import opaque_cursor
 
     class Cursor:
-        def __init__(self, state_row=None):
-            self.state_row = state_row
+        """State and events arrive as one row set (P1-7 single snapshot)."""
+
+        def __init__(self, epoch, head, events):
+            self.rows = [(epoch, head, 0, *event) for event in events]
             self.calls = []
 
         def execute(self, sql, args):
             self.calls.append((" ".join(sql.split()), args))
 
-        def fetchone(self):
-            return self.state_row
-
         def fetchall(self):
-            return []
+            return self.rows
 
         def close(self):
             return None
 
-    profile_cursor = Cursor(("profile-epoch", 10, 0))
+    profile_cursor = Cursor(
+        "profile-epoch",
+        10,
+        [(seq, f"t{seq}", "ready", {}, "2026-07-30T12:00:00Z") for seq in (3, 4)],
+    )
     profile_db = type("Db", (), {"cursor": lambda _self: profile_cursor})()
     monkeypatch.setattr(
         catalog_enrichment,
@@ -1080,13 +1108,22 @@ def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch)
         profile_db,
         opaque_cursor("catalog-a", "profile-epoch", 2),
         catalog_instance_id="catalog-a",
+        limit=2,
     )
 
     assert profile_page["has_more"] is True
-    assert "seq>%s AND seq<=%s" in profile_cursor.calls[-1][0]
-    assert profile_cursor.calls[-1][1][2:4] == (2, 10)
+    assert "c.seq>%s AND c.seq<=s.head_seq" in profile_cursor.calls[-1][0]
+    assert "profile_stream_state" in profile_cursor.calls[-1][0]
+    assert profile_cursor.calls[-1][1][2] == 2
 
-    relationship_cursor = Cursor()
+    relationship_cursor = Cursor(
+        "relationship-epoch",
+        20,
+        [
+            (seq, 4, "album", f"album-{seq}", "upsert", {}, "2026-07-30T12:00:00Z")
+            for seq in (4, 5)
+        ],
+    )
     relationship_db = type(
         "Db", (), {"cursor": lambda _self: relationship_cursor}
     )()
@@ -1108,11 +1145,13 @@ def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch)
         relationship_db,
         opaque_cursor("catalog-a", "relationship-epoch", 3),
         catalog_instance_id="catalog-a",
+        limit=2,
     )
 
     assert relationship_page["has_more"] is True
-    assert "seq>%s AND seq<=%s" in relationship_cursor.calls[-1][0]
-    assert relationship_cursor.calls[-1][1][2:4] == (3, 20)
+    assert "c.seq>%s AND c.seq<=s.head_seq" in relationship_cursor.calls[-1][0]
+    assert "relationship_state" in relationship_cursor.calls[-1][0]
+    assert relationship_cursor.calls[-1][1][2] == 3
 
 
 def test_enrichment_stream_endpoints_are_source_scoped_and_nonblocking(monkeypatch):
@@ -1272,6 +1311,13 @@ def test_catalog_changes_report_remaining_events_and_estimated_bytes(monkeypatch
     db = FakeDb(
         [
             (
+                "epoch-a",
+                10,
+                0,
+                0,
+                {},
+                0,
+                1,
                 3,
                 8,
                 "track",
@@ -1289,6 +1335,7 @@ def test_catalog_changes_report_remaining_events_and_estimated_bytes(monkeypatch
     result = catalog.read_catalog_changes(
         db,
         catalog.opaque_cursor("catalog-a", "epoch-a", 2),
+        limit=1,
     )
 
     assert result["remaining_events"] == 7
@@ -2105,6 +2152,7 @@ def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch
             self.rows = []
             self.collection_reads = 0
             self.feed_head = 0
+            self.rowcount = 1
 
         def execute(self, sql, params=None):
             if "UPDATE" in sql and "collection_feed_state" in sql:
@@ -9819,8 +9867,10 @@ def test_change_journal_compaction_advances_floor_and_deletes_expired_events():
     )
 
     assert floor == 127_604
-    assert cur.executed[0][1] == ("catalog-a", "epoch-a", "epoch-a", 127_604)
-    assert "seq<=%s" in cur.executed[0][0]
+    # P1-2: one index range delete on the retained epoch, no OR.
+    assert cur.executed[0][1] == ("catalog-a", "epoch-a", 127_604)
+    assert "epoch=%s AND seq<=%s" in cur.executed[0][0]
+    assert " OR " not in cur.executed[0][0].upper()
     assert cur.executed[1][1] == (127_604, "catalog-a", "epoch-a")
     assert "GREATEST(analysis_floor_seq, %s)" in cur.executed[1][0]
 
@@ -9897,7 +9947,7 @@ def test_enrichment_cleanup_bounds_relationship_history_to_two_snapshots():
                 self.rows = [("catalog-a", "relationship-epoch", 7_620, 1_324, 581)]
             elif "FROM plugin_lumae_analysis__profile_stream_state" in sql and "FOR UPDATE" in sql:
                 self.rows = [("profile-epoch", 0, 0)]
-            elif "SELECT COUNT(*) FROM plugin_lumae_analysis__source_profiles" in sql:
+            elif "SELECT GREATEST(" in sql and "published_source_profiles" in sql:
                 self.rows = [(21_709,)]
             else:
                 self.rows = []

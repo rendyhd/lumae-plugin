@@ -321,6 +321,10 @@ def test_http_lock_is_shared_across_workers_and_empty_credits_expire_after_seven
             client.get("release", uid(20))
         assert calls == []
     finally:
+        # Unlock explicitly: a closed session's lock is released asynchronously,
+        # so the retry below could otherwise still see it held.
+        cur.execute("SELECT pg_advisory_unlock(%s)", (mb.LOCK_ID,))
+        other.commit()
         other.close()
     response = SimpleNamespace(status_code=200, headers={}, content=b'{}',
                                json=lambda: {"id": uid(20), "title": "Album", "relations": []})

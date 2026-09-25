@@ -251,6 +251,8 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - the floor hold keeps an open session's `snapshot_seq` readable;
   - the statement plan uses the primary-key index (assert via `EXPLAIN` in the test).
 - Performance: publication critical section ≤5 ms at 50k retained events (P0-3).
+- **Decision (2026-09-24, orchestrator):** measured after P1-1 + P1-2, the critical section is 8.2 ms at p95 (it was 20.9 ms). About 1.9 ms of that is the edge that P1-1 now keeps and embeds (≈16 KB per event), and about 3.5 ms is 17 statement round-trips. Phase 1 accepts this. The ≤5 ms budget is re-checked after P3-2 (K6 edge references). If it still misses then, collapse the stream-state and compaction statements into CTEs (≈1 ms) and merge the two `source_profiles` updates (≈0.4 ms). No-op re-analysis, the common case, no longer publishes at all.
+- The `pub_bench.py` `compaction_delete_ms` figure still times the old OR delete. Update it together with the P3-2 re-check.
 
 **P1-3 — Fail-closed fences against old workers; version 1.3.0 (AUD-05).**
 - Files:
@@ -279,7 +281,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 **P1-4 — Transport compression and private headers (AUD-02, K1).**
 - Files: `__init__.py` (`_private_json` 2041, `_catalog_error` 2050, `profiles()` 2507-2551, blueprint registration).
 - Change:
-  - Add a blueprint `after_request` that gzips (level 6) when all of these hold: the request's `Accept-Encoding` contains gzip, the response is `application/json`, the body is ≥1 KiB, the status is 200, and there is no existing `Content-Encoding`. Set `Content-Encoding`, `Vary: Accept-Encoding` (merged with existing values) and `Content-Length`.
+  - Add a blueprint `after_request` that gzips (level 4: about 99% of level 6's ratio for about 80% of its CPU, measured on 1 MB and 20 MB edge pages) when all of these hold: the request's `Accept-Encoding` contains gzip, the response is `application/json`, the body is ≥1 KiB, the status is 200, and there is no existing `Content-Encoding`. Set `Content-Encoding`, `Vary: Accept-Encoding` (merged with existing values) and `Content-Length`.
   - `profiles()` uses `_private_json`, so it gets private cache headers.
   - Health: `capabilities.transport:{gzip:true}`.
 - Tests: gzipped and plain responses round-trip; headers are correct; v2 pages, `/changes`, `/bootstrap` and `/api/profiles` are compressed; small responses are not.
@@ -290,7 +292,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 - Change:
   1. The capture stores the waveform payload plus `edge_ref(media_revision, profile_digest)` from `edge_join()`. `MAX_SNAPSHOT_BYTES` counts waveform bytes only, and each row is serialized once.
   2. `snapshot_page` joins `edge_profiles` on `(catalog_instance_id, track_id, media_revision, profile_digest)`. If the reference is present, it embeds the edge; if the reference is gone (replaced or withdrawn after capture), the row is returned without `edge_profile`. The catch-up interval contains the replacing event.
-  3. Catch-up capture stores event payloads the same way, as a waveform part plus an edge reference. `MAX_CATCHUP_BYTES` excludes edges, and `MAX_CATCHUP_EVENTS` is raised to the retention limit from P1-2.
+  3. Catch-up capture stores event payloads the same way, as a waveform part plus an edge reference. `MAX_CATCHUP_BYTES` excludes edges, and `MAX_CATCHUP_EVENTS` is raised to at least 4 × `retention_limit` from P1-2 (the floor-hold cap). Otherwise a held session's catch-up returns 413 and the hold never helps (P1-2 review F1). Remove the `MAX_CATCHUP_EVENTS` monkeypatch in `test_profile_journal_compaction_postgres.py` once this lands.
   4. Additive migration: new column `edge_ref JSONB`; existing sessions are left as they are.
 - Tests:
   - create for 10k profiles with real 19 KB edges succeeds (previously 413);
@@ -308,6 +310,8 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
      - Admission runs in a short transaction under `pg_advisory_xact_lock(110094,10)`: purge expired **and identity-stale** rows (core server, epochs, inactive source); count slots; insert a session in state `capturing`.
      - Capture then runs under a **per-source** `pg_advisory_lock(110094, hashtext(source))`.
      - `capturing` rows older than 10 minutes are purged.
+     - **Decision (P1-6 implementation, review-accepted):** the purge runs right after admission in its own best-effort transaction, not under the global admission lock. Admission counts only live sessions, so stale rows never occupy a slot. Deleting a stale 94k-row session under the lock would break the 50 ms global-lock budget. The purge uses `SKIP LOCKED`, is capped per call, and a failed purge never fails the create.
+     - The floor hold (P1-2) ignores sessions whose catalogue epoch or core server no longer matches: they would 410 anyway (P1-2 review F3). The session row for the hold is committed at admission, before capture, so the hold covers the capture window (F2).
   2. **Release** deletes any row matching token hash and source, even if identity-stale, and always returns 200 `released`.
   3. **K5:** optional `client_request_id` (UUID). An unexpired session with the same (source, id) and `pages_served=0` is deleted before a new one is created. New columns `client_request_id` and `pages_served`.
   4. **K4:** `Retry-After` on 429 (seconds until the earliest slot expires, capped at 300) and on 503 (5).
@@ -388,7 +392,12 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 
 **P2-4 — v2 capture off the request thread (conditional).**
 - After P1-5 and P1-6, measure create p95 at 94k with edges on gunicorn gthread×4 (P2-6).
-- If it is ≤5 s and no 503s occur under 2 concurrent creators, **close as not needed**.
+- Also measure a first **catch-up capture at the cap** (4 × retention, about 752k events at 94k). The P1-5 review extrapolated about 3.5–4 minutes on one web thread, about 690 MB of WAL and a table of about 750 MB. The client's 10 s fast-fail gives up long before that, and retries get 503 while the capture holds the session row. If this misses, choose one:
+  - (a) page the catch-up straight from `profile_changes` while the floor hold lasts the whole session, with no copy;
+  - (b) capture with a single `INSERT…SELECT` in SQL, or move capture to an RQ task (below).
+
+  The 1 KiB-per-event catch-up byte cap never binds in practice.
+- If create is ≤5 s, no 503s occur under 2 concurrent creators, and the capped catch-up is acceptable, **close as not needed**.
 - Otherwise implement create → 202 `{status_url}` with the capture as an RQ task, add a new capability flag and a contract entry, and add client support through §H C-3.
 
 **P2-5 — Migration and lock hygiene (P3 migration items).**
@@ -474,6 +483,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
      - the revision is bumped and events are emitted through `_record_change`;
      - scope to the matching catalogue once K10 lands;
      - **stop rewriting delivered `collection_changes` and receipt payloads**;
+     - `_copy_analysis_generation` runs `ANALYZE` on the new generation's key columns before commit, as P2-2 does for projection. Without it, `_load_relationship_inputs` can plan a quadratic nested loop after a rekey (found in P2-2).
      - a collision in one principal is isolated: that principal's rekey is deferred with a diagnostic, and the installation rekey proceeds.
   5. **Shelves:** `rekey_shelves` (179-194) takes the `shelf_scopes` lock before `nextval`, and shelf receipts bind the request fingerprint (235-238).
   6. **Growth:** compact `collection_changes` below `floor_seq` once K8 has shipped and clients have been observed on it. Receipts get a 30-day TTL.
