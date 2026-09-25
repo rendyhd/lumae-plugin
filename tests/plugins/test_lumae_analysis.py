@@ -237,6 +237,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "enabled": mod.edge_profiles_enabled(),
             },
             "transport": {"gzip": True},
+            "profile_stream": {"edge_refs": True},
         },
         # The host stub has no database, so the invariants are unknown.
         "integrity": {
@@ -356,8 +357,12 @@ def test_edge_upgrade_publication_is_atomic_identical_on_all_routes_and_idempote
     direct = mod.serialize_ready_profile(mod.fetch_published_profile_rows(['track-a'], 'catalog-a')[0])
     cur = db.cursor()
     bootstrap = enrichment._profile_rows(cur, 'catalog-a', '', 100)[0]
-    cur.execute('SELECT payload FROM plugin_lumae_analysis__profile_changes ORDER BY seq')
-    deltas = [row[0] for row in cur.fetchall()]
+    # K6 (P3-2): the journal references the edge; /changes serves it embedded.
+    from plugins.LumaeAnalysis.catalog import opaque_cursor
+    cur.execute('SELECT epoch FROM plugin_lumae_analysis__profile_stream_state')
+    cursor = opaque_cursor('catalog-a', cur.fetchone()[0], 0)
+    changes = enrichment.read_profile_changes(db, cursor, 'catalog-a')['changes']
+    deltas = [change['payload'] for change in changes]
     assert deltas == [bootstrap] == [direct]
     assert direct['edge_profile'] == payload
     assert direct['media_signature'] == direct['media_revision'] == job['media_revision']
@@ -445,8 +450,8 @@ def test_edge_publish_rolls_back_payload_and_cursor_when_journal_fails(edge_publ
     db = edge_publication_db
     jobs, _ = store.claim_edge_jobs(db, 'catalog-a', ['track-a'])
     original = enrichment.record_profile_change
-    def fail_after_journal(*args):
-        original(*args)
+    def fail_after_journal(*args, **kwargs):
+        original(*args, **kwargs)
         raise RuntimeError('simulated publication interruption')
     monkeypatch.setattr(enrichment, 'record_profile_change', fail_after_journal)
     with pytest.raises(RuntimeError):

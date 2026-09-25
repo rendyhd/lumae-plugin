@@ -46,6 +46,7 @@ The server plugin work happens in parallel in `rendyhd/lumae-plugin`. The author
 - `ref_lufs` arrives as float64 in change events and as float4 in reads and snapshots until plugin P1-1. Compare with tolerance, not exact equality.
 - A `/profiles/changes` cursor ahead of head returns 400 `invalid_cursor`, not 410. Treat it as needing a full resync.
 - Timestamps: `analyzed_at` has no zone; `expires_at` and `created_at` carry the server's offset. Parse offsets explicitly.
+- **K6 edge references (plugin 1.3.0, P3-2; contract §3.7) for C-10.** Gate: `capabilities.profile_stream.edge_refs === true`. Send `edge_refs=1` on every `/profiles/changes` request and `edge_refs: true` in the v2 create body (the create response then echoes `edge_refs: true`). Only a waveform-only republish that kept its edge arrives as `payload.edge_profile_ref: {media_revision, profile_digest}` (never together with `edge_profile`); edge publications, snapshot pages, legacy bootstrap rows and `/api/profiles` always carry full edges, and journal events from before the upgrade keep their full edge. Keep the local edge when both fields match; otherwise drop it and queue the track, then fetch through `/api/profiles?ids=` (at most 500 ids, and within the host's 4,094-byte request line: batches of 100 are safe), verify the digest, and store the edge only for the event's `media_revision`. A reference can be stale (the edge was replaced later); the replacing event follows, and a fetched edge with another digest but the same revision is still valid. Without the opt-in nothing changes.
 
 ### H.3 Server capabilities you will detect
 
@@ -182,7 +183,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
 **C-10 — Edge references (K6).**
 - When `profile_stream.edge_refs` is advertised, opt in, and handle `edge_profile_ref`:
   - keep the existing local edge (published or opportunistic) if the digest and `media_revision` match;
-  - otherwise queue the track for fetch through `GET /api/profiles?ids=` (batches of up to 100; note the comma-joined ids), writing results through the C-4 path.
+  - otherwise queue the track for fetch through `GET /api/profiles?ids=` (batches of up to 100; note the comma-joined ids; the server caps a request at 500 ids and the stock host's request line at 4,094 bytes), writing results through the C-4 path. Store a fetched edge only for the event's `media_revision`, after digest verification (H.2a, contract §3.7).
 - Without the capability, keep today's rule.
 - This is required before the plugin starts loudness v2 regeneration. Without it, every track would re-download its 19 KB edge.
 

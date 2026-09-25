@@ -49,8 +49,10 @@ from plugin.api import config, logger, table
 
 from .catalog import MAX_HELD_RETENTION_MULTIPLIER, opaque_cursor
 from .catalog_enrichment import (
+    EDGE_REF_KEPT,
     PROFILE_BOOTSTRAP_CAPTURE_MINUTES,
     PROFILE_CHANGE_RETENTION_EVENTS,
+    edge_profile_ref_sql,
     live_bootstrap_session_sql,
     serialize_profile,
 )
@@ -220,10 +222,11 @@ def _require_request(body, *, creating=False):
 
 
 def _create_options(body):
-    """(page_size, expiry_mode, client_request_id) of a create body.
+    """(page_size, expiry_mode, client_request_id, edge_refs) of a create body.
 
     ``expiry_mode`` (K3) is ``"absolute"`` (the default) or ``"sliding"``.
     ``client_request_id`` (K5) is an optional UUID, stored in canonical form.
+    ``edge_refs`` (K6) is an optional boolean, false by default.
     """
     size = _require_request(body, creating=True)
     mode = body.get("expiry_mode")
@@ -239,7 +242,12 @@ def _create_options(body):
             request_id = str(uuid.UUID(request_id))
         except ValueError:
             invalid()
-    return size, mode, request_id
+    edge_refs = body.get("edge_refs")
+    if edge_refs is None:
+        edge_refs = False
+    if type(edge_refs) is not bool:
+        invalid()
+    return size, mode, request_id, edge_refs
 
 
 def _rollback_quietly(db):
@@ -316,7 +324,8 @@ def _monotonic():
 _availability_cache = None
 # Every relation and P1-6 column v2 needs: health reports v2 available only
 # once the 1.3.0 migration has run.
-_REQUIRED_SESSION_COLUMNS = ("state", "expiry_mode", "client_request_id", "pages_served")
+_REQUIRED_SESSION_COLUMNS = ("state", "expiry_mode", "client_request_id", "pages_served",
+                             "edge_refs")
 
 
 def availability():
@@ -389,7 +398,7 @@ def _session(cur, body, *, lock=False):
                    catalog_instance_id, core_server_id, catalog_epoch,
                    profile_epoch, page_size, snapshot_seq, head_seq,
                    snapshot_count, expires_at, schema_version, state,
-                   expiry_mode
+                   expiry_mode, edge_refs
               FROM {_table('profile_bootstrap_sessions')}
              WHERE token_hash=%s""" + (" FOR UPDATE" if lock else ""),
         (token_hash,))
@@ -551,6 +560,9 @@ _SNAPSHOT_DOC_LENGTH = f"""
 # holds: its only writer, _profile_json, writes json.dumps text, so every number
 # is a Python float repr or int, which reads back to the same float or int and
 # is written again as the same repr, and JSONB keeps its value and scale.
+# Since K6 (P3-2) the journal itself stores an upsert's waveform part plus
+# edge_ref, which is copied as is (with its "kept" marker, K6's opt-in); only
+# rows journalled before K6 still embed an edge to split off here.
 _CATCHUP_VALUES = """
     j.seq, j.track_id, j.operation, j.created_at,
     CASE WHEN j.split THEN j.payload - 'edge_profile' ELSE j.payload END AS part_json,
@@ -559,7 +571,7 @@ _CATCHUP_VALUES = """
         'media_revision', NULLIF(j.payload#>'{edge_profile,media_revision}',
                                  j.payload->'media_revision'),
         'profile_digest', j.payload#>'{edge_profile,profile_digest}'))
-    END AS edge_ref"""
+    ELSE j.edge_ref END AS edge_ref"""
 
 # json.dumps of the event dict the Python capture built, from b (b.part is the
 # payload part's JSON text).
@@ -783,6 +795,7 @@ def _catchup_batch(cur, session, after, upto, count, byte_count, limits):
                                   FROM (SELECT {_CATCHUP_VALUES},
                                                row_number() OVER (ORDER BY j.seq) - 1 AS i
                                           FROM (SELECT seq, track_id, operation, payload, created_at,
+                                                       edge_ref,
                                                        COALESCE(
                                                            jsonb_typeof(payload#>'{{edge_profile,media_revision}}')='string'
                                                            AND jsonb_typeof(payload#>'{{edge_profile,profile_digest}}')='string',
@@ -840,7 +853,7 @@ def _capture_catchup(cur, session, head, limits):
     return count
 
 
-def _edge_lookup(alias, profile):
+def _edge_lookup(alias, profile, *, skip_kept=False):
     """Resolve a stored edge_ref to the live edge_profiles payload (K2).
 
     ``profile`` is the SQL path of the row's waveform payload. The edge row is
@@ -849,6 +862,8 @@ def _edge_lookup(alias, profile):
     capture finds no row, and the row is returned without ``edge_profile``:
     the catch-up (or the later /changes stream) carries the replacing event.
     Rows captured before 1.3.0 have a NULL ``edge_ref`` and embed their edge.
+    ``skip_kept`` looks nothing up for a kept reference, which a session that
+    opted in to K6 serves as ``edge_profile_ref``.
 
     Invariant: an edge_profiles row's ``track_id`` and ``media_revision``
     columns equal the same fields of its payload (publish_edge_profile checks
@@ -856,9 +871,10 @@ def _edge_lookup(alias, profile):
     writer). So matching the columns is the embedding check serialize_profile
     makes on the payload, and pages never detoast the edge to re-check it.
     """
+    skip = f" AND NOT {EDGE_REF_KEPT.format(alias=alias)}" if skip_kept else ""
     return f"""LEFT JOIN LATERAL (
         SELECT e.payload FROM {_table('edge_profiles')} e
-         WHERE {alias}.edge_ref IS NOT NULL
+         WHERE {alias}.edge_ref IS NOT NULL{skip}
            AND e.catalog_instance_id=%s
            AND e.track_id={profile}->>'track_id'
            AND e.media_revision=COALESCE({alias}.edge_ref->>'media_revision',
@@ -882,7 +898,8 @@ def _metadata(session):
             "total_profiles": session[11], "expires_at": _iso(session[12])}
 
 
-def _admit(db, source, session_id, token_hash, secret, size, mode, request_id, caller_key):
+def _admit(db, source, session_id, token_hash, secret, size, mode, request_id, caller_key,
+           edge_refs=False):
     """Admission: one short transaction under the global advisory lock.
 
     Returns ``(state, expires_at)``; the ``capturing`` session row is
@@ -942,12 +959,13 @@ def _admit(db, source, session_id, token_hash, secret, size, mode, request_id, c
                 (session_id, token_hash, signing_secret, source_scope,
                  catalog_instance_id, core_server_id, catalog_epoch,
                  profile_epoch, schema_version, page_size, snapshot_seq,
-                 snapshot_count, expires_at, state, expiry_mode, client_request_id)
+                 snapshot_count, expires_at, state, expiry_mode, client_request_id,
+                 edge_refs)
                 VALUES (%s,%s,%s,%s,%s,%s,%s,%s,1,%s,%s,0,
-                        now() + make_interval(mins => %s), 'capturing', %s, %s)
+                        now() + make_interval(mins => %s), 'capturing', %s, %s, %s)
                 RETURNING expires_at""",
             (session_id, token_hash, secret, source, source, state[0], state[2],
-             state[3], size, state[4], SESSION_MINUTES, mode, request_id))
+             state[3], size, state[4], SESSION_MINUTES, mode, request_id, edge_refs))
         expires_at = cur.fetchone()[0]
     db.commit()
     return state, expires_at
@@ -1079,7 +1097,7 @@ def _abandon(db, session_id):
 def create_session(body, caller=ANONYMOUS_CALLER):
     """Create a v2 session. ``caller`` identifies the requester for the
     per-(source, caller) create rate limit; only its hash is stored."""
-    size, mode, request_id = _create_options(body)
+    size, mode, request_id, edge_refs = _create_options(body)
     source = body["catalog_instance_id"]
     token = secrets.token_hex(32)
     token_hash = hashlib.sha256(token.encode()).hexdigest()
@@ -1088,7 +1106,7 @@ def create_session(body, caller=ANONYMOUS_CALLER):
     caller_key = hashlib.sha256(str(caller or ANONYMOUS_CALLER).encode()).hexdigest()
     with _connection() as db:
         admitted, expires_at = _admit(db, source, session_id, token_hash, secret, size, mode,
-                                      request_id, caller_key)
+                                      request_id, caller_key, edge_refs)
         try:
             _purge(db)
             ordinal, snapshot_seq = _capture(db, source, session_id, admitted)
@@ -1096,17 +1114,21 @@ def create_session(body, caller=ANONYMOUS_CALLER):
             _abandon(db, session_id)
             raise
     catalog_epoch, profile_epoch = admitted[2], admitted[3]
-    return {"protocol_version": 2, "schema_version": 1,
-            "transfer_contract": TRANSFER_CONTRACT,
-            "catalog_instance_id": source,
-            "session_token": token, "page_size": size,
-            "snapshot_count": ordinal, "total_profiles": ordinal,
-            "catalog_epoch": catalog_epoch, "profile_epoch": profile_epoch,
-            "snapshot_seq": snapshot_seq, "expires_at": _iso(expires_at),
-            "snapshot_cursor": opaque_cursor(source, profile_epoch, snapshot_seq),
-            "cursor": opaque_cursor(source, profile_epoch, snapshot_seq),
-            "next_page_token": _page_token((session_id, None, secret, None, None, None,
-                                             None, None, size), "snapshot", 0)}
+    created = {"protocol_version": 2, "schema_version": 1,
+               "transfer_contract": TRANSFER_CONTRACT,
+               "catalog_instance_id": source,
+               "session_token": token, "page_size": size,
+               "snapshot_count": ordinal, "total_profiles": ordinal,
+               "catalog_epoch": catalog_epoch, "profile_epoch": profile_epoch,
+               "snapshot_seq": snapshot_seq, "expires_at": _iso(expires_at),
+               "snapshot_cursor": opaque_cursor(source, profile_epoch, snapshot_seq),
+               "cursor": opaque_cursor(source, profile_epoch, snapshot_seq),
+               "next_page_token": _page_token((session_id, None, secret, None, None, None,
+                                                None, None, size), "snapshot", 0)}
+    if edge_refs:
+        # K6: echoed only when requested, so other creates answer as before.
+        created["edge_refs"] = True
+    return created
 
 
 def snapshot_page(body):
@@ -1174,16 +1196,24 @@ def catchup_page(body):
                 invalid()
             session = _served(cur, session)
             # The page's rows are chosen before the edge lookup, as in
-            # snapshot_page.
+            # snapshot_page. A session created with edge_refs (K6) gets a
+            # kept event's reference instead of its edge (ref-eligible
+            # upserts only; an edge publication is always resolved in full).
+            refs = ""
+            if session[16]:
+                refs = (f"""WHEN {EDGE_REF_KEPT.format(alias='c')}
+                            THEN jsonb_set(c.payload, '{{payload,edge_profile_ref}}',
+                                           {edge_profile_ref_sql('c', "c.payload->'payload'")})
+                            """)
             cur.execute(
-                f"""SELECT CASE WHEN edge.payload IS NOT NULL
+                f"""SELECT CASE {refs}WHEN edge.payload IS NOT NULL
                             THEN jsonb_set(c.payload, '{{payload,edge_profile}}', edge.payload)
                             ELSE c.payload END
                       FROM (SELECT ordinal, payload, edge_ref
                               FROM {_table('profile_bootstrap_catchup')}
                              WHERE session_id=%s AND ordinal>=%s
                              ORDER BY ordinal LIMIT %s) c
-                      {_edge_lookup('c', "c.payload->'payload'")}
+                      {_edge_lookup('c', "c.payload->'payload'", skip_kept=bool(session[16]))}
                      ORDER BY c.ordinal""",
                 (session[0], ordinal, session[8], session[4]))
             changes = [row[0] for row in cur.fetchall()]

@@ -62,7 +62,20 @@ def _frontier(db):
     cur = db.cursor()
     cur.execute(f"SELECT epoch, head_seq, floor_seq FROM {STATE} WHERE catalog_instance_id=%s", (SOURCE,))
     state = cur.fetchone()
-    cur.execute(f"SELECT seq, track_id, payload FROM {CHANGES} WHERE catalog_instance_id=%s ORDER BY seq", (SOURCE,))
+    # Since K6 (P3-2) an event journals its waveform part and a reference to
+    # its edge; the payload is read as /changes serves it, with the referenced
+    # edge row joined back (this also pins that the reference names it).
+    cur.execute(
+        f"""SELECT c.seq, c.track_id,
+                   CASE WHEN e.payload IS NOT NULL
+                        THEN c.payload || jsonb_build_object('edge_profile', e.payload)
+                        ELSE c.payload END
+              FROM {CHANGES} c
+              LEFT JOIN plugin_lumae_analysis__edge_profiles e
+                ON c.edge_ref IS NOT NULL AND e.catalog_instance_id=c.catalog_instance_id
+               AND e.track_id=c.track_id AND e.media_revision=c.payload->>'media_revision'
+               AND e.profile_digest=c.edge_ref->>'profile_digest'
+             WHERE c.catalog_instance_id=%s ORDER BY c.seq""", (SOURCE,))
     events = cur.fetchall()
     cur.execute(f"SELECT track_id FROM {PUBLISHED} WHERE catalog_instance_id=%s AND track_id LIKE 'branch-%%' ORDER BY track_id", (SOURCE,))
     profiles = [row[0] for row in cur.fetchall()]
@@ -385,8 +398,8 @@ def test_actual_upsert_profile_serializes_two_independent_connections(
     first_staged = Event()
     release_first = Event()
 
-    def pause_after_publication(cur, source, track, status, payload):
-        result = original(cur, source, track, status, payload)
+    def pause_after_publication(cur, source, track, status, payload, **kwargs):
+        result = original(cur, source, track, status, payload, **kwargs)
         if track == "branch-first":
             first_staged.set()
             assert release_first.wait(5), "first publisher was not released"
@@ -448,8 +461,8 @@ def test_edge_first_blocks_legacy_publication(edge_publication_db, monkeypatch):
     edge_staged = Event()
     release_edge = Event()
 
-    def pause_after_edge(cur, source, track, status, public_payload):
-        seq = original(cur, source, track, status, public_payload)
+    def pause_after_edge(cur, source, track, status, public_payload, **kwargs):
+        seq = original(cur, source, track, status, public_payload, **kwargs)
         if track == "track-a":
             edge_staged.set()
             assert release_edge.wait(5), "edge publisher was not released"
@@ -773,8 +786,8 @@ def test_actual_upsert_and_edge_publishers_share_one_order(
     release_first = Event()
 
     def stage_after_record(original):
-        def record(cur, source, track, status, public_payload):
-            seq = original(cur, source, track, status, public_payload)
+        def record(cur, source, track, status, public_payload, **kwargs):
+            seq = original(cur, source, track, status, public_payload, **kwargs)
             if track == ("branch-legacy" if first_kind == "legacy" else "track-a"):
                 first_staged.set()
                 assert release_first.wait(5), "first publisher was not released"

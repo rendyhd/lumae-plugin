@@ -100,7 +100,7 @@ def update_edge_job(db, catalog_id, job, status, reason=None):
 
 
 def publish_edge_profile(db, catalog_id, job, payload, signature):
-    from .catalog_enrichment import record_profile_change, serialize_profile
+    from .catalog_enrichment import journal_edge_ref, record_profile_change, serialize_profile
 
     if (payload.get('schema_version') != SCHEMA_VERSION or payload.get('catalog_instance_id') != catalog_id or
             payload.get('track_id') != job['track_id'] or payload.get('media_revision') != job['media_revision'] or
@@ -154,7 +154,10 @@ def publish_edge_profile(db, catalog_id, job, payload, signature):
         VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)""",
                 (catalog_id, job['track_id'], job['media_revision'], payload['representation_id'],
                  signature, payload['profile_digest'], canonical_json(payload)))
-    record_profile_change(cur, catalog_id, job['track_id'], 'ready', serialize_profile(*legacy, edge_profile=payload))
+    # The event journals the waveform part and a reference to the edge just
+    # stored (K6); an edge publication is served in full to every client.
+    record_profile_change(cur, catalog_id, job['track_id'], 'ready', serialize_profile(*legacy),
+                          edge_ref=journal_edge_ref(payload['profile_digest'], kept=False))
     cur.execute(f"""UPDATE {table('edge_profile_jobs')} SET status='ready', last_error=NULL, updated_at=now()
         WHERE catalog_instance_id=%s AND track_id=%s AND job_token=%s""",
                 (catalog_id, job['track_id'], job['job_token']))

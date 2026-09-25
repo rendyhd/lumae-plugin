@@ -17,6 +17,14 @@ where SQL and Python part ways, and everything observable is compared:
 It also covers what P2-4 changes around the capture: the page queries pick
 their rows before the edge lookup (a fresh table without statistics), and a
 backend killed during either capture leaves nothing half visible.
+
+Since P3-2 (K6) the publishers journal an upsert's waveform part plus a
+reference to its edge. The oracle only knows journals that embed the edge,
+which is what rows written before K6 still hold: ``_journal`` writes that
+format (``record_profile_change`` stores an embedded edge as given), so the
+tests above compare against the oracle unchanged. The K6 rows are compared
+in ``test_sql_capture_of_k6_journal_rows_equals_the_oracle_on_their_pre_k6_form``:
+the oracle captures the same events in their pre-K6 form.
 """
 
 import io
@@ -711,6 +719,75 @@ def test_sql_capture_equals_the_python_capture(db):
     # The pre-P2-4 catch-up page query serves the same events.
     again = ORACLE.catchup_page(body(session_token=tokens["new"]))
     assert again["changes"] == old_changes[0]["changes"]
+
+
+def _k6_journal(db):
+    """Events as the K6 publishers journal them (P3-2): the waveform part plus
+    ``edge_ref`` naming the edge edge_join() picks (kept or published), none
+    for a row without a current edge, and deletes. Returns the kept seqs."""
+    kept = set()
+    with db.cursor() as cur:
+        cur.execute(f"SELECT {PROFILE_COLUMNS}, edge.media_revision, edge.profile_digest "
+                    f"FROM {PUBLISHED} p {edge_join(columns='e.media_revision, e.profile_digest')} "
+                    "WHERE p.analyzed_at > '0001-01-01' AND p.analyzed_at < '9999-01-01' "
+                    "ORDER BY p.track_id")
+        for index, row in enumerate(cur.fetchall()[:len(TRACK_IDS) * 3 + len(LUFS)]):
+            payload = catalog_enrichment.serialize_profile(*row[:9])
+            edge_ref = None
+            if row[10] and payload["media_revision"] and row[9] == payload["media_revision"]:
+                edge_ref = catalog_enrichment.journal_edge_ref(row[10], kept=index % 2 == 0)
+            seq = catalog_enrichment.record_profile_change(
+                cur, SOURCE, row[0], "ready", payload, edge_ref=edge_ref)
+            if edge_ref and edge_ref.get("kept"):
+                kept.add(seq)
+            if index % 7 == 3:
+                catalog_enrichment.record_profile_change(cur, SOURCE, row[0], "deleted")
+    db.commit()
+    return kept
+
+
+def test_sql_capture_of_k6_journal_rows_equals_the_oracle_on_their_pre_k6_form(db):
+    """P3-2 (K6): the journal no longer embeds edges, so the oracle (which
+    only splits embedded edges) is given each event's pre-K6 form: the same
+    event with its referenced edge embedded, as the pre-K6 publishers wrote
+    it. The SQL capture of the K6 rows stores the same catch-up rows (its
+    edge_ref also keeps the "kept" marker) and serves the same pages, byte
+    for byte, to a session that did not opt in."""
+    _seed_profiles(db)
+    client = _app().test_client()
+    old = _create(client, oracle=True)
+    new = _create(client)
+    kept = _k6_journal(db)
+    assert len(kept) > 10
+    columns = ("ordinal", "seq", "payload::text", "edge_ref::text", "payload", "edge_ref")
+    raw, changes = _pages(client, new["session_token"], "/catchup")
+    stored = _stored(db, CATCHUP, new["session_token"], *columns)
+    # The pre-K6 form of the same journal, rewritten in place for the oracle.
+    rewritten = _query(db, f"""UPDATE {CHANGES} c
+                                  SET payload=c.payload || jsonb_build_object('edge_profile',
+                                                                              e.payload),
+                                      edge_ref=NULL
+                                 FROM {EDGES} e
+                                WHERE c.edge_ref IS NOT NULL
+                                  AND e.catalog_instance_id=c.catalog_instance_id
+                                  AND e.track_id=c.track_id
+                                  AND e.media_revision=c.payload->>'media_revision'
+                                  AND e.profile_digest=c.edge_ref->>'profile_digest'
+                            RETURNING c.seq""")
+    assert len(rewritten) > 20
+    assert _query(db, f"SELECT count(*) FROM {CHANGES} WHERE edge_ref IS NOT NULL") == [(0,)]
+    old_raw, old_changes = _pages(client, old["session_token"], "/catchup", oracle=True)
+    expected = _stored(db, CATCHUP, old["session_token"], *columns)
+    assert len(stored) == len(expected) > 50
+    for row, want in zip(stored, expected):
+        assert row[:3] == want[:3] and row[4] == want[4]
+        if row[1] in kept:
+            assert row[5] == dict(want[5], kept=True)
+        else:
+            assert row[3] == want[3]
+    assert _neutral(raw, changes) == _neutral(old_raw, old_changes)
+    assert sum(c["payload"] is not None and "edge_profile" in c["payload"]
+               for page in changes for c in page["changes"]) > 20
 
 
 def _round32(text):
