@@ -24,6 +24,7 @@ import json
 import os
 import types
 import uuid
+from fractions import Fraction
 
 import numpy as np
 import pytest
@@ -326,14 +327,20 @@ def test_oracle_copy_value_escapes_copy_text_format():
 # Fixture: the values where SQL and Python part ways.
 # ---------------------------------------------------------------------------
 
-# REAL values as text. serialize_profile writes float4(): the shortest text of
-# the float4, as Python's float repr (fixed notation with a decimal between
-# 1e-4 and 1e16, exponent notation outside), null for NaN and infinity.
+# REAL values as text. serialize_profile writes float4(): numpy's shortest text
+# of the float4 psycopg2's double rounds to, as Python's float repr (fixed
+# notation with a decimal between 1e-4 and 1e16, exponent notation outside),
+# null for NaN and infinity. Plain values are written in SQL, the others
+# (NaN, infinities, |x| >= 2^23, 0 < |t| < 1e-4) by serialize_profile.
 LUFS = [
     "-14.2", "-14.199999809265137", "-14", "-14.5", "0", "-0", "0.1", "-70.123456",
     "-23.0000019", "1e-5", "-1.5e-05", "0.0001", "0.00009999", "123456.7", "1e6",
-    "1234567", "16777217", "1e15", "9.999999e15", "1e16", "3.4028235e38",
-    "-3.4028235e38", "1.4e-45", "1.17549435e-38", "NaN", "Infinity", "-Infinity",
+    "1234567", "8388607.5", "8388608", "16777217", "33554450", "1e15", "9.999999e15",
+    "1e16", "3.4028235e38", "-3.4028235e38", "3.4026e38", "1.4e-45", "1.17549435e-38",
+    "NaN", "Infinity", "-Infinity",
+    # float4 0x15ae43fd: psycopg2 reads 7.038531e-26, and its double rounds to
+    # the neighbouring float4, so float4() gives 7.0385313e-26 (review LOW-2).
+    "7.038531e-26", "-7.038531e-26",
 ]
 # analyzed_at (TIMESTAMP): isoformat() drops ".000000"; +-infinity are
 # psycopg2's datetime.max/min; years below 1000 keep four digits.
@@ -376,6 +383,12 @@ def _float32_texts(count, seed):
     return texts
 
 
+def _loudness_texts(count, seed, low=-80.0, high=20.0):
+    """Random float32 values of analyzed loudness, as REAL input text."""
+    values = np.random.RandomState(seed).uniform(low, high, size=count).astype(np.float32)
+    return [str(value) for value in values]
+
+
 def _seed_profiles(db):
     """Profiles cycling through every trap, edges of every kind, and random
     float32 levels. Returns the number of profiles."""
@@ -388,7 +401,8 @@ def _seed_profiles(db):
             LUFS[index % len(LUFS)], RAMPS[index % len(RAMPS)],
             RAMPS[(index + 4) % len(RAMPS)], INTS[(index + 3) % len(INTS)],
             f"{signature}{index}" if signature else signature, STAMPS[index % len(STAMPS)]))
-    for index, lufs in enumerate(LUFS + _float32_texts(1500, 20260925)):
+    for index, lufs in enumerate(LUFS + _float32_texts(1500, 20260925)
+                                 + _loudness_texts(1500, 20260926)):
         rows.append((f"rand-{index:05d}", 44100, 180000 + index, lufs,
                      RAMPS[index % len(RAMPS)], RAMPS[(index + 1) % len(RAMPS)], 1,
                      f"rand-sig-{index}", STAMPS[index % len(STAMPS)]))
@@ -511,9 +525,12 @@ def _use_source(migrated_db, monkeypatch, options=""):
 
 
 # The owned connections also run with extra_float_digits=0 (psycopg2 then
-# reads REAL values with 6 digits, and so does the SQL) and a non-UTC TimeZone.
-@pytest.fixture(params=["", "-c extra_float_digits=0 -c TimeZone=Asia/Kolkata"],
-                ids=["defaults", "efd0-kolkata"])
+# reads REAL values with 6 digits, and so does the SQL) and a non-UTC TimeZone,
+# and with extra_float_digits=-2, where FLT_MAX reads as 3.403e+38, beyond a
+# float4 (review LOW-1: that row is null, never a failed capture).
+@pytest.fixture(params=["", "-c extra_float_digits=0 -c TimeZone=Asia/Kolkata",
+                        "-c extra_float_digits=-2"],
+                ids=["defaults", "efd0-kolkata", "efd-2"])
 def db(migrated_db, monkeypatch, request):
     return _use_source(migrated_db, monkeypatch, request.param)
 
@@ -696,23 +713,53 @@ def test_sql_capture_equals_the_python_capture(db):
     assert again["changes"] == old_changes[0]["changes"]
 
 
+def _round32(text):
+    """The float4 nearest the decimal ``text`` (ties to even), exactly."""
+    exact = Fraction(text)
+    guess = np.float32(float(text))
+    candidates = (np.nextafter(guess, np.float32(-np.inf)), guess,
+                  np.nextafter(guess, np.float32(np.inf)))
+    return min(candidates, key=lambda c: (abs(Fraction(float(c)) - exact),
+                                          int(np.array(c).view(np.uint32)) & 1))
+
+
+def _plain(bits, text):
+    """The plain rule of profile_bootstrap._PLAIN_LUFS, computed in Python
+    from the REAL's bits and its text as psycopg2 reads it."""
+    value = np.frombuffer(bytes(bits), dtype=">f4")[0]
+    if not np.isfinite(value):
+        return False
+    if value == 0:
+        return True
+    if not 1e-5 <= abs(float(value)) < 2 ** 23 or abs(Fraction(text)) < Fraction(1, 10_000):
+        return False
+    return np.float32(float(text)) == _round32(text)
+
+
 def test_snapshot_bytes_equal_json_dumps_per_row_and_at_the_caps(db, monkeypatch):
     _seed_profiles(db)
     owned = _owned_like()
     python = _python_snapshot_bytes(owned)
-    # Per row: the measured length, and the length of the JSON text stored,
-    # plus json.dumps' ASCII escapes.
+    # Per row: which rows are plain, their measured length and the length of
+    # their JSON text, plus json.dumps' ASCII escapes. The others are
+    # serialized in Python.
     escapes = profile_bootstrap._ascii_escape_extra("b.track_id")
     measured = _query(owned, f"""
-        SELECT b.track_id, {profile_bootstrap._SNAPSHOT_DOC_LENGTH} + {escapes},
+        SELECT b.track_id, b.plain, b.bits, b.lufs_text,
+               {profile_bootstrap._SNAPSHOT_DOC_LENGTH} + {escapes},
                length({profile_bootstrap._SNAPSHOT_DOC}) + {escapes}
-          FROM (SELECT {profile_bootstrap._SNAPSHOT_VALUES},
+          FROM (SELECT {profile_bootstrap._SNAPSHOT_VALUES}, float4send(p.ref_lufs) AS bits,
                        CASE WHEN p.media_signature <> '' THEN 'sha256:' || encode(sha256(
                            convert_to(p.media_signature, 'UTF8')), 'hex') END AS revision
                   FROM {PUBLISHED} p WHERE p.catalog_instance_id=%s
                  ORDER BY p.track_id LIMIT 1000000) b""", (SOURCE,))
     owned.close()
-    assert measured == [(track_id, size, size) for track_id, size in python]
+    assert [row[0] for row in measured] == [track_id for track_id, _size in python]
+    assert [row[1] for row in measured] == [_plain(row[2], row[3]) for row in measured]
+    assert [row[4:] for row in measured] == [
+        (size, size) if row[1] else (None, None) for row, (_t, size) in zip(measured, python)]
+    plain = sum(row[1] for row in measured)
+    assert 0 < len(measured) - plain < plain
     total = sum(size for _track_id, size in python)
     # The byte cap: 413 one byte short of the total, a capture at the total,
     # the same for the oracle.
@@ -748,6 +795,150 @@ def test_snapshot_bytes_equal_json_dumps_per_row_and_at_the_caps(db, monkeypatch
                 assert exc.value.status == 413
             else:
                 assert profile_bootstrap.create_session(body())["snapshot_count"] == limit
+
+
+def _counting_fallback(monkeypatch):
+    """Record the rows _snapshot_fallback serializes in Python."""
+    rows = []
+    original = profile_bootstrap._snapshot_fallback
+
+    def counting(cur, source, session_id, ordinal, positions, track_ids):
+        rows.extend(track_ids)
+        return original(cur, source, session_id, ordinal, positions, track_ids)
+
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_fallback", counting)
+    return rows
+
+
+def _levels(db, levels):
+    """One profile per REAL text in ``levels``, track ids in the same order."""
+    with db.cursor() as cur:
+        cur.executemany(
+            f"INSERT INTO {PUBLISHED} (catalog_instance_id, track_id, sample_rate, duration_ms, "
+            "ref_lufs, start_ramp, end_ramp, analyzer_ver, profile_schema_ver, media_signature, "
+            "analyzed_at) VALUES (%s, %s, 44100, 1000, %s::real, '\\x01', '\\x02', 1, 1, %s, "
+            "'2026-09-01 12:00:00')",
+            [(SOURCE, f"level-{index:05d}", level, f"sig-{index}")
+             for index, level in enumerate(levels)])
+    db.commit()
+
+
+def _stored_levels(db):
+    return [row[0] for row in _query(db, f"SELECT payload->'ref_lufs' FROM {SNAPSHOT} "
+                                         "ORDER BY ordinal")]
+
+
+@pytest.mark.parametrize("options", ["", "-c extra_float_digits=0",
+                                     "-c extra_float_digits=3", "-c extra_float_digits=-5"])
+def test_analyzed_loudness_takes_no_python_fallback(migrated_db, monkeypatch, options):
+    """Analyzed loudness is plain: the whole snapshot is built in SQL,
+    whatever the session's extra_float_digits."""
+    db = _use_source(migrated_db, monkeypatch, options)
+    levels = _loudness_texts(4000, 7) + [
+        "-14.2", "-14", "-23", "-70", "0", "-0", "-0.5", "-8.123456", "5", "-0.0001"]
+    _levels(db, levels)
+    fallback = _counting_fallback(monkeypatch)
+    monkeypatch.setattr(profile_bootstrap, "SNAPSHOT_BATCH_ROWS", 1000)
+    created = profile_bootstrap.create_session(body())
+    assert created["snapshot_count"] == len(levels)
+    assert fallback == []
+    owned = _owned_like()
+    expected = _python_snapshot_payloads(owned)
+    owned.close()
+    assert _query(db, f"SELECT payload::text FROM {SNAPSHOT} ORDER BY ordinal") == expected
+
+
+def _python_snapshot_payloads(db):
+    """The JSONB text of json.dumps(serialize_profile(row)) per profile."""
+    rows = _query(db, f"SELECT {PROFILE_COLUMNS} FROM {PUBLISHED} p "
+                      "WHERE p.catalog_instance_id=%s ORDER BY p.track_id", (SOURCE,))
+    texts = [json.dumps(catalog_enrichment.serialize_profile(*row), separators=(",", ":"))
+             for row in rows]
+    return _query(db, "SELECT u.v::jsonb::text FROM unnest(%s::text[]) WITH ORDINALITY "
+                      "u(v, n) ORDER BY n", (texts,))
+
+
+@pytest.mark.parametrize("options, levels, expected", [
+    # LOW-2: float4 0x15ae43fd reads as 7.038531e-26, whose double rounds to
+    # the neighbouring float4, so serialize_profile writes 7.0385313e-26.
+    ("", ["7.038531e-26", "-7.038531e-26", "-14.2"], [7.0385313e-26, -7.0385313e-26, -14.2]),
+    # LOW-1: with extra_float_digits=-2 FLT_MAX reads as 3.403e+38, beyond a
+    # float4, so serialize_profile writes null (the create failed with 503).
+    ("-c extra_float_digits=-2", ["3.4028235e38", "-3.4028235e38", "-14.2"], [None, None, -14.2]),
+], ids=["low-2", "low-1"])
+def test_review_levels_are_written_by_serialize_profile(migrated_db, monkeypatch, options,
+                                                         levels, expected):
+    """Levels that are not plain are serialized by serialize_profile itself."""
+    assert np.float32(float("7.038531e-26")) != np.frombuffer(
+        bytes.fromhex("15ae43fd"), dtype=">f4")[0]
+    db = _use_source(migrated_db, monkeypatch, options)
+    _levels(db, levels)
+    fallback = _counting_fallback(monkeypatch)
+    with np.errstate(over="ignore"):
+        created = profile_bootstrap.create_session(body())
+    assert created["snapshot_count"] == 3
+    assert fallback == ["level-00000", "level-00001"]
+    assert _stored_levels(db) == expected
+
+
+def test_changes_between_snapshot_batches_are_not_captured(plain_db, second_connection,
+                                                           monkeypatch):
+    """Every batch reads the capture's one REPEATABLE READ snapshot (review
+    LOW-7): profiles published, updated, deleted or inserted between two
+    batches are invisible to the rest of the capture, the fallback's rows
+    included, and snapshot_seq stays the head the capture started from."""
+    db = plain_db
+    _simple_profiles(db, 7)
+    # A non-plain row in a later batch: the Python fallback reads it too.
+    _query(db, f"UPDATE {PUBLISHED} SET ref_lufs='NaN' WHERE track_id='track-6'")
+    with db.cursor() as cur:
+        catalog_enrichment.record_profile_change(cur, SOURCE, "track-1", "ready",
+                                                 {"track_id": "track-1"})
+    db.commit()
+    head = _query(db, f"SELECT head_seq FROM {STATE}")[0][0]
+    before = _query(db, f"SELECT {PROFILE_COLUMNS} FROM {PUBLISHED} p ORDER BY p.track_id")
+    expected = _query(db, "SELECT u.v::jsonb::text FROM unnest(%s::text[]) WITH ORDINALITY "
+                          "u(v, n) ORDER BY n", ([json.dumps(
+                              catalog_enrichment.serialize_profile(*row), separators=(",", ":"))
+                              for row in before],))
+    monkeypatch.setattr(profile_bootstrap, "SNAPSHOT_BATCH_ROWS", 2)
+    calls = []
+    original = profile_bootstrap._snapshot_batch
+
+    def change_after_second_batch(*args):
+        result = original(*args)
+        calls.append(result[0])
+        if len(calls) == 2:
+            with second_connection.cursor() as cur:
+                # Batches [1, 2] and [3, 4] are captured, [5, 6] and [7] not.
+                cur.execute(f"UPDATE {PUBLISHED} SET ref_lufs=-1, duration_ms=1 "
+                            "WHERE track_id IN ('track-3', 'track-5', 'track-6')")
+                cur.execute(f"DELETE FROM {PUBLISHED} WHERE track_id IN ('track-4', 'track-7')")
+                cur.execute(
+                    f"INSERT INTO {PUBLISHED} (catalog_instance_id, track_id, sample_rate, "
+                    "duration_ms, ref_lufs, start_ramp, end_ramp, analyzer_ver, "
+                    "profile_schema_ver, media_signature, analyzed_at) "
+                    f"SELECT catalog_instance_id, track_id || 'a', sample_rate, duration_ms, "
+                    "ref_lufs, start_ramp, end_ramp, analyzer_ver, profile_schema_ver, "
+                    f"media_signature, analyzed_at FROM {PUBLISHED} "
+                    "WHERE track_id IN ('track-4', 'track-6')")
+                for track_id in ("track-3", "track-4", "track-4a", "track-6a"):
+                    catalog_enrichment.record_profile_change(
+                        cur, SOURCE, track_id, "ready", {"track_id": track_id})
+            second_connection.commit()
+        return result
+
+    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", change_after_second_batch)
+    fallback = _counting_fallback(monkeypatch)
+    created = profile_bootstrap.create_session(body())
+    assert calls == [2, 2, 2, 1]
+    assert fallback == ["track-6"]
+    assert created["snapshot_seq"] == head
+    assert _query(db, f"SELECT snapshot_seq, snapshot_count FROM {SESSIONS}") == [(head, 7)]
+    assert _query(db, f"SELECT payload::text FROM {SNAPSHOT} ORDER BY ordinal") == expected
+    assert [row[0]["ref_lufs"] for row in _query(
+        db, f"SELECT payload FROM {SNAPSHOT} ORDER BY ordinal")] == [-14.5] * 5 + [None, -14.5]
+    assert _query(db, f"SELECT head_seq FROM {STATE}")[0][0] == head + 4
 
 
 def test_catchup_bytes_equal_json_dumps_per_event_and_at_the_caps(db, monkeypatch):
