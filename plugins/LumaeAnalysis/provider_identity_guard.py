@@ -10,6 +10,7 @@ from typing import Iterable
 
 from plugin.api import table
 
+from . import migrations
 from .provider_identity import (
     ProviderIdentityTransitionState,
     canonicalize_navidrome_id,
@@ -136,28 +137,18 @@ def migrate_provider_identity(db):
         )
         """
     )
-    for statement in (
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS target_scan_count INTEGER NOT NULL DEFAULT 0",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS first_seq BIGINT",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS last_seq BIGINT",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS analysis_baseline JSONB NOT NULL DEFAULT '{}'::jsonb",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS baseline_integrity BOOLEAN",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS audiomuse_health TEXT",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS projection_reconcile_required "
-        "BOOLEAN NOT NULL DEFAULT FALSE",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS manifest_sha256 TEXT",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ",
-    ):
-        cur.execute(statement)
+    migrations.ensure_columns(
+        cur, t('provider_identity_transitions'),
+        "target_scan_count INTEGER NOT NULL DEFAULT 0",
+        "first_seq BIGINT",
+        "last_seq BIGINT",
+        "analysis_baseline JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "baseline_integrity BOOLEAN",
+        "audiomuse_health TEXT",
+        "projection_reconcile_required BOOLEAN NOT NULL DEFAULT FALSE",
+        "manifest_sha256 TEXT",
+        "applied_at TIMESTAMPTZ",
+    )
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {t('provider_identity_manifests')} (

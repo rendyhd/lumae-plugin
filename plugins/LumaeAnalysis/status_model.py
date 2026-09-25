@@ -37,6 +37,8 @@ what the live query returned when it was taken.
 
 from plugin.api import logger, table
 
+from . import migrations
+
 
 PROFILE_COUNTS_MIN_AGE_SECONDS = 30
 
@@ -123,21 +125,13 @@ def migrate_status_summary(cur):
     """Additive, idempotent schema for the summaries (run by ``migrate_catalog``).
 
     Existing columns are looked up first, so a re-run issues no ALTER and takes
-    no ACCESS EXCLUSIVE lock on ``analysis_state``.
+    no ACCESS EXCLUSIVE lock on ``analysis_state`` (P2-5 ``ensure_columns``,
+    which also bounds the lock wait when a column is missing).
     """
-    cur.execute(
-        "SELECT attname FROM pg_attribute "
-        "WHERE attrelid=to_regclass(%s) AND attnum > 0 AND NOT attisdropped",
-        (t("analysis_state"),),
+    migrations.ensure_columns(
+        cur, t("analysis_state"),
+        *(f"{name} {kind}" for name, kind in ANALYSIS_SUMMARY_COLUMNS),
     )
-    existing = {str(row[0]) for row in cur.fetchall()}
-    missing = [
-        f"ADD COLUMN IF NOT EXISTS {name} {kind}"
-        for name, kind in ANALYSIS_SUMMARY_COLUMNS
-        if name not in existing
-    ]
-    if missing:
-        cur.execute(f"ALTER TABLE {t('analysis_state')} {', '.join(missing)}")
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {t('status_summary')} (

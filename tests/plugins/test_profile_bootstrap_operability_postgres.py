@@ -267,6 +267,8 @@ def test_capture_holds_only_its_source_lock_and_always_releases_it(
             cur.execute(
                 "SELECT l.pid, a.application_name FROM pg_locks l "
                 "JOIN pg_stat_activity a USING (pid) WHERE l.locktype='advisory' "
+                "AND l.database=(SELECT oid FROM pg_database "
+                "WHERE datname=current_database()) "
                 "AND l.classid=110094 AND l.objid<>10 AND l.granted")
             observed.append((global_free, source_free, cur.fetchall()))
         second_connection.rollback()

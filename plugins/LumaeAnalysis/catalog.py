@@ -14,6 +14,7 @@ import uuid
 
 from plugin.api import table
 
+from . import migrations
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .provider_identity_guard import inspect_catalog_identity, observe_provider_version
 from .status_model import migrate_status_summary, refresh_status_summary
@@ -1037,11 +1038,11 @@ def migrate_catalog(db):
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
-        f"""
+        lambda cur: migrations.ensure_index(cur, f"""
         CREATE UNIQUE INDEX IF NOT EXISTS {t("idx_catalog_source_core")}
         ON {t("catalog_sources")} (current_core_server_id)
         WHERE current_core_server_id IS NOT NULL AND rebind_status = 'active'
-        """,
+        """),
         f"""
         CREATE TABLE IF NOT EXISTS {t("catalog_state")} (
             catalog_instance_id TEXT PRIMARY KEY,
@@ -1196,59 +1197,41 @@ def migrate_catalog(db):
             PRIMARY KEY (catalog_instance_id, epoch, seq)
         )
         """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS fingerprint_schema_version INTEGER NOT NULL DEFAULT 1
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ALTER COLUMN fingerprint_schema_version
-        SET DEFAULT {CATALOG_FINGERPRINT_SCHEMA_VERSION}
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS snapshot_estimated_bytes BIGINT NOT NULL DEFAULT 0
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS last_scan_change_counts JSONB NOT NULL DEFAULT '{{}}'::jsonb
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS last_scan_change_reason TEXT
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ADD COLUMN IF NOT EXISTS last_scan_duration_ms BIGINT
-        """,
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ADD COLUMN IF NOT EXISTS change_reason TEXT NOT NULL DEFAULT 'provider_diff'
-        """,
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ADD COLUMN IF NOT EXISTS old_entity_id TEXT
-        """,
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ADD COLUMN IF NOT EXISTS evidence JSONB
-        """,
+        # P2-5: each ALTER below runs only when the schema differs (an
+        # up-to-date database takes no ACCESS EXCLUSIVE lock) and waits for
+        # its lock boundedly (migrations.py).
+        lambda cur: migrations.ensure_columns(
+            cur, t("catalog_state"),
+            "fingerprint_schema_version INTEGER NOT NULL DEFAULT 1",
+        ),
+        lambda cur: migrations.ensure_default(
+            cur, t("catalog_state"), "fingerprint_schema_version",
+            str(CATALOG_FINGERPRINT_SCHEMA_VERSION),
+        ),
+        lambda cur: migrations.ensure_columns(
+            cur, t("catalog_state"),
+            "snapshot_estimated_bytes BIGINT NOT NULL DEFAULT 0",
+            "last_scan_change_counts JSONB NOT NULL DEFAULT '{}'::jsonb",
+            "last_scan_change_reason TEXT",
+            "last_scan_duration_ms BIGINT",
+        ),
+        lambda cur: migrations.ensure_columns(
+            cur, t("catalog_changes"),
+            "change_reason TEXT NOT NULL DEFAULT 'provider_diff'",
+            "old_entity_id TEXT",
+            "evidence JSONB",
+        ),
         # AUD-05: 1.2.5 publication does not withdraw profiles of changed
         # media and 1.2.5 rekey does not move published profiles. Their
         # catalog_changes insert omits this column and now fails closed.
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ADD COLUMN IF NOT EXISTS writer_generation SMALLINT NOT NULL
-            DEFAULT {JOURNAL_WRITER_GENERATION}
-        """,
-        f"""
-        ALTER TABLE {t("catalog_changes")}
-        ALTER COLUMN writer_generation DROP DEFAULT
-        """,
-        f"""
-        ALTER TABLE {t("catalog_state")}
-        ALTER COLUMN catalog_schema_version SET DEFAULT {CATALOG_SCHEMA_VERSION}
-        """,
+        lambda cur: migrations.ensure_columns(
+            cur, t("catalog_changes"),
+            f"writer_generation SMALLINT NOT NULL DEFAULT {JOURNAL_WRITER_GENERATION}",
+        ),
+        lambda cur: migrations.ensure_no_default(cur, t("catalog_changes"), "writer_generation"),
+        lambda cur: migrations.ensure_default(
+            cur, t("catalog_state"), "catalog_schema_version", str(CATALOG_SCHEMA_VERSION),
+        ),
         f"""
         UPDATE {t("catalog_state")}
            SET catalog_schema_version={CATALOG_SCHEMA_VERSION}
@@ -1337,19 +1320,12 @@ def migrate_catalog(db):
         )
         """,
     ]
-    for statement in statements:
-        cur.execute(statement)
-    cur.execute(
-        f"ALTER TABLE {t('catalog_state')} "
-        "ADD COLUMN IF NOT EXISTS catalog_builder_version INTEGER NOT NULL DEFAULT 0"
-    )
-    cur.execute(
-        f"ALTER TABLE {t('catalog_state')} "
-        "ADD COLUMN IF NOT EXISTS refresh_required BOOLEAN NOT NULL DEFAULT TRUE"
-    )
-    cur.execute(
-        f"ALTER TABLE {t('catalog_state')} "
-        "ADD COLUMN IF NOT EXISTS refresh_reason TEXT"
+    migrations.apply(cur, statements)
+    migrations.ensure_columns(
+        cur, t("catalog_state"),
+        "catalog_builder_version INTEGER NOT NULL DEFAULT 0",
+        "refresh_required BOOLEAN NOT NULL DEFAULT TRUE",
+        "refresh_reason TEXT",
     )
     cur.execute(
         f"""

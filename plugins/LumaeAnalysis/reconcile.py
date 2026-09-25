@@ -6,6 +6,8 @@ import json
 
 from plugin.api import get_db, table
 
+from . import migrations
+
 
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
 ACTIVE_CRON = "* * * * *"
@@ -35,13 +37,10 @@ def migrate_reconcile(db):
     migrate_credits(db)
     cur = db.cursor()
     for name in ("analysis_runs", "preparation_state", "profile_backfill_state", "relationship_state"):
-        cur.execute(
-            f"ALTER TABLE {_work_table(name)} "
-            "ADD COLUMN IF NOT EXISTS retry_count INTEGER NOT NULL DEFAULT 0"
-        )
-        cur.execute(
-            f"ALTER TABLE {_work_table(name)} "
-            "ADD COLUMN IF NOT EXISTS next_retry_at TIMESTAMPTZ"
+        migrations.ensure_columns(
+            cur, _work_table(name),
+            "retry_count INTEGER NOT NULL DEFAULT 0",
+            "next_retry_at TIMESTAMPTZ",
         )
     cur.execute(
         f"""
@@ -90,9 +89,10 @@ def migrate_reconcile(db):
         )
         """
     )
-    cur.execute(
+    migrations.ensure_index(
+        cur,
         f"CREATE INDEX IF NOT EXISTS {table('reconcile_events_source_idx')} "
-        f"ON {events_table()} (catalog_instance_id, event_id DESC)"
+        f"ON {events_table()} (catalog_instance_id, event_id DESC)",
     )
     cur.execute(
         """
