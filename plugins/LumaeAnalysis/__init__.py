@@ -25,6 +25,7 @@ from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
     publish_edge_profile, edge_backfill_candidates,
 )
+from . import migrations
 from . import optional_storage
 from . import credits_service, credits_store, personal_discovery, music_metadata
 from .shelves import SHELVES_SCHEMA_VERSION, migrate_shelves, register_shelf_routes
@@ -1243,9 +1244,10 @@ def migrate(db):
         )
         """
     )
-    cur.execute(
+    migrations.ensure_index(
+        cur,
         f"CREATE INDEX IF NOT EXISTS {table('source_profiles_status_idx')} "
-        f"ON {source_profiles_table()} (catalog_instance_id, status)"
+        f"ON {source_profiles_table()} (catalog_instance_id, status)",
     )
     migrate_attempts(cur)
     migrate_edge_profiles(db)
@@ -1357,16 +1359,13 @@ def migrate(db):
         )
         """
     )
-    for column in (
+    migrations.ensure_columns(
+        cur, preparation_state_table(),
         "target_plugin_version TEXT",
         "target_catalog_builder_version INTEGER",
         "worker_plugin_version TEXT",
         "worker_catalog_builder_version INTEGER",
-    ):
-        cur.execute(
-            f"ALTER TABLE {preparation_state_table()} "
-            f"ADD COLUMN IF NOT EXISTS {column}"
-        )
+    )
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {profile_backfill_state_table()} (
@@ -1383,9 +1382,9 @@ def migrate(db):
         )
         """
     )
-    cur.execute(
-        f"ALTER TABLE {profile_backfill_state_table()} "
-        "ADD COLUMN IF NOT EXISTS refresh_wake_pending BOOLEAN NOT NULL DEFAULT FALSE"
+    migrations.ensure_columns(
+        cur, profile_backfill_state_table(),
+        "refresh_wake_pending BOOLEAN NOT NULL DEFAULT FALSE",
     )
     cur.execute(
         f"""
@@ -1409,9 +1408,10 @@ def migrate(db):
         )
         """
     )
-    cur.execute(
+    migrations.ensure_index(
+        cur,
         f"CREATE INDEX IF NOT EXISTS {table('analysis_runs_status_idx')} "
-        f"ON {analysis_runs_table()} (status, updated_at)"
+        f"ON {analysis_runs_table()} (status, updated_at)",
     )
     # Releases through 1.1.6 could strand rows while importing AudioMuse/RQ
     # queue internals. Re-admit them to the database-driven reconciler.

@@ -15,12 +15,14 @@ SAFE_FAILURES = TRANSIENT_FAILURES | REVISION_FAILURES
 
 from plugin.api import table
 
+from . import migrations
 from .catalog_enrichment import float4, record_profile_change, serialize_profile
 from .edge_profile_store import edge_join
 
 
 def migrate_attempts(cur):
-    for definition in (
+    migrations.ensure_columns(
+        cur, table('source_profiles'),
         "attempt_token TEXT",
         "attempt_media_signature TEXT",
         "attempt_catalog_epoch TEXT",
@@ -33,8 +35,7 @@ def migrate_attempts(cur):
         "retry_media_signature TEXT",
         "retry_analyzer_ver INTEGER",
         "retry_profile_schema_ver INTEGER",
-    ):
-        cur.execute(f"ALTER TABLE {table('source_profiles')} ADD COLUMN IF NOT EXISTS {definition}")
+    )
 
 
 def _source_state(cur, source):
