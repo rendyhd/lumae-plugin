@@ -18,6 +18,7 @@ from plugin.api import table
 from . import migrations
 from .catalog_enrichment import (
     float4,
+    journal_edge_ref,
     record_profile_change,
     record_profile_deletions,
     serialize_profile,
@@ -425,21 +426,28 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
                     (source, track_id, *values),
                 )
                 stamp = cur.fetchone()[0]
-                edge = None
+                payload = serialize_profile(track_id, *values[:6], stamp, media_sig)
+                edge_ref = None
                 if not media_changed:
                     # Clients delete their edge on an upsert without one, so a
-                    # waveform-only change carries the still-current edge.
+                    # waveform-only change carries the still-current edge: the
+                    # journal references it (K6) and readers embed it, or send
+                    # the reference to clients that opted in. Only its key is
+                    # read; the edge payload is never detoasted here.
                     cur.execute(
-                        f"""SELECT edge.payload
-                              FROM {table('published_source_profiles')} p {edge_join()}
+                        f"""SELECT edge.media_revision, edge.profile_digest
+                              FROM {table('published_source_profiles')} p
+                              {edge_join(columns='e.media_revision, e.profile_digest')}
                              WHERE p.catalog_instance_id=%s AND p.track_id=%s""",
                         (source, track_id),
                     )
-                    edge = cur.fetchone()[0]
-                payload = serialize_profile(
-                    track_id, *values[:6], stamp, media_sig, edge_profile=edge,
-                )
-                record_profile_change(cur, source, track_id, "ready", payload)
+                    revision, digest = cur.fetchone()
+                    # serialize_profile embedded an edge only for the row's
+                    # own revision (edge columns equal their payload's).
+                    if digest and revision and revision == payload["media_revision"]:
+                        edge_ref = journal_edge_ref(digest, kept=True)
+                record_profile_change(cur, source, track_id, "ready", payload,
+                                      edge_ref=edge_ref)
         db.commit()
         return True
     except Exception:

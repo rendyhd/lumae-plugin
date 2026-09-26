@@ -26,7 +26,15 @@ the gate can be run and measured without a phone:
 * every edge is verified before it is stored: ``profile_digest`` over the
   canonical re-sorted JSON (contract §4.2), identity, and the ``boundaries``
   rule of §4.4. An upsert without a valid edge deletes the local edge
-  (contract §6 rule 1); a ``delete`` removes both.
+  (contract §6 rule 1); a ``delete`` removes both;
+* K6 edge references (hand-off C-10), when ``capabilities.profile_stream.
+  edge_refs`` is advertised (``edge_refs=False`` simulates a client without
+  K6): ``edge_refs=1`` on ``/changes`` and ``edge_refs: true`` on create. An
+  upsert with ``edge_profile_ref`` keeps the local edge when its
+  ``media_revision`` and ``profile_digest`` match; otherwise the track is
+  queued (in the page's transaction) and fetched through ``/api/profiles?ids=``
+  after the page, at most 500 ids and a 4,000-byte request line per request,
+  and the fetched edge is verified and kept for the queued revision only.
 
 Edge payloads are stored zlib-compressed (level 1) to save disk on the test
 machine; the verified canonical JSON is what is compressed.
@@ -236,8 +244,9 @@ class Transport:
                 pass
             self.conn = None
 
-    def request(self, method, path, *, query=None, body=None, timeout=30.0, kind="other"):
-        url = PREFIX + path + ("?" + urlencode(query) if query else "")
+    def request(self, method, path, *, query=None, body=None, timeout=30.0, kind="other",
+                safe=""):
+        url = PREFIX + path + ("?" + urlencode(query, safe=safe) if query else "")
         headers = {"Accept": "application/json",
                    "Accept-Encoding": "gzip" if self.accept_gzip else "identity"}
         data = None
@@ -310,7 +319,14 @@ CREATE TABLE IF NOT EXISTS published_profiles (track_id TEXT PRIMARY KEY, media_
                                                payload TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS edges (track_id TEXT PRIMARY KEY, media_revision TEXT NOT NULL,
                                   profile_digest TEXT NOT NULL, payload BLOB NOT NULL);
+CREATE TABLE IF NOT EXISTS edge_misses (track_id TEXT PRIMARY KEY, media_revision TEXT NOT NULL,
+                                        profile_digest TEXT NOT NULL);
 """
+# K6/C-10 miss fetch: at most 500 ids per /api/profiles request (the server
+# ignores the rest), and a request line within gunicorn's default
+# --limit-request-line (4,094 bytes), which the stock host runs with.
+FETCH_MAX_IDS = 500
+FETCH_MAX_REQUEST_LINE = 4000
 
 
 class Store:
@@ -323,7 +339,6 @@ class Store:
         self.db.executescript(SCHEMA)
         self.counters = collections.Counter()
         self.invalid = collections.Counter()
-        self.misses = set()  # K6 references whose edge is not held locally
 
     def close(self):
         self.db.close()
@@ -359,17 +374,25 @@ class Store:
                 if key not in ("edge_profile", "edge_profile_ref")}
         cur.execute(f"INSERT OR REPLACE INTO {table} (track_id, media_revision, payload) "
                     "VALUES (?, ?, ?)", (track_id, revision, canonical_json(wave)))
+        # Any later event supersedes a queued miss fetch of the track.
+        cur.execute("DELETE FROM edge_misses WHERE track_id=?", (track_id,))
         if edge is None and isinstance(ref, dict):
-            # K6 (opt-in, P3-2): the edge is unchanged; keep the local copy when
-            # its revision and digest match, otherwise fetch it by id.
+            # K6 (opt-in, C-10): the edge is unchanged; keep the local copy when
+            # its revision and digest match. Otherwise the local edge is not
+            # this one: drop it, and queue the track for a fetch by id
+            # (resolve_misses), in the same transaction as the page.
+            digest = ref.get("profile_digest")
             if ref.get("media_revision") == revision and cur.execute(
                     "SELECT 1 FROM edges WHERE track_id=? AND media_revision=? "
-                    "AND profile_digest=?",
-                    (track_id, revision, ref.get("profile_digest"))).fetchone():
+                    "AND profile_digest=?", (track_id, revision, digest)).fetchone():
                 self.counters["edge_refs_kept"] += 1
                 return
             self.counters["edge_refs_missed"] += 1
-            self.misses.add(track_id)
+            if revision and isinstance(digest, str) and ref.get("media_revision") == revision:
+                cur.execute("INSERT INTO edge_misses VALUES (?, ?, ?)",
+                            (track_id, revision, digest))
+            else:
+                self.invalid["edge_ref_revision"] += 1
         if edge is not None:
             reason = verify_edge(edge, track_id, revision)
             if reason is None:
@@ -387,7 +410,33 @@ class Store:
     def apply_delete(self, cur, table, track_id):
         cur.execute(f"DELETE FROM {table} WHERE track_id=?", (str(track_id),))
         cur.execute("DELETE FROM edges WHERE track_id=?", (str(track_id),))
+        cur.execute("DELETE FROM edge_misses WHERE track_id=?", (str(track_id),))
         self.counters["deletes"] += 1
+
+    def store_fetched_edge(self, cur, track_id, media_revision, digest, profile):
+        """C-10: keep a fetched profile's edge only when it is valid for the
+        queued revision (the fetch returns the current profile, which a
+        later event may still change); drop the miss either way."""
+        cur.execute("DELETE FROM edge_misses WHERE track_id=? AND media_revision=? "
+                    "AND profile_digest=?", (track_id, media_revision, digest))
+        if not cur.rowcount:
+            return  # superseded by an event applied meanwhile
+        edge = (profile or {}).get("edge_profile")
+        if edge is None or edge.get("media_revision") != media_revision:
+            self.counters["edge_fetch_stale"] += 1
+            return
+        reason = verify_edge(edge, track_id, media_revision)
+        if reason is not None:
+            self.counters["edges_invalid"] += 1
+            self.invalid[reason] += 1
+            return
+        if edge.get("profile_digest") != digest:
+            # Replaced after the event; the replacing event follows.
+            self.counters["edge_fetch_newer"] += 1
+        cur.execute("INSERT OR REPLACE INTO edges VALUES (?, ?, ?, ?)",
+                    (track_id, media_revision, edge["profile_digest"],
+                     zlib.compress(canonical_json(edge).encode("utf-8"), 1)))
+        self.counters["edges_fetched"] += 1
 
     def apply_change(self, cur, table, change):
         if change["operation"] == "upsert" and isinstance(change.get("payload"), dict):
@@ -438,8 +487,11 @@ class SyncClient:
     def __init__(self, base_url, db_path, *, mode="auto", page_size=50, legacy_limit=50,
                  changes_limit=100, server_id=None, catalog_instance_id=None, token=None,
                  user=None, hook=None, stats=None, create_timeout=10.0, page_timeout=60.0,
-                 max_outage_s=600.0, log=None):
+                 max_outage_s=600.0, log=None, edge_refs=None):
         self.stats = stats or Stats()
+        # K6: None follows capabilities.profile_stream.edge_refs; False is a
+        # client without K6 support (it never opts in).
+        self.edge_refs = edge_refs
         self.transport = Transport(base_url, self.stats, token=token, user=user)
         self.store = Store(db_path, self.stats)
         self.mode = mode
@@ -479,14 +531,14 @@ class SyncClient:
         self.close()
 
     # -- HTTP with the client's retry policy (C-3) --------------------------
-    def call(self, kind, method, path, *, body=None, query=None, timeout=None):
+    def call(self, kind, method, path, *, body=None, query=None, timeout=None, safe=""):
         timeout = timeout or self.page_timeout
         outage_started = None
         attempt = 0
         while True:
             try:
                 resp = self.transport.request(method, path, query=query, body=body,
-                                              timeout=timeout, kind=kind)
+                                              timeout=timeout, kind=kind, safe=safe)
             except TransportError as exc:
                 attempt += 1
                 now = time.monotonic()
@@ -532,6 +584,7 @@ class SyncClient:
         if not self.state.get("catalog_instance_id") or not self.state.get("mode"):
             self.detect()
         self.catalog_instance_id = self.state["catalog_instance_id"]
+        self.resolve_misses()  # a fetch queue left by a crash (C-10)
         while True:
             phase = self.state.get("phase")
             if phase in (None, "create"):
@@ -596,7 +649,8 @@ class SyncClient:
             "sliding": pb.get("sliding_expiry") is True,
             "idempotent": pb.get("idempotent_create") is True,
             "gzip": (caps.get("transport") or {}).get("gzip") is True,
-            "edge_refs": (caps.get("profile_stream") or {}).get("edge_refs") is True,
+            "edge_refs": self.edge_refs is not False
+                         and (caps.get("profile_stream") or {}).get("edge_refs") is True,
         })
         self.save()
 
@@ -615,6 +669,8 @@ class SyncClient:
             body["expiry_mode"] = "sliding"
         if self.state.get("idempotent"):
             body["client_request_id"] = self.state["client_request_id"]
+        if self.state.get("edge_refs"):
+            body["edge_refs"] = True  # K6: ref-eligible catch-up upserts as references
         t0 = time.perf_counter()
         self.hook("create_sending", client=self)
         while True:
@@ -782,6 +838,7 @@ class SyncClient:
                                "published": True})
         self.bump("catchup_pages_fetched")
         self.save(apply)
+        self.resolve_misses()
         self.hook("catchup_page", client=self, index=self.state["catchup_pages"])
         if done:
             self.timings["catchup_s"] = round(time.perf_counter() - self.phase_started, 2)
@@ -857,23 +914,45 @@ class SyncClient:
             self.timings["legacy_bootstrap_s"] = round(time.perf_counter() - self.phase_started, 2)
             self.phase_started = time.perf_counter()
 
-    def fetch_missing_edges(self):
-        """K6: fetch edges the device does not hold through /api/profiles (<= 100 ids)."""
-        while self.store.misses:
-            batch = sorted(self.store.misses)[:100]
+    def resolve_misses(self):
+        """K6/C-10: fetch the edges of queued misses through /api/profiles.
+
+        At most FETCH_MAX_IDS ids per request (the server truncates to 500),
+        comma-joined, and a request line of at most FETCH_MAX_REQUEST_LINE
+        bytes. Each fetched edge is verified (digest, identity, boundaries)
+        and kept only for the queued media_revision; each batch commits on
+        its own, and a crash leaves the rest queued.
+        """
+        while True:
+            rows = self.store.db.execute(
+                "SELECT track_id, media_revision, profile_digest FROM edge_misses "
+                "ORDER BY track_id LIMIT ?", (FETCH_MAX_IDS,)).fetchall()
+            if not rows:
+                return
+            base = len(PREFIX) + len("GET /api/profiles?catalog_instance_id=&ids= HTTP/1.1") \
+                + len(urlencode({"c": self.state["catalog_instance_id"]}))
+            batch, size = [], base
+            for row in rows:
+                cost = len(urlencode({"i": row[0]}, safe=",")) - 2 + 1
+                if batch and size + cost > FETCH_MAX_REQUEST_LINE:
+                    break
+                batch.append(row)
+                size += cost
             resp = self.call("profiles_fetch", "GET", "/api/profiles",
                              query={"catalog_instance_id": self.state["catalog_instance_id"],
-                                    "ids": ",".join(batch)})
+                                    "ids": ",".join(row[0] for row in batch)},
+                             safe=",")
             if resp.status != 200:
                 raise SyncFailed(f"/api/profiles failed: {resp.status} {resp.body}")
-            profiles = resp.body.get("profiles") or []
+            profiles = {p.get("track_id"): p for p in resp.body.get("profiles") or []}
 
             def apply(cur):
-                for profile in profiles:
-                    self.store.apply_upsert(cur, "published_profiles", profile)
-            self.save(apply)
+                for track_id, revision, digest in batch:
+                    self.store.store_fetched_edge(cur, track_id, revision, digest,
+                                                  profiles.get(track_id))
             self.bump("edge_fetches", len(batch))
-            self.store.misses.difference_update(batch)
+            self.bump("edge_fetch_requests")
+            self.save(apply)
 
     # -- incremental /profiles/changes -----------------------------------------
     def delta_page(self):
@@ -906,7 +985,7 @@ class SyncClient:
             self.bump("delta_pages_fetched")
             self.bump("delta_events", len(changes))
         self.save(apply)
-        self.fetch_missing_edges()
+        self.resolve_misses()
         self.hook("delta_page", client=self, index=self.state.get("counters", {}).get(
             "delta_pages_fetched", 0), events=len(changes))
         if done:

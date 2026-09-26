@@ -382,9 +382,9 @@ def test_waveform_replacement_invalidates_edge_before_matching_delta(
 
     db = edge_publication_db
     jobs, _ = edge_profile_store.claim_edge_jobs(db, SOURCE, ["track-a"])
+    edge = _edge_payload_for_job(jobs[0])
     assert edge_profile_store.publish_edge_profile(
-        db, SOURCE, jobs[0], _edge_payload_for_job(jobs[0]),
-        "private/path:123:456",
+        db, SOURCE, jobs[0], edge, "private/path:123:456",
     )
     token = profile_publication.admit_attempts(db, SOURCE, ["track-a"])["track-a"]
     assert profile_publication.complete_attempt(
@@ -392,11 +392,15 @@ def test_waveform_replacement_invalidates_edge_before_matching_delta(
         "ready", None, "catalog-media:private/path:123:456", 1, 1,
     )
     with db.cursor() as cur:
-        cur.execute(f"SELECT seq, payload FROM {CHANGES} ORDER BY seq")
+        cur.execute(f"SELECT seq, payload, edge_ref FROM {CHANGES} ORDER BY seq")
         changes = cur.fetchall()
         assert [row[0] for row in changes] == [1, 2]
-        assert "edge_profile" in changes[0][1]
-        assert "edge_profile" not in changes[1][1]
+        # K6: the edge publication journals a reference to its edge (never a
+        # copy); the replacement references none.
+        assert "edge_profile" not in changes[0][1]
+        assert changes[0][2] == {"profile_digest": edge["profile_digest"]}
+        assert "edge_profile" not in changes[1][1] and changes[1][2] is None
+        changes = [(row[0], row[1]) for row in changes]
         page = catalog_enrichment._profile_rows(cur, SOURCE, "", 100)
         assert page == [changes[1][1]]
         cur.execute(

@@ -375,6 +375,11 @@ def migrate_enrichment(db):
             f"writer_generation SMALLINT NOT NULL DEFAULT {JOURNAL_WRITER_GENERATION}",
         ),
         lambda cur: migrations.ensure_no_default(cur, t("profile_changes"), "writer_generation"),
+        # K6 (P3-2): an upsert journals its waveform payload plus a reference
+        # to its edge (journal_edge_ref) instead of a copy of the edge. Rows
+        # journalled before (1.2.5, 1.3.0 before K6) keep their embedded edge
+        # and a NULL reference; they are never rewritten. Additive, no default.
+        lambda cur: migrations.ensure_columns(cur, t("profile_changes"), "edge_ref JSONB"),
         f"""
         CREATE TABLE IF NOT EXISTS {t("profile_bootstrap_sessions")} (
             session_id UUID PRIMARY KEY,
@@ -450,6 +455,11 @@ def migrate_enrichment(db):
             "expiry_mode TEXT NOT NULL DEFAULT 'absolute'",
             "client_request_id UUID",
             "pages_served INTEGER NOT NULL DEFAULT 0",
+        ),
+        # K6 (P3-2): a session created with edge_refs: true serves ref-eligible
+        # catch-up upserts as edge_profile_ref. Metadata-only default.
+        lambda cur: migrations.ensure_columns(
+            cur, t('profile_bootstrap_sessions'), "edge_refs BOOLEAN NOT NULL DEFAULT FALSE",
         ),
         lambda cur: migrations.ensure_index(cur, f"""
         CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_request_idx')}
@@ -638,19 +648,48 @@ def _profile_json(payload):
     )
 
 
-def record_profile_change(cur, catalog_instance_id, track_id, status, payload=None):
-    """Append a profile upsert/delete in the same transaction as its profile."""
+def journal_edge_ref(profile_digest, *, kept):
+    """An upsert's reference to its edge in the journal (K6, P3-2).
+
+    ``profile_digest`` names the ``edge_profiles`` row; its media_revision is
+    the upsert payload's own (an edge belongs to its row's revision only).
+    ``kept`` marks a waveform-only republish that kept the current edge. Only
+    such an event is served as ``edge_profile_ref`` to a client that opted
+    in; an edge publication (not kept) always reaches every client in full.
+    """
+    reference = {"profile_digest": str(profile_digest)}
+    if kept:
+        reference["kept"] = True
+    return reference
+
+
+def record_profile_change(cur, catalog_instance_id, track_id, status, payload=None, *,
+                          edge_ref=None):
+    """Append a profile upsert/delete in the same transaction as its profile.
+
+    An upsert with an edge journals its waveform payload (``serialize_profile``
+    without the edge) and ``edge_ref`` (``journal_edge_ref``); readers join
+    the edge back from ``edge_profiles`` (K6). A payload that embeds
+    ``edge_profile`` and has no ``edge_ref`` is journalled as given: the
+    format of 1.2.5 and of 1.3.0 before K6, which every reader still serves.
+    """
     epoch, head_seq, floor_seq = _profile_stream_state(
         cur, catalog_instance_id, for_update=True
     )
     seq = head_seq + 1
     operation = "upsert" if status == "ready" and payload is not None else "delete"
+    if edge_ref is not None and (
+            operation != "upsert" or "edge_profile" in payload
+            or not payload.get("media_revision")
+            or not isinstance(edge_ref, dict) or not edge_ref.get("profile_digest")):
+        raise ValueError("An edge reference needs an upsert with a media revision "
+                         "and without an embedded edge")
     cur.execute(
         f"""
         INSERT INTO {t("profile_changes")}
             (catalog_instance_id, epoch, seq, track_id, operation, payload,
-             writer_generation)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s)
+             edge_ref, writer_generation)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
         """,
         (
             catalog_instance_id,
@@ -659,6 +698,7 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
             str(track_id),
             operation,
             _profile_json(payload) if payload is not None and operation == "upsert" else None,
+            _profile_json(edge_ref) if edge_ref is not None else None,
             JOURNAL_WRITER_GENERATION,
         ),
     )
@@ -825,15 +865,68 @@ def profile_bootstrap_page(db, catalog_instance_id, page_token=None, limit=250):
     }
 
 
-def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250):
+# K6 (P3-2): a journalled edge reference is ref-eligible when it is kept
+# (journal_edge_ref); ``{alias}`` is the journal (or catch-up) row.
+EDGE_REF_KEPT = """{alias}.edge_ref @> '{{"kept": true}}'::jsonb"""
+
+
+def edge_profile_ref_sql(alias, payload):
+    """SQL: the wire ``edge_profile_ref`` of a kept journal row whose waveform
+    payload is at the SQL path ``payload``."""
+    return (f"jsonb_build_object('media_revision', {payload}->'media_revision', "
+            f"'profile_digest', {alias}.edge_ref->'profile_digest')")
+
+
+def _changes_page_sql(edge_refs):
+    """(select, join) that serve a /changes page's journal rows (alias ``c``).
+
+    A row journalled with an edge reference is joined back to its edge: the
+    edge of that digest (for the row's track and media_revision), else the
+    edge current for that media_revision (the referenced one was replaced
+    later), else none (it was removed). Either way the event that replaced or
+    removed it follows in the journal. The join runs only for the page's own
+    rows, and without the opt-in a row reads exactly as the pre-K6 journal
+    row with the edge embedded. With ``edge_refs`` a kept row carries
+    ``edge_profile_ref`` instead, as journalled, and looks nothing up. Rows
+    journalled before K6 (NULL edge_ref) are served as stored.
+    """
+    kept = EDGE_REF_KEPT.format(alias="c")
+    embedded = ("CASE WHEN edge.payload IS NOT NULL "
+                "THEN c.payload || jsonb_build_object('edge_profile', edge.payload) "
+                "ELSE c.payload END")
+    payload = embedded
+    lookup = "c.edge_ref IS NOT NULL"
+    if edge_refs:
+        payload = (f"CASE WHEN {kept} THEN c.payload || jsonb_build_object("
+                   f"'edge_profile_ref', {edge_profile_ref_sql('c', 'c.payload')}) "
+                   f"ELSE {embedded} END")
+        lookup += f" AND NOT {kept}"
+    select = f"c.seq, c.track_id, c.operation, {payload}, c.created_at"
+    join = f"""LEFT JOIN LATERAL (
+        SELECT e.payload FROM {t('edge_profiles')} e
+         WHERE {lookup}
+           AND e.catalog_instance_id=%s AND e.track_id=c.track_id
+           AND e.media_revision=c.payload->>'media_revision'
+         ORDER BY e.profile_digest=c.edge_ref->>'profile_digest' DESC,
+                  e.updated_at DESC, e.profile_digest
+         LIMIT 1
+    ) edge ON TRUE"""
+    return select, join
+
+
+def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250, *,
+                         edge_refs=False):
+    """One /profiles/changes page. ``edge_refs`` is the K6 opt-in (P3-2)."""
     cursor = parse_opaque_cursor(cursor_value)
     expected_id = catalog_instance_id or cursor["catalog_instance_id"]
     sources = resolve_catalog_source(db, catalog_instance_id=expected_id)
     if len(sources) != 1 or sources[0]["catalog_instance_id"] != cursor["catalog_instance_id"]:
         raise ValueError("Cursor belongs to another profile source")
+    page_select, page_join = _changes_page_sql(bool(edge_refs))
     cur = db.cursor()
     try:
-        # State and events from one snapshot, checked for density (P1-7).
+        # State and events from one snapshot, checked for density (P1-7);
+        # each event's edge is resolved in that snapshot too (K6).
         epoch, head_seq, rows, _state = read_change_page(
             cur,
             catalog_instance_id=expected_id,
@@ -844,8 +937,11 @@ def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250):
             head_column="head_seq",
             floor_column="floor_seq",
             changes_table="profile_changes",
-            columns=("seq", "track_id", "operation", "payload", "created_at"),
+            columns=("seq", "track_id", "operation", "payload", "created_at", "edge_ref"),
             ahead_message="Cursor is ahead of the profile head",
+            page_select=page_select,
+            page_join=page_join,
+            page_params=(expected_id,),
         )
     finally:
         cur.close()

@@ -489,6 +489,17 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - Without the opt-in, it expands to the full current edge, joined by digest. If the digest is gone, it falls back to the current edge for that `media_revision`, and otherwise omits the edge; the replacing event follows.
   - Edge publications themselves always carry the full edge.
 - Tests: both modes; an old-client byte-compatibility test against golden responses; a 94k waveform-only republish producing ≤1 KB per event on the wire with the opt-in.
+- **Outcome (merged, review PASS).**
+  - **Journal:** stores the waveform part plus `edge_ref` (`kept: true` marks a waveform-only republish whose edge was kept). Rows written before K6 (`edge_ref` NULL) are served as stored in both modes and never rewritten.
+  - **Opt-in:** `/changes?edge_refs=1` and v2 create `edge_refs: true`. Snapshot pages, the legacy bootstrap and `/api/profiles` always carry full edges.
+  - **Old clients:** byte-identical against goldens regenerated from f36e087. The one exception is a `/changes` replay of an event whose edge was later replaced; it now carries the current edge of the same `media_revision`, or none, and the replacing event follows.
+  - **Size:** a full republish costs 150–192 B per track on the wire with the opt-in, against 8.3 KB without.
+  - **Publication:** `complete_attempt` p95 is 3.6–4.6 ms, which **meets the ≤5 ms budget** and closes the P1-2 accepted miss.
+  - **v2 catch-up:** keeps the K2 rule for a replaced edge (omitted, no fallback).
+  - **Miss fetches:** budgeted by request-line bytes; gunicorn's limit is 4,094 bytes.
+  - **Follow-ups:**
+    - Without the opt-in, `/changes` on K6 rows is 108 ms p50 against 83 ms for a 250-event page, because of the JSONB concatenation and the wide sort. Attach the edge payload in Python.
+    - Optionally serve a kept row whose digest is gone with the current same-revision edge in full.
 
 **P3-3 — Compact edge transport (K7, optional, about 13% after gzip).**
 - With `edge_compact=1`, strip `boundaries` (and the other derivable fields only if the client supports it) at serialization. The stored payload and digest are unchanged.

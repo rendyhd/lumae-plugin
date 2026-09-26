@@ -179,8 +179,19 @@ def test_waveform_change_on_same_media_keeps_edge_and_embeds_it(source_db):
     assert after["jobs"] == before["jobs"]
     new_events = after["events"][len(before["events"]):]
     assert len(new_events) == 1
-    _seq, operation, payload = new_events[0]
+    seq, operation, payload = new_events[0]
     assert operation == "upsert"
+    # K6 (P3-2): the journal references the kept edge instead of copying it,
+    # and /changes serves the event with the edge embedded.
+    assert "edge_profile" not in payload
+    assert _fetch(db, f"SELECT edge_ref FROM {P}profile_changes "
+                      "WHERE catalog_instance_id=%s AND seq=%s", (SOURCE, seq))[0][0] == {
+        "profile_digest": edge["profile_digest"], "kept": True}
+    epoch = _fetch(db, f"SELECT epoch FROM {P}profile_stream_state "
+                       "WHERE catalog_instance_id=%s", (SOURCE,))[0][0]
+    served = enrichment.read_profile_changes(db, opaque_cursor(SOURCE, epoch, seq - 1), SOURCE)
+    db.commit()
+    payload = served["changes"][0]["payload"]
     assert payload["edge_profile"] == edge
     assert payload["edge_profile"]["media_revision"] == opaque_revision("catalog-media:rev-a")
     # The edge stays current, so the follow-up upgrade request is a no-op.

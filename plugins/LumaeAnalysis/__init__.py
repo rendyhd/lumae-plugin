@@ -2158,6 +2158,7 @@ def health():
                 "catalog_mirror": catalog_capability(),
                 "credits": credits_service.capability(),
                 "transport": {"gzip": True},
+                "profile_stream": {"edge_refs": True},
             },
             "integrity": integrity_status(),
             "status": "ok" if compatibility.supported else compatibility.status,
@@ -2886,6 +2887,14 @@ def profiles_bootstrap_api():
         return _catalog_error("invalid_profile_bootstrap", str(exc), 400)
 
 
+def _edge_refs_requested():
+    """K6 (P3-2): ``edge_refs=1`` (or ``true``) on a profile stream route.
+
+    Any other value, or none, keeps the default: every edge in full.
+    """
+    return str(request.args.get("edge_refs") or "").strip().lower() in ("1", "true")
+
+
 @bp.get("/api/profiles/changes")
 def profile_changes_api():
     cursor = request.args.get("cursor")
@@ -2898,6 +2907,7 @@ def profile_changes_api():
                 cursor,
                 catalog_instance_id=request.args.get("catalog_instance_id"),
                 limit=request.args.get("limit", 250),
+                edge_refs=_edge_refs_requested(),
             ),
             no_store=False,
         )

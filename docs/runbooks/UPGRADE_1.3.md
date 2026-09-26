@@ -9,6 +9,10 @@ RQ worker alive used to corrupt shared state without any warning (AUD-05):
 - a 1.2.5 profile worker wrote `ready` profiles that 1.3.0 never publishes;
 - a 1.2.5 catalogue publication or provider rekey skipped the 1.3.0 profile
   withdrawal.
+- a 1.2.5 **web** worker reading the 1.3.0 profile journal serves an event
+  that carries an edge reference (K6) as an upsert without an edge, so
+  devices delete that edge until a later event for the track. No fence
+  stops readers; only step 1 does.
 
 1.3.0 fails closed instead. The migration adds fences that make every 1.2.5
 writer's insert fail, so its whole transaction rolls back:

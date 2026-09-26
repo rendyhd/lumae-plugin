@@ -2318,6 +2318,9 @@ def read_change_page(
     columns,
     ahead_message,
     state_columns=(),
+    page_select=None,
+    page_join="",
+    page_params=(),
 ):
     """Read one v1 ``/changes`` page from a single snapshot (P1-7).
 
@@ -2333,6 +2336,12 @@ def read_change_page(
     order, and ``columns[0]`` must be ``"seq"``. ``state`` maps each of
     ``state_columns`` (extra columns of the state row) to its value in that
     same snapshot.
+
+    ``page_select`` (with ``page_join`` and its ``page_params``) reads the
+    page's rows through a join in the same statement: the rows are chosen
+    first (alias ``c``, holding ``columns``), then joined, so a join runs
+    once per returned row. Each row then holds ``page_select``, which must
+    start with ``c.seq``.
     """
     if columns[0] != "seq":
         raise ValueError("read_change_page needs seq as the first column")
@@ -2341,6 +2350,21 @@ def read_change_page(
     select = ", ".join(f"c.{column}" for column in columns)
     extra = "".join(f", {column}" for column in state_columns)
     extra_out = "".join(f", s.{column}" for column in state_columns)
+    page = f"""
+              SELECT {select}
+                FROM {t(changes_table)} AS c
+               WHERE c.catalog_instance_id=%s AND c.epoch=s.epoch
+                 AND c.seq>%s AND c.seq<=s.head_seq
+                 AND s.epoch=%s AND s.floor_seq<=%s
+               ORDER BY c.seq
+               LIMIT %s"""
+    if page_select is not None:
+        if not page_select.startswith("c.seq"):
+            raise ValueError("read_change_page needs c.seq first in page_select")
+        page = f"""
+              SELECT {page_select}
+                FROM ({page}) AS c
+                {page_join}"""
     cur.execute(
         f"""
         WITH state AS (
@@ -2351,14 +2375,7 @@ def read_change_page(
         )
         SELECT s.epoch, s.head_seq, s.floor_seq{extra_out}, page.*
           FROM state AS s
-          LEFT JOIN LATERAL (
-              SELECT {select}
-                FROM {t(changes_table)} AS c
-               WHERE c.catalog_instance_id=%s AND c.epoch=s.epoch
-                 AND c.seq>%s AND c.seq<=s.head_seq
-                 AND s.epoch=%s AND s.floor_seq<=%s
-               ORDER BY c.seq
-               LIMIT %s
+          LEFT JOIN LATERAL ({page}
           ) AS page ON TRUE
          ORDER BY page.seq
         """,
@@ -2369,6 +2386,7 @@ def read_change_page(
             str(cursor["epoch"]),
             after,
             limit,
+            *page_params,
         ),
     )
     result = cur.fetchall()
