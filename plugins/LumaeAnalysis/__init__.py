@@ -2212,6 +2212,35 @@ def _persisted_profile_integrity(cur):
     return result
 
 
+def edge_profiles_stored(db=None):
+    """Health ``edge_profiles.stored``: whether any edge profile is stored.
+
+    ``available``/``enabled`` describe this process's PyAV runtime and the
+    setting; edges are computed by the analysis worker, so a web process
+    without PyAV still serves them (``served``). ``stored`` answers whether
+    profile transfers can carry edges at all: True when at least one edge row
+    exists, False when none does, None when unknown (no database or an older
+    schema). One ``LIMIT 1`` probe; never raises.
+    """
+    try:
+        db = db or get_db()
+    except Exception:
+        db = None
+    if db is None:
+        return None
+    try:
+        cur = db.cursor()
+        try:
+            cur.execute(f"SELECT 1 FROM {table('edge_profiles')} LIMIT 1")
+            return cur.fetchone() is not None
+        finally:
+            cur.close()
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not probe stored edge profiles")
+        return None
+
+
 def integrity_status(db=None):
     """Health ``integrity``: fail-closed invariants of the 1.3.0 upgrade (AUD-05).
 
@@ -2366,7 +2395,8 @@ def health():
                     "idempotent_create": True,
                 },
                 "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
-                                  "available": edge_runtime_available(), "enabled": edge_profiles_enabled()},
+                                  "available": edge_runtime_available(), "enabled": edge_profiles_enabled(),
+                                  "served": True, "stored": edge_profiles_stored()},
                 "personal_discovery": {"schema_version": 1, "enabled": collections_enabled(), "scope": health_scope_mode(), "features": ["album_memory_context", "enjoyment_feedback"]},
                 "music_metadata": {"schema_version": 1, "enabled": not maintenance_paused(), "provider": "musicbrainz", "daily_request_limit": 80, "recording_membership": True},
                 "shelves": {

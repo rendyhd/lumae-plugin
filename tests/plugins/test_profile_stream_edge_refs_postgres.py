@@ -977,3 +977,17 @@ def test_api_profiles_returns_full_edges_for_the_first_500_ids(source_db):
     for profile in body["profiles"]:
         assert profile["edge_profile"] == stored[profile["track_id"]]
         assert profile["edge_profile"]["media_revision"] == profile["media_revision"]
+
+
+def test_health_edge_profiles_stored_follows_the_edge_table(source_db):
+    """Health says whether transfers can carry edges, on the real schema."""
+    client = _app()
+
+    def edge_capability():
+        return client.get("/api/health").get_json()["capabilities"]["edge_profiles"]
+
+    before = edge_capability()
+    assert before["served"] is True and before["stored"] is False
+    _complete(source_db, TRACKS[0], -14.0)
+    _publish_edge(source_db, TRACKS[0])
+    assert edge_capability()["stored"] is True

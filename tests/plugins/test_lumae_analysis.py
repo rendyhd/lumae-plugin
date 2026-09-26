@@ -238,6 +238,9 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "method": mod.EDGE_METHOD,
                 "available": mod.edge_runtime_available(),
                 "enabled": mod.edge_profiles_enabled(),
+                "served": True,
+                # No database: whether edges are stored is unknown.
+                "stored": None,
             },
             "transport": {"gzip": True},
             "profile_stream": {"edge_refs": True},
@@ -252,6 +255,57 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
         },
         "status": "ok",
     }
+
+
+class _EdgeProbeCursor:
+    def __init__(self, row, fail):
+        self.row, self.fail, self.sql = row, fail, []
+
+    def execute(self, sql, params=None):
+        self.sql.append(sql)
+        if self.fail:
+            raise RuntimeError("relation does not exist")
+
+    def fetchone(self):
+        return self.row
+
+    def close(self):
+        pass
+
+
+class _EdgeProbeDb:
+    def __init__(self, row=None, fail=False):
+        self.cur = _EdgeProbeCursor(row, fail)
+        self.rolled_back = False
+
+    def cursor(self):
+        return self.cur
+
+    def rollback(self):
+        self.rolled_back = True
+
+
+@pytest.mark.parametrize("row, fail, expected", [((1,), False, True), (None, False, False), (None, True, None)])
+def test_health_edge_profiles_stored_reports_whether_edges_exist(monkeypatch, row, fail, expected):
+    mod = load_plugin()
+    db = _EdgeProbeDb(row, fail)
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+
+    assert mod.edge_profiles_stored() is expected
+    assert "LIMIT 1" in db.cur.sql[0] and "edge_profiles" in db.cur.sql[0]
+    assert db.rolled_back is fail
+
+
+def test_health_edge_profiles_served_is_independent_of_the_local_runtime(monkeypatch):
+    mod = load_plugin()
+    client = plugin_client(mod)
+    monkeypatch.setattr(mod, "edge_runtime_available", lambda: False)
+    monkeypatch.setattr(mod, "edge_profiles_stored", lambda db=None: True)
+
+    edge = client.get("/api/health").get_json()["capabilities"]["edge_profiles"]
+
+    assert edge["available"] is False and edge["enabled"] is False
+    assert edge["served"] is True and edge["stored"] is True
 
 
 def test_profile_bootstrap_capability_requires_public_database_url(monkeypatch):

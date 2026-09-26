@@ -18,6 +18,8 @@ precise wire changes (K1–K11) are in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md)
 §7. Summary:
 
+- Health `capabilities.edge_profiles` adds `served: true` and a live `stored: bool|null`, so clients can tell whether profile transfers carry edges; `available`/`enabled` only describe the answering process's PyAV runtime (contract §2).
+
 - **Transport:** gzip for JSON responses of 1 KiB or more (K1).
 - **v2 profile bootstrap:** snapshot pages store an edge *reference* instead
   of a copy, resolved at read time (K2); sessions get a sliding expiry
