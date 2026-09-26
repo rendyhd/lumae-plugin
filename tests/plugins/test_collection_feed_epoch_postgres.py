@@ -69,8 +69,8 @@ def collections_api(migrated_db, monkeypatch):
 
     app.register_blueprint(load_plugin().bp)
 
-    def call(method, path, body=None, key=None, user="alice", if_match=None):
-        headers = {}
+    def call(method, path, body=None, key=None, user="alice", if_match=None, headers=None):
+        headers = dict(headers or {})
         if user is not None:
             headers["X-Test-User"] = user
         if key:

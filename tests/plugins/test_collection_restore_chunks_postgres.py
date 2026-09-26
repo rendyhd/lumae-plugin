@@ -387,6 +387,49 @@ def test_collection_deleted_during_a_restore_stays_deleted(collections_api, monk
     db.close()
 
 
+def test_collection_finished_earlier_and_deleted_before_the_last_chunk_is_its_tombstone(
+        collections_api, monkeypatch):
+    """The last chunk lists the collections earlier chunks finished as they
+    stand then; one deleted meanwhile is listed as its tombstone, not left
+    out (``_fetch_collections`` reads tombstones; P3-4a follow-up, mutant M21).
+    """
+    api = collections_api
+    manager = api.manager
+    backup = _backup(manager, [("Small", 3), ("Big", 5_000)])
+    original = manager._restore_principal_collections
+    chunks, deleted = [], []
+
+    def delete_small_before_the_last_chunk(cur, principal, segments):
+        chunks.append(segments)
+        if len(chunks) == 2:
+            # Chunk 1 created and finished Small; chunks 2 and 3 write only
+            # Big's remaining items and never touch Small. A client deletes
+            # Small while chunk 2 is open, so before the last chunk starts.
+            assert [(s["name"], s["create"]) for s in segments] == [("Big", False)]
+            small_id = chunks[0][0]["id"]
+            client = threading.Thread(target=lambda: deleted.append(
+                api.call("DELETE", f"/api/collections/{small_id}", {})))
+            client.start()
+            client.join(20)
+        return original(cur, principal, segments)
+
+    monkeypatch.setattr(manager, "_restore_principal_collections", delete_small_before_the_last_chunk)
+    response = api.call("POST", "/api/collections/restore", backup, key="late")
+    assert response.status_code == 201, response.get_json()
+    assert len(chunks) == 3 and deleted[0].status_code == 200
+    body = response.get_json()
+    assert (body["collection_count"], body["item_count"]) == (2, 5_003)
+    small, big = body["collections"]
+    assert (small["id"], small["name"], small["revision"], small["track_count"]) == (
+        chunks[0][0]["id"], "Small", 3, 3)
+    assert small["deleted_at"] is not None
+    assert (big["name"], big["revision"], big["track_count"], big["deleted_at"]) == (
+        "Big", 4, 5_000, None)
+    # The replay returns the same list.
+    replay = api.call("POST", "/api/collections/restore", backup, key="late")
+    assert replay.headers["Idempotency-Replayed"] == "true" and replay.get_json() == body
+
+
 def _record_head_holds(api, monkeypatch, thread_name):
     """[(seconds, statements)] for each transaction of ``thread_name``'s
     requests that took the feed head: the time from the head UPDATE to the

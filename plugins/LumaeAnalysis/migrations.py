@@ -227,6 +227,43 @@ def ensure_index(cur, statement):
     return True
 
 
+_EXTENSION_SAVEPOINT = "lumae_migration_extension"
+
+
+def ensure_extension(cur, name):
+    """``CREATE EXTENSION IF NOT EXISTS name`` when it is missing and the role
+    may create it. Returns whether the extension is installed afterwards.
+
+    An installed extension (in any schema) issues no DDL. Otherwise the
+    statement runs through ``run_ddl`` (bounded lock wait and retries) inside
+    its own savepoint: when the role lacks the privilege, the server has no
+    such extension, or the lock is still unavailable, the savepoint is rolled
+    back, a warning names the SQLSTATE, and migration continues without it.
+    The extension goes in the current schema, where the plugin's tables are.
+    """
+    _identifier(name)
+    cur.execute("SELECT 1 FROM pg_extension WHERE extname=%s", (name,))
+    if cur.fetchone() is not None:
+        return True
+    cur.execute(f"SAVEPOINT {_EXTENSION_SAVEPOINT}")
+    try:
+        run_ddl(cur, f"CREATE EXTENSION IF NOT EXISTS {name}")
+    except Exception as exc:
+        code = getattr(exc, "pgcode", None)
+        if code is None:
+            raise
+        cur.execute(f"ROLLBACK TO SAVEPOINT {_EXTENSION_SAVEPOINT}")
+        cur.execute(f"RELEASE SAVEPOINT {_EXTENSION_SAVEPOINT}")
+        logger.warning(
+            "lumae_analysis could not create the PostgreSQL extension %s (SQLSTATE %s); "
+            "continuing without it. A database owner can run CREATE EXTENSION %s.",
+            name, code, name,
+        )
+        return False
+    cur.execute(f"RELEASE SAVEPOINT {_EXTENSION_SAVEPOINT}")
+    return True
+
+
 def apply(cur, steps):
     """Run ``steps`` in order: SQL text is executed, a callable gets ``cur``."""
     for step in steps:

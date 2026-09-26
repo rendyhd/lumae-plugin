@@ -99,6 +99,7 @@ from .profile_publication import (
 from . import profile_bootstrap
 from .collection_manager import (
     COLLECTIONS_BACKUP_VERSION,
+    COLLECTIONS_CONTRACT,
     COLLECTIONS_SCHEMA_VERSION,
     collections_enabled,
     current_collection_scope,
@@ -2154,6 +2155,7 @@ def health():
                     "enabled": collections_enabled(),
                     "scope": current_collection_scope()["mode"],
                     "feed_epoch": True,
+                    "contract": COLLECTIONS_CONTRACT,
                 },
                 "catalog_mirror": catalog_capability(),
                 "credits": credits_service.capability(),

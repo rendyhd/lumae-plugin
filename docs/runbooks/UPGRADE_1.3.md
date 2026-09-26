@@ -62,6 +62,13 @@ is safe to run again. On success it has:
 - added `collection_feed_state.floor_seq`, set once to the feed head at the
   upgrade (the K8 cutover; the feed epoch is kept), and the
   `collection_restores` progress table for chunked restores;
+- added `collection_mutations.collection_id` and
+  `shelf_mutations.request_fingerprint` (both NULL on existing receipts);
+- created the `unaccent` extension in the current schema if it was missing
+  and the database role may create it. If it may not, the install still
+  succeeds: the log has a warning `could not create the PostgreSQL extension
+  unaccent (SQLSTATE 42501)`, and collection library search matches without
+  folding accents until a database owner runs `CREATE EXTENSION unaccent;`;
 - added `writer_generation` to `profile_changes` and `catalog_changes`, filled
   existing rows with 2 and dropped the column default;
 - retargeted queued, running and failed catalogue preparations to plugin
