@@ -138,6 +138,7 @@ def record_golden(api):
 
 K10_ECHO = re.compile(rb'"catalog_instance_id":"catalog-a",')
 PROVIDER_ALBUM_ID = re.compile(rb'"provider_album_id":"[^"]+"')
+LUM016_PAGING = re.compile(rb'"next_cursor":(?:null|"[^"]*"),|,"total_exact":(?:true|false)')
 READS = (
     f"{LIBRARY}?scope=albums",
     f"{LIBRARY}/stats",
@@ -185,6 +186,11 @@ def test_single_source_reads_match_the_pre_k10_golden(workbench):
                 assert all(row["provider_album_id"] == row["cover_item_id"].rsplit("-t", 1)[0]
                            for row in albums), label
                 body = PROVIDER_ALBUM_ID.sub(b'"provider_album_id":null', body)
+                # LUM-016 (P3-5c): every section carries keyset paging and
+                # whether its total is exact. Only those two fields are undone.
+                assert all({"next_cursor", "total_exact"} <= set(section)
+                           for section in json.loads(body)["sections"].values()), label
+                body = LUM016_PAGING.sub(b"", body)
             stripped.append((label, status, K10_ECHO.sub(b"", body), headers))
         assert _normalized(stripped) == golden, suffix
 

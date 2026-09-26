@@ -14,7 +14,7 @@ import uuid
 
 from plugin.api import logger, table
 
-from . import migrations
+from . import catalog_search, migrations
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .provider_identity_guard import inspect_catalog_identity, observe_provider_version
 from .status_model import migrate_status_summary, refresh_status_summary
@@ -1341,6 +1341,8 @@ def migrate_catalog(db):
     )
     # P2-1: committed status summary (analysis_state counts, status_summary).
     migrate_status_summary(cur)
+    # P3-5c (LUM-016): stored workbench search text, trigram and keyset indexes.
+    catalog_search.migrate_search_text(cur)
     cur.close()
 
 
@@ -1358,6 +1360,9 @@ def _json_param(value):
 
 
 def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, rows, now):
+    """Insert one entity type's rows of a new generation. For tracks, also
+    their search text (LUM-016); returns whether it was folded with unaccent
+    (None for other types), which the caller records in catalog_state."""
     table_name, id_column = ENTITY_TABLES[entity_type]
     common = ["catalog_instance_id", "published_generation", id_column]
     if entity_type == "library":
@@ -1407,6 +1412,19 @@ def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, r
     columns = common + fields + ["available", "first_seen_at", "last_seen_at", "deleted_at"]
     placeholders = ["%s"] * len(columns)
     placeholders[columns.index("payload")] = "%s::jsonb"
+    album_names = folded = None
+    if entity_type == "track":
+        # LUM-016: the workbench search text is written with the rows, from
+        # this generation's album names (albums are inserted first).
+        folded = catalog_search.fold_available(cur)
+        cur.execute(
+            f"SELECT album_id, name FROM {t('catalog_albums')} "
+            "WHERE catalog_instance_id=%s AND published_generation=%s AND available",
+            (catalog_instance_id, generation),
+        )
+        album_names = dict(cur.fetchall())
+        columns.append("search_text")
+        placeholders.append(catalog_search.search_text_placeholder(folded))
     sql = f"INSERT INTO {t(table_name)} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
     def parameters():
         for row in rows:
@@ -1415,11 +1433,18 @@ def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, r
                 value = row.get(field)
                 values.append(_json_param(value) if field == "payload" else value)
             values.extend([True, now, now, None])
+            if album_names is not None:
+                values.append(catalog_search.search_text_value(
+                    row.get("title"), row.get("artist_display"),
+                    row.get("album_artist_display"), album_names.get(row.get("album_id"))))
             yield tuple(values)
 
     params = parameters()
     for batch in _chunks(params):
         cur.executemany(sql, batch)
+    # How the search text was folded (tracks only): the caller records it
+    # with the generation in catalog_state, under its publication lock.
+    return folded
 
 
 def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
@@ -2114,9 +2139,13 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 "changes": 0,
             }
 
+        search_folded = None
         for entity_type in ENTITY_ORDER:
             rows = normalized[ENTITY_COLLECTIONS[entity_type]]
-            _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, rows, now)
+            folded = _insert_generation_rows(
+                cur, entity_type, catalog_instance_id, generation, rows, now)
+            if entity_type == "track":
+                search_folded = folded
         _insert_relationship_rows(cur, catalog_instance_id, generation, normalized)
 
         ordered_changes = [change for change in changes if change[2] == "upsert"]
@@ -2181,6 +2210,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             f"""
             UPDATE {t("catalog_state")}
                SET published_generation=%s, catalog_epoch=%s, catalog_head_seq=%s,
+                   search_text_generation=%s, search_text_folded=%s,
                    catalog_floor_seq=CASE WHEN %s THEN 0 ELSE catalog_floor_seq END,
                    status='complete',
                    fingerprint_schema_version=%s,
@@ -2200,6 +2230,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 generation,
                 publication_epoch,
                 next_seq,
+                generation,
+                bool(search_folded),
                 fingerprint_rebase,
                 CATALOG_FINGERPRINT_SCHEMA_VERSION,
                 _json_param(counts),

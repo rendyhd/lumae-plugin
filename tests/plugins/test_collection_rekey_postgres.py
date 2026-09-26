@@ -470,3 +470,24 @@ def test_a_rekey_without_collection_items_records_no_events(migrated_db):
     assert _head(db) == head
     assert _rows(db, f"SELECT collection_deferrals FROM {P}provider_identity_transitions") == [
         ([],)]
+
+
+def test_the_rekey_generation_is_marked_as_holding_search_text(migrated_db):
+    """LUM-016: the rekey copies each track's search text into the generation
+    it publishes and marks that generation current; without the mark, search
+    silently falls back to building the text inline on every query."""
+    from plugins.LumaeAnalysis import catalog_search
+
+    db = migrated_db
+    source = _publish_old_catalogue(db)
+    _rekey(db, source)
+
+    [(generation, marked, folded)] = _rows(
+        db, f"""SELECT published_generation, search_text_generation, search_text_folded
+                  FROM {P}catalog_state WHERE catalog_instance_id=%s""", (source,))
+    assert marked == generation
+    with db.cursor() as cur:
+        assert folded == catalog_search.fold_available(cur)
+    assert _rows(db, f"""SELECT count(*) FROM {P}catalog_tracks
+                          WHERE catalog_instance_id=%s AND published_generation=%s
+                            AND search_text IS NULL""", (source, generation)) == [(0,)]

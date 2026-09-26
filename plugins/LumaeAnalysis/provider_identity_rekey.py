@@ -14,6 +14,7 @@ from dataclasses import dataclass
 
 from plugin.api import table
 
+from . import catalog_search
 from .provider_identity import canonicalize_navidrome_id
 
 
@@ -673,6 +674,9 @@ def _publish_provider_identity_rekey(
             now,
         )
     _insert_relationship_rows(cur, catalog_instance_id, next_generation, normalized)
+    # LUM-016: the catalog_state row is already held (FOR UPDATE above).
+    catalog_search.mark_search_text(
+        cur, catalog_instance_id, next_generation, catalog_search.fold_available(cur))
     _rekey_plugin_owned_state(cur, catalog_instance_id, plan.mappings)
 
     track_mapping = {

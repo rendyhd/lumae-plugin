@@ -2061,6 +2061,7 @@ def test_collection_library_route_forwards_scope_search_sort_and_artist(monkeypa
         "page": "2",
         "limit": "24",
         "catalog_instance_id": None,
+        "cursor": None,
     }
 
 
@@ -2077,11 +2078,8 @@ def test_collection_library_rejects_broad_partial_queries_before_database_work(
     result = library.browse_library(scope="all", query="ra")
 
     assert result["query"] == "ra"
-    assert result["sections"] == {
-        "albums": {"items": [], "total": 0},
-        "tracks": {"items": [], "total": 0},
-        "artists": {"items": [], "total": 0},
-    }
+    empty = {"items": [], "total": 0, "total_exact": True, "next_cursor": None}
+    assert result["sections"] == {"albums": empty, "tracks": empty, "artists": empty}
 
 
 def test_collection_track_sorts_use_source_columns_not_nested_select_aliases():
@@ -2100,8 +2098,11 @@ def test_collection_track_sorts_use_source_columns_not_nested_select_aliases():
             return []
 
     cursor = CaptureCursor()
-    for sort in library.LIBRARY_SORTS:
-        library._browse_tracks(cursor, "", None, sort, 12, 0)
+    # LUM-016: title order is the keyset query; artist and year keep this one.
+    ctx = {"catalog": "catalog-a", "generation": 1, "stored": True, "folded": True,
+           "tokens": [], "artist": None, "counts": {}}
+    for sort in ("artist", "year"):
+        library._browse_tracks(cursor, ctx, sort, 12, 0)
 
     orders = [sql.rsplit("ORDER BY", 1)[1].split("LIMIT", 1)[0] for sql in cursor.queries]
     assert all("lower(artist)" not in order for order in orders)
@@ -6523,6 +6524,16 @@ def test_catalog_generation_parameters_are_materialized_one_batch_at_a_time():
 
         def executemany(self, _sql, params):
             self.batch_sizes.append(len(params))
+
+        # LUM-016: the track insert reads unaccent and the album names first.
+        def execute(self, _sql, _params=None):
+            pass
+
+        def fetchone(self):
+            return (True,)
+
+        def fetchall(self):
+            return []
 
     rows = (
         {

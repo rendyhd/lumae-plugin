@@ -78,7 +78,12 @@ def postgres_library():
         CREATE TABLE {state} (
             catalog_instance_id TEXT PRIMARY KEY,
             published_generation BIGINT NOT NULL,
-            status TEXT NOT NULL
+            status TEXT NOT NULL,
+            entity_counts JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            -- LUM-016: NULL, so this module searches the inline text (the
+            -- stored-text path is test_workbench_search_paging_postgres).
+            search_text_generation BIGINT,
+            search_text_folded BOOLEAN
         );
         CREATE TABLE {analysis_state} (
             catalog_instance_id TEXT PRIMARY KEY,
@@ -108,6 +113,7 @@ def postgres_library():
             release_type TEXT,
             cover_art_id TEXT,
             available BOOLEAN NOT NULL,
+            search_text TEXT,
             PRIMARY KEY (catalog_instance_id, published_generation, track_id)
         );
         CREATE TABLE {links} (

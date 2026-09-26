@@ -489,6 +489,16 @@ All of these routes return **404 `{"error":"collection_manager_disabled"}`** whe
   - **Release gate:** the client must first align its album unique index (C-13 change 5, partial on `provider_album_id IS NULL` for `album_key`), or two same-name editions in one collection break its feed apply. Nothing ships before the app changes; there is no capability flag.
 - Stream, art and album details take the catalogue per request, so a mixed-catalogue collection sends each item's `catalog_instance_id` (the workbench does); an item with `null` falls back to the rule above (the only active source, else 400).
 
+### 5.1b Workbench browse paging and totals (LUM-016, 1.3.0, unreleased, P3-5c)
+
+`GET /api/collections/library` sections keep `{items, total}` and add two fields: `{items, total, total_exact, next_cursor}`.
+
+- **Paging:** `next_cursor` is an opaque string, or `null` on the last page. Send it back as `cursor=` with the same `scope`, `q`, `artist`, `sort` and `catalog_instance_id` to get the next page. The page is read by keyset on `(lower(key), id)`: tracks by `(lower(title), track_id)`, albums by `(lower(name), album_id)`, artists by `(lower(name), name)`. Its cost does not grow with depth. A cursor is bound to the section and the order it was issued for: an unreadable cursor, or one sent with another `scope`, or with a `sort` that reads in another order, is 400 `invalid_cursor` (albums by `sort=year` read in title order, so a title cursor carries over). `scope=all` has no cursor (`next_cursor` is always `null`): its sections are capped at 12 rows, as before.
+- **Legacy `page` (offset) paging:** `page=N` without `cursor` still works for old clients, and gives the same rows as the cursor walk. It is **legacy**: deep pages cost OFFSET (at 132k tracks, page 1000 takes about 0.2 s against about 2 ms by cursor). `cursor` wins when both are sent. Albums by `sort=artist` and tracks by `sort=artist` or `sort=year` have no indexable order: their `next_cursor` carries the next offset, so it pages them like `page` does, at OFFSET cost.
+- **Order:** the same keys as before, with a different tie-break for equal keys: tracks by title break ties by `track_id` (was artist, then album), and albums by title by `album_id` (was artist). `sort=year` is title order (LUM-015).
+- **Totals:** `total` is exact when `total_exact` is `true`. The unfiltered track total is the published `catalog_state.entity_counts.track`. Every other total counts matching rows up to 1,000: beyond that, `total` is `1000` and `total_exact` is `false`. Show it as "1000+". Page by `next_cursor`, not by `items.length < total`.
+- **Search** matches as before: every whitespace token (at most 8) is a case-insensitive substring of the track's title, artist, album artist or album name, and accent-insensitive when the server has `unaccent`. The text is stored at catalogue publication and indexed by trigrams when `pg_trgm` is installed. Without `pg_trgm`, search gives the same results, only slower.
+
 ### 5.2 `GET /api/collections/changes` (`collection_manager.py:1062-1097`)
 
 | Parameter | Rule |
