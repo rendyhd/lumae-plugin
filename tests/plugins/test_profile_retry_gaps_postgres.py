@@ -25,9 +25,15 @@ psycopg2 = pytest.importorskip("psycopg2")
 from pg_helpers import connect  # noqa: E402
 from test_lumae_analysis import load_plugin  # noqa: E402
 from test_catalog_publication_lock_postgres import _source, _wait_until_waiting  # noqa: E402
-from test_database_state_postgres import PROFILE_ROWS, fixture_db  # noqa: E402,F401
+from test_database_state_postgres import (  # noqa: E402,F401
+    PROFILE_ROWS,
+    _insert_profile,
+    _insert_track,
+    fixture_db,
+)
 from plugins.LumaeAnalysis import (  # noqa: E402
     catalog_enrichment,
+    database_state,
     profile_publication as publication,
     provider_identity_rekey,
 )
@@ -443,10 +449,25 @@ def _selected(db, predicate):
 
 
 def test_the_shared_predicates_select_what_the_inline_ones_did(fixture_db, monkeypatch):
-    """Over P3-10's fixture (every status, category, cooldown and limit)."""
+    """Over P3-10's fixture (every status, category, cooldown and limit),
+    plus the one row where they deliberately differ: a stale row without a
+    category and with its attempts used up. The inline SQL selected it (so a
+    stale transition reset an exhausted budget); the shared predicate keeps
+    it exhausted, and the diagnostics say so."""
     assert RETRY_LIMIT == 3
+    with fixture_db.cursor() as cur:
+        _insert_track(cur, "t-stale-exhausted", {})
+        _insert_profile(cur, "t-stale-exhausted", {"status": "stale",
+                                                   "retry_count": RETRY_LIMIT})
+    fixture_db.commit()
     due = sorted(track for track, _t, _p, _pub, state in PROFILE_ROWS if state == "due")
-    assert _selected(fixture_db, _INLINE_DUE) == due
+    assert _selected(fixture_db, _INLINE_DUE) == sorted([*due, "t-stale-exhausted"])
+    with fixture_db.cursor() as cur:
+        cur.execute(database_state._profile_work_sql(
+            "SELECT state FROM work WHERE track_id='t-stale-exhausted'"),
+            database_state.profile_work_params(SOURCE))
+        assert cur.fetchone() == ("exhausted",)
+    fixture_db.rollback()
     assert _selected(fixture_db, backfill_due_sql()) == due
     assert _selected(fixture_db, backfill_due_sql("statement_timestamp()")) == due
     armed = _selected(fixture_db, _INLINE_ARMED)
@@ -470,16 +491,18 @@ def _retried_then_admitted(db, track):
     return publication.admit_attempts(db, SOURCE, [track])[track]
 
 
-def _strand(db, track):
+def _strand(db, track, used=1):
     """What a stale transition left before P3-6: the category kept."""
     _retried_then_admitted(db, track)
-    _sql(db, f"UPDATE {P}source_profiles SET status='stale', attempt_token=NULL "
-             "WHERE catalog_instance_id=%s AND track_id=%s", (SOURCE, track))
-    assert _row(db, track) == ("stale", "analysis_error", 1, False, {"stage": "decode"})
+    _sql(db, f"UPDATE {P}source_profiles SET status='stale', attempt_token=NULL, "
+             "retry_count=%s WHERE catalog_instance_id=%s AND track_id=%s",
+         (used, SOURCE, track))
+    assert _row(db, track) == ("stale", "analysis_error", used, False, {"stage": "decode"})
 
 
 def test_migrate_requeues_rows_stranded_before_1_3_0_once(db, run_plugin_migration):
     _strand(db, "stranded")
+    _strand(db, "used-up", used=RETRY_LIMIT)
     _track(db, "released")
     token = publication.admit_attempts(db, SOURCE, ["released"])["released"]
     assert publication.release_attempts(db, SOURCE, {"released": token}, "reason") == 1
@@ -489,6 +512,9 @@ def test_migrate_requeues_rows_stranded_before_1_3_0_once(db, run_plugin_migrati
     run_plugin_migration(db)
     assert _row(db, "stranded") == ("stale", None, 1, False, None)
     assert _eligible("stranded")
+    # An exhausted row stays exhausted, with its category.
+    assert _row(db, "used-up")[:3] == ("stale", "analysis_error", RETRY_LIMIT)
+    assert not _eligible("used-up")
     # A released row keeps its category and cooldown.
     assert _row(db, "released")[:4] == ("stale", "queue_unavailable", 1, True)
     assert not _eligible("released")
@@ -509,3 +535,120 @@ def test_the_provider_rekey_requeues_an_attempt_it_abandons(db):
             cur, SOURCE, [{"entity_type": "track", "old_id": "old-id", "new_id": "new-id"}])
     db.commit()
     assert _row(db, "new-id") == ("stale", None, 1, False, None)
+
+
+# ---------------------------------------------------------------------------
+# 7. Review round 1: exhausted budgets, batch aborts, recovery lock order
+# ---------------------------------------------------------------------------
+def _exhausted_in_flight(db, track):
+    """All attempts used on rev-a (a transient failure), then admitted anyway
+    (an interactive request admits any row)."""
+    _track(db, track)
+    token = publication.admit_attempts(db, SOURCE, [track])[track]
+    _sql(db, f"""UPDATE {P}source_profiles
+                    SET retry_count=%s, retry_category='analysis_error',
+                        retry_media_signature=attempt_media_signature,
+                        retry_analyzer_ver=1, retry_profile_schema_ver=1
+                  WHERE catalog_instance_id=%s AND track_id=%s""",
+         (RETRY_LIMIT, SOURCE, track))
+    return token
+
+
+@pytest.mark.parametrize("media", ["same", "changed"])
+def test_a_stale_transition_keeps_an_exhausted_budget_for_the_same_media(db, media):
+    token = _exhausted_in_flight(db, "spent")
+    _track(db, "spent", fp=None)
+    assert not _complete(db, "spent", token)
+    _track(db, "spent", fp="rev-a" if media == "same" else "rev-b")
+    assert _row(db, "spent")[:3] == ("stale", None, RETRY_LIMIT)
+    if media == "same":
+        assert not _eligible("spent")
+        assert load_plugin().next_profile_retry_at(SOURCE, db=db) is None
+    else:
+        # New media gets a fresh budget.
+        assert _eligible("spent")
+        publication.admit_attempts(db, SOURCE, ["spent"])
+        assert _row(db, "spent")[2] == 0
+
+
+def test_a_batch_abort_retries_the_batch_after_a_minute(db, monkeypatch):
+    mod = load_plugin()
+    _track(db, "boom")
+    _sql(db, f"INSERT INTO {P}profile_backfill_state (catalog_instance_id, server_id, status) "
+             "VALUES (%s, %s, 'queued')", (SOURCE, SERVER))
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "resolve_profile_source",
+                        lambda **_kwargs: {"catalog_instance_id": SOURCE, "server_id": SERVER})
+    monkeypatch.setattr(mod, "heartbeat_profile_backfill", lambda *_args, **_kwargs: None)
+
+    def abort(*_args, **_kwargs):
+        raise RuntimeError("persistent failure")
+
+    monkeypatch.setattr(mod, "analyze_tracks_task", abort)
+    with pytest.raises(RuntimeError, match="persistent failure"):
+        mod.profile_backfill_task(SERVER, SOURCE)
+    state = _sql(db, f"""SELECT status, extract(epoch FROM next_retry_at - now())
+                           FROM {P}profile_backfill_state WHERE catalog_instance_id=%s""",
+                 (SOURCE,))[0]
+    assert state[0] == "failed" and 50 < float(state[1]) <= 60
+    # The released row is due, uncounted; the batch is not claimed yet.
+    assert _row(db, "boom")[:3] == ("stale", "queue_unavailable", 0) and _eligible("boom")
+    assert not mod.claim_profile_backfill_batch(SOURCE, db=db)
+    assert mod.next_profile_backfill_run(db=db) is None
+    _sql(db, f"UPDATE {P}profile_backfill_state SET next_retry_at=now()-interval '1 second'")
+    assert mod.claim_profile_backfill_batch(SOURCE, db=db)
+
+
+@pytest.mark.parametrize("first", ["admission", "recovery"])
+def test_concurrent_admission_and_recovery_do_not_deadlock(db, second_connection, first):
+    """As for a release: rows b then a (so a scan in table order meets b
+    first), a third connection holds a, and admission (a, b) and the
+    recovery of both aged claims queue behind it in either order."""
+    for track in ("b", "a"):
+        _track(db, track)
+        publication.admit_attempts(db, SOURCE, [track])
+    _sql(db, f"UPDATE {P}source_profiles SET analyzed_at=now()-interval '2 days'")
+    schema = _sql(db, "SELECT current_schema()")[0][0]
+    admitter = _bound(second_connection)
+    recoverer, holder = _bound(connect(schema)), _bound(connect(schema))
+    outcome = {}
+
+    def admit():
+        try:
+            outcome["tokens"] = publication.admit_attempts(admitter, SOURCE, ["a", "b"])
+        except Exception as exc:  # pragma: no cover - reported below
+            outcome["error"] = exc
+
+    def recover():
+        try:
+            outcome["recovered"] = load_plugin().recover_stale_pending_profiles(
+                SOURCE, db=recoverer)
+        except Exception as exc:  # pragma: no cover - reported below
+            outcome["error"] = exc
+
+    workers = {
+        "admission": (threading.Thread(target=admit), admitter.get_backend_pid()),
+        "recovery": (threading.Thread(target=recover), recoverer.get_backend_pid()),
+    }
+    try:
+        with holder.cursor() as cur:
+            cur.execute(f"SELECT 1 FROM {P}source_profiles WHERE catalog_instance_id=%s "
+                        "AND track_id='a' FOR UPDATE", (SOURCE,))
+        for name in [first] + [name for name in workers if name != first]:
+            worker, pid = workers[name]
+            worker.start()
+            _wait_until_waiting(pid)
+    finally:
+        holder.commit()
+        for worker, _pid in workers.values():
+            worker.join(30)
+        for connection in (recoverer, holder):
+            connection.rollback()
+            connection.close()
+    assert not any(worker.is_alive() for worker, _pid in workers.values())
+    assert "error" not in outcome, outcome
+    rows = {track: _row(db, track) for track in ("a", "b")}
+    assert all(row[0] == "pending" for row in rows.values())
+    # Recovery took both aged claims or, after admission renewed them, none.
+    assert outcome["recovered"] == (2 if first == "recovery" else 0)
+    assert {row[2] for row in rows.values()} == {outcome["recovered"] // 2}

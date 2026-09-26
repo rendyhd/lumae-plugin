@@ -509,8 +509,10 @@ def _profile_work_sql(select):
                           AND p.retry_count < %(retry_limit)s
                           AND p.retry_after > statement_timestamp()
                        THEN 'cooling'
-                     WHEN p.status IN ('failed', 'skipped_no_file', 'stale')
-                          AND p.retry_category = ANY(%(transient)s)
+                     WHEN (p.status IN ('failed', 'skipped_no_file', 'stale')
+                           AND p.retry_category = ANY(%(transient)s)
+                           -- a stale transition clears the category (P3-6)
+                           OR p.status='stale' AND p.retry_category IS NULL)
                           AND p.retry_count >= %(retry_limit)s
                        THEN 'exhausted'
                      WHEN p.status IN ('failed', 'skipped_no_file', 'stale')

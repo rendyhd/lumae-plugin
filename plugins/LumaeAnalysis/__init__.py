@@ -99,6 +99,7 @@ from .provider_identity_guard import (
 from .provider_identity_rekey import read_transition_manifest, refresh_audiomuse_health
 from .profile_publication import (
     RETRY_ARMED_SQL,
+    RETRY_LIMIT,
     admit_attempts,
     backfill_due_sql,
     complete_attempt,
@@ -1363,8 +1364,8 @@ def migrate(db):
     # P3-6 (LUM-007): before 1.3.0 a stale transition kept the category of an
     # earlier failure, and the scheduler selects a stale row only without one
     # (or a released one after its cooldown), so such rows were never retried.
-    # Stale transitions now clear it; clear it once on the rows left behind,
-    # keeping retry_count. The marker is read first, so a re-run takes no
+    # Stale transitions now clear it; clear it once on the rows left behind
+    # with attempts left, keeping retry_count (an exhausted row stays so). The marker is read first, so a re-run takes no
     # lock on source_profiles.
     cur.execute(
         f"SELECT 1 FROM {table('profile_migrations')} WHERE name='stale_retry_category_v1'"
@@ -1383,7 +1384,9 @@ def migrate(db):
               FROM migration
              WHERE p.status='stale' AND p.retry_category IS NOT NULL
                AND p.retry_category <> 'queue_unavailable'
-            """
+               AND p.retry_count < %s
+            """,
+            (RETRY_LIMIT,),
         )
     # Published validity is independent of the current analysis attempt. This
     # additive table is seeded once; runtime routing is introduced separately.
@@ -4393,6 +4396,9 @@ def claim_profile_backfill(source, db=None):
     return claimed
 
 
+BACKFILL_ABORT_RETRY_SECONDS = 60
+
+
 def claim_profile_backfill_batch(catalog_instance_id, db=None):
     """Claim one queued or interrupted batch for exclusive execution."""
     db = db or get_db()
@@ -4447,8 +4453,11 @@ def update_profile_backfill_state(
     last_error=None,
     completed=False,
     next_retry_at=None,
+    retry_after_seconds=None,
     db=None,
 ):
+    """``retry_after_seconds`` sets ``next_retry_at`` from the database clock
+    when ``next_retry_at`` is not given."""
     db = db or get_db()
     cur = db.cursor()
     cur.execute(
@@ -4458,7 +4467,8 @@ def update_profile_backfill_state(
              queued_profiles, last_error, started_at, completed_at,
              next_retry_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, now(),
-                CASE WHEN %s THEN now() ELSE NULL END, %s, now())
+                CASE WHEN %s THEN now() ELSE NULL END,
+                COALESCE(%s, now() + %s::float8 * interval '1 second'), now())
         ON CONFLICT (catalog_instance_id) DO UPDATE SET
             server_id=EXCLUDED.server_id,
             status=CASE WHEN EXCLUDED.status='complete'
@@ -4470,7 +4480,11 @@ def update_profile_backfill_state(
             queued_profiles=EXCLUDED.queued_profiles,
             last_error=EXCLUDED.last_error,
             completed_at=EXCLUDED.completed_at,
+            -- A wake (a catalogue refresh, or the recovery arm of this
+            -- batch's own admissions) runs now, except after an explicit
+            -- retry delay: an aborted batch waits it out (LUM-007).
             next_retry_at=CASE WHEN {profile_backfill_state_table()}.refresh_wake_pending
+                                    AND %s::float8 IS NULL
                                   THEN NULL ELSE EXCLUDED.next_retry_at END,
             updated_at=now()
         """,
@@ -4483,6 +4497,8 @@ def update_profile_backfill_state(
             str(last_error)[:2000] if last_error else None,
             bool(completed),
             next_retry_at,
+            retry_after_seconds,
+            retry_after_seconds,
         ),
     )
     db.commit()
@@ -4675,6 +4691,10 @@ def profile_backfill_task(server_id, catalog_instance_id):
             "failed",
             last_error=exc,
             completed=True,
+            # Its rows are due at once (an uncounted release), so a persistent
+            # error would abort a batch on every reconcile tick: retry the
+            # batch after a fixed minute instead (LUM-007).
+            retry_after_seconds=BACKFILL_ABORT_RETRY_SECONDS,
         )
         raise
 

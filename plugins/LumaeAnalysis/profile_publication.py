@@ -59,11 +59,14 @@ def scheduler_params(analyzer_version, schema_version):
 
 
 def stale_due_sql(clock="now()"):
-    """A 'stale' row is due unless it was released and is in its cooldown or
-    out of attempts. Stale transitions clear ``retry_category``, so only a
-    release (``queue_unavailable``) keeps one (LUM-007)."""
+    """A 'stale' row is due while it has attempts left, unless it was
+    released and is in its cooldown; new media is always due (a fresh
+    budget). Stale transitions clear ``retry_category``, so only a release
+    (``queue_unavailable``) keeps one; they keep ``retry_count``, so an
+    exhausted row stays exhausted for the same media (LUM-007)."""
     return f"""(p.status='stale' AND (
-                        p.retry_category IS NULL
+                        (p.retry_category IS NULL
+                         AND p.retry_count < %(retry_limit)s)
                         OR (p.retry_category='queue_unavailable'
                             AND p.retry_count < %(retry_limit)s
                             AND p.retry_after <= {clock})
