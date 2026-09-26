@@ -46,6 +46,7 @@ The server plugin work happens in parallel in `rendyhd/lumae-plugin`. The author
 - `ref_lufs` arrives as float64 in change events and as float4 in reads and snapshots until plugin P1-1. Compare with tolerance, not exact equality.
 - A `/profiles/changes` cursor ahead of head returns 400 `invalid_cursor`, not 410. Treat it as needing a full resync.
 - Timestamps: `analyzed_at` has no zone; `expires_at` and `created_at` carry the server's offset. Parse offsets explicitly.
+- **K6 edge references (plugin 1.3.0, P3-2; contract §3.7) for C-10.** Gate: `capabilities.profile_stream.edge_refs === true`. Send `edge_refs=1` on every `/profiles/changes` request and `edge_refs: true` in the v2 create body (the create response then echoes `edge_refs: true`). Only a waveform-only republish that kept its edge arrives as `payload.edge_profile_ref: {media_revision, profile_digest}` (never together with `edge_profile`); edge publications, snapshot pages, legacy bootstrap rows and `/api/profiles` always carry full edges, and journal events from before the upgrade keep their full edge. Keep the local edge when both fields match; otherwise drop it and queue the track, then fetch through `/api/profiles?ids=` (at most 500 ids, and within the host's 4,094-byte request line: batches of 100 are safe), verify the digest, and store the edge only for the event's `media_revision`. A reference can be stale (the edge was replaced later); the replacing event follows, and a fetched edge with another digest but the same revision is still valid. Without the opt-in nothing changes.
 
 ### H.3 Server capabilities you will detect
 
@@ -61,7 +62,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
 | `profile_stream.edge_refs` | Send `edge_refs=1` (query) or `edge_refs:true` (v2 body). Upserts may carry `edge_profile_ref:{media_revision, profile_digest}` instead of `edge_profile`. |
 | `edge_profiles.compact_transport` | Optionally send `edge_compact=1`. `boundaries` is omitted; rebuild it before verifying. |
 | `collections.feed_epoch` | Echo `epoch`; handle 410 `collections_resync_required` through `GET /plugins/lumae_analysis/api/collections/snapshot`; use `has_more`/`next_cursor`. |
-| `collections.contract: 2` | Send `X-Lumae-Collections-Contract: 2`; handle 409 `membership_conflict {existing_item_id}` and `idempotency_key_conflict` with `current`. |
+| `collections.contract: 2` | Send `X-Lumae-Collections-Contract: 2` on collection and shelf mutations; handle 409 `membership_conflict {item_id, existing_item_id, conflicts, current}`, `idempotency_key_conflict` with `current` (may be `null`), and `collection_exists` / `collection_deleted` on create (C-13 server note). |
 | `collections.source_scoped_items` | Items carry `catalog_instance_id`. |
 | `lumae_analysis_profiles.analyzer_versions` includes 2 | Profiles may have `analyzer_ver:2` (BS.1770-4 `ref_lufs`). |
 
@@ -182,7 +183,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
 **C-10 — Edge references (K6).**
 - When `profile_stream.edge_refs` is advertised, opt in, and handle `edge_profile_ref`:
   - keep the existing local edge (published or opportunistic) if the digest and `media_revision` match;
-  - otherwise queue the track for fetch through `GET /api/profiles?ids=` (batches of up to 100; note the comma-joined ids), writing results through the C-4 path.
+  - otherwise queue the track for fetch through `GET /api/profiles?ids=` (batches of up to 100; note the comma-joined ids; the server caps a request at 500 ids and the stock host's request line at 4,094 bytes), writing results through the C-4 path. Store a fetched edge only for the event's `media_revision`, after digest verification (H.2a, contract §3.7).
 - Without the capability, keep today's rule.
 - This is required before the plugin starts loudness v2 regeneration. Without it, every track would re-download its 19 KB edge.
 
@@ -214,12 +215,34 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
      - on 410, fetch `GET /plugins/lumae_analysis/api/collections/snapshot` and merge with the outbox, preserving unsent mutations, memberships, order and undo;
      - a failed feed shows a recoverable state, not a sticky string.
   5. **Before the plugin's LUM-014 ships:** align the album unique index with the server. Make it partial where `provider_album_id IS NULL` for `album_key`, so same-name editions with distinct provider ids can coexist. In v39, include `catalog_instance_id` when K10 is advertised.
+     - **Server note (plugin P3-5b, LUM-014 implemented in 1.3.0, unreleased; contract §5.1a "LUM-014").** Library browse and album search now return one row per catalogue album, and every row has `provider_album_id` (the catalogue `album_id`), so two "Blue" editions are two rows with one `album_key`. Store album items by `provider_album_id` and open details with `provider_album_id` + `catalog_instance_id`; `title` + `artist` alone is a legacy fallback that picks one edition. The release is gated on this index change: there is no capability flag, so nothing is released until the app has it. Art, stream and details of collection items take the item's own `catalog_instance_id` (the plugin's workbench already does). A provider-identity rekey only rewrites items of its catalogue or with `null`, and its upserts carry `catalog_instance_id`.
   6. Send `X-Lumae-Collections-Contract: 2` when `collections.contract==2`.
+  - **Server note (plugin P3-5c, LUM-016 implemented in 1.3.0, unreleased; contract §5.1b).** The workbench library browse (`GET /api/collections/library`) now gives each section `total_exact` and `next_cursor`. If the app browses the library, page with `cursor=<next_cursor>` until it is `null`, instead of `page=N` and `items.length < total`. Send it back with the same `scope` and `sort`: a cursor sent with another list or sort order is 400 `invalid_cursor`. `page` still works, but it is legacy and slow on deep pages. Show a total with `total_exact: false` as "1000+": `total` is then capped at 1000 and is not the real count. Ties between equal titles are now ordered by id. Nothing else changes, and there is no capability flag: the fields are additive.
 - **Tests:**
   - reorder retry after a lost response has the same body;
   - a server id remap is adopted and the feed continues;
   - a 410 resync keeps the outbox;
   - two same-name editions coexist.
+- **Server note (plugin P3-4a, K8 implemented in 1.3.0, unreleased; contract §5.2, §5.2a, §5.3).**
+  - Gate: `capabilities.collections.feed_epoch: true`. Every feed 200 then carries `epoch`, `head_seq`, `floor_seq` and `has_more`, whether or not you echo.
+  - 410 `collections_resync_required` (`reason`: `epoch_mismatch` or `cursor_ahead`) comes **only** when you send a non-empty `epoch`. Without it, a cursor past head is still an empty 200. So send `epoch` from the first request after you have one, and treat `cursor_ahead` like a mismatch.
+  - Snapshot: `{schema_version, scope, epoch, head_seq, floor_seq, collections, collection_count, items, item_count}`. Items are a flat list with `collection_id`; only active collections are included, so a collection missing from it is deleted. Afterwards continue the feed with `cursor=head_seq` and the snapshot's `epoch`. It is one response, not paged (20k items: 8 MB, 0.7 MB gzipped). A worker builds one snapshot at a time, so it can answer 503 with `Retry-After: 5`; retry then.
+  - Collection mutations can now answer 503 `collection_busy` with `Retry-After: 5` (a lock wait over 3 s). Keep the mutation queued and retry with the same `Idempotency-Key`.
+  - Restores above 2,000 rows commit in chunks. Send an `Idempotency-Key` and keep it for that backup: a retry with the same key and body resumes the restore. Until it finishes, reusing that key for anything else is 409 `idempotency_key_conflict`. Final revisions can exceed 2, so use the returned revision.
+- **Server note (plugin P3-4b, K9 implemented in 1.3.0, unreleased; contract §5.3 "K9", §5.4).**
+  - Gate: `capabilities.collections.contract: 2`. Then send `X-Lumae-Collections-Contract: 2` on collection mutations **and** on `POST /api/shelves/mutations`. Only the value `2` opts in; without it every response is 1.2.5's byte for byte. The header is not part of the idempotency fingerprint, and a 409 is never stored, so the same key can be retried after you adapt.
+  - `409 {"error":"idempotency_key_conflict","current":<collection>|null}`: `current` is the collection the key was **first** used on (for a create, the created id, including a server-generated one), as it is now, tombstones included. It can differ from the collection your retry names, so match it by `current.id`. It is `null` for a restore's key, a receipt stored before 1.3.0, or a missing collection: refetch then. The key's earlier request succeeded (or is a restore still in progress), so stop retrying under it. Freezing the reorder body at enqueue (change 1) is still what avoids this 409.
+  - `409 {"error":"membership_conflict","item_id","existing_item_id","conflicts":[{"item_id","existing_item_id"}…],"current":<collection>}` on item PUT and batch upsert. Nothing was written. `conflicts` lists every conflicting request item in request order (the top-level pair is the first). `existing_item_id` is the server's item for that track, provider album id or album key (exact match), or an earlier item of the same batch. Re-point each local item to its `existing_item_id`, then retry. The server no longer remaps silently under the header, so the "server id remap is adopted" test applies only without it.
+  - `POST /api/collections` with a taken id: `409 {"error":"collection_exists","current":…}`, or `collection_deleted` with the tombstone. A create retried without a key after a lost response sees its own collection in `current`.
+  - Restores are unchanged by the header (fresh ids; key conflicts carry `current: null`).
+  - Shelves: with the header, reusing a mutation `id` with another body is `409 {"error":"idempotency_key_conflict"}` (no `current`) and changes nothing; re-read `/api/shelves/changes`. The same body still replays the stored response.
+  - A request whose host auth method is neither the session nor the installation bearer (for example a plugin-scoped token) now gets 401 on every collections, shelves and personal-discovery route, instead of the shared library. Health still answers it 200, with `scope: null` on `collections`, `shelves` and `personal_discovery`: treat a null `scope` as "collections unavailable for this caller".
+- **Server note (plugin P3-5a, K10 implemented in 1.3.0, unreleased; contract §5.1 "K10", §5.1a).**
+  - Gate: `capabilities.collections.source_scoped_items: true`. Every item object (write responses, collection detail, feed payloads, snapshot, backups) then has `catalog_instance_id`: a string, or `null` when the server does not know the catalogue.
+  - Send the item's `catalog_instance_id` on every item write. Omitted, the server keeps the stored value for an existing id, or uses the install's only catalogue (else `null`).
+  - Membership is per catalogue: give the v39 unique indexes `COALESCE(catalog_instance_id, '')` after the collection (step 5). A 409 `membership_conflict` now means the same key **in the same catalogue**.
+  - The upgrade backfill (only when exactly one catalogue has ever existed) emits no feed events: when the capability first appears, take one snapshot to pick up the stored values.
+  - Workbench reads (`/library`, `/stats`, `/album`, `/stream`, `/art`, `/api/collections/search`) take `catalog_instance_id`. With several active sources, omitting it is 400 `catalog_instance_required` listing `catalogs`; an unknown or inactive id is 404 `catalog_instance_not_found`.
 
 **C-14 — Readiness UI (LUM-017 client).** Show per-stream states: catalogue, waveform profiles, edge profiles, relationships, collections. Each has availability, freshness and last outcome, including `deferred` from C-3 and truthful partial success, with a scoped retry. Accessibility: screen-reader labels, focus order, and dynamic type or zoom.
 

@@ -14,7 +14,7 @@ import uuid
 
 from plugin.api import logger, table
 
-from . import migrations
+from . import catalog_search, migrations
 from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .provider_identity_guard import inspect_catalog_identity, observe_provider_version
 from .status_model import migrate_status_summary, refresh_status_summary
@@ -1341,6 +1341,8 @@ def migrate_catalog(db):
     )
     # P2-1: committed status summary (analysis_state counts, status_summary).
     migrate_status_summary(cur)
+    # P3-5c (LUM-016): stored workbench search text, trigram and keyset indexes.
+    catalog_search.migrate_search_text(cur)
     cur.close()
 
 
@@ -1358,6 +1360,9 @@ def _json_param(value):
 
 
 def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, rows, now):
+    """Insert one entity type's rows of a new generation. For tracks, also
+    their search text (LUM-016); returns whether it was folded with unaccent
+    (None for other types), which the caller records in catalog_state."""
     table_name, id_column = ENTITY_TABLES[entity_type]
     common = ["catalog_instance_id", "published_generation", id_column]
     if entity_type == "library":
@@ -1407,6 +1412,19 @@ def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, r
     columns = common + fields + ["available", "first_seen_at", "last_seen_at", "deleted_at"]
     placeholders = ["%s"] * len(columns)
     placeholders[columns.index("payload")] = "%s::jsonb"
+    album_names = folded = None
+    if entity_type == "track":
+        # LUM-016: the workbench search text is written with the rows, from
+        # this generation's album names (albums are inserted first).
+        folded = catalog_search.fold_available(cur)
+        cur.execute(
+            f"SELECT album_id, name FROM {t('catalog_albums')} "
+            "WHERE catalog_instance_id=%s AND published_generation=%s AND available",
+            (catalog_instance_id, generation),
+        )
+        album_names = dict(cur.fetchall())
+        columns.append("search_text")
+        placeholders.append(catalog_search.search_text_placeholder(folded))
     sql = f"INSERT INTO {t(table_name)} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
     def parameters():
         for row in rows:
@@ -1415,11 +1433,18 @@ def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, r
                 value = row.get(field)
                 values.append(_json_param(value) if field == "payload" else value)
             values.extend([True, now, now, None])
+            if album_names is not None:
+                values.append(catalog_search.search_text_value(
+                    row.get("title"), row.get("artist_display"),
+                    row.get("album_artist_display"), album_names.get(row.get("album_id"))))
             yield tuple(values)
 
     params = parameters()
     for batch in _chunks(params):
         cur.executemany(sql, batch)
+    # How the search text was folded (tracks only): the caller records it
+    # with the generation in catalog_state, under its publication lock.
+    return folded
 
 
 def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
@@ -1684,9 +1709,14 @@ def _after_publication(db, catalog_instance_id, generation):
     Best effort, like the status summary. What a failure leaves goes with the
     next publication, or with maintenance: compact_enrichment_storage sweeps
     the edges and prune_catalog_storage the generations at install.
+
+    Before those, published profiles the new generation lacks but its diff
+    did not name are withdrawn (_withdraw_orphaned_profiles), so the sweep
+    takes their edges too.
     """
     from .profile_publication import purge_withdrawn_edges
 
+    _withdraw_orphaned_profiles(db, catalog_instance_id)
     steps = (
         (
             "purge unpublished edge payloads",
@@ -1715,6 +1745,41 @@ def _after_publication(db, catalog_instance_id, generation):
             logger.warning(
                 "lumae_analysis could not %s of %s", label, catalog_instance_id, exc_info=True,
             )
+
+
+def _withdraw_orphaned_profiles(db, catalog_instance_id):
+    """Withdraw the source's published profiles its generation lacks (P3-7).
+
+    A publication withdraws the profiles of the tracks its diff deletes. A
+    published profile whose track was already missing from the previous
+    generation is never in a diff (the 1.2.5 upgrade seeded such rows), so
+    each refresh, including one without changes, compares the published
+    profiles with the generation it leaves published. In short batches after
+    the refresh commits, bounded per refresh; best effort, like the other
+    post-publication work.
+    """
+    from .profile_publication import withdraw_orphaned_profiles
+
+    try:
+        withdrawn = withdraw_orphaned_profiles(db, catalog_instance_id)
+    except Exception:
+        try:
+            rollback = getattr(db, "rollback", None)
+            if callable(rollback):
+                rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "lumae_analysis could not withdraw orphaned profiles of %s",
+            catalog_instance_id, exc_info=True,
+        )
+        return 0
+    if withdrawn:
+        logger.warning(
+            "lumae_analysis withdrew %s published profiles of %s whose tracks are "
+            "no longer in the catalogue", len(withdrawn), catalog_instance_id,
+        )
+    return len(withdrawn)
 
 
 def refresh_catalog(server_id=None, db=None, bridge=None):
@@ -2052,6 +2117,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             )
             cur.close()
             db.commit()
+            _withdraw_orphaned_profiles(db, catalog_instance_id)
             # P2-1: the catalogue is unchanged, but AudioMuse may have mapped
             # or fingerprinted tracks since (an analysis run ends here).
             refresh_status_summary(db, catalog_instance_id, getattr(provider_bridge, "core", None))
@@ -2073,9 +2139,13 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 "changes": 0,
             }
 
+        search_folded = None
         for entity_type in ENTITY_ORDER:
             rows = normalized[ENTITY_COLLECTIONS[entity_type]]
-            _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, rows, now)
+            folded = _insert_generation_rows(
+                cur, entity_type, catalog_instance_id, generation, rows, now)
+            if entity_type == "track":
+                search_folded = folded
         _insert_relationship_rows(cur, catalog_instance_id, generation, normalized)
 
         ordered_changes = [change for change in changes if change[2] == "upsert"]
@@ -2140,6 +2210,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             f"""
             UPDATE {t("catalog_state")}
                SET published_generation=%s, catalog_epoch=%s, catalog_head_seq=%s,
+                   search_text_generation=%s, search_text_folded=%s,
                    catalog_floor_seq=CASE WHEN %s THEN 0 ELSE catalog_floor_seq END,
                    status='complete',
                    fingerprint_schema_version=%s,
@@ -2159,6 +2230,8 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 generation,
                 publication_epoch,
                 next_seq,
+                generation,
+                bool(search_folded),
                 fingerprint_rebase,
                 CATALOG_FINGERPRINT_SCHEMA_VERSION,
                 _json_param(counts),
@@ -2318,6 +2391,9 @@ def read_change_page(
     columns,
     ahead_message,
     state_columns=(),
+    page_select=None,
+    page_join="",
+    page_params=(),
 ):
     """Read one v1 ``/changes`` page from a single snapshot (P1-7).
 
@@ -2333,6 +2409,12 @@ def read_change_page(
     order, and ``columns[0]`` must be ``"seq"``. ``state`` maps each of
     ``state_columns`` (extra columns of the state row) to its value in that
     same snapshot.
+
+    ``page_select`` (with ``page_join`` and its ``page_params``) reads the
+    page's rows through a join in the same statement: the rows are chosen
+    first (alias ``c``, holding ``columns``), then joined, so a join runs
+    once per returned row. Each row then holds ``page_select``, which must
+    start with ``c.seq``.
     """
     if columns[0] != "seq":
         raise ValueError("read_change_page needs seq as the first column")
@@ -2341,6 +2423,21 @@ def read_change_page(
     select = ", ".join(f"c.{column}" for column in columns)
     extra = "".join(f", {column}" for column in state_columns)
     extra_out = "".join(f", s.{column}" for column in state_columns)
+    page = f"""
+              SELECT {select}
+                FROM {t(changes_table)} AS c
+               WHERE c.catalog_instance_id=%s AND c.epoch=s.epoch
+                 AND c.seq>%s AND c.seq<=s.head_seq
+                 AND s.epoch=%s AND s.floor_seq<=%s
+               ORDER BY c.seq
+               LIMIT %s"""
+    if page_select is not None:
+        if not page_select.startswith("c.seq"):
+            raise ValueError("read_change_page needs c.seq first in page_select")
+        page = f"""
+              SELECT {page_select}
+                FROM ({page}) AS c
+                {page_join}"""
     cur.execute(
         f"""
         WITH state AS (
@@ -2351,14 +2448,7 @@ def read_change_page(
         )
         SELECT s.epoch, s.head_seq, s.floor_seq{extra_out}, page.*
           FROM state AS s
-          LEFT JOIN LATERAL (
-              SELECT {select}
-                FROM {t(changes_table)} AS c
-               WHERE c.catalog_instance_id=%s AND c.epoch=s.epoch
-                 AND c.seq>%s AND c.seq<=s.head_seq
-                 AND s.epoch=%s AND s.floor_seq<=%s
-               ORDER BY c.seq
-               LIMIT %s
+          LEFT JOIN LATERAL ({page}
           ) AS page ON TRUE
          ORDER BY page.seq
         """,
@@ -2369,6 +2459,7 @@ def read_change_page(
             str(cursor["epoch"]),
             after,
             limit,
+            *page_params,
         ),
     )
     result = cur.fetchall()

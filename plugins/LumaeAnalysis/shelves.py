@@ -5,12 +5,13 @@ transaction. The sequence on each latest record is a compact, tombstone-preservi
 change feed; consumers can restart paging without retaining an unbounded log of
 old artwork snapshots or old arrangements.
 """
+import hashlib
 import json
 import math
 from flask import jsonify, request
 from plugin.api import get_db, table
 from . import migrations
-from .collection_manager import current_principal, require_collections_enabled
+from .collection_manager import contract_v2, current_principal, require_collections_enabled
 
 SHELVES_SCHEMA_VERSION = 1
 
@@ -31,6 +32,8 @@ def migrate_shelves(db):
         cur.execute(f"""CREATE TABLE IF NOT EXISTS {table('shelf_mutations')} (
             principal TEXT NOT NULL, catalog_id TEXT NOT NULL, id TEXT NOT NULL,
             response JSONB NOT NULL, PRIMARY KEY (principal,catalog_id,id))""")
+        # 1.3.0: a receipt binds its request body (NULL on older receipts).
+        migrations.ensure_columns(cur, table("shelf_mutations"), "request_fingerprint TEXT")
 
 
 def _text(value, name, maximum=512):
@@ -101,6 +104,24 @@ def validate_mutation(body):
     else:
         raise ValueError("Invalid operation")
     return body
+
+
+def request_fingerprint(body):
+    """SHA-256 of the canonical mutation body; the receipt key is its ``id``."""
+    canonical = json.dumps(body, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+def _lock_scopes(cur, scopes):
+    """Lock shelf scopes in (principal, catalogue) order, creating missing rows.
+
+    Every shelf seq is allocated under its scope's lock, held to commit, so
+    within a scope seqs commit in order and a reader paging by
+    ``seq > cursor`` never skips a record that commits late (LUM-004).
+    """
+    for scope in sorted(set(scopes)):
+        cur.execute(f"INSERT INTO {table('shelf_scopes')} (principal,catalog_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", scope)
+        cur.execute(f"SELECT principal FROM {table('shelf_scopes')} WHERE principal=%s AND catalog_id=%s FOR UPDATE", scope)
 
 
 def _load(cur, scope, record_type):
@@ -178,13 +199,28 @@ def apply_mutation(cur, scope, body):
 
 
 def rekey_shelves(cur, catalog_id, mapping):
-    """Rewrite exact references, publishing new sequence values for other devices."""
+    """Rewrite exact references, publishing new sequence values for other devices.
+
+    Like a mutation, a rewrite takes its scope's lock before it allocates a
+    seq, and the caller's transaction holds the lock until commit. Scopes with
+    nothing to rewrite are not locked.
+    """
     from .provider_identity_rekey import _replace_exact
-    for name, key_columns, payload_column in (
+    tables = (
         ("shelf_records", ("principal", "catalog_id", "type", "id"), "value"),
         ("shelf_mutations", ("principal", "catalog_id", "id"), "response"),
-    ):
-        cur.execute(f"SELECT {','.join(key_columns)},{payload_column} FROM {table(name)} WHERE catalog_id=%s", (catalog_id,))
+    )
+    affected = set()
+    for name, _, payload_column in tables:
+        cur.execute(f"SELECT principal,{payload_column} FROM {table(name)} WHERE catalog_id=%s", (catalog_id,))
+        affected.update(row[0] for row in cur.fetchall() if _replace_exact(row[1], mapping) != row[1])
+    if not affected:
+        return
+    _lock_scopes(cur, [(principal, catalog_id) for principal in affected])
+    for name, key_columns, payload_column in tables:
+        # Read again under the locks: a mutation may have committed meanwhile.
+        cur.execute(f"SELECT {','.join(key_columns)},{payload_column} FROM {table(name)} "
+                    "WHERE catalog_id=%s AND principal=ANY(%s)", (catalog_id, sorted(affected)))
         for row in cur.fetchall():
             rewritten = _replace_exact(row[-1], mapping)
             if rewritten == row[-1]:
@@ -228,19 +264,22 @@ def register_shelf_routes(bp):
         except (ValueError, TypeError) as error:
             return jsonify(error=str(error)), 400
         scope = (current_principal(), catalog)
+        fingerprint = request_fingerprint(body)
         db = get_db()
         try:
             with db.cursor() as cur:
-                cur.execute(f"INSERT INTO {table('shelf_scopes')} (principal,catalog_id) VALUES (%s,%s) ON CONFLICT DO NOTHING", scope)
-                cur.execute(f"SELECT principal FROM {table('shelf_scopes')} WHERE principal=%s AND catalog_id=%s FOR UPDATE", scope)
-                cur.execute(f"SELECT response FROM {table('shelf_mutations')} WHERE principal=%s AND catalog_id=%s AND id=%s", (*scope, body["id"]))
+                _lock_scopes(cur, [scope])
+                cur.execute(f"SELECT response,request_fingerprint FROM {table('shelf_mutations')} WHERE principal=%s AND catalog_id=%s AND id=%s", (*scope, body["id"]))
                 receipt = cur.fetchone()
-                if receipt:
+                if receipt and receipt[1] is not None and receipt[1] != fingerprint and contract_v2():
+                    # K9: this mutation id already acknowledged another body.
+                    payload, status = {"error": "idempotency_key_conflict"}, 409
+                elif receipt:
                     payload, status = receipt[0], 200
                 else:
                     payload, status = apply_mutation(cur, scope, body)
                     if status == 200:
-                        cur.execute(f"INSERT INTO {table('shelf_mutations')} (principal,catalog_id,id,response) VALUES (%s,%s,%s,%s::jsonb)", (*scope, body["id"], json.dumps(payload)))
+                        cur.execute(f"INSERT INTO {table('shelf_mutations')} (principal,catalog_id,id,response,request_fingerprint) VALUES (%s,%s,%s,%s::jsonb,%s)", (*scope, body["id"], json.dumps(payload), fingerprint))
             db.commit()
         except Exception:
             db.rollback()

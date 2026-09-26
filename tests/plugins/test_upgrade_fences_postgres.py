@@ -526,6 +526,32 @@ def test_runbook_repair_a_realigns_the_feed_head(collection_api):
     assert changes == [1, 7, 8]
 
 
+def test_runbook_repair_c_rotates_the_feed_epoch(collection_api):
+    manager_mod, call, connect = collection_api
+    assert call("POST", "/api/collections", {"id": "a", "name": "a"}).status_code == 201
+    before = call("GET", "/api/collections/changes").get_json()
+    db = connect()
+    try:
+        with db.cursor() as cur:
+            cur.execute(_runbook_sql(
+                "UPDATE plugin_lumae_analysis__collection_feed_state\n   SET epoch = gen_random_uuid()"))
+        db.commit()
+    finally:
+        db.rollback()
+        db.close()
+    stale = call("GET", f"/api/collections/changes?cursor={before['next_cursor']}"
+                        f"&epoch={before['epoch']}")
+    assert stale.status_code == 410
+    assert stale.get_json() == {"error": "collections_resync_required", "reason": "epoch_mismatch"}
+    after = call("GET", "/api/collections/changes").get_json()
+    assert after["epoch"] != before["epoch"]
+    assert (after["head_seq"], after["floor_seq"]) == (before["head_seq"], before["head_seq"])
+    # History and clients that do not echo the epoch are unaffected.
+    assert after["changes"] == before["changes"]
+    assert call("GET", f"/api/collections/changes?cursor={after['head_seq']}"
+                       f"&epoch={after['epoch']}").status_code == 200
+
+
 # -- health -------------------------------------------------------------------
 
 
@@ -537,12 +563,13 @@ def test_health_reports_integrity(migrated_db, monkeypatch):
     assert body["plugin_version"] == mod.PLUGIN_VERSION == "1.3.0"
     integrity = body["integrity"]
     assert set(integrity) == {
-        "collections_feed_ok", "profiles_unpublished_ready", "profiles_checked_at",
-        "fences_installed",
+        "collections_feed_ok", "profiles_unpublished_ready", "profiles_orphaned",
+        "profiles_checked_at", "fences_installed",
     }
     assert integrity["collections_feed_ok"] is True
     assert integrity["fences_installed"] is True
     assert integrity["profiles_unpublished_ready"] == 0  # counted by the migration
+    assert integrity["profiles_orphaned"] == 0
     assert integrity["profiles_checked_at"].endswith("Z")
     with migrated_db.cursor() as cur:
         cur.execute(
@@ -559,11 +586,22 @@ def test_health_reports_integrity(migrated_db, monkeypatch):
                         'catalog-media:rev-a', now(), 'ready')""",
             (SOURCE,),
         )
+        # P3-7: a published profile of a track the catalogue does not have.
+        cur.execute(
+            f"""INSERT INTO {P}published_source_profiles
+                (catalog_instance_id, track_id, sample_rate, duration_ms, ref_lufs,
+                 start_ramp, end_ramp, analyzer_ver, profile_schema_ver,
+                 media_signature, analyzed_at)
+                VALUES (%s, 'gone', 48000, 1234, -14, 'a', 'b', 1, 1,
+                        'catalog-media:rev-a', now())""",
+            (SOURCE,),
+        )
     migrated_db.commit()
     body = plugin_client(mod).get("/api/health").get_json()
-    # The feed check is live; the profile count is the persisted snapshot.
+    # The feed check is live; the profile counts are the persisted snapshot.
     assert body["integrity"]["collections_feed_ok"] is False
     assert body["integrity"]["profiles_unpublished_ready"] == 0
+    assert body["integrity"]["profiles_orphaned"] == 0
     logged = []
     monkeypatch.setattr(mod, "logger", SimpleNamespace(
         error=lambda *args: logged.append(("error", args[0])),
@@ -573,10 +611,13 @@ def test_health_reports_integrity(migrated_db, monkeypatch):
     status = mod.log_integrity_on_start(migrated_db)  # the web-worker start hook
     assert status["collections_feed_ok"] is False
     assert status["profiles_unpublished_ready"] == 1
-    assert [level for level, _ in logged] == ["error", "warning"]
+    assert status["profiles_orphaned"] == 1
+    assert [level for level, _ in logged] == ["error", "warning", "warning"]
     assert "feed invariant" in logged[0][1]
+    assert "no longer in the catalogue" in logged[2][1]
     body = plugin_client(mod).get("/api/health").get_json()
     assert body["integrity"]["profiles_unpublished_ready"] == 1
+    assert body["integrity"]["profiles_orphaned"] == 1
 
 
 @pytest.mark.parametrize("undo", [
@@ -643,6 +684,7 @@ def test_health_integrity_is_null_without_a_database(monkeypatch):
     assert body["integrity"] == {
         "collections_feed_ok": None,
         "profiles_unpublished_ready": None,
+        "profiles_orphaned": None,
         "profiles_checked_at": None,
         "fences_installed": None,
     }

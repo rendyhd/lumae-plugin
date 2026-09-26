@@ -1,0 +1,74 @@
+[
+ {
+  "request": "stats",
+  "status": 200,
+  "body": "{\"album_count\":3,\"artist_count\":2,\"track_count\":6}\n",
+  "headers": {}
+ },
+ {
+  "request": "albums by title",
+  "status": 200,
+  "body": "{\"artist\":null,\"limit\":36,\"page\":1,\"query\":\"\",\"scope\":\"albums\",\"sections\":{\"albums\":{\"items\":[{\"album_key\":\"radiohead::a moon shaped pool\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-moon-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"A Moon Shaped Pool\",\"track_count\":1,\"year\":null},{\"album_key\":\"radiohead::in rainbows\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"In Rainbows\",\"track_count\":3,\"year\":null},{\"album_key\":\"beyonc\\u00e9::lemonade\",\"artist\":\"Beyonc\\u00e9\",\"cover_item_id\":\"al-bey-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"Lemonade\",\"track_count\":2,\"year\":null}],\"total\":3}},\"sort\":\"title\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "albums by artist",
+  "status": 200,
+  "body": "{\"artist\":null,\"limit\":2,\"page\":2,\"query\":\"\",\"scope\":\"albums\",\"sections\":{\"albums\":{\"items\":[{\"album_key\":\"radiohead::in rainbows\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"In Rainbows\",\"track_count\":3,\"year\":null}],\"total\":3}},\"sort\":\"artist\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "albums by year",
+  "status": 200,
+  "body": "{\"artist\":null,\"limit\":36,\"page\":1,\"query\":\"\",\"scope\":\"albums\",\"sections\":{\"albums\":{\"items\":[{\"album_key\":\"radiohead::a moon shaped pool\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-moon-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"A Moon Shaped Pool\",\"track_count\":1,\"year\":null},{\"album_key\":\"radiohead::in rainbows\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"In Rainbows\",\"track_count\":3,\"year\":null},{\"album_key\":\"beyonc\\u00e9::lemonade\",\"artist\":\"Beyonc\\u00e9\",\"cover_item_id\":\"al-bey-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"Lemonade\",\"track_count\":2,\"year\":null}],\"total\":3}},\"sort\":\"year\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "tracks by artist",
+  "status": 200,
+  "body": "{\"artist\":null,\"limit\":36,\"page\":1,\"query\":\"\",\"scope\":\"tracks\",\"sections\":{\"tracks\":{\"items\":[{\"album\":\"Lemonade\",\"album_artist\":\"Beyonc\\u00e9\",\"artist\":\"Beyonc\\u00e9\",\"cover_item_id\":\"al-bey-t1\",\"kind\":\"track\",\"rating\":null,\"title\":\"Hold Up\",\"track_id\":\"al-bey-t1\",\"year\":null},{\"album\":\"Lemonade\",\"album_artist\":\"Beyonc\\u00e9\",\"artist\":\"Beyonc\\u00e9\",\"cover_item_id\":\"al-bey-t2\",\"kind\":\"track\",\"rating\":null,\"title\":\"Sorry\",\"track_id\":\"al-bey-t2\",\"year\":null},{\"album\":\"A Moon Shaped Pool\",\"album_artist\":\"Radiohead\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-moon-t1\",\"kind\":\"track\",\"rating\":null,\"title\":\"Burn the Witch\",\"track_id\":\"al-moon-t1\",\"year\":null},{\"album\":\"In Rainbows\",\"album_artist\":\"Radiohead\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t2\",\"kind\":\"track\",\"rating\":null,\"title\":\"15 Step\",\"track_id\":\"al-rain-t2\",\"year\":null},{\"album\":\"In Rainbows\",\"album_artist\":\"Radiohead\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t3\",\"kind\":\"track\",\"rating\":null,\"title\":\"Nude\",\"track_id\":\"al-rain-t3\",\"year\":null},{\"album\":\"In Rainbows\",\"album_artist\":\"Radiohead\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t1\",\"kind\":\"track\",\"rating\":null,\"title\":\"Reckoner\",\"track_id\":\"al-rain-t1\",\"year\":null}],\"total\":6}},\"sort\":\"artist\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "artists",
+  "status": 200,
+  "body": "{\"artist\":null,\"limit\":36,\"page\":1,\"query\":\"\",\"scope\":\"artists\",\"sections\":{\"artists\":{\"items\":[{\"album_count\":1,\"artist\":\"Beyonc\\u00e9\",\"cover_item_id\":\"al-bey-t1\",\"first_year\":null,\"kind\":\"artist\",\"latest_year\":null,\"title\":\"Beyonc\\u00e9\",\"track_count\":2},{\"album_count\":2,\"artist\":\"Radiohead\",\"cover_item_id\":\"al-moon-t1\",\"first_year\":null,\"kind\":\"artist\",\"latest_year\":null,\"title\":\"Radiohead\",\"track_count\":4}],\"total\":2}},\"sort\":\"title\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "search all",
+  "status": 200,
+  "body": "{\"artist\":null,\"limit\":36,\"page\":1,\"query\":\"radio\",\"scope\":\"all\",\"sections\":{\"albums\":{\"items\":[{\"album_key\":\"radiohead::a moon shaped pool\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-moon-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"A Moon Shaped Pool\",\"track_count\":1,\"year\":null},{\"album_key\":\"radiohead::in rainbows\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"In Rainbows\",\"track_count\":3,\"year\":null}],\"total\":2},\"artists\":{\"items\":[{\"album_count\":2,\"artist\":\"Radiohead\",\"cover_item_id\":\"al-moon-t1\",\"first_year\":null,\"kind\":\"artist\",\"latest_year\":null,\"title\":\"Radiohead\",\"track_count\":4}],\"total\":1},\"tracks\":{\"items\":[{\"album\":\"In Rainbows\",\"album_artist\":\"Radiohead\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t2\",\"kind\":\"track\",\"rating\":null,\"title\":\"15 Step\",\"track_id\":\"al-rain-t2\",\"year\":null},{\"album\":\"A Moon Shaped Pool\",\"album_artist\":\"Radiohead\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-moon-t1\",\"kind\":\"track\",\"rating\":null,\"title\":\"Burn the Witch\",\"track_id\":\"al-moon-t1\",\"year\":null},{\"album\":\"In Rainbows\",\"album_artist\":\"Radiohead\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t3\",\"kind\":\"track\",\"rating\":null,\"title\":\"Nude\",\"track_id\":\"al-rain-t3\",\"year\":null},{\"album\":\"In Rainbows\",\"album_artist\":\"Radiohead\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t1\",\"kind\":\"track\",\"rating\":null,\"title\":\"Reckoner\",\"track_id\":\"al-rain-t1\",\"year\":null}],\"total\":4}},\"sort\":\"title\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "artist filter",
+  "status": 200,
+  "body": "{\"artist\":\"Radiohead\",\"limit\":36,\"page\":1,\"query\":\"\",\"scope\":\"albums\",\"sections\":{\"albums\":{\"items\":[{\"album_key\":\"radiohead::a moon shaped pool\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-moon-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"A Moon Shaped Pool\",\"track_count\":1,\"year\":null},{\"album_key\":\"radiohead::in rainbows\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t1\",\"kind\":\"album\",\"provider_album_id\":null,\"rating\":null,\"title\":\"In Rainbows\",\"track_count\":3,\"year\":null}],\"total\":2}},\"sort\":\"title\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "album by key",
+  "status": 200,
+  "body": "{\"album\":{\"album_key\":\"radiohead::in rainbows\",\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t1\",\"kind\":\"album\",\"provider_album_id\":\"al-rain\",\"title\":\"In Rainbows\",\"track_count\":3,\"year\":null},\"metadata_source\":\"provider_catalog\",\"provider_type\":\"navidrome\",\"tracks\":[{\"album\":\"In Rainbows\",\"album_artist\":\"Radiohead\",\"album_id\":\"al-rain\",\"analyzed\":false,\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t1\",\"disc_number\":1,\"duration_seconds\":\"200\",\"kind\":\"track\",\"provider_index\":2,\"provider_type\":\"navidrome\",\"rating\":null,\"title\":\"Reckoner\",\"track_id\":\"al-rain-t1\",\"track_number\":1,\"year\":null},{\"album\":\"In Rainbows\",\"album_artist\":\"Radiohead\",\"album_id\":\"al-rain\",\"analyzed\":false,\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t2\",\"disc_number\":1,\"duration_seconds\":\"200\",\"kind\":\"track\",\"provider_index\":0,\"provider_type\":\"navidrome\",\"rating\":null,\"title\":\"15 Step\",\"track_id\":\"al-rain-t2\",\"track_number\":2,\"year\":null},{\"album\":\"In Rainbows\",\"album_artist\":\"Radiohead\",\"album_id\":\"al-rain\",\"analyzed\":false,\"artist\":\"Radiohead\",\"cover_item_id\":\"al-rain-t3\",\"disc_number\":1,\"duration_seconds\":\"200\",\"kind\":\"track\",\"provider_index\":1,\"provider_type\":\"navidrome\",\"rating\":null,\"title\":\"Nude\",\"track_id\":\"al-rain-t3\",\"track_number\":3,\"year\":null}]}\n",
+  "headers": {}
+ },
+ {
+  "request": "album by id",
+  "status": 200,
+  "body": "{\"album\":{\"album_key\":\"beyonc\\u00e9::lemonade\",\"artist\":\"Beyonc\\u00e9\",\"cover_item_id\":\"al-bey-t1\",\"kind\":\"album\",\"provider_album_id\":\"al-bey\",\"title\":\"Lemonade\",\"track_count\":2,\"year\":null},\"metadata_source\":\"provider_catalog\",\"provider_type\":\"navidrome\",\"tracks\":[{\"album\":\"Lemonade\",\"album_artist\":\"Beyonc\\u00e9\",\"album_id\":\"al-bey\",\"analyzed\":false,\"artist\":\"Beyonc\\u00e9\",\"cover_item_id\":\"al-bey-t1\",\"disc_number\":1,\"duration_seconds\":\"200\",\"kind\":\"track\",\"provider_index\":0,\"provider_type\":\"navidrome\",\"rating\":null,\"title\":\"Hold Up\",\"track_id\":\"al-bey-t1\",\"track_number\":1,\"year\":null},{\"album\":\"Lemonade\",\"album_artist\":\"Beyonc\\u00e9\",\"album_id\":\"al-bey\",\"analyzed\":false,\"artist\":\"Beyonc\\u00e9\",\"cover_item_id\":\"al-bey-t2\",\"disc_number\":1,\"duration_seconds\":\"200\",\"kind\":\"track\",\"provider_index\":1,\"provider_type\":\"navidrome\",\"rating\":null,\"title\":\"Sorry\",\"track_id\":\"al-bey-t2\",\"track_number\":2,\"year\":null}]}\n",
+  "headers": {}
+ },
+ {
+  "request": "album missing",
+  "status": 200,
+  "body": "{\"album\":{\"album_key\":\"nobody::nope\",\"artist\":\"Nobody\",\"cover_item_id\":null,\"kind\":\"album\",\"provider_album_id\":null,\"title\":\"Nope\",\"track_count\":0,\"year\":null},\"metadata_source\":\"provider_catalog\",\"provider_type\":\"unknown\",\"tracks\":[]}\n",
+  "headers": {}
+ },
+ {
+  "request": "album bad",
+  "status": 400,
+  "body": "{\"error\":\"Album title and artist are required\"}\n",
+  "headers": {}
+ }
+]

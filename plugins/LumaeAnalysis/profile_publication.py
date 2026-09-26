@@ -1,16 +1,131 @@
 """Fenced source-profile attempts and atomic public profile publication."""
 
+import json
 from uuid import uuid4
 
 
 RETRY_LIMIT = 3
 RETRY_DELAYS_SECONDS = (60, 300, 1800)
+# Transient: retried after a RETRY_DELAYS_SECONDS cooldown while retry_count < RETRY_LIMIT.
+# Revision: retried only for new media, a new analyzer or a new schema.
+# The scheduler predicates below select TRANSIENT_FAILURES, so a category
+# added here is retried by fetch_backfill_rows and next_profile_retry_at too.
 TRANSIENT_FAILURES = frozenset((
     "download_unavailable", "media_unavailable", "analysis_timeout",
     "analysis_error", "queue_unavailable",
+    "analysis_crash",  # LUM-018: the analysis child died (signal, exit, MemoryError)
 ))
-REVISION_FAILURES = frozenset(("silent_audio", "unsupported_media", "resource_limit"))
+REVISION_FAILURES = frozenset((
+    "silent_audio", "unsupported_media", "resource_limit",
+    "media_error",  # LUM-018: the decoder rejected the data (InvalidDataError)
+))
 SAFE_FAILURES = TRANSIENT_FAILURES | REVISION_FAILURES
+# /api/profiles reports ``last_error`` as ``failed[].reason``. Categories added
+# after 1.2.5 are reported as the reason 1.2.5 gave for the same failure, so
+# clients never see a new value without a capability gate (contract §8.5).
+_PUBLIC_REASONS = {"media_error": "unsupported_media", "analysis_crash": "analysis_error"}
+
+
+# P3-6: the cooldown after a used attempt, by the attempts used before it:
+# RETRY_DELAYS_SECONDS[retry_count], the last slot once they run out. Every
+# path that arms ``retry_after`` (a failure, a release, a recovered claim)
+# uses it with the row's retry_count before the update.
+def retry_delay_sql(count="retry_count"):
+    first, second, rest = RETRY_DELAYS_SECONDS
+    return (f"make_interval(secs => CASE {count} WHEN 0 THEN {int(first)} "
+            f"WHEN 1 THEN {int(second)} ELSE {int(rest)} END)")
+
+
+# P3-6: the scheduler's predicates, shared by fetch_backfill_rows (what a
+# batch selects), next_profile_retry_at (when to wake for a cooldown) and the
+# /database-state work states, so the three cannot drift. Fragments over the
+# attempt row ``p`` (source_profiles) and its occurrence ``t`` in the
+# published catalogue generation, with the named parameters
+# scheduler_params() gives. ``clock`` is what a cooldown is compared with.
+MEDIA_KNOWN_SQL = "NULLIF(t.media_fp, '') IS NOT NULL"
+RETRY_REVISION_CHANGED_SQL = f"""({MEDIA_KNOWN_SQL}
+                 AND p.retry_media_signature IS NOT NULL
+                 AND p.retry_media_signature IS DISTINCT FROM
+                     ('catalog-media:' || t.media_fp))"""
+
+
+def scheduler_params(analyzer_version, schema_version):
+    return {
+        "analyzer_version": int(analyzer_version),
+        "schema_version": int(schema_version),
+        "retry_limit": int(RETRY_LIMIT),
+        "transient": sorted(TRANSIENT_FAILURES),
+    }
+
+
+def stale_due_sql(clock="now()"):
+    """A 'stale' row is due while it has attempts left, unless it was
+    released and is in its cooldown; new media is always due (a fresh
+    budget). Stale transitions clear ``retry_category``, so only a release
+    (``queue_unavailable``) keeps one; they keep ``retry_count``, so an
+    exhausted row stays exhausted for the same media (LUM-007)."""
+    return f"""(p.status='stale' AND (
+                        (p.retry_category IS NULL
+                         AND p.retry_count < %(retry_limit)s)
+                        OR (p.retry_category='queue_unavailable'
+                            AND p.retry_count < %(retry_limit)s
+                            AND p.retry_after <= {clock})
+                        OR {RETRY_REVISION_CHANGED_SQL}))"""
+
+
+def failure_due_sql(clock="now()"):
+    """A failure is due for a new revision, analyzer or schema, and a
+    transient one after its cooldown while attempts remain."""
+    return f"""(p.status IN ('failed', 'skipped_no_file') AND (
+                        {RETRY_REVISION_CHANGED_SQL}
+                        OR (p.retry_analyzer_ver IS NOT NULL
+                            AND p.retry_analyzer_ver < %(analyzer_version)s)
+                        OR (p.retry_profile_schema_ver IS NOT NULL
+                            AND p.retry_profile_schema_ver < %(schema_version)s)
+                        OR (p.retry_category IS NULL AND p.retry_count=0)
+                        OR (p.retry_category = ANY(%(transient)s)
+                            AND p.retry_count < %(retry_limit)s
+                            AND p.retry_after <= {clock})))"""
+
+
+def backfill_due_sql(clock="now()", *, stale=None, failure=None):
+    """What a backfill batch selects among available, analysis-eligible
+    occurrences; ``p`` is NULL for a track without an attempt row. The
+    legacy (pre-registry) table passes its own ``stale``/``failure`` terms."""
+    stale = stale_due_sql(clock) if stale is None else stale
+    failure = failure_due_sql(clock) if failure is None else failure
+    return f"""(
+            (COALESCE(p.status, '') NOT IN
+                 ('pending', 'pending_interactive', 'deferred_no_media_revision')
+             OR (p.status='deferred_no_media_revision' AND {MEDIA_KNOWN_SQL}))
+            AND (
+                p.track_id IS NULL
+                OR p.analyzer_ver IS NULL
+                OR p.analyzer_ver < %(analyzer_version)s
+                OR {stale}
+                OR (p.status='deferred_no_media_revision' AND {MEDIA_KNOWN_SQL})
+                OR (p.status='ready' AND {MEDIA_KNOWN_SQL}
+                    AND p.media_signature IS DISTINCT FROM
+                        ('catalog-media:' || COALESCE(t.media_fp, '')))
+                OR {failure}
+            ))"""
+
+
+# A transient retry with an armed cooldown: next_profile_retry_at wakes the
+# backfill at the earliest such ``retry_after``.
+RETRY_ARMED_SQL = """(p.status IN ('failed', 'skipped_no_file', 'stale')
+                        AND p.retry_category = ANY(%(transient)s)
+                        AND p.retry_count < %(retry_limit)s
+                        AND p.retry_after IS NOT NULL)"""
+# What a stale transition (an attempt or occurrence abandoned, not a failed
+# analysis) resets: an earlier failure's category would otherwise keep the
+# row out of stale_due_sql with no cooldown to wake it (LUM-007). The count
+# is kept, so the attempt budget still holds.
+STALE_RETRY_RESET_SQL = "retry_category=NULL, failure_diagnostics=NULL"
+
+
+def public_failure_reason(code):
+    return _PUBLIC_REASONS.get(code, code)
 
 
 from plugin.api import table
@@ -18,6 +133,7 @@ from plugin.api import table
 from . import migrations
 from .catalog_enrichment import (
     float4,
+    journal_edge_ref,
     record_profile_change,
     record_profile_deletions,
     serialize_profile,
@@ -40,6 +156,8 @@ def migrate_attempts(cur):
         "retry_media_signature TEXT",
         "retry_analyzer_ver INTEGER",
         "retry_profile_schema_ver INTEGER",
+        # Safe facts about the latest failed analysis (LUM-018); NULL once ready.
+        "failure_diagnostics JSONB",
     )
 
 
@@ -208,29 +326,56 @@ def admit_attempts(db, source, ids, priority="background",
 
 
 def release_attempts(db, source, tokens, reason, count_failure=True):
+    """Return admitted attempts to the scheduler as ``queue_unavailable``.
+
+    ``count_failure`` uses up an attempt and cools down for the slot of the
+    attempts used (retry_delay_sql): the job could not be queued or its claim
+    was lost. A maintenance pause, a legacy-job migration or an aborted batch
+    never tried the analysis and passes False: no attempt and no cooldown,
+    the row is due again at once (LUM-007). Rows are locked in track-ID
+    order, as admission locks them, so they cannot deadlock.
+    """
     if not tokens:
         return 0
+    # ``now()`` rather than NULL: stale_due_sql selects a queue_unavailable
+    # row once ``retry_after <= now()``, and a NULL cooldown means exhausted.
+    delay = retry_delay_sql("s.retry_count") if count_failure else "interval '0 seconds'"
+    ids = sorted(tokens)
     cur = db.cursor()
     try:
-        count = 0
-        for track_id, token in tokens.items():
-            cur.execute(
-                f"""UPDATE {table('source_profiles')}
+        cur.execute(
+            f"""WITH released AS MATERIALIZED (
+                    SELECT s.track_id
+                      FROM {table('source_profiles')} s
+                      JOIN unnest(%(ids)s::text[], %(tokens)s::text[]) AS r(track_id, token)
+                        ON s.track_id=r.track_id AND s.attempt_token=r.token
+                     WHERE s.catalog_instance_id=%(source)s
+                       AND s.status IN ('pending', 'pending_interactive')
+                     ORDER BY s.track_id COLLATE "C"
+                       FOR UPDATE OF s
+                ), updated AS (
+                    UPDATE {table('source_profiles')} s
                        SET status='stale', last_error='queue_unavailable',
                            analyzed_at=now(), attempt_token=NULL,
                            retry_category='queue_unavailable',
-                           retry_count=retry_count + %s,
-                           retry_after=CASE WHEN retry_count + %s < %s
-                               THEN now() + interval '60 seconds' ELSE NULL END,
-                           retry_media_signature=attempt_media_signature,
-                           retry_analyzer_ver=attempt_analyzer_ver,
-                           retry_profile_schema_ver=attempt_profile_schema_ver
-                     WHERE catalog_instance_id=%s AND track_id=%s AND attempt_token=%s
-                       AND status IN ('pending', 'pending_interactive')""",
-                (int(count_failure), int(count_failure), RETRY_LIMIT,
-                 source, track_id, token),
-            )
-            count += max(0, cur.rowcount)
+                           retry_count=s.retry_count + %(used)s,
+                           retry_after=CASE WHEN s.retry_count + %(used)s < %(retry_limit)s
+                               THEN now() + {delay}
+                               ELSE NULL END,
+                           retry_media_signature=s.attempt_media_signature,
+                           retry_analyzer_ver=s.attempt_analyzer_ver,
+                           retry_profile_schema_ver=s.attempt_profile_schema_ver
+                      FROM released
+                     WHERE s.catalog_instance_id=%(source)s
+                       AND s.track_id=released.track_id
+                 RETURNING 1
+                )
+                SELECT count(*) FROM updated""",
+            {"ids": ids, "tokens": [tokens[track_id] for track_id in ids],
+             "source": source, "used": int(bool(count_failure)),
+             "retry_limit": int(RETRY_LIMIT)},
+        )
+        count = int(cur.fetchone()[0])
         db.commit()
         return count
     except Exception:
@@ -278,8 +423,13 @@ def published_profile_current(db, source, track_id, analyzer_version, schema_ver
 
 
 def complete_attempt(db, source, track_id, token, result, status, error, media_sig,
-                     analyzer_version, schema_version, failure_code=None):
-    """Publish only the currently admitted revision, row and journal together."""
+                     analyzer_version, schema_version, failure_code=None,
+                     diagnostics=None):
+    """Publish only the currently admitted revision, row and journal together.
+
+    ``diagnostics`` (already allowlisted by ``analysis_isolation``) is stored
+    with a failure and cleared by a ready completion.
+    """
     if not token:
         return False
     cur = db.cursor()
@@ -308,7 +458,7 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
             cur.execute(
                 f"""UPDATE {table('source_profiles')}
                        SET status='stale', last_error='Catalogue media revision changed',
-                           attempt_token=NULL
+                           attempt_token=NULL, {STALE_RETRY_RESET_SQL}
                      WHERE catalog_instance_id=%s AND track_id=%s""",
                 (source, track_id),
             )
@@ -355,7 +505,7 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
                 f"""UPDATE {table('source_profiles')}
                        SET retry_category=NULL, retry_count=0, retry_after=NULL,
                            retry_media_signature=NULL, retry_analyzer_ver=NULL,
-                           retry_profile_schema_ver=NULL
+                           retry_profile_schema_ver=NULL, failure_diagnostics=NULL
                      WHERE catalog_instance_id=%s AND track_id=%s""",
                 (source, track_id),
             )
@@ -365,15 +515,16 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
                        SET retry_category=%s, retry_count=retry_count+1,
                            retry_after=CASE
                                WHEN %s AND retry_count+1 < %s
-                               THEN now() + make_interval(secs => CASE retry_count
-                                   WHEN 0 THEN %s WHEN 1 THEN %s ELSE %s END)
+                               THEN now() + {retry_delay_sql()}
                                ELSE NULL END,
                            retry_media_signature=%s, retry_analyzer_ver=%s,
-                           retry_profile_schema_ver=%s
+                           retry_profile_schema_ver=%s, failure_diagnostics=%s::jsonb
                      WHERE catalog_instance_id=%s AND track_id=%s""",
                 (code, code in TRANSIENT_FAILURES, RETRY_LIMIT,
-                 *RETRY_DELAYS_SECONDS, attempt[1], analyzer_version,
-                 schema_version, source, track_id),
+                 attempt[1], analyzer_version,
+                 schema_version,
+                 json.dumps(diagnostics, sort_keys=True) if diagnostics else None,
+                 source, track_id),
             )
         if status == "ready":
             cur.execute(
@@ -425,21 +576,28 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
                     (source, track_id, *values),
                 )
                 stamp = cur.fetchone()[0]
-                edge = None
+                payload = serialize_profile(track_id, *values[:6], stamp, media_sig)
+                edge_ref = None
                 if not media_changed:
                     # Clients delete their edge on an upsert without one, so a
-                    # waveform-only change carries the still-current edge.
+                    # waveform-only change carries the still-current edge: the
+                    # journal references it (K6) and readers embed it, or send
+                    # the reference to clients that opted in. Only its key is
+                    # read; the edge payload is never detoasted here.
                     cur.execute(
-                        f"""SELECT edge.payload
-                              FROM {table('published_source_profiles')} p {edge_join()}
+                        f"""SELECT edge.media_revision, edge.profile_digest
+                              FROM {table('published_source_profiles')} p
+                              {edge_join(columns='e.media_revision, e.profile_digest')}
                              WHERE p.catalog_instance_id=%s AND p.track_id=%s""",
                         (source, track_id),
                     )
-                    edge = cur.fetchone()[0]
-                payload = serialize_profile(
-                    track_id, *values[:6], stamp, media_sig, edge_profile=edge,
-                )
-                record_profile_change(cur, source, track_id, "ready", payload)
+                    revision, digest = cur.fetchone()
+                    # serialize_profile embedded an edge only for the row's
+                    # own revision (edge columns equal their payload's).
+                    if digest and revision and revision == payload["media_revision"]:
+                        edge_ref = journal_edge_ref(digest, kept=True)
+                record_profile_change(cur, source, track_id, "ready", payload,
+                                      edge_ref=edge_ref)
         db.commit()
         return True
     except Exception:
@@ -542,7 +700,7 @@ def withdraw_catalog_changes(cur, plan):
         cur.execute(
             f"""UPDATE {table('source_profiles')}
                    SET status='stale', last_error='Catalogue epoch changed',
-                       attempt_token=NULL
+                       attempt_token=NULL, {STALE_RETRY_RESET_SQL}
                  WHERE catalog_instance_id=%s AND attempt_token IS NOT NULL""",
             (source,),
         )
@@ -568,7 +726,7 @@ def withdraw_catalog_changes(cur, plan):
                 UPDATE {table('source_profiles')} s
                    SET status='stale',
                        last_error='Catalogue media revision changed or track removed',
-                       attempt_token=NULL
+                       attempt_token=NULL, {STALE_RETRY_RESET_SQL}
                   FROM stale
                  WHERE s.catalog_instance_id=%(source)s AND s.track_id=stale.track_id
             ), withdrawn AS (
@@ -593,7 +751,8 @@ def purge_withdrawn_edges(cur, source, track_ids=None):
     media signature and is read only through one (``edge_join``). Once that
     row is withdrawn or replaced the edge is unreachable, and it never becomes
     reachable again: a waveform published for a track without a published
-    row drops the track's edges first (``complete_attempt``). So the deletion
+    row drops the track's edges first (``complete_attempt``, and the P3-7
+    repair ``_republish_ready``). So the deletion
     can follow a withdrawal in a later transaction, after catalog_state is
     released (P2-3), and the signature guard keeps any edge that is current.
 
@@ -623,6 +782,311 @@ def purge_withdrawn_edges(cur, source, track_ids=None):
         (source, track_ids, track_ids),
     )
     return max(0, int(getattr(cur, "rowcount", 0) or 0))
+
+
+# P3-7: whole-source repairs of the publication. Each batch is one short
+# transaction under the catalog_state row lock (P2-3), and a run examines a
+# bounded number of rows; the next run continues where the rows remain.
+ORPHAN_WITHDRAWAL_BATCH = 1000
+ORPHAN_WITHDRAWAL_RUN_LIMIT = 20000
+READY_REPUBLISH_BATCH = 25
+READY_REPUBLISH_RUN_LIMIT = 2000
+
+# A published row of ``p``'s source is orphaned when the source's published
+# generation ``{generation}`` has no available row for its track. The same
+# "gone" rule as a catalogue withdrawal (_revision_lookup).
+_ORPHANED = """NOT EXISTS (
+    SELECT 1 FROM {tracks} t
+     WHERE t.catalog_instance_id=p.catalog_instance_id
+       AND t.published_generation={generation}
+       AND t.track_id=p.track_id AND t.available=TRUE)"""
+# Only a generation that has rows says which tracks are gone: a catalogue
+# that never published (generation 0) or whose rows are missing says nothing,
+# and a publication is never empty (refresh_catalog refuses an empty scan).
+_AUTHORITATIVE = """{generation} > 0 AND EXISTS (
+    SELECT 1 FROM {tracks} g
+     WHERE g.catalog_instance_id={source} AND g.published_generation={generation})"""
+
+
+def orphaned_publication_count(cur):
+    """Published profiles of active sources whose track the source's current
+    catalogue generation no longer has (health ``profiles_orphaned``)."""
+    cur.execute(
+        f"""SELECT count(*)
+              FROM {table('published_source_profiles')} p
+              JOIN {table('catalog_sources')} src
+                ON src.catalog_instance_id=p.catalog_instance_id
+               AND src.rebind_status='active'
+              JOIN {table('catalog_state')} c
+                ON c.catalog_instance_id=p.catalog_instance_id
+               AND {_AUTHORITATIVE.format(tracks=table('catalog_tracks'),
+                                          source='c.catalog_instance_id',
+                                          generation='c.published_generation')}
+             WHERE {_ORPHANED.format(tracks=table('catalog_tracks'),
+                                     generation='c.published_generation')}"""
+    )
+    return int(cur.fetchone()[0])
+
+
+def _orphan_candidates(cur, source, limit):
+    """The first ``limit`` orphaned published tracks, read without any lock."""
+    cur.execute(
+        f"""SELECT p.track_id
+              FROM {table('catalog_state')} c
+              JOIN {table('published_source_profiles')} p
+                ON p.catalog_instance_id=c.catalog_instance_id
+             WHERE c.catalog_instance_id=%s
+               AND {_AUTHORITATIVE.format(tracks=table('catalog_tracks'),
+                                          source='c.catalog_instance_id',
+                                          generation='c.published_generation')}
+               AND {_ORPHANED.format(tracks=table('catalog_tracks'),
+                                     generation='c.published_generation')}
+             ORDER BY p.track_id
+             LIMIT %s""",
+        (source, limit),
+    )
+    return [row[0] for row in cur.fetchall()]
+
+
+def _withdraw_orphans(cur, source, track_ids):
+    """Withdraw those of ``track_ids`` that are orphaned, under the lock.
+
+    Takes the catalog_state row lock and re-checks each candidate against the
+    generation published now (P2-3): a publication or completion that ran
+    since the candidates were read wins. Then, as a catalogue withdrawal
+    does, stales the attempt rows (locked in track-ID order), deletes the
+    published rows and journals one delete event per withdrawn track. The
+    edge payloads go with purge_withdrawn_edges after the commit. Returns the
+    withdrawn track IDs in order, or None when the source is not active.
+    """
+    state = _source_state(cur, source)
+    if state is None:
+        return None
+    cur.execute(
+        f"""WITH orphan AS MATERIALIZED (
+                SELECT p.track_id
+                  FROM unnest(%(track_ids)s::text[]) AS candidate(track_id)
+                  JOIN {table('published_source_profiles')} p
+                    ON p.catalog_instance_id=%(source)s AND p.track_id=candidate.track_id
+                 WHERE {_AUTHORITATIVE.format(tracks=table('catalog_tracks'),
+                                              source='%(source)s',
+                                              generation='%(generation)s')}
+                   AND {_ORPHANED.format(tracks=table('catalog_tracks'),
+                                         generation='%(generation)s')}
+            ), stale AS MATERIALIZED (
+                SELECT s.track_id
+                  FROM {table('source_profiles')} s
+                  JOIN orphan ON s.catalog_instance_id=%(source)s
+                             AND s.track_id=orphan.track_id
+                 ORDER BY s.track_id COLLATE "C"
+                   FOR UPDATE OF s
+            ), staled AS (
+                UPDATE {table('source_profiles')} s
+                   SET status='stale', last_error='Track removed from the catalogue',
+                       attempt_token=NULL, {STALE_RETRY_RESET_SQL}
+                  FROM stale
+                 WHERE s.catalog_instance_id=%(source)s AND s.track_id=stale.track_id
+            ), withdrawn AS (
+                DELETE FROM {table('published_source_profiles')} p
+                 USING orphan
+                 WHERE p.catalog_instance_id=%(source)s AND p.track_id=orphan.track_id
+             RETURNING p.track_id
+            )
+            SELECT track_id FROM withdrawn ORDER BY track_id COLLATE "C" """,
+        {"source": source, "generation": state[0], "track_ids": list(track_ids)},
+    )
+    withdrawn = [row[0] for row in cur.fetchall()]
+    record_profile_deletions(cur, source, withdrawn)
+    return withdrawn
+
+
+def withdraw_orphaned_profiles(db, source, *, commit=True,
+                               batch_size=ORPHAN_WITHDRAWAL_BATCH,
+                               limit=ORPHAN_WITHDRAWAL_RUN_LIMIT):
+    """Withdraw published profiles whose track left the catalogue (P3-7).
+
+    A catalogue publication withdraws only the tracks its diff names. A
+    published profile whose track the previous generation already lacked is
+    in no diff and stays: the ready rows the 1.2.5 upgrade seeded for tracks
+    1.2.5 had already dropped (``published_source_profiles_seed_v1``), and
+    anything else that slipped through. This pass compares every published
+    row with the current generation instead: candidates are read without a lock, and each batch
+    re-checks them under the catalog_state row lock, which admission,
+    completion and publication also take first, so it is safe next to them
+    and idempotent. One read finds at most ``limit`` candidates per run,
+    withdrawn ``batch_size`` per lock; the next run (after each catalogue
+    publication, in maintenance) continues.
+
+    ``commit`` commits each batch and then deletes the withdrawn tracks'
+    edges in their own transaction; without it (the install transaction)
+    everything stays in the caller's transaction. Returns the withdrawn IDs.
+    """
+    withdrawn = []
+    cur = db.cursor()
+    try:
+        candidates = _orphan_candidates(cur, source, limit)
+        for start in range(0, len(candidates), batch_size):
+            batch = _withdraw_orphans(cur, source, candidates[start:start + batch_size])
+            if commit:
+                db.commit()
+            if batch is None:
+                break
+            withdrawn.extend(batch)
+        if withdrawn:
+            purge_withdrawn_edges(cur, source, withdrawn)
+            if commit:
+                db.commit()
+        return withdrawn
+    except Exception:
+        if commit:
+            db.rollback()
+        raise
+    finally:
+        cur.close()
+
+
+def _ready_unpublished(cur, source, analyzer_version, schema_version, limit):
+    """What ``profiles_unpublished_ready`` counts, for one source, by track.
+
+    'ready' attempt rows of the current analyzer and schema without a
+    published row, whose media is the track's in the published generation.
+    A 'ready' row for other media (the backfill re-analyses it), a track the
+    generation lacks, or an older analyzer or schema is not republished.
+    """
+    cur.execute(
+        f"""WITH unpublished AS MATERIALIZED (
+                SELECT s.track_id, s.media_signature
+                  FROM {table('source_profiles')} s
+                 WHERE s.catalog_instance_id=%s AND s.status='ready'
+                   AND s.analyzer_ver=%s AND s.profile_schema_ver=%s
+                   AND NOT EXISTS (
+                       SELECT 1 FROM {table('published_source_profiles')} p
+                        WHERE p.catalog_instance_id=s.catalog_instance_id
+                          AND p.track_id=s.track_id)
+            )
+            SELECT u.track_id
+              FROM unpublished u
+              JOIN {table('catalog_state')} c ON c.catalog_instance_id=%s
+             CROSS JOIN LATERAL (
+                   -- One key lookup per row (LIMIT keeps it a lookup: joined
+                   -- on the source alone, the planner can compare every row
+                   -- with every track).
+                   SELECT 1 FROM {table('catalog_tracks')} t
+                    WHERE t.catalog_instance_id=c.catalog_instance_id
+                      AND t.published_generation=c.published_generation
+                      AND t.track_id=u.track_id
+                      AND t.available=TRUE AND COALESCE(t.media_fp, '') <> ''
+                      AND u.media_signature='catalog-media:' || t.media_fp
+                    LIMIT 1) t
+             ORDER BY u.track_id
+             LIMIT %s""",
+        (source, analyzer_version, schema_version, source, limit),
+    )
+    return [row[0] for row in cur.fetchall()]
+
+
+def _republish_ready(cur, source, generation, track_id, analyzer_version, schema_version):
+    """Publish one 'ready' attempt row that has no published row.
+
+    ``complete_attempt`` for status 'ready', with the stored result: under
+    the catalog_state row lock, the row must still be 'ready' for the current
+    analyzer and schema and for the media the published generation has, and
+    unpublished. Then the track's edges and edge job go (a waveform published
+    for a track without a published row drops them first; see
+    purge_withdrawn_edges), the published row is written with the analysis
+    time the row carries, and the upsert is journalled without an edge.
+    """
+    revision = _current_revision(cur, source, generation, track_id)
+    if revision is None:
+        return False
+    cur.execute(
+        f"""SELECT sample_rate, duration_ms, ref_lufs, start_ramp, end_ramp,
+                   analyzer_ver, profile_schema_ver, media_signature, analyzed_at
+              FROM {table('source_profiles')}
+             WHERE catalog_instance_id=%s AND track_id=%s AND status='ready'
+               FOR UPDATE""",
+        (source, track_id),
+    )
+    row = cur.fetchone()
+    if (
+        row is None or row[5] != analyzer_version or row[6] != schema_version
+        or row[7] != revision
+    ):
+        return False
+    cur.execute(
+        f"""SELECT 1 FROM {table('published_source_profiles')}
+             WHERE catalog_instance_id=%s AND track_id=%s FOR UPDATE""",
+        (source, track_id),
+    )
+    if cur.fetchone() is not None:
+        return False
+    values = (
+        int(row[0]), int(row[1]), float4(row[2]), bytes(row[3]), bytes(row[4]),
+        analyzer_version, schema_version, revision,
+    )
+    cur.execute(
+        f"DELETE FROM {table('edge_profiles')} "
+        "WHERE catalog_instance_id=%s AND track_id=%s",
+        (source, track_id),
+    )
+    cur.execute(
+        f"DELETE FROM {table('edge_profile_jobs')} "
+        "WHERE catalog_instance_id=%s AND track_id=%s",
+        (source, track_id),
+    )
+    cur.execute(
+        f"""INSERT INTO {table('published_source_profiles')}
+            (catalog_instance_id, track_id, sample_rate, duration_ms,
+             ref_lufs, start_ramp, end_ramp, analyzer_ver,
+             profile_schema_ver, media_signature, analyzed_at)
+           VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+           RETURNING analyzed_at""",
+        (source, track_id, *values, row[8]),
+    )
+    stamp = cur.fetchone()[0]
+    record_profile_change(
+        cur, source, track_id, "ready",
+        serialize_profile(track_id, *values[:6], stamp, revision),
+    )
+    return True
+
+
+def republish_ready_profiles(db, source, analyzer_version, schema_version, *,
+                             commit=True, batch_size=READY_REPUBLISH_BATCH,
+                             limit=READY_REPUBLISH_RUN_LIMIT):
+    """Republish 'ready' attempt rows that have no published row (P3-7).
+
+    The rows ``profiles_unpublished_ready`` counts (P1-3): a 1.2.5 worker
+    marked them 'ready' and journalled them, but never published them, and
+    1.3.0 treats them as current, so no analysis would. Each is published
+    through ``complete_attempt``'s checks, fences and journal event (see
+    _republish_ready), ``batch_size`` rows per catalog_state hold, at most
+    ``limit`` rows per run. ``commit`` as in withdraw_orphaned_profiles.
+    Returns the republished track IDs.
+    """
+    republished = []
+    cur = db.cursor()
+    try:
+        candidates = _ready_unpublished(cur, source, analyzer_version, schema_version, limit)
+        for start in range(0, len(candidates), batch_size):
+            state = _source_state(cur, source)
+            if state is None:
+                if commit:
+                    db.rollback()
+                break
+            for track_id in candidates[start:start + batch_size]:
+                if _republish_ready(cur, source, state[0], track_id,
+                                    analyzer_version, schema_version):
+                    republished.append(track_id)
+            if commit:
+                db.commit()
+        return republished
+    except Exception:
+        if commit:
+            db.rollback()
+        raise
+    finally:
+        cur.close()
 
 
 def invalidate_catalog_changes(cur, source, generation, track_changes, *, full_reconcile=False):

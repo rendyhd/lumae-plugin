@@ -3,16 +3,26 @@
 import hashlib
 import json
 import re
+import threading
 import uuid
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from functools import wraps
 
+import psycopg2
 from flask import Response, abort, current_app, g, jsonify, request
 
-from plugin.api import get_db, get_setting, render_page, table
+from plugin.api import config, get_db, get_setting, render_page, table
 
 from . import migrations
-from .collection_library import catalog_track_view_sql, register_collection_library_routes
+from .collection_library import (
+    CatalogScopeError,
+    album_artist_sql,
+    catalog_track_view_sql,
+    register_collection_library_routes,
+    requested_catalog,
+    resolve_catalog,
+)
 from .collection_ui import render_collection_workbench
 
 
@@ -25,6 +35,31 @@ MAX_BACKUP_ITEMS = 100_000
 GLOBAL_PRINCIPAL = "__global__"
 FINGERPRINT_VERSION = 1
 FEED_PROTOCOL_VERSION = 1
+# K9: a request that sends this header with the value "2" opts in to
+# contract 2 (conflicts answer 409 with the server's state instead of being
+# absorbed). Health advertises the highest contract as collections.contract.
+COLLECTIONS_CONTRACT = 2
+CONTRACT_HEADER = "X-Lumae-Collections-Contract"
+# Every mutation transaction waits at most this long for any one lock (the
+# idempotency key, the collection row, the feed head); then it answers 503
+# collection_busy with Retry-After instead of queueing indefinitely.
+MUTATION_LOCK_TIMEOUT = "3s"
+LOCK_NOT_AVAILABLE = "55P03"
+BUSY_RETRY_AFTER_S = 5
+# A restore commits in transactions of at most this many rows: one per
+# collection it creates plus one per item. Each transaction appends its events
+# as one block, so the feed head is held only for that block's insert.
+RESTORE_CHUNK_ROWS = 2_000
+# The K8 snapshot reads on its own REPEATABLE READ connection.
+SNAPSHOT_APPLICATION_NAME = "lumae-collections-snapshot"
+SNAPSHOT_CONNECT_TIMEOUT_S = 5
+SNAPSHOT_STATEMENT_TIMEOUT_MS = 30_000
+SNAPSHOT_LOCK_TIMEOUT_MS = 5_000
+UNAVAILABLE_RETRY_AFTER_S = 5
+# One snapshot is built at a time per web worker process (100k items take
+# about 250 MB while the JSON is built). Another waits this long, then 503s.
+SNAPSHOT_WAIT_S = 2
+_SNAPSHOT_SLOT = threading.BoundedSemaphore(1)
 
 
 class FeedProtocolUnavailable(RuntimeError):
@@ -60,6 +95,10 @@ def collection_feed_state_table():
     return table("collection_feed_state")
 
 
+def collection_restores_table():
+    return table("collection_restores")
+
+
 def collections_enabled():
     value = get_setting("collection_manager_enabled", False)
     if isinstance(value, str):
@@ -67,19 +106,57 @@ def collections_enabled():
     return bool(value)
 
 
-def current_principal():
-    """JWT/session users are isolated; bearer-token installs share one library."""
-    if getattr(g, "auth_method", None) == "bearer":
+def _resolve_principal():
+    """The request's principal, or None when its host auth method is unknown.
+
+    Only the host's own methods name a principal: ``session`` (a user),
+    ``bearer`` (the installation token, shared) and no method at all (auth
+    disabled, shared). Anything else, such as a plugin-scoped token, names
+    none rather than a default principal.
+    """
+    method = getattr(g, "auth_method", None)
+    if method == "bearer":
         return GLOBAL_PRINCIPAL
+    if method not in (None, "session"):
+        return None
     username = getattr(g, "auth_user", None)
     if username:
         return f"user:{username}"
-    if getattr(g, "auth_method", None) == "session":
+    if method == "session":
         # Fail closed if host authentication ever presents a malformed session.
         # Falling back to the shared bearer principal here would expose another
         # account's collections.
         abort(401)
     return GLOBAL_PRINCIPAL
+
+
+def current_principal():
+    """JWT/session users are isolated; bearer-token installs share one library.
+
+    An unknown host auth method is denied (401), never mapped to a default
+    principal.
+    """
+    principal = _resolve_principal()
+    if principal is None:
+        abort(401)
+    return principal
+
+
+def health_scope_mode():
+    """The collections ``scope`` for health: "shared", "personal", or None when
+    the host auth method names no principal (the collection, shelf and
+    discovery routes answer 401 then). Health keeps answering 200 for such a
+    caller; a malformed session still aborts with 401, as in 1.2.5.
+    """
+    principal = _resolve_principal()
+    if principal is None:
+        return None
+    return current_collection_scope()["mode"]
+
+
+def contract_v2():
+    """The request opted in to collections contract 2 (K9)."""
+    return (request.headers.get(CONTRACT_HEADER) or "").strip() == str(COLLECTIONS_CONTRACT)
 
 
 def current_collection_scope():
@@ -172,17 +249,28 @@ def migrate_collections(db):
             singleton SMALLINT PRIMARY KEY CHECK (singleton = 1),
             protocol_version INTEGER NOT NULL,
             epoch UUID NOT NULL,
-            head_seq BIGINT NOT NULL CHECK (head_seq >= 0)
+            head_seq BIGINT NOT NULL CHECK (head_seq >= 0),
+            floor_seq BIGINT NOT NULL
         )
         """
     )
+    # K8 floor_seq: the head when this epoch's feed was cut over (seeded, or
+    # upgraded to 1.3.0). Nothing at or below it is guaranteed to stay in the
+    # journal. An upgraded row gets the head it has now, once.
+    migrations.ensure_columns(cur, collection_feed_state_table(), "floor_seq BIGINT")
     cur.execute(
         f"INSERT INTO {collection_feed_state_table()} "
-        f"(singleton, protocol_version, epoch, head_seq) "
-        f"SELECT 1, %s, gen_random_uuid(), COALESCE(MAX(seq), 0) "
-        f"FROM {collection_changes_table()} ON CONFLICT (singleton) DO NOTHING",
+        f"(singleton, protocol_version, epoch, head_seq, floor_seq) "
+        f"SELECT 1, %s, gen_random_uuid(), head, head "
+        f"FROM (SELECT COALESCE(MAX(seq), 0) AS head FROM {collection_changes_table()}) seeded "
+        f"ON CONFLICT (singleton) DO NOTHING",
         (FEED_PROTOCOL_VERSION,),
     )
+    cur.execute(
+        f"UPDATE {collection_feed_state_table()} SET floor_seq = head_seq "
+        "WHERE singleton = 1 AND floor_seq IS NULL"
+    )
+    migrations.ensure_not_null(cur, collection_feed_state_table(), "floor_seq")
     cur.execute(
         f"SELECT protocol_version FROM {collection_feed_state_table()} WHERE singleton = 1"
     )
@@ -208,10 +296,32 @@ def migrate_collections(db):
         )
         """
     )
+    # collection_id (1.3.0, K9): the collection a receipt's request applied
+    # to, so a key conflict can answer with its current state. NULL for a
+    # restore and for receipts written before 1.3.0.
     migrations.ensure_columns(
         cur, collection_mutations_table(),
         "request_fingerprint TEXT",
         "fingerprint_version INTEGER",
+        "collection_id TEXT",
+    )
+    # Progress of a keyed restore that spans several transactions. The row
+    # lives from its first chunk until the chunk that stores the receipt.
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {collection_restores_table()} (
+            principal TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL,
+            request_fingerprint TEXT NOT NULL,
+            restore_id UUID NOT NULL,
+            chunk_rows INTEGER NOT NULL CHECK (chunk_rows > 0),
+            chunk_count INTEGER NOT NULL CHECK (chunk_count > 1),
+            chunks_done INTEGER NOT NULL CHECK (chunks_done >= 0),
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            PRIMARY KEY (principal, idempotency_key)
+        )
+        """
     )
     migrations.ensure_constraint(
         cur, collection_mutations_table(),
@@ -230,25 +340,80 @@ def migrate_collections(db):
         f"CREATE INDEX IF NOT EXISTS lumae_collection_items_order_idx "
         f"ON {collection_items_table()} (principal, collection_id, kind, position)",
     )
-    migrations.ensure_index(
-        cur,
-        f"CREATE UNIQUE INDEX IF NOT EXISTS lumae_collection_track_unique_idx "
-        f"ON {collection_items_table()} (principal, collection_id, track_id) "
-        "WHERE kind = 'track'",
-    )
-    migrations.ensure_index(
-        cur,
-        f"CREATE UNIQUE INDEX IF NOT EXISTS lumae_collection_album_provider_unique_idx "
-        f"ON {collection_items_table()} (principal, collection_id, provider_album_id) "
-        "WHERE kind = 'album' AND provider_album_id IS NOT NULL",
-    )
-    migrations.ensure_index(
-        cur,
-        f"CREATE UNIQUE INDEX IF NOT EXISTS lumae_collection_album_key_unique_idx "
-        f"ON {collection_items_table()} (principal, collection_id, album_key) "
-        "WHERE kind = 'album' AND provider_album_id IS NULL",
-    )
+    # K10 (LUM-013): the catalogue an item was chosen from. NULL means
+    # unknown (written before 1.3.0 on an install with several catalogues, or
+    # by a client that sent none there); it is never guessed.
+    migrations.ensure_columns(cur, collection_items_table(), "catalog_instance_id TEXT")
+    # Membership is unique per catalogue. COALESCE(..., '') makes NULL one
+    # key of its own ('' is never stored: _normalize_item folds it to NULL),
+    # so two unscoped rows still conflict, as before, while the same track
+    # may sit in a collection once per catalogue. The replacements are built
+    # before the 1.2.5 indexes they supersede are dropped.
+    for name, key, predicate in (
+        ("lumae_collection_track_scoped_unique_idx", "track_id", "kind = 'track'"),
+        ("lumae_collection_album_provider_scoped_unique_idx", "provider_album_id",
+         "kind = 'album' AND provider_album_id IS NOT NULL"),
+        ("lumae_collection_album_key_scoped_unique_idx", "album_key",
+         "kind = 'album' AND provider_album_id IS NULL"),
+    ):
+        migrations.ensure_index(
+            cur,
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {collection_items_table()} "
+            f"(principal, collection_id, COALESCE(catalog_instance_id, ''), {key}) "
+            f"WHERE {predicate}",
+        )
+    for name in (
+        "lumae_collection_track_unique_idx",
+        "lumae_collection_album_provider_unique_idx",
+        "lumae_collection_album_key_unique_idx",
+    ):
+        migrations.ensure_no_index(cur, collection_items_table(), name)
+    backfill_item_catalogs(cur)
+    # Library search folds accents with unaccent when it can be installed;
+    # without it, search still works, accent-sensitively (collection_library).
+    migrations.ensure_extension(cur, "unaccent")
     cur.close()
+
+
+def sole_catalog_sql():
+    """SQL for the one catalogue this install has ever had, else NULL.
+
+    Sources are never deleted, so ``catalog_sources`` holds every catalogue
+    that has existed; with more than one, an unscoped item's catalogue is
+    unknowable and stays NULL.
+    """
+    return f"(SELECT MIN(catalog_instance_id) FROM {table('catalog_sources')} HAVING COUNT(*) = 1)"
+
+
+def backfill_item_catalogs(cur):
+    """Scope unscoped items when exactly one catalogue has ever existed (K10).
+
+    Runs on every migrate (row locks only; a no-op when nothing is NULL). An
+    item whose scoped twin exists (written after the catalogue appeared) is
+    left NULL rather than violating the membership index.
+    """
+    cur.execute("SELECT to_regclass(%s) IS NOT NULL", (table("catalog_sources"),))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return 0
+    items = collection_items_table()
+    cur.execute(
+        f"""
+        UPDATE {items} i SET catalog_instance_id = sole.id
+          FROM (SELECT {sole_catalog_sql()} AS id) sole
+         WHERE sole.id IS NOT NULL AND i.catalog_instance_id IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM {items} o
+                WHERE o.principal = i.principal AND o.collection_id = i.collection_id
+                  AND o.kind = i.kind AND o.catalog_instance_id = sole.id
+                  AND CASE WHEN i.kind = 'track' THEN o.track_id = i.track_id
+                           WHEN i.provider_album_id IS NOT NULL
+                             THEN o.provider_album_id = i.provider_album_id
+                           ELSE o.provider_album_id IS NULL AND o.album_key = i.album_key
+                      END)
+        """
+    )
+    return cur.rowcount
 
 
 def _feed_fence_installed(cur):
@@ -316,11 +481,27 @@ def _fetch_collection(cur, principal, collection_id, include_deleted=False):
     return _row_dict(cur, cur.fetchone())
 
 
+def _fetch_collections(cur, principal, collection_ids):
+    """Collection objects by id, tombstones included, in one query."""
+    if not collection_ids:
+        return {}
+    cur.execute(
+        _collection_select()
+        + """
+         WHERE c.principal = %s AND c.id = ANY(%s)
+         GROUP BY c.principal, c.id
+        """,
+        (principal, list(collection_ids)),
+    )
+    return {row["id"]: row for row in _all_dicts(cur)}
+
+
 def _fetch_items(cur, principal, collection_id):
     cur.execute(
         f"""
         SELECT id, collection_id, kind, track_id, provider_album_id, album_key,
-               title, artist, album, cover_item_id, position, added_at, updated_at
+               title, artist, album, cover_item_id, position, added_at, updated_at,
+               catalog_instance_id
           FROM {collection_items_table()}
          WHERE principal = %s AND collection_id = %s
          ORDER BY kind, position, added_at
@@ -459,12 +640,13 @@ def _normalize_backup_document(document):
             if not isinstance(raw_item, dict):
                 raise ValueError(f"Every item in {name} must be an object.")
             item = _normalize_item(raw_item)
+            scope = item["catalog_instance_id"]
             if item["kind"] == "track":
-                membership_key = ("track", item["track_id"])
+                membership_key = (scope, "track", item["track_id"])
             elif item["provider_album_id"]:
-                membership_key = ("album-id", item["provider_album_id"])
+                membership_key = (scope, "album-id", item["provider_album_id"])
             else:
-                membership_key = ("album-key", item["album_key"].lower())
+                membership_key = (scope, "album-key", item["album_key"].lower())
             if membership_key in membership_keys:
                 raise ValueError(f"{name} contains the same media item more than once.")
             membership_keys.add(membership_key)
@@ -476,30 +658,109 @@ def _normalize_backup_document(document):
     return normalized
 
 
+def _plan_restore(collections, restore_id, chunk_rows):
+    """Split a normalised backup into restore chunks of at most ``chunk_rows`` rows.
+
+    A row is one collection creation or one item. Ids derive from
+    ``restore_id``, so a resumed restore plans exactly the same chunks, ids and
+    positions. Each chunk is a list of segments ``{id, name, description,
+    create, items}``: ``create`` is true for the segment that inserts the
+    collection, and the later segments of a split collection append to it.
+    """
+    namespace = uuid.UUID(str(restore_id))
+    chunks = []
+    current = []
+    used = 0
+    for index, source in enumerate(collections):
+        collection_id = str(uuid.uuid5(namespace, f"collection:{index}"))
+        items = [
+            {**item, "id": str(uuid.uuid5(namespace, f"item:{index}:{offset}"))}
+            for offset, item in enumerate(source["items"])
+        ]
+        create = True
+        taken = 0
+        while True:
+            needed = 1 if create else 0
+            if current and used + needed > chunk_rows:
+                chunks.append(current)
+                current, used = [], 0
+            segment_items = items[taken:taken + chunk_rows - used - needed]
+            current.append({
+                "id": collection_id,
+                "name": source["name"],
+                "description": source["description"],
+                "create": create,
+                "items": segment_items,
+            })
+            used += needed + len(segment_items)
+            taken += len(segment_items)
+            create = False
+            if taken >= len(items):
+                break
+            chunks.append(current)
+            current, used = [], 0
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+# The one order in which a statement locks several collections: a restore
+# chunk and the provider-identity rekey both use it (principal, then id, in
+# byte order), so neither can deadlock with the other. Single-collection
+# mutations lock one row and need no order.
+_MULTI_COLLECTION_LOCK_ORDER = 'ORDER BY c.principal COLLATE "C", c.id COLLATE "C" FOR UPDATE OF c'
+
+
 def _restore_principal_collections(cur, principal, collections):
-    """Add backup contents as new collections in the caller's transaction."""
+    """Write one restore chunk in the caller's transaction.
+
+    ``collections`` holds segments (see ``_plan_restore``). A segment without
+    ``id`` gets a new one, and a segment without ``create`` creates its
+    collection. A created collection starts at revision 1, and each segment
+    that writes items bumps the revision once. The creating segment emits the
+    collection upsert; every item emits an upsert carrying the collection
+    revision after its segment. A collection deleted before a later chunk
+    reached it keeps its tombstone, and its remaining items are skipped.
+    """
     restored = []
     item_count = 0
     staged_changes = []
-    for source in collections:
-        collection_id = str(uuid.uuid4())
+    # Lock every existing collection of the chunk first, in the shared order
+    # (_MULTI_COLLECTION_LOCK_ORDER), so a chunk and a rekey cannot deadlock.
+    existing = sorted({source["id"] for source in collections if not source.get("create", True)})
+    if existing:
         cur.execute(
-            f"INSERT INTO {collections_table()} (principal, id, name, description) "
-            "VALUES (%s, %s, %s, %s)",
-            (principal, collection_id, source["name"], source["description"]),
+            f"SELECT c.id FROM {collections_table()} c "
+            f"WHERE c.principal = %s AND c.id = ANY(%s) {_MULTI_COLLECTION_LOCK_ORDER}",
+            (principal, existing),
         )
+    for source in collections:
+        collection_id = source.get("id") or str(uuid.uuid4())
+        create = source.get("create", True)
+        if create:
+            cur.execute(
+                f"INSERT INTO {collections_table()} (principal, id, name, description) "
+                "VALUES (%s, %s, %s, %s)",
+                (principal, collection_id, source["name"], source["description"]),
+            )
+        else:
+            locked = _lock_collection(cur, principal, collection_id, include_deleted=True)
+            if locked is None or locked["deleted_at"] is not None:
+                restored.append(locked)
+                continue
         for item in source["items"]:
             _upsert_item(cur, principal, collection_id, item)
         if source["items"]:
             cur.execute(
-                f"UPDATE {collections_table()} SET revision = 2, updated_at = now() "
+                f"UPDATE {collections_table()} SET revision = revision + 1, updated_at = now() "
                 "WHERE principal = %s AND id = %s",
                 (principal, collection_id),
             )
         collection = _fetch_collection(cur, principal, collection_id)
-        staged_changes.append(
-            (principal, collection_id, "collection", collection_id, "upsert", collection)
-        )
+        if create:
+            staged_changes.append(
+                (principal, collection_id, "collection", collection_id, "upsert", collection)
+            )
         for item in source["items"]:
             staged_changes.append(
                 (
@@ -514,40 +775,367 @@ def _restore_principal_collections(cur, principal, collections):
         item_count += len(source["items"])
         restored.append(collection)
     # Keep event emission after every parent and item write for LUM-004's lock order.
-    for change in staged_changes:
-        _record_change(cur, *change)
+    _record_changes(cur, staged_changes)
     return {"collections": restored, "collection_count": len(restored), "item_count": item_count}
 
 
-def _record_change(cur, principal, collection_id, entity_kind, entity_id, operation, payload):
-    # The UPDATE locks the singleton until the outer mutation transaction commits.
-    # All callers have finished parent/item writes before reaching this point.
+class _RestoreRun:
+    """One restore request, applied as ``_plan_restore`` chunks.
+
+    ``step`` applies the next chunk in the caller's transaction. It returns
+    ``None`` while chunks remain, then the final response body.
+
+    With an idempotency key, progress is a ``collection_restores`` row written
+    in each chunk's transaction, under the key's advisory lock. A retry with
+    the same key and body resumes after the last committed chunk, and two
+    requests with the same key never apply a chunk twice. While the row
+    exists, ``_begin_mutation`` answers any other body under that key with
+    ``idempotency_key_conflict``. A restore that fits in one chunk writes no
+    progress row. Without a key, progress lives only in this object.
+    """
+
+    def __init__(self, collections, key, fingerprint):
+        self.collections = collections
+        self.key = key
+        self.fingerprint = fingerprint
+        self.restore_id = None
+        self.chunks = None
+        self.done = 0
+
+    def _plan(self, restore_id, chunk_rows):
+        if self.chunks is None or str(restore_id) != str(self.restore_id):
+            self.restore_id = restore_id
+            self.chunks = _plan_restore(self.collections, restore_id, chunk_rows)
+
+    def _progress(self, cur, principal):
+        """(chunks already done, whether a progress row tracks them)."""
+        if not self.key:
+            self._plan(self.restore_id or uuid.uuid4(), RESTORE_CHUNK_ROWS)
+            return self.done, False
+        # _begin_mutation has matched this request's fingerprint to the row.
+        cur.execute(
+            f"SELECT restore_id, chunk_rows, chunks_done "
+            f"FROM {collection_restores_table()} "
+            "WHERE principal = %s AND idempotency_key = %s FOR UPDATE",
+            (principal, self.key),
+        )
+        row = cur.fetchone()
+        if row is not None:
+            restore_id, chunk_rows, done = row
+            self._plan(restore_id, chunk_rows)
+            return done, True
+        if self.done:
+            # This request committed a chunk, yet there is neither a receipt
+            # (checked before each step) nor progress: it was removed by hand.
+            raise RuntimeError("collection restore progress disappeared")
+        self._plan(uuid.uuid4(), RESTORE_CHUNK_ROWS)
+        if len(self.chunks) == 1:
+            return 0, False
+        cur.execute(
+            f"INSERT INTO {collection_restores_table()} "
+            "(principal, idempotency_key, request_fingerprint, restore_id, chunk_rows, "
+            "chunk_count, chunks_done) VALUES (%s, %s, %s, %s, %s, %s, 0)",
+            (principal, self.key, self.fingerprint, str(self.restore_id),
+             RESTORE_CHUNK_ROWS, len(self.chunks)),
+        )
+        return 0, True
+
+    def step(self, cur, principal):
+        done, tracked = self._progress(cur, principal)
+        chunk = self.chunks[done]
+        last = done == len(self.chunks) - 1
+        # Everything except the chunk's own writes happens first: once the
+        # chunk appends its events it holds the feed head until commit, and
+        # only the receipt insert may run then (nothing per collection).
+        if tracked:
+            if last:
+                cur.execute(
+                    f"DELETE FROM {collection_restores_table()} "
+                    "WHERE principal = %s AND idempotency_key = %s",
+                    (principal, self.key),
+                )
+            else:
+                cur.execute(
+                    f"UPDATE {collection_restores_table()} "
+                    "SET chunks_done = %s, updated_at = now() "
+                    "WHERE principal = %s AND idempotency_key = %s",
+                    (done + 1, principal, self.key),
+                )
+        finished = {}
+        if last:
+            # The response lists collections finished by earlier chunks (by
+            # this request or another with the same key) as they stand now;
+            # the last chunk does not touch them.
+            written = {segment["id"] for segment in chunk}
+            finished = _fetch_collections(cur, principal, [
+                segment["id"]
+                for earlier in self.chunks[:-1] for segment in earlier
+                if segment["create"] and segment["id"] not in written
+            ])
+        result = _restore_principal_collections(cur, principal, chunk)
+        self.done = done + 1
+        if not last:
+            return None
+        states = {segment["id"]: state for segment, state in zip(chunk, result["collections"])}
+        restored = [
+            states[segment["id"]] if segment["id"] in states else finished.get(segment["id"])
+            for planned in self.chunks for segment in planned if segment["create"]
+        ]
+        return {
+            "restored": True,
+            "collections": restored,
+            "collection_count": len(restored),
+            "item_count": sum(len(source["items"]) for source in self.collections),
+        }
+
+
+def _record_changes(cur, changes):
+    """Append staged change events as one block of consecutive seqs.
+
+    ``changes`` are ``(principal, collection_id, entity_kind, entity_id,
+    operation, payload)`` tuples in feed order. One UPDATE reserves the whole
+    block and locks the feed head until the outer transaction commits; every
+    caller has finished its parent and item writes before this point. One
+    INSERT then writes all the events.
+    """
+    if not changes:
+        return
+    count = len(changes)
     cur.execute(
-        f"UPDATE {collection_feed_state_table()} SET head_seq = head_seq + 1 "
+        f"UPDATE {collection_feed_state_table()} SET head_seq = head_seq + %s "
         "WHERE singleton = 1 AND protocol_version = %s RETURNING head_seq",
-        (FEED_PROTOCOL_VERSION,),
+        (count, FEED_PROTOCOL_VERSION),
     )
     allocated = cur.fetchone()
     if allocated is None:
         raise FeedProtocolUnavailable("collection feed frontier unavailable")
+    first = allocated[0] - count + 1
+    principals, collection_ids, kinds, entity_ids, operations, payloads = zip(*changes)
     # The invariant MAX(seq) <= head is checked against the head this
-    # transaction has just locked: one primary-key probe in the same statement.
+    # transaction has just locked: one primary-key probe, evaluated once for
+    # the block, so either every event is written or none is.
     cur.execute(
         f"""
         INSERT INTO {collection_changes_table()}
             (seq, principal, collection_id, entity_kind, entity_id, operation, payload)
-        SELECT %s, %s, %s, %s, %s, %s, %s::jsonb
+        SELECT %s + staged.ordinal - 1, staged.principal, staged.collection_id,
+               staged.entity_kind, staged.entity_id, staged.operation, staged.payload::jsonb
+          FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[], %s::text[], %s::text[])
+               WITH ORDINALITY AS staged(principal, collection_id, entity_kind, entity_id,
+                                         operation, payload, ordinal)
          WHERE NOT EXISTS (
              SELECT 1 FROM {collection_changes_table()} WHERE seq >= %s
          )
         """,
         (
-            allocated[0], principal, collection_id, entity_kind, entity_id, operation,
-            json.dumps(payload), allocated[0],
+            first, list(principals), list(collection_ids), list(kinds), list(entity_ids),
+            list(operations), [json.dumps(payload) for payload in payloads], first,
         ),
     )
-    if cur.rowcount != 1:
+    if cur.rowcount != count:
         raise FeedInvariantViolation("collection change rows exist past the feed head")
+
+
+def _record_change(cur, principal, collection_id, entity_kind, entity_id, operation, payload):
+    _record_changes(
+        cur, [(principal, collection_id, entity_kind, entity_id, operation, payload)]
+    )
+
+
+_ITEM_EVENT_FIELDS = (
+    "id", "kind", "track_id", "provider_album_id", "album_key", "title", "artist",
+    "album", "cover_item_id", "position", "catalog_instance_id",
+)
+
+
+def _plan_item_rekey(rows, tracks, albums, covers):
+    """``(rewrites, duplicates, collisions)`` for one principal's candidate items.
+
+    Items are grouped by the membership they hold after the rekey. A group
+    with one item is rewritten when its ids change. A group of rekeyed items
+    and exactly one item that already holds the new id merges: that item
+    stays, and the rekeyed ones are duplicates. Any other group is a
+    collision the merge rule cannot resolve.
+    """
+    groups = {}
+    for row in rows:
+        column, mapping = (
+            ("track_id", tracks) if row["kind"] == "track" else ("provider_album_id", albums)
+        )
+        moved = row[column] is not None and row[column] in mapping
+        target = mapping.get(row[column], row[column])
+        # Membership is per catalogue (K10), NULL being one of its own, as in
+        # the unique indexes. An album kept by album_key alone has no
+        # provider membership to rekey.
+        scope = row.get("catalog_instance_id") or ""
+        key = (row["collection_id"], row["kind"], target, scope) if target else (
+            row["collection_id"], "item", row["id"], scope)
+        groups.setdefault(key, []).append((moved, column, target, row))
+    rewrites, duplicates, collisions = [], [], []
+    for key in sorted(groups):
+        group = groups[key]
+        movers = [row for moved, _, _, row in group if moved]
+        holders = [entry for entry in group if not entry[0]]
+        if len(group) > 1 and movers:
+            if len(holders) != 1:
+                collisions.append({
+                    "collection_id": key[0], "kind": key[1], "provider_id": key[2],
+                    "item_ids": sorted(row["id"] for _, _, _, row in group),
+                })
+                continue
+            duplicates.extend(movers)
+            group = holders
+        for _, column, target, row in group:
+            rewritten = {**row, column: target,
+                         "cover_item_id": covers.get(row["cover_item_id"], row["cover_item_id"])}
+            if rewritten != row:
+                rewrites.append(rewritten)
+    return rewrites, duplicates, collisions
+
+
+def rekey_collection_items(cur, catalog_instance_id, tracks, albums, covers):
+    """Rekey collection items through the collections protocol (P3-4c).
+
+    ``tracks``, ``albums`` and ``covers`` map old provider ids to new ones for
+    track membership, album membership and ``cover_item_id``. Only items of
+    the rekeyed catalogue ``catalog_instance_id``, or of none (NULL), are
+    touched; another catalogue's items never are, even with the same ids
+    (K10). The parent
+    collections are locked in sorted order. When the new id is already a
+    member of the same collection, the rekeyed item is the duplicate: it is
+    deleted with a delete event. Each rewritten item gets an upsert event, and
+    each live affected collection's revision is bumped once. Delivered events
+    and receipts are never rewritten; clients see the rekey as new events.
+    Items of a deleted collection are rewritten without revision or events.
+
+    A principal with a collision the merge rule cannot resolve is deferred:
+    none of its items is written and one diagnostic is returned for it. The
+    other principals proceed.
+
+    Returns ``(changes, deferred)``. ``changes`` are ``_record_changes``
+    tuples that the caller records just before its commit, so the feed head
+    is held only for the event insert.
+    """
+    if not (tracks or albums or covers):
+        return [], []
+    old_tracks, old_albums, old_covers = sorted(tracks), sorted(albums), sorted(covers)
+    # K10: the rekeyed catalogue's items and unscoped (NULL) ones only.
+    scoped = "(i.catalog_instance_id = %s OR i.catalog_instance_id IS NULL)"
+    # One statement finds and locks the parents, in the shared order.
+    cur.execute(
+        f"""
+        SELECT c.principal, c.id, c.deleted_at IS NOT NULL
+          FROM {collections_table()} c
+         WHERE EXISTS (
+               SELECT 1 FROM {collection_items_table()} i
+                WHERE i.principal = c.principal AND i.collection_id = c.id
+                  AND {scoped}
+                  AND ((i.kind = 'track' AND i.track_id = ANY(%s))
+                       OR (i.kind = 'album' AND i.provider_album_id = ANY(%s))
+                       OR i.cover_item_id = ANY(%s)))
+         {_MULTI_COLLECTION_LOCK_ORDER}
+        """,
+        (catalog_instance_id, old_tracks, old_albums, old_covers),
+    )
+    deleted = {(row[0], row[1]): row[2] for row in cur.fetchall()}
+    if not deleted:
+        return [], []
+    principals, collection_ids = (list(column) for column in zip(*deleted))
+    # Read again under the locks: a mutation may have committed meanwhile.
+    cur.execute(
+        f"""
+        SELECT i.principal, i.collection_id, i.id, i.kind, i.track_id,
+               i.provider_album_id, i.album_key, i.title, i.artist, i.album,
+               i.cover_item_id, i.position, i.catalog_instance_id
+          FROM {collection_items_table()} i
+          JOIN unnest(%s::text[], %s::text[]) AS parent(principal, id)
+            ON i.principal = parent.principal AND i.collection_id = parent.id
+         WHERE {scoped}
+           AND ((i.kind = 'track' AND i.track_id = ANY(%s))
+                OR (i.kind = 'album' AND i.provider_album_id = ANY(%s))
+                OR i.cover_item_id = ANY(%s))
+        """,
+        (
+            principals, collection_ids, catalog_instance_id,
+            old_tracks + sorted(set(tracks.values())),
+            old_albums + sorted(set(albums.values())), old_covers,
+        ),
+    )
+    by_principal = {}
+    for row in _all_dicts(cur):
+        by_principal.setdefault(row["principal"], []).append(row)
+    rewrites, duplicates, deferred = [], [], []
+    for principal in sorted(by_principal):
+        planned, merged, collisions = _plan_item_rekey(
+            by_principal[principal], tracks, albums, covers)
+        if collisions:
+            deferred.append({"principal": principal, "reason": "unresolved_membership_collision",
+                             "collisions": collisions})
+            continue
+        rewrites.extend(planned)
+        duplicates.extend(merged)
+    if duplicates:
+        cur.execute(
+            f"""
+            DELETE FROM {collection_items_table()} target
+             USING unnest(%s::text[], %s::text[]) AS gone(principal, id)
+             WHERE target.principal = gone.principal AND target.id = gone.id
+            """,
+            ([row["principal"] for row in duplicates], [row["id"] for row in duplicates]),
+        )
+    if rewrites:
+        cur.execute(
+            f"""
+            UPDATE {collection_items_table()} target
+               SET track_id = changed.track_id,
+                   provider_album_id = changed.provider_album_id,
+                   cover_item_id = changed.cover_item_id,
+                   updated_at = now()
+              FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[], %s::text[])
+                   AS changed(principal, id, track_id, provider_album_id, cover_item_id)
+             WHERE target.principal = changed.principal AND target.id = changed.id
+            """,
+            tuple(
+                [row[name] for row in rewrites]
+                for name in ("principal", "id", "track_id", "provider_album_id", "cover_item_id")
+            ),
+        )
+    touched = sorted({
+        (row["principal"], row["collection_id"]) for row in duplicates + rewrites
+        if not deleted.get((row["principal"], row["collection_id"]), True)
+    })
+    if not touched:
+        return [], deferred
+    cur.execute(
+        f"""
+        UPDATE {collections_table()} target
+           SET revision = revision + 1, updated_at = now()
+          FROM unnest(%s::text[], %s::text[]) AS bumped(principal, id)
+         WHERE target.principal = bumped.principal AND target.id = bumped.id
+        RETURNING target.principal, target.id, target.revision, target.updated_at
+        """,
+        tuple(list(column) for column in zip(*touched)),
+    )
+    revisions = {
+        (row[0], row[1]): {"collection_revision": row[2],
+                           "collection_updated_at": _json_value(row[3])}
+        for row in cur.fetchall()
+    }
+    # Per collection: the merged duplicates' deletes, then the upserts; the
+    # payloads are those of the item delete and item write routes.
+    staged = {}
+    for operation, rows in (("delete", duplicates), ("upsert", rewrites)):
+        for row in sorted(rows, key=lambda row: row["id"]):
+            staged.setdefault((row["principal"], row["collection_id"]), []).append((operation, row))
+    changes = []
+    for parent in touched:
+        for operation, row in staged[parent]:
+            payload = (
+                {"id": row["id"], "collection_id": parent[1]} if operation == "delete"
+                else {name: row[name] for name in _ITEM_EVENT_FIELDS}
+            )
+            changes.append((*parent, "item", row["id"], operation, {**payload, **revisions[parent]}))
+    return changes, deferred
 
 
 def collection_feed_integrity(cur):
@@ -566,6 +1154,105 @@ def collection_feed_integrity(cur):
     )
     row = cur.fetchone()
     return None if row is None else bool(row[0])
+
+
+def _feed_state(cur):
+    """The committed feed ``{epoch, head_seq, floor_seq}``, or None when the
+    state row is missing or has an unknown protocol."""
+    cur.execute(
+        f"SELECT protocol_version, epoch::text, head_seq, floor_seq "
+        f"FROM {collection_feed_state_table()} WHERE singleton = 1"
+    )
+    row = cur.fetchone()
+    if row is None or row[0] != FEED_PROTOCOL_VERSION:
+        return None
+    return {"epoch": row[1], "head_seq": row[2], "floor_seq": row[3]}
+
+
+def _same_epoch(echoed, epoch):
+    try:
+        return uuid.UUID(echoed) == uuid.UUID(epoch)
+    except ValueError:
+        return False
+
+
+@contextmanager
+def _snapshot_connection():
+    """Own one read-only REPEATABLE READ backend, apart from the request's.
+
+    The host may already have read settings on the request connection, after
+    which its isolation level can no longer change.
+    """
+    dsn = getattr(config, "DATABASE_URL", None)
+    if not dsn:
+        raise FeedProtocolUnavailable("no database configured")
+    try:
+        db = psycopg2.connect(dsn, connect_timeout=SNAPSHOT_CONNECT_TIMEOUT_S,
+                              application_name=SNAPSHOT_APPLICATION_NAME)
+    except (psycopg2.Error, TypeError, ValueError) as exc:
+        # Name only the class: libpq can quote the DSN, password included.
+        current_app.logger.warning("Collection snapshot could not connect (%s)", type(exc).__name__)
+        raise FeedProtocolUnavailable("snapshot connection failed") from None
+    try:
+        db.set_session(isolation_level="REPEATABLE READ", readonly=True)
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT set_config('statement_timeout', %s, false), "
+                "set_config('lock_timeout', %s, false)",
+                (str(SNAPSHOT_STATEMENT_TIMEOUT_MS), str(SNAPSHOT_LOCK_TIMEOUT_MS)),
+            )
+        db.commit()
+        yield db
+    finally:
+        # Read-only: nothing to commit. Never mask the exception in flight.
+        for close in (db.rollback, db.close):
+            try:
+                close()
+            except Exception:
+                pass
+
+
+def _read_snapshot(cur, principal):
+    """All of a principal's active collections and items, and the feed head.
+
+    One REPEATABLE READ transaction: the feed state is its first read, so the
+    rows reflect exactly the events with ``seq <= head_seq`` (every writer
+    moves the head in the transaction that writes the rows).
+    """
+    state = _feed_state(cur)
+    if state is None:
+        raise FeedProtocolUnavailable("collection feed state unavailable")
+    cur.execute(
+        _collection_select()
+        + """
+         WHERE c.principal = %s AND c.deleted_at IS NULL
+         GROUP BY c.principal, c.id
+         ORDER BY c.created_at, c.id
+        """,
+        (principal,),
+    )
+    collections = _all_dicts(cur)
+    cur.execute(
+        f"""
+        SELECT i.id, i.collection_id, i.kind, i.track_id, i.provider_album_id,
+               i.album_key, i.title, i.artist, i.album, i.cover_item_id, i.position,
+               i.added_at, i.updated_at, i.catalog_instance_id
+          FROM {collection_items_table()} i
+          JOIN {collections_table()} c
+            ON c.principal = i.principal AND c.id = i.collection_id
+         WHERE i.principal = %s AND c.deleted_at IS NULL
+         ORDER BY i.collection_id, i.kind, i.position, i.added_at, i.id
+        """,
+        (principal,),
+    )
+    items = _all_dicts(cur)
+    return {
+        **state,
+        "collections": collections,
+        "items": items,
+        "collection_count": len(collections),
+        "item_count": len(items),
+    }
 
 
 def _expected_revision(body):
@@ -609,58 +1296,116 @@ def _lock_collection(cur, principal, collection_id, include_deleted=False):
     return _fetch_collection(cur, principal, collection_id, include_deleted=include_deleted)
 
 
-def _mutation_response(handler):
+def _idempotency_key():
+    return (request.headers.get("Idempotency-Key") or "").strip()[:200]
+
+
+# A handler returns (None, CONTINUE) to commit its transaction and be called
+# again in a new one (a chunked restore).
+CONTINUE = "continue"
+
+
+def _key_conflict(db, cur, principal, collection_id):
+    """409 ``idempotency_key_conflict``; the transaction is rolled back.
+
+    Under contract 2 the body adds ``current``: the collection the key's
+    receipt applied to as it stands now (tombstones included), or null when
+    the key belongs to a restore, the receipt predates 1.3.0, or the
+    collection does not exist.
+    """
+    body = {"error": "idempotency_key_conflict"}
+    if contract_v2():
+        body["current"] = None if collection_id is None else _fetch_collection(
+            cur, principal, collection_id, include_deleted=True
+        )
+    db.rollback()
+    return jsonify(body), 409
+
+
+def _begin_mutation(db, cur, principal, key, fingerprint):
+    """Open one mutation transaction; a response here ends the request.
+
+    Checks the isolation level, bounds every lock wait, and with a key takes
+    the key's advisory lock and replays or rejects an existing receipt.
+    """
+    # The host may have queried settings on this request-scoped connection.
+    # SHOW is valid after that read; SET TRANSACTION would be rejected then.
+    # Row-lock waiters must see the holder's committed revision.
+    cur.execute("SHOW transaction_isolation")
+    isolation = cur.fetchone()[0].lower()
+    if isolation != "read committed" or getattr(db, "autocommit", False):
+        db.rollback()
+        return jsonify({"error": "unsupported_transaction_isolation"}), 503
+    # Transaction-scoped: the host connection's own setting returns at commit.
+    cur.execute(f"SET LOCAL lock_timeout = '{MUTATION_LOCK_TIMEOUT}'")
+    if not key:
+        return None
+    identity = json.dumps((1, principal, key), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    lock_id = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+    cur.execute(
+        f"SELECT response_payload::text, status_code, request_fingerprint, fingerprint_version, "
+        f"collection_id FROM {collection_mutations_table()} "
+        "WHERE principal = %s AND idempotency_key = %s",
+        (principal, key),
+    )
+    saved = cur.fetchone()
+    if not saved:
+        # An unfinished chunked restore owns the key: only a retry of that
+        # restore (same fingerprint) may use it, whatever the route.
+        cur.execute(
+            f"SELECT request_fingerprint FROM {collection_restores_table()} "
+            "WHERE principal = %s AND idempotency_key = %s",
+            (principal, key),
+        )
+        restoring = cur.fetchone()
+        if restoring is not None and restoring[0] != fingerprint:
+            return _key_conflict(db, cur, principal, None)
+        return None
+    payload_text, status, saved_digest, saved_version, saved_collection = saved
+    if saved_digest is None and saved_version is None:
+        current_app.logger.warning("Replaying legacy unbound collection receipt")
+        headers = {"Idempotency-Replayed": "true", "Idempotency-Fingerprint": "legacy-unbound"}
+    elif saved_version != FINGERPRINT_VERSION or saved_digest != fingerprint:
+        return _key_conflict(db, cur, principal, saved_collection)
+    else:
+        headers = {"Idempotency-Replayed": "true"}
+    db.rollback()
+    return jsonify(json.loads(payload_text)), status, headers
+
+
+def _mutation_response(handler, collection_id=None):
+    """Run ``handler`` as one keyed, bounded mutation; ``collection_id`` is the
+    collection the request applies to (None for a restore), kept with its
+    receipt."""
     principal = current_principal()
-    key = (request.headers.get("Idempotency-Key") or "").strip()[:200]
+    key = _idempotency_key()
     fingerprint = _request_fingerprint()
     db = get_db()
     cur = db.cursor()
     try:
-        # The host may have queried settings on this request-scoped connection.
-        # SHOW is valid after that read; SET TRANSACTION would be rejected then.
-        # Row-lock waiters must see the holder's committed revision.
-        cur.execute("SHOW transaction_isolation")
-        isolation = cur.fetchone()[0].lower()
-        if isolation != "read committed" or getattr(db, "autocommit", False):
-            db.rollback()
-            return jsonify({"error": "unsupported_transaction_isolation"}), 503
-        if key:
-            identity = json.dumps((1, principal, key), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            lock_id = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
-            cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
-            cur.execute(
-                f"SELECT response_payload::text, status_code, request_fingerprint, fingerprint_version "
-                f"FROM {collection_mutations_table()} "
-                "WHERE principal = %s AND idempotency_key = %s",
-                (principal, key),
-            )
-            saved = cur.fetchone()
-            if saved:
-                payload_text, status, saved_digest, saved_version = saved
-                if saved_digest is None and saved_version is None:
-                    current_app.logger.warning("Replaying legacy unbound collection receipt")
-                    headers = {"Idempotency-Replayed": "true", "Idempotency-Fingerprint": "legacy-unbound"}
-                elif saved_version != FINGERPRINT_VERSION or saved_digest != fingerprint:
-                    db.rollback()
-                    return jsonify({"error": "idempotency_key_conflict"}), 409
-                else:
-                    headers = {"Idempotency-Replayed": "true"}
+        while True:
+            early = _begin_mutation(db, cur, principal, key, fingerprint)
+            if early is not None:
+                return early
+            payload, status = handler(cur, principal)
+            if status == CONTINUE:
+                db.commit()
+                continue
+            if not 200 <= status < 300:
                 db.rollback()
-                return jsonify(json.loads(payload_text)), status, headers
-        payload, status = handler(cur, principal)
-        if not 200 <= status < 300:
-            db.rollback()
+                return jsonify(payload), status
+            if key:
+                cur.execute(
+                    f"INSERT INTO {collection_mutations_table()} "
+                    "(principal, idempotency_key, response_payload, status_code, "
+                    "request_fingerprint, fingerprint_version, collection_id) "
+                    "VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s)",
+                    (principal, key, json.dumps(payload), status, fingerprint,
+                     FINGERPRINT_VERSION, collection_id),
+                )
+            db.commit()
             return jsonify(payload), status
-        if key:
-            cur.execute(
-                f"INSERT INTO {collection_mutations_table()} "
-                "(principal, idempotency_key, response_payload, status_code, "
-                "request_fingerprint, fingerprint_version) "
-                "VALUES (%s, %s, %s::jsonb, %s, %s, %s)",
-                (principal, key, json.dumps(payload), status, fingerprint, FINGERPRINT_VERSION),
-            )
-        db.commit()
-        return jsonify(payload), status
     except ForeignItemConflict:
         db.rollback()
         return jsonify({"error": "item_id_collection_conflict"}), 409
@@ -674,8 +1419,11 @@ def _mutation_response(handler):
             "blocked until the head is realigned (docs/runbooks/UPGRADE_1.3.md)"
         )
         return jsonify({"error": "collection_feed_invariant"}), 503
-    except Exception:
+    except Exception as exc:
         db.rollback()
+        if getattr(exc, "pgcode", None) == LOCK_NOT_AVAILABLE:
+            return (jsonify({"error": "collection_busy"}), 503,
+                    {"Retry-After": str(BUSY_RETRY_AFTER_S)})
         raise
     finally:
         cur.close()
@@ -718,6 +1466,12 @@ def _normalize_item(raw):
         raise ValueError("Track items require track_id.")
     if kind == "album" and not (provider_album_id or album_key):
         raise ValueError("Album items require provider_album_id or album_key.")
+    catalog_instance_id = raw.get("catalog_instance_id")
+    if catalog_instance_id is not None and not isinstance(catalog_instance_id, str):
+        raise ValueError("catalog_instance_id must be a string.")
+    catalog_instance_id = (catalog_instance_id or "").strip() or None
+    if catalog_instance_id and len(catalog_instance_id) > 256:
+        raise ValueError("catalog_instance_id is too long.")
     return {
         "id": str(raw.get("id") or uuid.uuid4()),
         "kind": kind,
@@ -729,6 +1483,9 @@ def _normalize_item(raw):
         "album": str(raw.get("album") or "").strip() or None,
         "cover_item_id": str(raw.get("cover_item_id") or "").strip() or None,
         "position": max(int(raw.get("position") or 0), 0),
+        # K10: the catalogue the item was chosen from; None lets _upsert_item
+        # keep the stored one or use the install's only catalogue.
+        "catalog_instance_id": catalog_instance_id,
     }
 
 
@@ -736,36 +1493,65 @@ class ForeignItemConflict(Exception):
     pass
 
 
-def _upsert_item(cur, principal, collection_id, item):
+def _upsert_item(cur, principal, collection_id, item, remap=True):
+    """Write one normalised item into a locked collection.
+
+    When another item of the collection already holds the same membership
+    (track id, provider album id, or album key without one), ``remap`` keeps
+    the 1.2.5 behaviour: ``item["id"]`` becomes that item's id and it is
+    updated. Without ``remap`` (contract 2) nothing is written and that item's
+    id is returned. Returns None when the item was written.
+
+    Membership is per catalogue (K10). An item sent without
+    ``catalog_instance_id`` keeps the one its id already has, or else takes
+    the install's only catalogue (NULL when there have been several);
+    ``item["catalog_instance_id"]`` is set to the result.
+    """
+    items = collection_items_table()
+    if item.get("catalog_instance_id") is None:
+        cur.execute(
+            f"SELECT (SELECT catalog_instance_id FROM {items} WHERE principal = %s AND id = %s), "
+            "to_regclass(%s) IS NOT NULL",
+            (principal, item["id"], table("catalog_sources")),
+        )
+        stored, has_sources = cur.fetchone() or (None, False)
+        if stored is None and has_sources:
+            cur.execute(f"SELECT {sole_catalog_sql()}")
+            stored = (cur.fetchone() or (None,))[0]
+        item["catalog_instance_id"] = stored
+    scope = "AND catalog_instance_id IS NOT DISTINCT FROM %s"
     if item["kind"] == "track":
         cur.execute(
-            f"SELECT id FROM {collection_items_table()} "
-            "WHERE principal = %s AND collection_id = %s AND kind = 'track' AND track_id = %s",
-            (principal, collection_id, item["track_id"]),
+            f"SELECT id FROM {items} "
+            f"WHERE principal = %s AND collection_id = %s {scope} "
+            "AND kind = 'track' AND track_id = %s",
+            (principal, collection_id, item["catalog_instance_id"], item["track_id"]),
         )
     elif item["provider_album_id"]:
         cur.execute(
-            f"SELECT id FROM {collection_items_table()} "
-            "WHERE principal = %s AND collection_id = %s AND kind = 'album' "
+            f"SELECT id FROM {items} "
+            f"WHERE principal = %s AND collection_id = %s {scope} AND kind = 'album' "
             "AND provider_album_id = %s",
-            (principal, collection_id, item["provider_album_id"]),
+            (principal, collection_id, item["catalog_instance_id"], item["provider_album_id"]),
         )
     else:
         cur.execute(
-            f"SELECT id FROM {collection_items_table()} "
-            "WHERE principal = %s AND collection_id = %s AND kind = 'album' "
+            f"SELECT id FROM {items} "
+            f"WHERE principal = %s AND collection_id = %s {scope} AND kind = 'album' "
             "AND provider_album_id IS NULL AND album_key = %s",
-            (principal, collection_id, item["album_key"]),
+            (principal, collection_id, item["catalog_instance_id"], item["album_key"]),
         )
     existing = cur.fetchone()
-    if existing:
+    if existing and existing[0] != item["id"]:
+        if not remap:
+            return existing[0]
         item["id"] = existing[0]
     cur.execute(
         f"""
         INSERT INTO {collection_items_table()} AS target
             (principal, id, collection_id, kind, track_id, provider_album_id, album_key,
-             title, artist, album, cover_item_id, position)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             title, artist, album, cover_item_id, position, catalog_instance_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (principal, id) DO UPDATE SET
             kind = EXCLUDED.kind,
             track_id = EXCLUDED.track_id,
@@ -776,6 +1562,7 @@ def _upsert_item(cur, principal, collection_id, item):
             album = EXCLUDED.album,
             cover_item_id = EXCLUDED.cover_item_id,
             position = EXCLUDED.position,
+            catalog_instance_id = EXCLUDED.catalog_instance_id,
             updated_at = now()
         WHERE target.collection_id = EXCLUDED.collection_id
         RETURNING id
@@ -793,10 +1580,12 @@ def _upsert_item(cur, principal, collection_id, item):
             item["album"],
             item["cover_item_id"],
             item["position"],
+            item["catalog_instance_id"],
         ),
     )
     if cur.fetchone() is None:
         raise ForeignItemConflict()
+    return None
 
 
 def register_collection_routes(bp):
@@ -846,10 +1635,13 @@ def register_collection_routes(bp):
             return jsonify({"error": str(exc)}), 400
         if not collections:
             return jsonify({"error": "The backup does not contain any collections."}), 400
+        run = _RestoreRun(collections, _idempotency_key(), _request_fingerprint())
 
         def mutate(cur, principal):
-            result = _restore_principal_collections(cur, principal, collections)
-            return {"restored": True, **result}, 201
+            result = run.step(cur, principal)
+            if result is None:
+                return None, CONTINUE
+            return result, 201
 
         return _mutation_response(mutate)
 
@@ -857,13 +1649,13 @@ def register_collection_routes(bp):
     @require_collections_enabled
     def collection_create():
         body = request.get_json(silent=True) or {}
+        collection_id = str(body.get("id") or uuid.uuid4())
 
         def mutate(cur, principal):
             try:
                 name, description = _clean_collection_body(body)
             except ValueError as exc:
                 return _error(str(exc), 400)
-            collection_id = str(body.get("id") or uuid.uuid4())
             cur.execute(
                 f"""
                 INSERT INTO {collections_table()} (principal, id, name, description)
@@ -874,6 +1666,12 @@ def register_collection_routes(bp):
                 (principal, collection_id, name, description),
             )
             inserted = cur.fetchone() is not None
+            if not inserted and contract_v2():
+                # K9: the id is taken; answer with the collection holding it.
+                existing = _fetch_collection(cur, principal, collection_id, include_deleted=True)
+                deleted = existing is not None and existing["deleted_at"] is not None
+                return _error("collection_deleted" if deleted else "collection_exists", 409,
+                              current=existing)
             collection = _fetch_collection(cur, principal, collection_id)
             if inserted:
                 _record_change(
@@ -881,7 +1679,7 @@ def register_collection_routes(bp):
                 )
             return {"collection": collection}, 201
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.get("/api/collections/<collection_id>")
     @require_collections_enabled
@@ -942,7 +1740,7 @@ def register_collection_routes(bp):
             )
             return {"collection": updated}, 200
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.delete("/api/collections/<collection_id>")
     @require_collections_enabled
@@ -972,7 +1770,7 @@ def register_collection_routes(bp):
             )
             return {"deleted": True, **payload}, 200
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.put("/api/collections/<collection_id>/items/<item_id>")
     @require_collections_enabled
@@ -1004,8 +1802,16 @@ def register_collection_routes(bp):
             expected = _expected_revision(body)
             if expected is not None and expected != current["revision"]:
                 return _error("revision_conflict", 409, current=current)
+            remap = not contract_v2()
+            conflicts = []
             for item in items:
-                _upsert_item(cur, principal, collection_id, item)
+                existing_id = _upsert_item(cur, principal, collection_id, item, remap=remap)
+                if existing_id is not None:
+                    conflicts.append({"item_id": item["id"], "existing_item_id": existing_id})
+            if conflicts:
+                # K9: nothing is written (the transaction rolls back).
+                return _error("membership_conflict", 409, **conflicts[0],
+                              conflicts=conflicts, current=current)
             cur.execute(
                 f"""
                 UPDATE {collections_table()}
@@ -1015,24 +1821,24 @@ def register_collection_routes(bp):
                 (principal, collection_id),
             )
             updated = _fetch_collection(cur, principal, collection_id)
-            for item in items:
-                change_payload = {
-                    **item,
-                    "collection_revision": updated["revision"],
-                    "collection_updated_at": updated["updated_at"],
-                }
-                _record_change(
-                    cur,
+            _record_changes(cur, [
+                (
                     principal,
                     collection_id,
                     "item",
                     item["id"],
                     "upsert",
-                    change_payload,
+                    {
+                        **item,
+                        "collection_revision": updated["revision"],
+                        "collection_updated_at": updated["updated_at"],
+                    },
                 )
+                for item in items
+            ])
             return {"collection": updated, "items": items}, success_status
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.delete("/api/collections/<collection_id>/items/<item_id>")
     @require_collections_enabled
@@ -1076,7 +1882,7 @@ def register_collection_routes(bp):
                 )
             return {"deleted": removed, "collection": updated}, 200
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.delete("/api/collections/<collection_id>/items/batch")
     @require_collections_enabled
@@ -1101,7 +1907,10 @@ def register_collection_routes(bp):
                 "WHERE principal = %s AND collection_id = %s AND id = ANY(%s) RETURNING id",
                 (principal, collection_id, item_ids),
             )
-            removed_ids = [str(row[0]) for row in cur.fetchall()]
+            removed = {str(row[0]) for row in cur.fetchall()}
+            # RETURNING has no defined row order (PostgreSQL 16 and 17 differ
+            # here): answer, and journal the deletes, in request order.
+            removed_ids = [item_id for item_id in item_ids if item_id in removed]
             if removed_ids:
                 cur.execute(
                     f"UPDATE {collections_table()} SET revision = revision + 1, updated_at = now() "
@@ -1109,9 +1918,8 @@ def register_collection_routes(bp):
                     (principal, collection_id),
                 )
             updated = _fetch_collection(cur, principal, collection_id)
-            for removed_id in removed_ids:
-                _record_change(
-                    cur,
+            _record_changes(cur, [
+                (
                     principal,
                     collection_id,
                     "item",
@@ -1124,13 +1932,15 @@ def register_collection_routes(bp):
                         "collection_updated_at": updated["updated_at"],
                     },
                 )
+                for removed_id in removed_ids
+            ])
             return {
                 "deleted": removed_ids,
                 "deleted_count": len(removed_ids),
                 "collection": updated,
             }, 200
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.get("/api/collections/changes")
     @require_collections_enabled
@@ -1140,18 +1950,28 @@ def register_collection_routes(bp):
             limit = min(max(int(request.args.get("limit", 200)), 1), 500)
         except ValueError:
             return jsonify({"error": "invalid_cursor"}), 400
+        # K8: only a client that echoes the epoch can be told to resync. An
+        # absent or empty epoch keeps the 1.2.5 behaviour (never 410).
+        echoed = (request.args.get("epoch") or "").strip()
         db = get_db()
         cur = db.cursor()
-        cur.execute(
-            f"SELECT protocol_version, head_seq FROM {collection_feed_state_table()} "
-            "WHERE singleton = 1"
-        )
-        state = cur.fetchone()
-        if state is None or state[0] != FEED_PROTOCOL_VERSION:
+        state = _feed_state(cur)
+        if state is None:
             db.rollback()
             cur.close()
             return jsonify({"error": "collection_feed_unavailable"}), 503
-        head_seq = state[1]
+        principal = current_principal()
+        head_seq = state["head_seq"]
+        if echoed:
+            reason = None
+            if not _same_epoch(echoed, state["epoch"]):
+                reason = "epoch_mismatch"
+            elif cursor > head_seq:
+                reason = "cursor_ahead"
+            if reason:
+                db.rollback()
+                cur.close()
+                return jsonify({"error": "collections_resync_required", "reason": reason}), 410
         cur.execute(
             f"""
             SELECT seq, collection_id, entity_kind, entity_id, operation,
@@ -1160,15 +1980,52 @@ def register_collection_routes(bp):
              WHERE principal = %s AND seq > %s AND seq <= %s
              ORDER BY seq ASC LIMIT %s
             """,
-            (current_principal(), cursor, head_seq, limit),
+            (principal, cursor, head_seq, limit + 1),
         )
         changes = _all_dicts(cur)
         cur.close()
+        has_more = len(changes) > limit
+        del changes[limit:]
         for change in changes:
             if isinstance(change.get("payload"), str):
                 change["payload"] = json.loads(change["payload"])
         next_cursor = changes[-1]["seq"] if changes else cursor
-        return jsonify({"changes": changes, "next_cursor": next_cursor})
+        return jsonify({
+            "changes": changes,
+            "next_cursor": next_cursor,
+            "epoch": state["epoch"],
+            "head_seq": head_seq,
+            "floor_seq": state["floor_seq"],
+            "has_more": has_more,
+        })
+
+    @bp.get("/api/collections/snapshot")
+    @require_collections_enabled
+    def collection_snapshot():
+        principal = current_principal()
+        scope = current_collection_scope()["mode"]
+
+        def unavailable():
+            return (jsonify({"error": "collection_feed_unavailable"}), 503,
+                    {"Retry-After": str(UNAVAILABLE_RETRY_AFTER_S)})
+
+        if not _SNAPSHOT_SLOT.acquire(timeout=SNAPSHOT_WAIT_S):
+            return unavailable()
+        try:
+            with _snapshot_connection() as db:
+                with db.cursor() as cur:
+                    snapshot = _read_snapshot(cur, principal)
+            return jsonify({"schema_version": COLLECTIONS_SCHEMA_VERSION, "scope": scope,
+                            **snapshot})
+        except (FeedProtocolUnavailable, psycopg2.OperationalError,
+                psycopg2.InterfaceError) as exc:
+            if not isinstance(exc, FeedProtocolUnavailable):
+                current_app.logger.warning(
+                    "Collection snapshot database unavailable (%s)", type(exc).__name__
+                )
+            return unavailable()
+        finally:
+            _SNAPSHOT_SLOT.release()
 
     @bp.get("/api/collections/search")
     @require_collections_enabled
@@ -1180,28 +2037,36 @@ def register_collection_routes(bp):
         like = f"%{query}%"
         db = get_db()
         cur = db.cursor()
+        try:
+            catalog, _provider = resolve_catalog(cur, requested_catalog())
+        except CatalogScopeError as exc:
+            cur.close()
+            return jsonify(exc.body()), exc.status
+        # ILIKE on the columns: search_u is unused, so unaccent is not needed.
         if kind == "album":
             cur.execute(
                 f"""
-                SELECT MIN(item_id) AS cover_item_id, album,
-                       COALESCE(NULLIF(album_artist, ''), author) AS artist,
-                       COUNT(*)::INTEGER AS track_count
-                  FROM ({catalog_track_view_sql()}) score
+                SELECT MIN(item_id) AS cover_item_id, MIN(album) AS album,
+                       {album_artist_sql()} AS artist,
+                       COUNT(*)::INTEGER AS track_count, album_id
+                  FROM ({catalog_track_view_sql(unaccent=False)}) score
                  WHERE album IS NOT NULL
                    AND (album ILIKE %s OR album_artist ILIKE %s OR author ILIKE %s)
-                 GROUP BY album, COALESCE(NULLIF(album_artist, ''), author)
-                 ORDER BY lower(album) LIMIT 50
+                 GROUP BY album_id
+                 ORDER BY lower(MIN(album)), album_id LIMIT 50
                 """,
-                (like, like, like),
+                (catalog, like, like, like),
             )
             results = _all_dicts(cur)
             for row in results:
                 album_title = row.pop("album")
+                # LUM-014: one row per catalogue album, with its id.
                 row.update(
                     {
                         "kind": "album",
                         "title": album_title,
                         "album_key": f"{str(row['artist']).lower()}::{str(album_title).lower()}",
+                        "provider_album_id": str(row.pop("album_id")),
                     }
                 )
         else:
@@ -1209,11 +2074,11 @@ def register_collection_routes(bp):
                 f"""
                 SELECT item_id AS track_id, title, author AS artist, album,
                        item_id AS cover_item_id
-                  FROM ({catalog_track_view_sql()}) score
+                  FROM ({catalog_track_view_sql(unaccent=False)}) score
                  WHERE title ILIKE %s OR author ILIKE %s OR album ILIKE %s
                  ORDER BY lower(title) LIMIT 50
                 """,
-                (like, like, like),
+                (catalog, like, like, like),
             )
             results = _all_dicts(cur)
             for row in results:

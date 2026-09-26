@@ -1481,7 +1481,8 @@ def client_view(path):
 def run_lum005(ctx):
     scenario = Scenario("lum005_k6", "LUM-005-style full republish (every waveform changes, "
                                      "same media) must reach a device at <= 1 KB per track "
-                                     "with K6 edge references (P3-2).")
+                                     "with K6 edge references (P3-2); a device without K6 "
+                                     "still receives every edge in full.")
     health = json.loads(urllib.request.urlopen(ctx.server.base_url + PREFIX + "/api/health",
                                                timeout=30).read())
     edge_refs = ((health.get("capabilities") or {}).get("profile_stream") or {}).get("edge_refs")
@@ -1497,40 +1498,87 @@ def run_lum005(ctx):
         path = ctx.db_path("lum005")
     client = ctx.client(path, mode="v2")
     client.run()  # current first (a fresh load, or the first_load_v2 device catching up)
+    # A second device of a client without K6 (it never opts in), also current.
+    old_path = ctx.db_path("lum005_no_k6")
+    old = ctx.client(old_path, mode="v2", edge_refs=False)
+    old.run()
+    # C-10 misses: the K6 device lost some local edges (for example an
+    # opportunistic edge it never had); those references must be fetched.
+    dropped = []
+    if edge_refs and ctx.args.lum005_misses > 0:
+        dropped = ids[:: max(1, len(ids) // ctx.args.lum005_misses)][: ctx.args.lum005_misses]
+    client.store.db.executemany("DELETE FROM edges WHERE track_id=?", [(t,) for t in dropped])
 
     def delta_bytes(summary):
         kinds = [summary["requests"].get(kind, {}) for kind in ("changes", "profiles_fetch")]
         return (sum(k.get("wire_bytes", 0) for k in kinds),
                 sum(k.get("decoded_bytes", 0) for k in kinds))
-    wire_before, decoded_before = delta_bytes(client.stats.summary())
+
+    def counts(device):
+        return {**device.state.get("counters", {}), **dict(device.store.counters)}
+
+    before = {"new": delta_bytes(client.stats.summary()), "old": delta_bytes(old.stats.summary())}
+    counters_before = {"new": counts(client), "old": counts(old)}
     republished = plugin.republish_waveform(ctx.source, sample, 0.05)
     result = client.run()
-    wire_after, decoded_after = delta_bytes(result["stats"])
-    wire = wire_after - wire_before
-    per_track = wire / max(1, republished)
+    old_result = old.run()
+
+    def per_track(name, device, summary):
+        wire, decoded = delta_bytes(summary)
+        wire, decoded = wire - before[name][0], decoded - before[name][1]
+        grown = {key: value - counters_before[name].get(key, 0)
+                 for key, value in counts(device).items()
+                 if value != counters_before[name].get(key, 0)}
+        return {"wire_bytes": wire, "wire_bytes_per_track": round(wire / max(1, republished)),
+                "decoded_bytes_per_track": round(decoded / max(1, republished)),
+                "counters": grown}
+    new_metrics = per_track("new", client, result["stats"])
+    old_metrics = per_track("old", old, old_result["stats"])
+    per_track_new = new_metrics["wire_bytes"] / max(1, republished)
     scenario.metrics.update({
         "capability_profile_stream_edge_refs": bool(edge_refs), "republished": republished,
-        "delta_wire_bytes": wire, "wire_bytes_per_track_without_k6": round(per_track),
-        "decoded_bytes_per_track": round((decoded_after - decoded_before) / max(1, republished)),
-        "edge_refs_kept": result["store"].get("edge_refs_kept", 0),
-        "edge_fetches": result["counters"].get("edge_fetches", 0),
-        "extrapolated_full_republish_wire_mb": round(per_track * len(ids) / 1e6, 1)})
+        "k6_device": new_metrics, "device_without_k6": old_metrics,
+        "local_edges_dropped": len(dropped),
+        "extrapolated_full_republish_wire_mb": {
+            "k6": round(per_track_new * len(ids) / 1e6, 1),
+            "without_k6": round(old_metrics["wire_bytes"] / max(1, republished) * len(ids)
+                                / 1e6, 1)}})
     scenario.check("every sampled track was republished",
                    republished == len(sample) > 0,
                    {"republished": republished, "sample": len(sample)})
-    ctx.compare(scenario, client, "device dataset equals the server's after the republish")
+    ctx.compare(scenario, client, "the K6 device's dataset equals the server's")
+    ctx.compare(scenario, old, "the device without K6 equals the server's")
+    grown_old = old_metrics["counters"]
+    scenario.check("the device without K6 got every edge in full, never a reference",
+                   grown_old.get("edges_stored", 0) >= republished
+                   and not grown_old.get("edge_refs_kept") and not grown_old.get("edge_refs_missed")
+                   and not grown_old.get("edge_fetches"), grown_old)
+    scenario.check("no invalid edge", not result["invalid_edges"] and not old_result["invalid_edges"],
+                   {"k6": result["invalid_edges"], "without_k6": old_result["invalid_edges"]})
     client.close()
+    old.close()
     if fresh:
         ctx.drop_db(path)
+    ctx.drop_db(old_path)
     if not edge_refs:
         scenario.notes.append("capabilities.profile_stream.edge_refs is absent: K6 (P3-2) is not "
                               "built. The measured delta above is the no-K6 baseline; the "
                               "<= 1 KB/track criterion cannot pass until P3-2 ships.")
         scenario.check(f"<= {BUDGET_K6_BYTES_PER_TRACK} B/track on the wire (pending P3-2)",
-                       per_track <= BUDGET_K6_BYTES_PER_TRACK, round(per_track), pending="P3-2")
+                       per_track_new <= BUDGET_K6_BYTES_PER_TRACK, round(per_track_new),
+                       pending="P3-2")
         return scenario.finish()
+    grown = new_metrics["counters"]
+    dropped_sampled = len(set(dropped) & set(sample))
+    scenario.check("the K6 device kept its matching edges and fetched only the dropped ones",
+                   grown.get("edge_refs_kept", 0) == republished - dropped_sampled
+                   and grown.get("edge_refs_missed", 0) == dropped_sampled
+                   and grown.get("edge_fetches", 0) == dropped_sampled
+                   and grown.get("edges_fetched", 0) == dropped_sampled, grown)
+    scenario.check("miss fetches stayed within 500 ids and one request line each",
+                   dropped_sampled == 0 or grown.get("edge_fetch_requests", 0) >= 1, grown)
     scenario.check(f"<= {BUDGET_K6_BYTES_PER_TRACK} B/track on the wire",
-                   per_track <= BUDGET_K6_BYTES_PER_TRACK, round(per_track))
+                   per_track_new <= BUDGET_K6_BYTES_PER_TRACK, round(per_track_new))
     return scenario.finish()
 
 
@@ -1696,6 +1744,9 @@ def main():
     parser.add_argument("--create-timeout-s", type=float, default=10.0,
                         help="client timeout for a create (the app fast-fails at 10 s)")
     parser.add_argument("--lum005-sample", type=int, default=1000)
+    parser.add_argument("--lum005-misses", type=int, default=50,
+                        help="local edges the K6 device drops before the republish "
+                             "(C-10 miss fetches)")
     parser.add_argument("--catchup-sizes", default="100000,cap,10000e",
                         help="first catch-up sizes: counts, 'cap' (4 x retention), suffix e = "
                              "events embedding their edge")

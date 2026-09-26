@@ -1,0 +1,220 @@
+[
+ {
+  "request": "create c1",
+  "status": 201,
+  "body": "{\"collection\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"}}\n",
+  "headers": {}
+ },
+ {
+  "request": "create c2",
+  "status": 201,
+  "body": "{\"collection\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"c2\",\"name\":\"Two\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"}}\n",
+  "headers": {}
+ },
+ {
+  "request": "put i1",
+  "status": 200,
+  "body": "{\"collection\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":2,\"track_count\":1,\"updated_at\":\"<ts>\"},\"items\":[{\"album\":null,\"album_key\":null,\"artist\":\"A\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":3,\"provider_album_id\":null,\"title\":\"Song\",\"track_id\":\"t1\"}]}\n",
+  "headers": {}
+ },
+ {
+  "request": "batch c1",
+  "status": 200,
+  "body": "{\"collection\":{\"album_count\":2,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":3,\"track_count\":2,\"updated_at\":\"<ts>\"},\"items\":[{\"album\":null,\"album_key\":null,\"artist\":\"\",\"cover_item_id\":null,\"id\":\"i2\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":\"t2\"},{\"album\":null,\"album_key\":null,\"artist\":\"\",\"cover_item_id\":null,\"id\":\"i3\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":\"al1\",\"title\":\"Alb\",\"track_id\":null},{\"album\":null,\"album_key\":\"x::y\",\"artist\":\"\",\"cover_item_id\":null,\"id\":\"i4\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":null}]}\n",
+  "headers": {}
+ },
+ {
+  "request": "remapped duplicate",
+  "status": 200,
+  "body": "{\"collection\":{\"album_count\":2,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":4,\"track_count\":2,\"updated_at\":\"<ts>\"},\"items\":[{\"album\":null,\"album_key\":null,\"artist\":\"\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":\"t1\"}]}\n",
+  "headers": {}
+ },
+ {
+  "request": "patch c2",
+  "status": 200,
+  "body": "{\"collection\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"d\",\"id\":\"c2\",\"name\":\"Two!\",\"revision\":2,\"track_count\":0,\"updated_at\":\"<ts>\"}}\n",
+  "headers": {}
+ },
+ {
+  "request": "stale patch",
+  "status": 409,
+  "body": "{\"current\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"d\",\"id\":\"c2\",\"name\":\"Two!\",\"revision\":2,\"track_count\":0,\"updated_at\":\"<ts>\"},\"error\":\"revision_conflict\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "batch delete",
+  "status": 200,
+  "body": "{\"collection\":{\"album_count\":1,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":5,\"track_count\":1,\"updated_at\":\"<ts>\"},\"deleted\":[\"i2\",\"i3\"],\"deleted_count\":2}\n",
+  "headers": {}
+ },
+ {
+  "request": "item delete",
+  "status": 200,
+  "body": "{\"collection\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":6,\"track_count\":1,\"updated_at\":\"<ts>\"},\"deleted\":true}\n",
+  "headers": {}
+ },
+ {
+  "request": "missing item delete",
+  "status": 200,
+  "body": "{\"collection\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":6,\"track_count\":1,\"updated_at\":\"<ts>\"},\"deleted\":false}\n",
+  "headers": {}
+ },
+ {
+  "request": "bob create",
+  "status": 201,
+  "body": "{\"collection\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"b1\",\"name\":\"Bob\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"}}\n",
+  "headers": {}
+ },
+ {
+  "request": "delete c2",
+  "status": 200,
+  "body": "{\"deleted\":true,\"id\":\"c2\",\"revision\":3}\n",
+  "headers": {}
+ },
+ {
+  "request": "restore",
+  "status": 201,
+  "body": "{\"collection_count\":2,\"collections\":[{\"album_count\":1,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"r\",\"id\":\"<uuid1>\",\"name\":\"Restored\",\"revision\":2,\"track_count\":2,\"updated_at\":\"<ts>\"},{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"<uuid2>\",\"name\":\"Empty\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"}],\"item_count\":3,\"restored\":true}\n",
+  "headers": {}
+ },
+ {
+  "request": "restore replay",
+  "status": 201,
+  "body": "{\"collection_count\":2,\"collections\":[{\"album_count\":1,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"r\",\"id\":\"<uuid1>\",\"name\":\"Restored\",\"revision\":2,\"track_count\":2,\"updated_at\":\"<ts>\"},{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"<uuid2>\",\"name\":\"Empty\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"}],\"item_count\":3,\"restored\":true}\n",
+  "headers": {
+   "Idempotency-Replayed": "true"
+  }
+ },
+ {
+  "request": "key conflict",
+  "status": 409,
+  "body": "{\"error\":\"idempotency_key_conflict\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "missing patch",
+  "status": 404,
+  "body": "{\"error\":\"collection_not_found\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "list",
+  "status": 200,
+  "body": "{\"collections\":[{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"<uuid2>\",\"name\":\"Empty\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},{\"album_count\":1,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"r\",\"id\":\"<uuid1>\",\"name\":\"Restored\",\"revision\":2,\"track_count\":2,\"updated_at\":\"<ts>\"},{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":6,\"track_count\":1,\"updated_at\":\"<ts>\"}],\"schema_version\":1,\"scope\":\"personal\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "detail c1",
+  "status": 200,
+  "body": "{\"collection\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":6,\"track_count\":1,\"updated_at\":\"<ts>\"},\"items\":[{\"added_at\":\"<ts>\",\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_id\":\"c1\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":\"t1\",\"updated_at\":\"<ts>\"}]}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed default",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"c1\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":1},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"c2\",\"name\":\"Two\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":2},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i1\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"A\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":3,\"provider_album_id\":null,\"title\":\"Song\",\"track_id\":\"t1\"},\"seq\":3},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i2\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":3,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i2\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":\"t2\"},\"seq\":4},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i3\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":3,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i3\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":\"al1\",\"title\":\"Alb\",\"track_id\":null},\"seq\":5},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i4\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":\"x::y\",\"artist\":\"\",\"collection_revision\":3,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i4\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":null},\"seq\":6},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i1\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":4,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":\"t1\"},\"seq\":7},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"d\",\"id\":\"c2\",\"name\":\"Two!\",\"revision\":2,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":8},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i2\",\"entity_kind\":\"item\",\"operation\":\"delete\",\"payload\":{\"collection_id\":\"c1\",\"collection_revision\":5,\"collection_updated_at\":\"<ts>\",\"id\":\"i2\"},\"seq\":9},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i3\",\"entity_kind\":\"item\",\"operation\":\"delete\",\"payload\":{\"collection_id\":\"c1\",\"collection_revision\":5,\"collection_updated_at\":\"<ts>\",\"id\":\"i3\"},\"seq\":10},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i4\",\"entity_kind\":\"item\",\"operation\":\"delete\",\"payload\":{\"collection_id\":\"c1\",\"collection_revision\":6,\"collection_updated_at\":\"<ts>\",\"id\":\"i4\"},\"seq\":11},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"delete\",\"payload\":{\"id\":\"c2\",\"revision\":3},\"seq\":13},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid1>\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":1,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"r\",\"id\":\"<uuid1>\",\"name\":\"Restored\",\"revision\":2,\"track_count\":2,\"updated_at\":\"<ts>\"},\"seq\":14},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid3>\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"<uuid3>\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":\"R1\",\"track_id\":\"rt1\"},\"seq\":15},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid4>\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":\"r::a\",\"artist\":\"\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"<uuid4>\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":null},\"seq\":16},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid5>\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"<uuid5>\",\"kind\":\"track\",\"position\":1,\"provider_album_id\":null,\"title\":null,\"track_id\":\"rt2\"},\"seq\":17},{\"collection_id\":\"<uuid2>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid2>\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"<uuid2>\",\"name\":\"Empty\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":18}],\"next_cursor\":18}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed page 0",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"c1\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":1},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"c2\",\"name\":\"Two\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":2},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i1\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"A\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":3,\"provider_album_id\":null,\"title\":\"Song\",\"track_id\":\"t1\"},\"seq\":3}],\"next_cursor\":3}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed page 1",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i2\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":3,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i2\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":\"t2\"},\"seq\":4},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i3\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":3,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i3\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":\"al1\",\"title\":\"Alb\",\"track_id\":null},\"seq\":5},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i4\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":\"x::y\",\"artist\":\"\",\"collection_revision\":3,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i4\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":null},\"seq\":6}],\"next_cursor\":6}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed page 2",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i1\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":4,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":\"t1\"},\"seq\":7},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"d\",\"id\":\"c2\",\"name\":\"Two!\",\"revision\":2,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":8},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i2\",\"entity_kind\":\"item\",\"operation\":\"delete\",\"payload\":{\"collection_id\":\"c1\",\"collection_revision\":5,\"collection_updated_at\":\"<ts>\",\"id\":\"i2\"},\"seq\":9}],\"next_cursor\":9}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed page 3",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i3\",\"entity_kind\":\"item\",\"operation\":\"delete\",\"payload\":{\"collection_id\":\"c1\",\"collection_revision\":5,\"collection_updated_at\":\"<ts>\",\"id\":\"i3\"},\"seq\":10},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i4\",\"entity_kind\":\"item\",\"operation\":\"delete\",\"payload\":{\"collection_id\":\"c1\",\"collection_revision\":6,\"collection_updated_at\":\"<ts>\",\"id\":\"i4\"},\"seq\":11},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"delete\",\"payload\":{\"id\":\"c2\",\"revision\":3},\"seq\":13}],\"next_cursor\":13}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed page 4",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid1>\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":1,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"r\",\"id\":\"<uuid1>\",\"name\":\"Restored\",\"revision\":2,\"track_count\":2,\"updated_at\":\"<ts>\"},\"seq\":14},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid3>\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"<uuid3>\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":\"R1\",\"track_id\":\"rt1\"},\"seq\":15},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid4>\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":\"r::a\",\"artist\":\"\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"<uuid4>\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":null},\"seq\":16}],\"next_cursor\":16}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed page 5",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid5>\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"<uuid5>\",\"kind\":\"track\",\"position\":1,\"provider_album_id\":null,\"title\":null,\"track_id\":\"rt2\"},\"seq\":17},{\"collection_id\":\"<uuid2>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid2>\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"<uuid2>\",\"name\":\"Empty\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":18}],\"next_cursor\":18}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed page 6",
+  "status": 200,
+  "body": "{\"changes\":[],\"next_cursor\":18}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed limit 1",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"c1\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":1}],\"next_cursor\":1}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed limit 0",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i1\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"A\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":3,\"provider_album_id\":null,\"title\":\"Song\",\"track_id\":\"t1\"},\"seq\":3}],\"next_cursor\":3}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed limit 9999",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"c1\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":1},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"c2\",\"name\":\"Two\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":2},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i1\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"A\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":3,\"provider_album_id\":null,\"title\":\"Song\",\"track_id\":\"t1\"},\"seq\":3},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i2\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":3,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i2\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":\"t2\"},\"seq\":4},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i3\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":3,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i3\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":\"al1\",\"title\":\"Alb\",\"track_id\":null},\"seq\":5},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i4\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":\"x::y\",\"artist\":\"\",\"collection_revision\":3,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i4\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":null},\"seq\":6},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i1\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":4,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"i1\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":\"t1\"},\"seq\":7},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"d\",\"id\":\"c2\",\"name\":\"Two!\",\"revision\":2,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":8},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i2\",\"entity_kind\":\"item\",\"operation\":\"delete\",\"payload\":{\"collection_id\":\"c1\",\"collection_revision\":5,\"collection_updated_at\":\"<ts>\",\"id\":\"i2\"},\"seq\":9},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i3\",\"entity_kind\":\"item\",\"operation\":\"delete\",\"payload\":{\"collection_id\":\"c1\",\"collection_revision\":5,\"collection_updated_at\":\"<ts>\",\"id\":\"i3\"},\"seq\":10},{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"i4\",\"entity_kind\":\"item\",\"operation\":\"delete\",\"payload\":{\"collection_id\":\"c1\",\"collection_revision\":6,\"collection_updated_at\":\"<ts>\",\"id\":\"i4\"},\"seq\":11},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"delete\",\"payload\":{\"id\":\"c2\",\"revision\":3},\"seq\":13},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid1>\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":1,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"r\",\"id\":\"<uuid1>\",\"name\":\"Restored\",\"revision\":2,\"track_count\":2,\"updated_at\":\"<ts>\"},\"seq\":14},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid3>\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"<uuid3>\",\"kind\":\"track\",\"position\":0,\"provider_album_id\":null,\"title\":\"R1\",\"track_id\":\"rt1\"},\"seq\":15},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid4>\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":\"r::a\",\"artist\":\"\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"<uuid4>\",\"kind\":\"album\",\"position\":0,\"provider_album_id\":null,\"title\":null,\"track_id\":null},\"seq\":16},{\"collection_id\":\"<uuid1>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid5>\",\"entity_kind\":\"item\",\"operation\":\"upsert\",\"payload\":{\"album\":null,\"album_key\":null,\"artist\":\"\",\"collection_revision\":2,\"collection_updated_at\":\"<ts>\",\"cover_item_id\":null,\"id\":\"<uuid5>\",\"kind\":\"track\",\"position\":1,\"provider_album_id\":null,\"title\":null,\"track_id\":\"rt2\"},\"seq\":17},{\"collection_id\":\"<uuid2>\",\"created_at\":\"<ts>\",\"entity_id\":\"<uuid2>\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"<uuid2>\",\"name\":\"Empty\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":18}],\"next_cursor\":18}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed negative",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"c1\",\"created_at\":\"<ts>\",\"entity_id\":\"c1\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":\"First\",\"id\":\"c1\",\"name\":\"One\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":1},{\"collection_id\":\"c2\",\"created_at\":\"<ts>\",\"entity_id\":\"c2\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"c2\",\"name\":\"Two\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":2}],\"next_cursor\":2}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed past head",
+  "status": 200,
+  "body": "{\"changes\":[],\"next_cursor\":1000}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed bad cursor",
+  "status": 400,
+  "body": "{\"error\":\"invalid_cursor\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed bad limit",
+  "status": 400,
+  "body": "{\"error\":\"invalid_cursor\"}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed empty epoch",
+  "status": 200,
+  "body": "{\"changes\":[],\"next_cursor\":1000}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed bob",
+  "status": 200,
+  "body": "{\"changes\":[{\"collection_id\":\"b1\",\"created_at\":\"<ts>\",\"entity_id\":\"b1\",\"entity_kind\":\"collection\",\"operation\":\"upsert\",\"payload\":{\"album_count\":0,\"created_at\":\"<ts>\",\"deleted_at\":null,\"description\":null,\"id\":\"b1\",\"name\":\"Bob\",\"revision\":1,\"track_count\":0,\"updated_at\":\"<ts>\"},\"seq\":12}],\"next_cursor\":12}\n",
+  "headers": {}
+ },
+ {
+  "request": "feed bearer",
+  "status": 200,
+  "body": "{\"changes\":[],\"next_cursor\":0}\n",
+  "headers": {}
+ }
+]

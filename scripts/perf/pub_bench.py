@@ -12,11 +12,16 @@ Measured per iteration (``N`` distinct published tracks, default 40):
 
 ``complete_attempt_ms``        admitted attempt -> committed publication;
 ``record_profile_change_ms``   append + compaction alone, then commit;
-``compaction_delete_ms``       the compaction ``DELETE`` statement alone.
+``compaction_delete_ms``       the compaction ``DELETE`` statement alone: the
+                               index range delete of one retained epoch that
+                               ``catalog.compact_change_journal`` runs (P1-2).
+
+Each ``complete_attempt`` is a waveform-only change on the same media, so the
+edge is kept (P1-1); since K6 (P3-2) its event references the edge instead of
+embedding it.
 
 Usage: ``pub_bench.py [N]``. Mutates the fixture: the chosen tracks get new
-ramps and lose their edge payloads (as a real waveform republish does); the
-retained journal stays at its size.
+ramps (and keep their edges); the retained journal stays at its size.
 """
 import os
 import sys
@@ -88,8 +93,9 @@ def main():
             record_ms.append((t1 - t0) * 1000)
             record_commit_ms.append((t2 - t0) * 1000)
 
-    # The compaction DELETE alone, in rolled-back transactions (same predicate
-    # as catalog.compact_change_journal).
+    # The compaction DELETE alone, in rolled-back transactions: the statement
+    # catalog.compact_change_journal runs per publication since P1-2 (an index
+    # range delete of the retained epoch; other epochs go in maintenance).
     cur.execute(f"SELECT epoch, head_seq FROM {T}profile_stream_state WHERE catalog_instance_id=%s",
                 (src,))
     epoch, head = cur.fetchone()
@@ -99,8 +105,8 @@ def main():
         floor = head - retention + 1 + k
         t0 = time.perf_counter()
         cur.execute(f"""DELETE FROM {T}profile_changes
-                         WHERE catalog_instance_id=%s AND (epoch<>%s OR (epoch=%s AND seq<=%s))""",
-                    (src, epoch, epoch, floor))
+                         WHERE catalog_instance_id=%s AND epoch=%s AND seq<=%s""",
+                    (src, epoch, floor))
         elapsed = (time.perf_counter() - t0) * 1000
         db.rollback()
         if k:

@@ -9,6 +9,10 @@ RQ worker alive used to corrupt shared state without any warning (AUD-05):
 - a 1.2.5 profile worker wrote `ready` profiles that 1.3.0 never publishes;
 - a 1.2.5 catalogue publication or provider rekey skipped the 1.3.0 profile
   withdrawal.
+- a 1.2.5 **web** worker reading the 1.3.0 profile journal serves an event
+  that carries an edge reference (K6) as an upsert without an edge, so
+  devices delete that edge until a later event for the track. No fence
+  stops readers; only step 1 does.
 
 1.3.0 fails closed instead. The migration adds fences that make every 1.2.5
 writer's insert fail, so its whole transaction rolls back:
@@ -55,11 +59,33 @@ is safe to run again. On success it has:
 
 - dropped the `collection_changes.seq` default (the sequence itself remains
   owned by the column);
+- added `collection_feed_state.floor_seq`, set once to the feed head at the
+  upgrade (the K8 cutover; the feed epoch is kept), and the
+  `collection_restores` progress table for chunked restores;
+- added `collection_mutations.collection_id` and
+  `shelf_mutations.request_fingerprint` (both NULL on existing receipts);
+- created the `unaccent` extension in the current schema if it was missing
+  and the database role may create it. If it may not, the install still
+  succeeds: the log has a warning `could not create the PostgreSQL extension
+  unaccent (SQLSTATE 42501)`, and collection library search matches without
+  folding accents until a database owner runs `CREATE EXTENSION unaccent;`;
 - added `writer_generation` to `profile_changes` and `catalog_changes`, filled
   existing rows with 2 and dropped the column default;
 - retargeted queued, running and failed catalogue preparations to plugin
   `1.3.0`;
-- recounted ready-but-unpublished profiles into `integrity_state`.
+- withdrawn the published profiles it seeds for tracks the catalogue no
+  longer has (1.2.5 never withdrew a removed track's profile), and
+  republished current `ready` profiles that have no published row (repair
+  D, which runs here too);
+- recounted ready-but-unpublished and orphaned profiles into
+  `integrity_state`;
+- added `catalog_tracks.search_text` and filled it for the published
+  generation, and built the workbench search and paging indexes (LUM-016).
+  This is the slowest step: about 15 s at 132k tracks, once. Reads continue
+  while it runs; catalogue publication waits for it. Later migrations find
+  the text current and skip it (about 1 s). Without the `pg_trgm` extension
+  the log has a warning, and search gives the same results without its
+  index.
 
 Each schema change runs only when it is still missing, so re-running the
 migration on an up-to-date database takes no exclusive table lock. A change
@@ -130,6 +156,7 @@ Expected:
   "integrity": {
     "collections_feed_ok": true,
     "profiles_unpublished_ready": 0,
+    "profiles_orphaned": 0,
     "profiles_checked_at": "2026-…Z",
     "fences_installed": true
   }
@@ -141,8 +168,13 @@ Expected:
 - `collections_feed_ok` is checked on every health call. When it is `false`,
   every collection mutation returns **503 `collection_feed_invariant`** until
   you run repair A.
-- `profiles_unpublished_ready` is the count taken at install or at the last web
-  worker start (`profiles_checked_at`). When it is above 0, run repair B.
+- `profiles_unpublished_ready` is the count taken at install, at the last web
+  worker start or by repair D (`profiles_checked_at`). When it is above 0, run
+  repair D.
+- `profiles_orphaned` (taken at the same times) counts published profiles
+  whose track the current catalogue generation no longer has. The install
+  withdraws up to 20,000 of the ones it seeds, so it is normally 0
+  afterwards; see repair D.
 - `null` means the value could not be read (no database, or the migration has
   not run).
 
@@ -151,8 +183,9 @@ Also confirm in `/api/catalog/health` that no server reports
 
 ## 7. Repairs
 
-Run each repair in `psql` as the database owner. Both are safe to run when
-nothing is wrong: they then change no rows.
+Run repairs A to C in `psql` as the database owner, and repair D from the
+plugin settings page. All are safe to run when nothing is wrong: they then
+change no rows.
 
 ### A. Collection feed head behind committed rows
 
@@ -186,7 +219,10 @@ COMMIT;
 Health reports `collections_feed_ok: true` immediately, and collection writes
 succeed again. No restart is needed.
 
-### B. Ready profiles without a published row
+### B. Ready profiles without a published row (SQL)
+
+Prefer repair D, which republishes these rows without analysing them again.
+Use this SQL when the web server cannot run it.
 
 A 1.2.5 worker (before the fence) marked profiles `ready` and journaled them,
 but never wrote `published_source_profiles`. 1.3.0 treats those tracks as
@@ -212,12 +248,14 @@ SELECT u.catalog_instance_id, count(*)
     ON src.catalog_instance_id = u.catalog_instance_id AND src.rebind_status = 'active'
   JOIN plugin_lumae_analysis__catalog_state c
     ON c.catalog_instance_id = u.catalog_instance_id
-  JOIN plugin_lumae_analysis__catalog_tracks t
-    ON t.catalog_instance_id = u.catalog_instance_id
-   AND t.published_generation = c.published_generation
-   AND t.track_id = u.track_id
- WHERE t.available AND COALESCE(t.media_fp, '') <> ''
-   AND u.media_signature = 'catalog-media:' || t.media_fp
+ CROSS JOIN LATERAL (
+       SELECT 1 FROM plugin_lumae_analysis__catalog_tracks t
+        WHERE t.catalog_instance_id = u.catalog_instance_id
+          AND t.published_generation = c.published_generation
+          AND t.track_id = u.track_id
+          AND t.available AND COALESCE(t.media_fp, '') <> ''
+          AND u.media_signature = 'catalog-media:' || t.media_fp
+        LIMIT 1) t
  GROUP BY 1;
 
 -- Repair: re-admit them for republication.
@@ -247,6 +285,101 @@ then resolved against the current catalogue. Then run **Prepare Lumae** (or
 wait for the reconcile schedule) so the backfill picks the rows up. Restart the
 web server, or wait for its next start, to refresh
 `profiles_unpublished_ready`.
+
+### C. Rotate the collections feed epoch (after restoring a database backup)
+
+A restored database keeps the collections feed `epoch` of the dump, but its
+history ends where the dump does. Clients that sync with the K8 epoch
+(`capabilities.collections.feed_epoch`) detect this on their own only when
+their cursor is past the restored head. Rotate the epoch after any restore of
+the plugin tables, so every such client resyncs from the snapshot:
+
+```sql
+UPDATE plugin_lumae_analysis__collection_feed_state
+   SET epoch = gen_random_uuid(), floor_seq = head_seq
+ WHERE singleton = 1;
+```
+
+It takes effect immediately; no restart is needed. Clients that do not echo
+the epoch (older apps) are unaffected.
+
+### D. Repair profile publications (settings page)
+
+Run it when health reports `profiles_unpublished_ready` or `profiles_orphaned`
+above 0 (each web worker also logs a warning at start). While either count is
+above 0, **Settings → Lumae Analysis → Background maintenance** shows **Repair
+profile publications**. Re-running the install (step 4) runs the same repair.
+
+For each active source it:
+
+1. withdraws published profiles whose track the current catalogue generation
+   no longer has: deletes the published row, marks the analysis attempt
+   `stale` and journals a `delete` event, then deletes the track's edge;
+2. republishes the rows `profiles_unpublished_ready` counts: `ready` for the
+   current analyzer and for the media of the published generation, with no
+   published row. It applies the checks of a completed analysis and writes
+   the published row with the stored result and its original analysis time,
+   plus an `upsert` event. Any old edge of the track is dropped first (as for
+   every first publication) and the edge backfill measures it again. A
+   `ready` row for other media, for a track the catalogue no longer has or
+   for an older analyzer is left alone; the profile backfill re-analyses the
+   ones still in the catalogue;
+3. recounts both health counts and reports what is left.
+
+Each batch (1,000 withdrawals, or 25 republications) is one short
+transaction under the source's catalogue row lock (at most about 70 ms and
+300 ms at 94k profiles), so the repair is safe while analysis and catalogue
+refreshes run. A run withdraws at most 20,000 profiles (about 2 s) and
+republishes at most 2,000 (about 5 s); run it again while the page reports
+rows left. Clients need nothing: they apply the events like any other.
+
+**Orphans between repairs.** Every catalogue refresh, also one without
+changes, ends with the same withdrawal (step 1), bounded the same way. Each
+withdrawal is an ordinary `delete` event in `/api/profiles/changes`, and the
+worker that ran the refresh logs `lumae_analysis withdrew N published profiles
+of <source> whose tracks are no longer in the catalogue`. `profiles_orphaned`
+in health is not live: it is the count of the last install, web-worker start
+or repair, and it should be 0. A withdrawal does not change
+`profiles_unpublished_ready` (the withdrawn track's attempt becomes `stale`,
+not `ready`).
+
+### E. Collection items deferred by a provider-identity rekey
+
+A provider-identity rekey moves collection items to the new provider ids and
+sends the change to clients as feed events. If one user's items collide in a
+way the merge cannot resolve, the rekey skips that user and moves everyone
+else. A collision is unresolvable when several items of one collection would
+take the same new id and no item already holds it. The skipped user's items
+keep the old ids. Each skipped user is listed on the transition row, and the
+list grows across rekeys until an operator clears an entry:
+
+```sql
+SELECT catalog_instance_id, jsonb_pretty(collection_deferrals)
+  FROM plugin_lumae_analysis__provider_identity_transitions
+ WHERE collection_deferrals <> '[]'::jsonb;
+```
+
+Each entry has `principal`, `transition_id`, `reason` and `collisions`, a list
+of `{collection_id, kind, provider_id, item_ids}`, where `provider_id` is the
+new id. To resolve an entry:
+
+1. Signed in as that user, remove the listed `item_ids` from the collection,
+   then add the track or album again from the library. These are ordinary
+   writes, so every client receives them as events.
+2. Remove the entry:
+
+```sql
+UPDATE plugin_lumae_analysis__provider_identity_transitions
+   SET collection_deferrals = COALESCE((
+         SELECT jsonb_agg(entry) FROM jsonb_array_elements(collection_deferrals) entry
+          WHERE NOT (entry->>'principal' = '<principal>'
+                     AND entry->>'transition_id' = '<transition_id>')), '[]'::jsonb)
+ WHERE catalog_instance_id = '<catalog_instance_id>';
+```
+
+Do not rewrite the items in SQL. A direct write sends no event, and synced
+clients would keep the old ids unless you also rotate the epoch (repair C).
+A later rekey does not retry a skipped user.
 
 ## Known gap: 1.2.5 fingerprint rebase
 

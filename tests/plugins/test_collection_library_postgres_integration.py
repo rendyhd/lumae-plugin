@@ -78,7 +78,12 @@ def postgres_library():
         CREATE TABLE {state} (
             catalog_instance_id TEXT PRIMARY KEY,
             published_generation BIGINT NOT NULL,
-            status TEXT NOT NULL
+            status TEXT NOT NULL,
+            entity_counts JSONB NOT NULL DEFAULT '{{}}'::jsonb,
+            -- LUM-016: NULL, so this module searches the inline text (the
+            -- stored-text path is test_workbench_search_paging_postgres).
+            search_text_generation BIGINT,
+            search_text_folded BOOLEAN
         );
         CREATE TABLE {analysis_state} (
             catalog_instance_id TEXT PRIMARY KEY,
@@ -89,6 +94,7 @@ def postgres_library():
             published_generation BIGINT NOT NULL,
             album_id TEXT NOT NULL,
             name TEXT NOT NULL,
+            album_artist_display TEXT,
             available BOOLEAN NOT NULL,
             PRIMARY KEY (catalog_instance_id, published_generation, album_id)
         );
@@ -107,6 +113,7 @@ def postgres_library():
             release_type TEXT,
             cover_art_id TEXT,
             available BOOLEAN NOT NULL,
+            search_text TEXT,
             PRIMARY KEY (catalog_instance_id, published_generation, track_id)
         );
         CREATE TABLE {links} (
@@ -274,10 +281,40 @@ def test_collection_search_uses_the_active_catalogue_projection(postgres_library
           FROM ({library.catalog_track_view_sql()}) score
          WHERE search_u LIKE unaccent(%s)
         """,
-        ("%meiko%",),
+        ("catalog-a", "%meiko%"),
     )
     plan = "\n".join(row[0] for row in cursor.fetchall())
     cursor.close()
 
     assert library.table("catalog_tracks") in plan
     assert library.table("catalog_state") in plan
+
+
+def test_collection_search_works_without_unaccent(postgres_library):
+    """P3-4b: a role that may not create unaccent still gets working browse,
+    search and album queries, matched case- but not accent-insensitively."""
+    library, connection = postgres_library
+    cursor = connection.cursor()
+    try:
+        assert library.unaccent_available(cursor) is True
+        # Dropped inside this transaction only; the rollback restores it.
+        cursor.execute("DROP EXTENSION unaccent")
+        assert library.unaccent_available(cursor) is False
+        meiko = library.browse_library(scope="all", query="MEIKO", limit=20)
+        assert meiko["sections"]["tracks"]["total"] == 2
+        assert meiko["sections"]["albums"]["total"] == 1
+        assert meiko["sections"]["artists"]["total"] == 1
+        exact = library.browse_library(scope="tracks", query="beyoncé")
+        assert [item["title"] for item in exact["sections"]["tracks"]["items"]] == ["Hold Up"]
+        folded = library.browse_library(scope="tracks", query="beyonce")
+        assert folded["sections"]["tracks"]["items"] == []
+        assert library.library_stats() == {"album_count": 4, "artist_count": 4, "track_count": 7}
+        detail = library.album_detail("Lemonade", "Beyoncé")
+        assert [track["track_id"] for track in detail["tracks"]] == ["bey-1"]
+    finally:
+        connection.rollback()
+        cursor.close()
+    cursor = connection.cursor()
+    assert library.unaccent_available(cursor) is True
+    cursor.close()
+    connection.rollback()

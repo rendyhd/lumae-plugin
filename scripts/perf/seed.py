@@ -222,6 +222,12 @@ def seed(args):
                TRUE, now(), now()
           FROM generate_series(1, %s) g""",
         (src, n["albums"], n["artists"], n["artists"], n["tracks"]))
+    # LUM-016: publication writes the workbench search text with the rows.
+    from plugins.LumaeAnalysis import catalog_search
+    t0 = time.perf_counter()
+    catalog_search.refresh_search_text(s.cur, src, 1, catalog_search.fold_available(s.cur))
+    s.db.commit()
+    s.timings["catalog_search_text"] = round(time.perf_counter() - t0, 2)
 
     # ---- AudioMuse host analysis tables ---------------------------------------
     canonical = getattr(args, "item_ids", "legacy") == "canonical"
