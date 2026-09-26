@@ -905,19 +905,23 @@ def _changes_page_sql(edge_refs):
     row with the edge embedded. With ``edge_refs`` a kept row carries
     ``edge_profile_ref`` instead, as journalled, and looks nothing up. Rows
     journalled before K6 (NULL edge_ref) are served as stored.
+
+    The found edge's own payload is returned as its own column, unmerged:
+    ``read_profile_changes`` attaches it to the row's ``payload`` in Python.
+    Concatenating it in SQL (``payload || jsonb_build_object('edge_profile',
+    ...)``) forced Postgres to rebuild a fresh ~19 KB JSONB value per row
+    (P3-2 follow-up: 108 ms p50 for a 250-event page against 83 ms), which a
+    plain Python dict merge does not.
     """
     kept = EDGE_REF_KEPT.format(alias="c")
-    embedded = ("CASE WHEN edge.payload IS NOT NULL "
-                "THEN c.payload || jsonb_build_object('edge_profile', edge.payload) "
-                "ELSE c.payload END")
-    payload = embedded
+    payload = "c.payload"
     lookup = "c.edge_ref IS NOT NULL"
     if edge_refs:
         payload = (f"CASE WHEN {kept} THEN c.payload || jsonb_build_object("
                    f"'edge_profile_ref', {edge_profile_ref_sql('c', 'c.payload')}) "
-                   f"ELSE {embedded} END")
+                   f"ELSE c.payload END")
         lookup += f" AND NOT {kept}"
-    select = f"c.seq, c.track_id, c.operation, {payload}, c.created_at"
+    select = f"c.seq, c.track_id, c.operation, {payload}, c.created_at, edge.payload"
     join = f"""LEFT JOIN LATERAL (
         SELECT e.payload FROM {t('edge_profiles')} e
          WHERE {lookup}
@@ -961,16 +965,23 @@ def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250, 
         )
     finally:
         cur.close()
-    changes = [
-        {
+    changes = []
+    for row in rows:
+        payload = _json(row[3])
+        edge_profile = _json(row[5])
+        # ``edge.payload`` (row[5]) is only ever non-NULL when the join found
+        # an edge for a non-"kept" edge_ref row (P3-2's invariant: such a
+        # payload never already embeds one), so this is the same merge the
+        # SQL ``||`` used to do, just in Python instead of in Postgres.
+        if edge_profile is not None and isinstance(payload, dict):
+            payload = dict(payload, edge_profile=edge_profile)
+        changes.append({
             "seq": int(row[0]),
             "track_id": str(row[1]),
             "operation": row[2],
-            "payload": _json(row[3]),
+            "payload": payload,
             "created_at": _iso(row[4]),
-        }
-        for row in rows
-    ]
+        })
     next_seq = changes[-1]["seq"] if changes else cursor["seq"]
     return {
         "schema_version": 1,
