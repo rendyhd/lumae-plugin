@@ -229,6 +229,7 @@ def test_an_unresolvable_collision_defers_only_that_principal(collections_api, m
     deferrals = _rows(db, f"SELECT collection_deferrals FROM {P}provider_identity_transitions")
     assert deferrals == [([{
         "principal": alice, "reason": "unresolved_membership_collision",
+        "transition_id": "transition-a",
         "collisions": [{"collection_id": "ca", "kind": "track", "provider_id": _new("track"),
                         "item_ids": ["i1", "i2"]}],
     }],)]
@@ -238,6 +239,102 @@ def test_an_unresolvable_collision_defers_only_that_principal(collections_api, m
     assert _revisions(db)[(bob, "cb")] == revisions[(bob, "cb")] + 1
     assert _rows(db, f"""SELECT principal, entity_id, operation FROM {P}collection_changes
                           WHERE seq > %s ORDER BY seq""", (head,)) == [(bob, "i1", "upsert")]
+
+
+def test_a_tombstoned_collection_is_rekeyed_without_events_or_revision(
+    collections_api, migrated_db
+):
+    db = migrated_db
+    api = collections_api
+    source = _publish_old_catalogue(db)
+    _seed(api, "alice", {"gone": [_track("i1", OLD["track"])], "live": [_track("i2", OLD["track"])]})
+    assert api.call("DELETE", "/api/collections/gone", key="delete-gone").status_code == 200
+    alice = _principal(db, "gone")
+    revisions, head = _revisions(db), _head(db)
+
+    _rekey(db, source)
+
+    items = _items(db, alice)
+    assert items[("gone", "i1")]["track_id"] == items[("live", "i2")]["track_id"] == _new("track")
+    assert _revisions(db) == {**revisions, (alice, "live"): revisions[(alice, "live")] + 1}
+    assert _rows(db, f"""SELECT collection_id, entity_id, operation FROM {P}collection_changes
+                          WHERE seq > %s ORDER BY seq""", (head,)) == [("live", "i2", "upsert")]
+
+
+def test_a_restore_chunk_and_a_rekey_lock_collections_in_one_order(collections_api, migrated_db):
+    """A chunk spanning {b, a} and a rekey of {a, b} both finish: no deadlock.
+
+    A third transaction holds ``a`` so that the rekey queues on it first; the
+    chunk then queues behind it. Locking one collection at a time in chunk
+    order, the chunk would hold ``b`` while the rekey, next to get ``a``,
+    waits for ``b``.
+    """
+    import threading
+    import time
+
+    import psycopg2
+
+    manager = collections_api.manager
+    db = migrated_db
+    with db.cursor() as cur:
+        for collection_id in ("a", "b"):
+            cur.execute(f"INSERT INTO {P}collections (principal, id, name) VALUES ('alice', %s, %s)",
+                        (collection_id, collection_id))
+            cur.execute(f"""INSERT INTO {P}collection_items (principal, id, collection_id, kind,
+                                                             track_id)
+                            VALUES ('alice', %s, %s, 'track', %s)""",
+                        (f"old-{collection_id}", collection_id, OLD["track"]))
+    db.commit()
+    holder, rekeyer, restorer = (collections_api.connect() for _ in range(3))
+    with holder.cursor() as cur:
+        cur.execute(f"SELECT 1 FROM {P}collections WHERE principal='alice' AND id='a' FOR UPDATE")
+    chunk = [
+        {"id": collection_id, "create": False, "items": [manager._normalize_item(
+            {"id": f"restored-{collection_id}", "kind": "track", "track_id": f"t-{collection_id}"})]}
+        for collection_id in ("b", "a")
+    ]
+    errors = []
+
+    def run(connection, work):
+        try:
+            with connection.cursor() as cur:
+                cur.execute("SET lock_timeout = '10s'")
+                work(cur)
+            connection.commit()
+        except psycopg2.Error as error:
+            connection.rollback()
+            errors.append(type(error).__name__)
+
+    def rekey(cur):
+        changes, _ = manager.rekey_collection_items(
+            cur, {OLD["track"]: _new("track")}, {}, {OLD["track"]: _new("track")})
+        manager._record_changes(cur, changes)
+
+    def waiting(connection):
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if _rows(db, "SELECT wait_event_type FROM pg_stat_activity WHERE pid=%s",
+                     (connection.get_backend_pid(),)) == [("Lock",)]:
+                return
+            time.sleep(0.02)
+        raise AssertionError("the transaction never queued on the lock")
+
+    threads = [
+        threading.Thread(target=run, args=(rekeyer, rekey)),
+        threading.Thread(target=run, args=(restorer, lambda cur: manager._restore_principal_collections(
+            cur, "alice", chunk))),
+    ]
+    for thread, connection in zip(threads, (rekeyer, restorer)):
+        thread.start()
+        waiting(connection)
+    holder.rollback()
+    for thread in threads:
+        thread.join(30)
+    assert errors == []
+    assert sorted(_items(db, "alice")) == [
+        ("a", "old-a"), ("a", "restored-a"), ("b", "old-b"), ("b", "restored-b")]
+    assert _rows(db, f"SELECT DISTINCT track_id FROM {P}collection_items WHERE id LIKE 'old-%%'") == [
+        (_new("track"),)]
 
 
 def _sync(api, state, cursor=0, epoch=""):

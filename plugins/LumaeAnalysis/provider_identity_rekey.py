@@ -853,7 +853,7 @@ def _publish_provider_identity_rekey(
                first_seq=%s, last_seq=%s, analysis_baseline=%s::jsonb,
                baseline_integrity=TRUE, audiomuse_health=%s,
                manifest_sha256=%s, last_checked_provider_version=%s,
-               collection_deferrals=%s::jsonb,
+               collection_deferrals=collection_deferrals || %s::jsonb,
                applied_at=now(), checked_at=now(), last_error=NULL,
                updated_at=now()
          WHERE catalog_instance_id=%s AND transition_id=%s
@@ -867,7 +867,12 @@ def _publish_provider_identity_rekey(
             audiomuse_health,
             manifest_sha256,
             current_provider_version,
-            canonical_json(collection_deferrals),
+            # Appended: an entry stays until an operator resolves it
+            # (docs/runbooks/UPGRADE_1.3.md, repair E); the transition_id
+            # names the manifest that holds its old-to-new mappings.
+            canonical_json([
+                {**entry, "transition_id": transition_id} for entry in collection_deferrals
+            ]),
             catalog_instance_id,
             transition_id,
         ),

@@ -643,6 +643,13 @@ def _plan_restore(collections, restore_id, chunk_rows):
     return chunks
 
 
+# The one order in which a statement locks several collections: a restore
+# chunk and the provider-identity rekey both use it (principal, then id, in
+# byte order), so neither can deadlock with the other. Single-collection
+# mutations lock one row and need no order.
+_MULTI_COLLECTION_LOCK_ORDER = 'ORDER BY c.principal COLLATE "C", c.id COLLATE "C" FOR UPDATE OF c'
+
+
 def _restore_principal_collections(cur, principal, collections):
     """Write one restore chunk in the caller's transaction.
 
@@ -657,6 +664,15 @@ def _restore_principal_collections(cur, principal, collections):
     restored = []
     item_count = 0
     staged_changes = []
+    # Lock every existing collection of the chunk first, in the shared order
+    # (_MULTI_COLLECTION_LOCK_ORDER), so a chunk and a rekey cannot deadlock.
+    existing = sorted({source["id"] for source in collections if not source.get("create", True)})
+    if existing:
+        cur.execute(
+            f"SELECT c.id FROM {collections_table()} c "
+            f"WHERE c.principal = %s AND c.id = ANY(%s) {_MULTI_COLLECTION_LOCK_ORDER}",
+            (principal, existing),
+        )
     for source in collections:
         collection_id = source.get("id") or str(uuid.uuid4())
         create = source.get("create", True)
@@ -936,32 +952,26 @@ def rekey_collection_items(cur, tracks, albums, covers):
     if not (tracks or albums or covers):
         return [], []
     old_tracks, old_albums, old_covers = sorted(tracks), sorted(albums), sorted(covers)
+    # One statement finds and locks the parents, in the shared order.
     # TODO(P3-5, K10): scope to the rekeyed catalogue once items carry it.
-    cur.execute(
-        f"""
-        SELECT DISTINCT principal, collection_id FROM {collection_items_table()}
-         WHERE (kind = 'track' AND track_id = ANY(%s))
-            OR (kind = 'album' AND provider_album_id = ANY(%s))
-            OR cover_item_id = ANY(%s)
-        """,
-        (old_tracks, old_albums, old_covers),
-    )
-    parents = sorted(tuple(row) for row in cur.fetchall())
-    if not parents:
-        return [], []
-    principals, collection_ids = (list(column) for column in zip(*parents))
     cur.execute(
         f"""
         SELECT c.principal, c.id, c.deleted_at IS NOT NULL
           FROM {collections_table()} c
-          JOIN unnest(%s::text[], %s::text[]) AS parent(principal, id)
-            ON c.principal = parent.principal AND c.id = parent.id
-         ORDER BY c.principal COLLATE "C", c.id COLLATE "C"
-           FOR UPDATE OF c
+         WHERE EXISTS (
+               SELECT 1 FROM {collection_items_table()} i
+                WHERE i.principal = c.principal AND i.collection_id = c.id
+                  AND ((i.kind = 'track' AND i.track_id = ANY(%s))
+                       OR (i.kind = 'album' AND i.provider_album_id = ANY(%s))
+                       OR i.cover_item_id = ANY(%s)))
+         {_MULTI_COLLECTION_LOCK_ORDER}
         """,
-        (principals, collection_ids),
+        (old_tracks, old_albums, old_covers),
     )
     deleted = {(row[0], row[1]): row[2] for row in cur.fetchall()}
+    if not deleted:
+        return [], []
+    principals, collection_ids = (list(column) for column in zip(*deleted))
     # Read again under the locks: a mutation may have committed meanwhile.
     cur.execute(
         f"""
