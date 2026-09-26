@@ -167,8 +167,11 @@ def publish_edge_profile(db, catalog_id, job, payload, signature):
 
 
 def edge_backfill_candidates(db, catalog_id, after='', limit=100):
+    # Published waveform rows without an edge for their media (P3-7): an edge
+    # is published only for, and read only through, such a row. An attempt
+    # row may be unpublished or describe other media than what is published.
     cur = db.cursor()
-    cur.execute(f"""SELECT p.track_id FROM {table('source_profiles')} p {edge_join()}
+    cur.execute(f"""SELECT p.track_id FROM {table('published_source_profiles')} p {edge_join()}
         LEFT JOIN {table('edge_profile_jobs')} j ON j.catalog_instance_id=p.catalog_instance_id AND j.track_id=p.track_id
         WHERE p.catalog_instance_id=%s AND p.media_signature IS NOT NULL
           AND p.track_id>%s AND edge.payload IS NULL

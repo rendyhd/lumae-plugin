@@ -73,7 +73,12 @@ is safe to run again. On success it has:
   existing rows with 2 and dropped the column default;
 - retargeted queued, running and failed catalogue preparations to plugin
   `1.3.0`;
-- recounted ready-but-unpublished profiles into `integrity_state`.
+- withdrawn the published profiles it seeds for tracks the catalogue no
+  longer has (1.2.5 never withdrew a removed track's profile), and
+  republished current `ready` profiles that have no published row (repair
+  D, which runs here too);
+- recounted ready-but-unpublished and orphaned profiles into
+  `integrity_state`.
 
 Each schema change runs only when it is still missing, so re-running the
 migration on an up-to-date database takes no exclusive table lock. A change
@@ -144,6 +149,7 @@ Expected:
   "integrity": {
     "collections_feed_ok": true,
     "profiles_unpublished_ready": 0,
+    "profiles_orphaned": 0,
     "profiles_checked_at": "2026-…Z",
     "fences_installed": true
   }
@@ -155,8 +161,13 @@ Expected:
 - `collections_feed_ok` is checked on every health call. When it is `false`,
   every collection mutation returns **503 `collection_feed_invariant`** until
   you run repair A.
-- `profiles_unpublished_ready` is the count taken at install or at the last web
-  worker start (`profiles_checked_at`). When it is above 0, run repair B.
+- `profiles_unpublished_ready` is the count taken at install, at the last web
+  worker start or by repair D (`profiles_checked_at`). When it is above 0, run
+  repair D.
+- `profiles_orphaned` (taken at the same times) counts published profiles
+  whose track the current catalogue generation no longer has. The install
+  withdraws up to 20,000 of the ones it seeds, so it is normally 0
+  afterwards; see repair D.
 - `null` means the value could not be read (no database, or the migration has
   not run).
 
@@ -165,8 +176,9 @@ Also confirm in `/api/catalog/health` that no server reports
 
 ## 7. Repairs
 
-Run each repair in `psql` as the database owner. Both are safe to run when
-nothing is wrong: they then change no rows.
+Run repairs A to C in `psql` as the database owner, and repair D from the
+plugin settings page. All are safe to run when nothing is wrong: they then
+change no rows.
 
 ### A. Collection feed head behind committed rows
 
@@ -200,7 +212,10 @@ COMMIT;
 Health reports `collections_feed_ok: true` immediately, and collection writes
 succeed again. No restart is needed.
 
-### B. Ready profiles without a published row
+### B. Ready profiles without a published row (SQL)
+
+Prefer repair D, which republishes these rows without analysing them again.
+Use this SQL when the web server cannot run it.
 
 A 1.2.5 worker (before the fence) marked profiles `ready` and journaled them,
 but never wrote `published_source_profiles`. 1.3.0 treats those tracks as
@@ -226,12 +241,14 @@ SELECT u.catalog_instance_id, count(*)
     ON src.catalog_instance_id = u.catalog_instance_id AND src.rebind_status = 'active'
   JOIN plugin_lumae_analysis__catalog_state c
     ON c.catalog_instance_id = u.catalog_instance_id
-  JOIN plugin_lumae_analysis__catalog_tracks t
-    ON t.catalog_instance_id = u.catalog_instance_id
-   AND t.published_generation = c.published_generation
-   AND t.track_id = u.track_id
- WHERE t.available AND COALESCE(t.media_fp, '') <> ''
-   AND u.media_signature = 'catalog-media:' || t.media_fp
+ CROSS JOIN LATERAL (
+       SELECT 1 FROM plugin_lumae_analysis__catalog_tracks t
+        WHERE t.catalog_instance_id = u.catalog_instance_id
+          AND t.published_generation = c.published_generation
+          AND t.track_id = u.track_id
+          AND t.available AND COALESCE(t.media_fp, '') <> ''
+          AND u.media_signature = 'catalog-media:' || t.media_fp
+        LIMIT 1) t
  GROUP BY 1;
 
 -- Repair: re-admit them for republication.
@@ -278,6 +295,46 @@ UPDATE plugin_lumae_analysis__collection_feed_state
 
 It takes effect immediately; no restart is needed. Clients that do not echo
 the epoch (older apps) are unaffected.
+
+### D. Repair profile publications (settings page)
+
+Run it when health reports `profiles_unpublished_ready` or `profiles_orphaned`
+above 0 (each web worker also logs a warning at start). While either count is
+above 0, **Settings → Lumae Analysis → Background maintenance** shows **Repair
+profile publications**. Re-running the install (step 4) runs the same repair.
+
+For each active source it:
+
+1. withdraws published profiles whose track the current catalogue generation
+   no longer has: deletes the published row, marks the analysis attempt
+   `stale` and journals a `delete` event, then deletes the track's edge;
+2. republishes the rows `profiles_unpublished_ready` counts: `ready` for the
+   current analyzer and for the media of the published generation, with no
+   published row. It applies the checks of a completed analysis and writes
+   the published row with the stored result and its original analysis time,
+   plus an `upsert` event. Any old edge of the track is dropped first (as for
+   every first publication) and the edge backfill measures it again. A
+   `ready` row for other media, for a track the catalogue no longer has or
+   for an older analyzer is left alone; the profile backfill re-analyses the
+   ones still in the catalogue;
+3. recounts both health counts and reports what is left.
+
+Each batch (1,000 withdrawals, or 25 republications) is one short
+transaction under the source's catalogue row lock (at most about 70 ms and
+300 ms at 94k profiles), so the repair is safe while analysis and catalogue
+refreshes run. A run withdraws at most 20,000 profiles (about 2 s) and
+republishes at most 2,000 (about 5 s); run it again while the page reports
+rows left. Clients need nothing: they apply the events like any other.
+
+**Orphans between repairs.** Every catalogue refresh, also one without
+changes, ends with the same withdrawal (step 1), bounded the same way. Each
+withdrawal is an ordinary `delete` event in `/api/profiles/changes`, and the
+worker that ran the refresh logs `lumae_analysis withdrew N published profiles
+of <source> whose tracks are no longer in the catalogue`. `profiles_orphaned`
+in health is not live: it is the count of the last install, web-worker start
+or repair, and it should be 0. A withdrawal does not change
+`profiles_unpublished_ready` (the withdrawn track's attempt becomes `stale`,
+not `ready`).
 
 ## Known gap: 1.2.5 fingerprint rebase
 

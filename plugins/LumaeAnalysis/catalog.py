@@ -1684,9 +1684,14 @@ def _after_publication(db, catalog_instance_id, generation):
     Best effort, like the status summary. What a failure leaves goes with the
     next publication, or with maintenance: compact_enrichment_storage sweeps
     the edges and prune_catalog_storage the generations at install.
+
+    Before those, published profiles the new generation lacks but its diff
+    did not name are withdrawn (_withdraw_orphaned_profiles), so the sweep
+    takes their edges too.
     """
     from .profile_publication import purge_withdrawn_edges
 
+    _withdraw_orphaned_profiles(db, catalog_instance_id)
     steps = (
         (
             "purge unpublished edge payloads",
@@ -1715,6 +1720,41 @@ def _after_publication(db, catalog_instance_id, generation):
             logger.warning(
                 "lumae_analysis could not %s of %s", label, catalog_instance_id, exc_info=True,
             )
+
+
+def _withdraw_orphaned_profiles(db, catalog_instance_id):
+    """Withdraw the source's published profiles its generation lacks (P3-7).
+
+    A publication withdraws the profiles of the tracks its diff deletes. A
+    published profile whose track was already missing from the previous
+    generation is never in a diff (the 1.2.5 upgrade seeded such rows), so
+    each refresh, including one without changes, compares the published
+    profiles with the generation it leaves published. In short batches after
+    the refresh commits, bounded per refresh; best effort, like the other
+    post-publication work.
+    """
+    from .profile_publication import withdraw_orphaned_profiles
+
+    try:
+        withdrawn = withdraw_orphaned_profiles(db, catalog_instance_id)
+    except Exception:
+        try:
+            rollback = getattr(db, "rollback", None)
+            if callable(rollback):
+                rollback()
+        except Exception:
+            pass
+        logger.warning(
+            "lumae_analysis could not withdraw orphaned profiles of %s",
+            catalog_instance_id, exc_info=True,
+        )
+        return 0
+    if withdrawn:
+        logger.warning(
+            "lumae_analysis withdrew %s published profiles of %s whose tracks are "
+            "no longer in the catalogue", len(withdrawn), catalog_instance_id,
+        )
+    return len(withdrawn)
 
 
 def refresh_catalog(server_id=None, db=None, bridge=None):
@@ -2052,6 +2092,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             )
             cur.close()
             db.commit()
+            _withdraw_orphaned_profiles(db, catalog_instance_id)
             # P2-1: the catalogue is unchanged, but AudioMuse may have mapped
             # or fingerprinted tracks since (an analysis run ends here).
             refresh_status_summary(db, catalog_instance_id, getattr(provider_bridge, "core", None))

@@ -245,6 +245,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
         "integrity": {
             "collections_feed_ok": None,
             "profiles_unpublished_ready": None,
+            "profiles_orphaned": None,
             "profiles_checked_at": None,
             "fences_installed": None,
         },
