@@ -669,6 +669,62 @@ def test_unknown_auth_method_is_denied_not_mapped_to_a_principal(conflicts_api, 
     db.close()
 
 
+def test_health_answers_200_with_a_null_scope_for_an_unknown_auth_method(monkeypatch):
+    """Health is the capability probe: a host auth method the plugin does not
+    know must not break it. The routes that need a principal answer 401; health
+    answers 200 with every principal ``scope`` null and nothing else changed.
+    A malformed session still gets 401 from health, as in 1.2.5."""
+    from flask import Flask, g, request
+
+    from test_lumae_analysis import load_plugin
+
+    mod = load_plugin()
+    manager = mod.collection_manager
+    monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", None, raising=False)
+    monkeypatch.setattr(manager, "collections_enabled", lambda: True)
+    monkeypatch.setattr(manager, "get_db", lambda: pytest.fail("no database access expected"))
+    app = Flask(__name__)
+
+    @app.before_request
+    def authenticate():
+        g.auth_method = request.headers.get("X-Auth-Method")
+        g.auth_user = request.headers.get("X-Auth-User")
+
+    app.register_blueprint(mod.bp)
+    client = app.test_client()
+    scoped = ("collections", "shelves", "personal_discovery")
+
+    def health(headers):
+        response = client.get("/api/health", headers=headers)
+        return response.status_code, response.get_json()
+
+    status, shared = health({"X-Auth-Method": "bearer"})
+    assert status == 200 and {shared["capabilities"][n]["scope"] for n in scoped} == {"shared"}
+    status, personal = health({"X-Auth-Method": "session", "X-Auth-User": "alice"})
+    assert status == 200 and {personal["capabilities"][n]["scope"] for n in scoped} == {"personal"}
+    assert health({})[1]["capabilities"]["collections"]["scope"] == "shared"
+    for user in (None, "alice"):
+        headers = {"X-Auth-Method": "plugin_bearer"}
+        if user:
+            headers["X-Auth-User"] = user
+        status, body = health(headers)
+        assert status == 200
+        expected = json.loads(json.dumps(shared))
+        for name in scoped:
+            expected["capabilities"][name]["scope"] = None
+        assert body == expected
+        # The routes that need the principal deny it.
+        assert client.post("/api/collections", json={"name": "X"}, headers=headers).status_code == 401
+        assert client.get("/api/shelves/changes?catalog_id=catalog-a",
+                          headers=headers).status_code == 401
+    # A malformed session keeps its 1.2.5 answer on health.
+    assert client.get("/api/health", headers={"X-Auth-Method": "session"}).status_code == 401
+    with app.test_request_context("/"):
+        g.auth_method = "plugin_bearer"
+        g.auth_user = None
+        assert manager.health_scope_mode() is None
+
+
 def test_current_principal_maps_only_known_auth_methods():
     from flask import Flask, g
     from werkzeug.exceptions import Unauthorized

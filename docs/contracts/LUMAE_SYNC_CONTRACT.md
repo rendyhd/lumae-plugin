@@ -41,7 +41,7 @@ Rules for clients:
 - Health still reports `capabilities.profile_bootstrap.auth: "host_authenticated"` when `AUTH_ENABLED=false` (`__init__.py:1840`). That string describes the design, not the live setting, and it is unchanged in 1.3.0. **From 1.3.0 (K4, P1-6):** `capabilities.profile_bootstrap.auth_enabled` is the host's live `AUTH_ENABLED` (`false` when the host does not set it). With `auth_enabled: false`, every transfer is anonymous (last row above).
 - The host redirects an unauthenticated request for a non-`/api/` host path to `/login` with **HTTP 302** instead of returning 401. This is host behaviour, not visible in this repo; it was *verified in the 2026-09-24 audit* (`docs/audit/2026-09-24/LUMAE_AUDIT_2026-09-24.md`, P3 list under AUD-12). Every plugin path starts with `/plugins/`, so plugin API calls get this redirect too. A client must treat any **3xx response, or any `text/html` body where JSON was expected, as `authentication_required`**. It must never parse the login page as data and must never follow the redirect as success.
 - Profile data (waveform and edge) is shared by everyone who can reach the catalogue source; it is scoped by `catalog_instance_id`, not by user. Collections and shelves are scoped by principal. Shelves are also scoped by catalogue.
-- The two fail-closed rows answer 401 on every route that resolves this principal: collections, shelves, personal discovery, and `GET /api/health` (it reports the collections `scope`).
+- The two fail-closed rows answer 401 on the collection, shelf and personal-discovery routes. On `GET /api/health` they differ: a malformed session gets 401 there too, as in 1.2.5, but an unknown host auth method gets the normal 200, with `scope: null` on `collections`, `shelves` and `personal_discovery` (§2), so a new host auth method cannot break capability detection.
 
 ### 1.3 Requests
 
@@ -101,7 +101,7 @@ Never compare server timestamps with the device clock. `expires_at` is advisory;
 
 ### `GET /api/health` (`__init__.py:1823-1864`)
 
-This route always answers 200 (unless an exception occurs, or the host auth method names no collections principal: then 401, §1.2). It has no side effects. From 1.3.0 it also reads the `integrity` object below (two index lookups, well under 1 ms at 94k profiles and 200k collection events).
+This route always answers 200 (unless an exception occurs, or the request carries a malformed session: 401, as in 1.2.5, §1.2). It has no side effects. From 1.3.0 it also reads the `integrity` object below (two index lookups, well under 1 ms at 94k profiles and 200k collection events).
 
 | Key | Value in 1.2.5 | Source |
 |---|---|---|
@@ -123,7 +123,7 @@ This route always answers 200 (unless an exception occurs, or the host auth meth
 | `edge_profiles` | `schema_version: 2`, `method: "lumae-edge-kweighted-bands-48k-k4-v2"`, `available: bool`, `enabled: bool` | `available`: the PyAV 16.1.0 / libswresample 6.1.100 runtime imports (`edge_profiles.py:86-98`). `enabled`: the setting `edge_profiles_enabled` and `available` (`__init__.py:2762-2763`). |
 | `personal_discovery` | `schema_version: 1`, `enabled`, `scope: "shared"\|"personal"`, `features: ["album_memory_context","enjoyment_feedback"]` | out of scope here; see `docs/discovery-api-v1.md` |
 | `music_metadata` | `schema_version: 1`, `enabled`, `provider: "musicbrainz"`, `daily_request_limit: 80`, `recording_membership: true` | out of scope |
-| `shelves` | `schema_version: 1`, `enabled`, `scope` | `enabled` is the collection-manager setting |
+| `shelves` | `schema_version: 1`, `enabled`, `scope` | `enabled` is the collection-manager setting. `scope` is `"shared"` or `"personal"`, the caller's collections principal (§1.2); **from 1.3.0 (P3-4b)** it is `null` when the host auth method names no principal, and then every shelf, collection and personal-discovery route answers that caller 401. The same holds for `personal_discovery.scope` and `collections.scope`. |
 | `collections` | `schema_version: 1`, `backup_version: 1`, `enabled`, `scope`. **1.3.0 adds** `feed_epoch: true` (K8, P3-4a) and `contract: 2` (K9, P3-4b). | `collection_manager.py:18-20, 53-57`. `feed_epoch` gates the feed `epoch` echo and 410 (§5.2) and the snapshot route (§5.2a). `contract` is the collections contract a request can opt in to with the header `X-Lumae-Collections-Contract` (K9, §5.3); it also covers shelf mutations (§5.4). |
 | `catalog_mirror` | `contract_revision`, `catalog_schema_version: 3`, `analysis_schema_version: 2`, `catalog_builder_version`, `supported_core_range`, `supported_provider_types: ["navidrome"]`, `features: [...]` | `catalog_capability()`, 1753-1762. `features` is the static `CATALOG_FEATURES` list (120-162), which includes `profile_cursor_stream` and `source_scoped_profiles`. |
 | `credits` | `credits_service.capability()` | out of scope |

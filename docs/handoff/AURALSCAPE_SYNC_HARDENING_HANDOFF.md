@@ -234,7 +234,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
   - `POST /api/collections` with a taken id: `409 {"error":"collection_exists","current":…}`, or `collection_deleted` with the tombstone. A create retried without a key after a lost response sees its own collection in `current`.
   - Restores are unchanged by the header (fresh ids; key conflicts carry `current: null`).
   - Shelves: with the header, reusing a mutation `id` with another body is `409 {"error":"idempotency_key_conflict"}` (no `current`) and changes nothing; re-read `/api/shelves/changes`. The same body still replays the stored response.
-  - A request whose host auth method is neither the session nor the installation bearer (for example a plugin-scoped token) now gets 401 on every collections, shelves and personal-discovery route and on health, instead of the shared library.
+  - A request whose host auth method is neither the session nor the installation bearer (for example a plugin-scoped token) now gets 401 on every collections, shelves and personal-discovery route, instead of the shared library. Health still answers it 200, with `scope: null` on `collections`, `shelves` and `personal_discovery`: treat a null `scope` as "collections unavailable for this caller".
 
 **C-14 — Readiness UI (LUM-017 client).** Show per-stream states: catalogue, waveform profiles, edge profiles, relationships, collections. Each has availability, freshness and last outcome, including `deferred` from C-3 and truthful partial success, with a scoped retry. Accessibility: screen-reader labels, focus order, and dynamic type or zoom.
 

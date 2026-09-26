@@ -99,19 +99,19 @@ def collections_enabled():
     return bool(value)
 
 
-def current_principal():
-    """JWT/session users are isolated; bearer-token installs share one library.
+def _resolve_principal():
+    """The request's principal, or None when its host auth method is unknown.
 
     Only the host's own methods name a principal: ``session`` (a user),
     ``bearer`` (the installation token, shared) and no method at all (auth
-    disabled, shared). Anything else, such as a plugin-scoped token, is denied
-    rather than mapped to a default principal.
+    disabled, shared). Anything else, such as a plugin-scoped token, names
+    none rather than a default principal.
     """
     method = getattr(g, "auth_method", None)
     if method == "bearer":
         return GLOBAL_PRINCIPAL
     if method not in (None, "session"):
-        abort(401)
+        return None
     username = getattr(g, "auth_user", None)
     if username:
         return f"user:{username}"
@@ -121,6 +121,30 @@ def current_principal():
         # account's collections.
         abort(401)
     return GLOBAL_PRINCIPAL
+
+
+def current_principal():
+    """JWT/session users are isolated; bearer-token installs share one library.
+
+    An unknown host auth method is denied (401), never mapped to a default
+    principal.
+    """
+    principal = _resolve_principal()
+    if principal is None:
+        abort(401)
+    return principal
+
+
+def health_scope_mode():
+    """The collections ``scope`` for health: "shared", "personal", or None when
+    the host auth method names no principal (the collection, shelf and
+    discovery routes answer 401 then). Health keeps answering 200 for such a
+    caller; a malformed session still aborts with 401, as in 1.2.5.
+    """
+    principal = _resolve_principal()
+    if principal is None:
+        return None
+    return current_collection_scope()["mode"]
 
 
 def contract_v2():
