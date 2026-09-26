@@ -786,7 +786,8 @@ def test_settings_offers_and_runs_the_repair(migrated_db, monkeypatch):
     migrated_db.commit()
     monkeypatch.setattr(mod, "get_db", lambda: migrated_db)
     monkeypatch.setattr(mod, "render_settings_status_panels", lambda _size: dict.fromkeys(
-        ("readiness", "relationships", "catalogue", "waveform", "reconcile", "identity"), ""))
+        ("readiness", "relationships", "catalogue", "waveform", "reconcile", "identity",
+         "stream_status"), ""))
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
     client = plugin_client(mod)
     page = client.get("/settings").get_data(as_text=True)
