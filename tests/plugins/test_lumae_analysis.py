@@ -8678,6 +8678,7 @@ def test_settings_page_recovers_transaction_after_identity_status_query_fails(mo
     monkeypatch.setattr(mod, "render_v3_readiness_panel", lambda: "")
     monkeypatch.setattr(mod, "render_relationship_status_panel", lambda: "")
     monkeypatch.setattr(mod, "render_source_preparation_sections", lambda _size: ("", ""))
+    monkeypatch.setattr(mod, "render_readiness_streams_panel", lambda: "")
     monkeypatch.setattr(mod, "render_collections_settings_panel", render_collections)
     monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
 
@@ -8698,6 +8699,7 @@ def test_settings_status_returns_private_fragments_without_rendering_page(monkey
     )
     monkeypatch.setattr(mod, "render_reconcile_status_panel", lambda: "<p>Idle</p>")
     monkeypatch.setattr(mod, "render_provider_identity_panel", lambda: "")
+    monkeypatch.setattr(mod, "render_readiness_streams_panel", lambda: "<p>Streams ready</p>")
     monkeypatch.setattr(mod, "render_page", lambda *_args, **_kwargs: pytest.fail("full page"))
     monkeypatch.setattr(mod, "set_setting", lambda *_args: pytest.fail("settings write"))
     monkeypatch.setattr(mod, "enqueue", lambda *_args, **_kwargs: pytest.fail("queued work"))
@@ -8714,13 +8716,15 @@ def test_settings_status_returns_private_fragments_without_rendering_page(monkey
         "waveform": "<p>Batch size: 3</p>",
             "reconcile": "<p>Idle</p>",
             "identity": "",
+            "stream_status": "<p>Streams ready</p>",
         }}
 
 
 def test_settings_polling_url_respects_plugin_mount_prefix(monkeypatch):
     mod = load_plugin()
     panels = dict.fromkeys(
-        ("readiness", "relationships", "catalogue", "waveform", "reconcile", "identity"), "",
+        ("readiness", "relationships", "catalogue", "waveform", "reconcile", "identity",
+         "stream_status"), "",
     )
     monkeypatch.setattr(mod, "render_settings_status_panels", lambda _size: panels)
     monkeypatch.setattr(mod, "render_collections_settings_panel", lambda: "")
@@ -10130,3 +10134,275 @@ def test_database_state_page_redacts_outer_snapshot_exception(monkeypatch):
     body = response.get_data(as_text=True)
     assert "Database diagnostic snapshot failed." in body
     assert secret not in body
+
+
+# ---------------------------------------------------------------------------
+# P3-9 (LUM-017): per-stream readiness panel — render snapshot and a11y lint
+# ---------------------------------------------------------------------------
+
+import re as _readiness_re  # noqa: E402  (local import; see module docstring)
+from html.parser import HTMLParser  # noqa: E402
+
+
+class _A11yLint(HTMLParser):
+    """A minimal accessibility lint over rendered HTML (``html.parser`` only,
+    no extra dependency). Checks: every ``<button>`` has an accessible name;
+    at least one ``aria-live="polite"`` region exists; every ``<section>``/
+    ``<article>`` is a labelled region; no ``<div onclick>`` without button
+    semantics; no inline ``style="width:...px"`` on a layout container.
+    """
+
+    _PX_WIDTH = _readiness_re.compile(r"width\s*:\s*[0-9.]+px")
+    _CONTAINERS = ("div", "section", "article", "form", "main", "header", "footer")
+
+    def __init__(self):
+        super().__init__()
+        self.violations = []
+        self.has_live_region = False
+        self._button_stack = []
+
+    def handle_starttag(self, tag, attrs):
+        attrs = dict(attrs)
+        if attrs.get("aria-live") == "polite":
+            self.has_live_region = True
+        if tag == "div" and "onclick" in attrs and not attrs.get("role") and "tabindex" not in attrs:
+            self.violations.append("a <div onclick> without button semantics")
+        style = attrs.get("style") or ""
+        if tag in self._CONTAINERS and self._PX_WIDTH.search(style):
+            self.violations.append(f"inline px width on <{tag}>")
+        if tag in ("section", "article") and not (
+            attrs.get("aria-label") or attrs.get("aria-labelledby")
+        ):
+            self.violations.append(f"<{tag}> is not a labelled region")
+        if tag == "button":
+            self._button_stack.append({"attrs": attrs, "text": ""})
+
+    def handle_endtag(self, tag):
+        if tag == "button" and self._button_stack:
+            button = self._button_stack.pop()
+            name = (
+                button["text"].strip()
+                or button["attrs"].get("aria-label")
+                or button["attrs"].get("aria-labelledby")
+            )
+            if not name:
+                self.violations.append("a <button> without an accessible name")
+
+    def handle_data(self, data):
+        for button in self._button_stack:
+            button["text"] += data
+
+
+def _a11y_lint(html_text):
+    parser = _A11yLint()
+    parser.feed(html_text)
+    if not parser.has_live_region:
+        parser.violations.append('no aria-live="polite" region')
+    return parser.violations
+
+
+def _readiness_ready_source():
+    return {
+        **settings_catalog_source(),
+        "catalog": {
+            "status": "complete", "entity_counts": {"track": 100},
+            "generation": 3, "completed_at": "2026-09-26T09:00:00Z",
+        },
+        "analysis": {
+            "status": "complete", "generation": 3, "completed_at": "2026-09-26T09:05:00Z",
+        },
+    }
+
+
+def _patch_readiness_streams(mod, monkeypatch, *, preparation, backfill, counts, edge,
+                              relationship):
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
+    monkeypatch.setattr(mod, "preparation_state", lambda _id: preparation)
+    monkeypatch.setattr(mod, "profile_backfill_state", lambda _id: backfill)
+    monkeypatch.setattr(mod, "_committed_profile_counts", lambda _source: counts)
+
+    def _edge(_db, _id):
+        if isinstance(edge, Exception):
+            raise edge
+        return edge
+
+    def _relationship(_db, _id):
+        if isinstance(relationship, Exception):
+            raise relationship
+        return relationship
+
+    monkeypatch.setattr(mod, "edge_profile_status", _edge)
+    monkeypatch.setattr(mod, "relationship_status", _relationship)
+
+
+_READINESS_READY_PREPARATION = {
+    "status": "ready", "phase": "catalog_ready", "last_error": None,
+    "completed_at": "2026-09-26T09:00:00Z", "updated_at": "2026-09-26T09:00:00Z",
+}
+_READINESS_READY_BACKFILL = {
+    "status": "complete", "last_error": None, "completed_at": "2026-09-26T09:01:00Z",
+    "updated_at": "2026-09-26T09:01:00Z", "next_retry_at": None,
+}
+_READINESS_READY_COUNTS = {
+    "total_with_files": 100, "ready_current": 100, "pending": 0, "failed": 0,
+    "skipped": 0, "needs_analysis": 0, "counted_at": "2026-09-26T09:01:00Z",
+}
+_READINESS_READY_EDGE = {
+    "ready": 100, "active": 0, "failed": 0, "last_error": None,
+    "last_success_at": "2026-09-26T09:02:00Z",
+}
+_READINESS_READY_RELATIONSHIP = {
+    "status": "complete", "source_catalog_generation": 3, "source_analysis_generation": 3,
+    "album_count": 10, "artist_count": 5, "completed_at": "2026-09-26T09:03:00Z",
+    "last_error": None,
+}
+
+READINESS_SECRET = "password=Sup3rSecretPass"  # noqa: S105  (test fixture, not a real secret)
+
+
+def test_settings_readiness_streams_panel_shows_all_ready(monkeypatch):
+    mod = load_plugin()
+    source = _readiness_ready_source()
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    _patch_readiness_streams(
+        mod, monkeypatch, preparation=_READINESS_READY_PREPARATION,
+        backfill=_READINESS_READY_BACKFILL, counts=_READINESS_READY_COUNTS,
+        edge=_READINESS_READY_EDGE, relationship=_READINESS_READY_RELATIONSHIP,
+    )
+
+    body = mod.render_readiness_streams_panel()
+
+    assert body.count("Ready</span>") == 5
+    for label in ("Catalogue", "Analysis projection", "Waveform profiles",
+                  "Edge profiles", "Relationships"):
+        assert f'aria-label="{label} readiness for Main Navidrome"' in body
+    assert not _a11y_lint(body)
+
+
+def test_settings_readiness_streams_panel_redacts_a_failed_stream(monkeypatch):
+    mod = load_plugin()
+    source = _readiness_ready_source()
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    _patch_readiness_streams(
+        mod, monkeypatch, preparation=_READINESS_READY_PREPARATION,
+        backfill=_READINESS_READY_BACKFILL, counts=_READINESS_READY_COUNTS,
+        edge={
+            **_READINESS_READY_EDGE, "failed": 3, "active": 0,
+            "last_error": f"edge upgrade failed: {READINESS_SECRET}",
+        },
+        relationship=_READINESS_READY_RELATIONSHIP,
+    )
+
+    body = mod.render_readiness_streams_panel()
+
+    assert "Sup3rSecretPass" not in body
+    assert "password=[redacted]" in body
+    assert "Failed" in body
+    assert not _a11y_lint(body)
+
+
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+def _readiness_times():
+    """(now, a cooldown still ahead, an expired cooldown), computed at call time."""
+    now = datetime.now(timezone.utc)
+    return (now.isoformat(), (now + timedelta(hours=1)).isoformat(),
+            (now - timedelta(hours=1)).isoformat())
+
+
+def test_settings_readiness_streams_panel_shows_waveform_cooling(monkeypatch):
+    mod = load_plugin()
+    now, future, _past = _readiness_times()
+    source = _readiness_ready_source()
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    _patch_readiness_streams(
+        mod, monkeypatch, preparation=_READINESS_READY_PREPARATION,
+        backfill={
+            **_READINESS_READY_BACKFILL, "status": "queued",
+            # A fresh row (the worker just wrote it) with a cooldown ahead:
+            # review P3-9 HIGH-1, "cooling" must not hide behind "queued".
+            "next_retry_at": future, "updated_at": now,
+        },
+        counts={
+            **_READINESS_READY_COUNTS, "ready_current": 40, "failed": 10, "needs_analysis": 50,
+        },
+        edge=_READINESS_READY_EDGE, relationship=_READINESS_READY_RELATIONSHIP,
+    )
+
+    body = mod.render_readiness_streams_panel()
+
+    assert "Cooling down" in body
+    assert future in body
+    assert not _a11y_lint(body)
+
+
+def test_settings_readiness_streams_panel_expired_cooldown_is_not_cooling(monkeypatch):
+    mod = load_plugin()
+    now, _future, past = _readiness_times()
+    source = _readiness_ready_source()
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    _patch_readiness_streams(
+        mod, monkeypatch, preparation=_READINESS_READY_PREPARATION,
+        backfill={
+            **_READINESS_READY_BACKFILL, "status": "queued",
+            "next_retry_at": past, "updated_at": now,
+        },
+        counts=_READINESS_READY_COUNTS,
+        edge=_READINESS_READY_EDGE, relationship=_READINESS_READY_RELATIONSHIP,
+    )
+
+    body = mod.render_readiness_streams_panel()
+
+    assert "Cooling down" not in body
+    assert "Queued to start shortly." in body
+
+
+def test_settings_readiness_streams_panel_shows_one_stream_unavailable(monkeypatch):
+    mod = load_plugin()
+    source = _readiness_ready_source()
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    _patch_readiness_streams(
+        mod, monkeypatch, preparation=_READINESS_READY_PREPARATION,
+        backfill=_READINESS_READY_BACKFILL, counts=_READINESS_READY_COUNTS,
+        edge=RuntimeError("connection refused"), relationship=_READINESS_READY_RELATIONSHIP,
+    )
+
+    body = mod.render_readiness_streams_panel()
+
+    assert "Unavailable" in body
+    assert "Edge profile status could not be read." in body
+    assert not _a11y_lint(body)
+
+
+def test_settings_readiness_streams_panel_self_check_mutants(monkeypatch):
+    """Two deliberate mutants the render must not pass silently (P3-9 self-check):
+    dropping the live region, and showing a stored error unredacted.
+    """
+    mod = load_plugin()
+    source = _readiness_ready_source()
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    _patch_readiness_streams(
+        mod, monkeypatch, preparation=_READINESS_READY_PREPARATION,
+        backfill=_READINESS_READY_BACKFILL, counts=_READINESS_READY_COUNTS,
+        edge={
+            **_READINESS_READY_EDGE, "failed": 1,
+            "last_error": f"edge upgrade failed: {READINESS_SECRET}",
+        },
+        relationship=_READINESS_READY_RELATIONSHIP,
+    )
+
+    body = mod.render_readiness_streams_panel()
+    assert not _a11y_lint(body)
+    assert READINESS_SECRET not in body
+
+    # Mutant 1: remove the live region -> the lint must catch it.
+    mutated = body.replace(' aria-live="polite"', "")
+    assert 'no aria-live="polite" region' in _a11y_lint(mutated)
+
+    # Mutant 2: show the stored error unredacted -> the secret must reappear.
+    with pytest.MonkeyPatch.context() as mutant:
+        mutant.setattr(mod, "redact_stored_error", lambda value: value)
+        unredacted = mod.render_readiness_streams_panel()
+    assert READINESS_SECRET in unredacted

@@ -660,6 +660,32 @@ def test_the_settings_page_shows_a_safe_code_unchanged(fixture_db, monkeypatch):
     assert '<div class="lumae-help">analysis_timeout</div>' in body
 
 
+def test_settings_readiness_streams_panel_reads_write_nothing(fixture_db, monkeypatch):
+    """LUM-017 (P3-9): the per-stream readiness panel's GET reads write nothing.
+
+    Reuses P2-1's ``RecordingConnection`` (as the diagnostics tests above do)
+    against the real, seeded ``fixture_db``: a failed preparation and backfill
+    row with a stored secret, so the panel has real redirected text to render,
+    not just an empty page.
+    """
+    connection = RecordingConnection(fixture_db)
+    mod, client = _route(monkeypatch, connection)
+    monkeypatch.setattr(mod, "detect_core", lambda: V2)
+
+    page = client.get("/settings").get_data(as_text=True)
+    status = client.get("/settings/status").get_json()["panels"]["stream_status"]
+
+    assert "Readiness by stream" in page
+    assert "Catalogue" in status and "Waveform profiles" in status
+    for secret in SECRETS:
+        assert secret not in page, secret
+        assert secret not in status, secret
+    assert connection.statements
+    assert connection.writes() == []
+    assert connection.commits == 0
+    assert connection.transaction_id() is None
+
+
 def _health(monkeypatch, db):
     mod, client = _route(monkeypatch, db)
     monkeypatch.setattr(mod, "detect_core", lambda: V2)

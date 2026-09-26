@@ -23,7 +23,7 @@ from .edge_profiles import (
 )
 from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
-    publish_edge_profile, edge_backfill_candidates,
+    publish_edge_profile, edge_backfill_candidates, edge_profile_status,
 )
 from . import analysis_isolation
 from . import migrations
@@ -4332,7 +4332,7 @@ def profile_backfill_state(catalog_instance_id, db=None):
     cur.execute(
         f"""
         SELECT server_id, status, processed_profiles, queued_profiles,
-               last_error, started_at, completed_at, updated_at
+               last_error, started_at, completed_at, updated_at, next_retry_at
           FROM {profile_backfill_state_table()}
          WHERE catalog_instance_id=%s
         """,
@@ -4352,6 +4352,9 @@ def profile_backfill_state(catalog_instance_id, db=None):
         "started_at": str(row[5]) if row[5] else None,
         "completed_at": str(row[6]) if row[6] else None,
         "updated_at": str(row[7]) if row[7] else None,
+        # LUM-017 (P3-9): when this is set the worker is deliberately
+        # cooling down after a transient failure, not idle or stuck.
+        "next_retry_at": str(row[8]) if row[8] else None,
     }
 
 
@@ -4366,6 +4369,19 @@ def profile_backfill_is_active(state, now=None):
         return (current - updated_at).total_seconds() < BACKFILL_STALE_MINUTES * 60
     except (KeyError, TypeError, ValueError):
         return True
+
+
+def _future_retry_at(value, now=None):
+    """``value`` while that cooldown is still ahead of ``now``, else None."""
+    if not value:
+        return None
+    try:
+        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return value if at > (now or datetime.now(timezone.utc)) else None
 
 
 def claim_profile_backfill(source, db=None):
@@ -5899,6 +5915,355 @@ def render_provider_identity_panel():
     """
 
 
+# ---------------------------------------------------------------------------
+# Per-stream readiness (LUM-017 / P3-9)
+#
+# Catalogue, analysis projection, waveform profiles, edge profiles and
+# relationships are shown as five independent regions: an availability word
+# (never colour alone), a last-success time and age, and a job status
+# (idle/queued/running/failed/cooling). Every read here reuses an existing,
+# already-bounded accessor (P2-1's committed status model, the same
+# preparation/backfill/relationship state readers the narrative panels above
+# already call); the one addition is ``edge_profile_status``, a single small
+# aggregate scoped to one source. No new heavy query is added.
+# ---------------------------------------------------------------------------
+
+_READINESS_AVAILABILITY_LABEL = {
+    "ready": "Ready", "partial": "Partial", "unavailable": "Unavailable",
+}
+_READINESS_AVAILABILITY_CLASS = {
+    "ready": "lumae-source-state-ready",
+    "partial": "lumae-source-state-working",
+    "unavailable": "lumae-source-state-danger",
+}
+_READINESS_JOB_LABEL = {
+    "idle": "Idle", "queued": "Queued", "running": "Running",
+    "failed": "Failed", "cooling": "Cooling down",
+}
+
+
+def _readiness_availability(ready, partial, ready_text, partial_text, unavailable_text):
+    """One of ready / partial / unavailable, with a plain-text reason.
+
+    The caller always renders the word next to any colour, so the state is
+    never conveyed by colour alone.
+    """
+    if ready:
+        return "ready", ready_text
+    if partial:
+        return "partial", partial_text
+    return "unavailable", unavailable_text
+
+
+def _readiness_age_text(iso_value):
+    """A short, human age for an ISO timestamp; text, never a bare number."""
+    if not iso_value:
+        return "no successful run recorded yet"
+    try:
+        when = datetime.fromisoformat(str(iso_value).replace("Z", "+00:00"))
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        seconds = max(0.0, (datetime.now(timezone.utc) - when).total_seconds())
+    except (TypeError, ValueError):
+        return "unknown age"
+    if seconds < 60:
+        return "just now"
+    if seconds < 3600:
+        return f"{int(seconds // 60)} minute(s) ago"
+    if seconds < 86400:
+        return f"{int(seconds // 3600)} hour(s) ago"
+    return f"{int(seconds // 86400)} day(s) ago"
+
+
+def _readiness_job(status, *, last_error=None, next_retry_at=None, stalled=False):
+    """One of idle / queued / running / failed / cooling, with plain-text detail.
+
+    ``last_error`` is redacted here (P3-10's ``redact_stored_error``) so every
+    caller gets safe text; the render site still HTML-escapes it.
+    """
+    if status == "running" and not stalled:
+        return "running", "Running now."
+    # A queued row with a cooldown still ahead is cooling, not about to start.
+    if next_retry_at:
+        return "cooling", f"Waiting to retry after a transient failure, until {next_retry_at}."
+    if status == "queued" and not stalled:
+        return "queued", "Queued to start shortly."
+    if last_error:
+        return "failed", redact_stored_error(last_error) or "Failed."
+    return "idle", "Nothing queued."
+
+
+def _readiness_stream_status(source):
+    """The five independent stream states for one catalogue source."""
+    catalog_instance_id = source["catalog_instance_id"]
+    catalog = source.get("catalog") or {}
+    analysis = source.get("analysis") or {}
+    paused = maintenance_paused()
+
+    try:
+        prep = preparation_state(catalog_instance_id)
+    except Exception:
+        _rollback_if_possible(get_db())
+        prep = None
+    prep_active = preparation_is_active(prep)
+    prep_stalled = bool(prep) and prep.get("status") in ("queued", "running") and not prep_active
+
+    try:
+        backfill = profile_backfill_state(catalog_instance_id)
+    except Exception:
+        _rollback_if_possible(get_db())
+        backfill = None
+    backfill_active = profile_backfill_is_active(backfill)
+    backfill_stalled = (
+        bool(backfill) and backfill.get("status") in ("queued", "running") and not backfill_active
+    )
+
+    counts = _committed_profile_counts(source)
+
+    try:
+        edge = edge_profile_status(get_db(), catalog_instance_id)
+    except Exception:
+        _rollback_if_possible(get_db())
+        edge = None
+
+    try:
+        relationship = relationship_status(get_db(), catalog_instance_id)
+    except Exception:
+        _rollback_if_possible(get_db())
+        relationship = None
+
+    streams = []
+
+    # 1. Catalogue
+    published = _published_track_count(source)
+    catalog_ready = catalog.get("status") == "complete" and published > 0
+    catalog_partial = prep_active or (
+        catalog.get("status") not in (None, "not_initialized") and not catalog_ready
+    )
+    availability, availability_text = _readiness_availability(
+        catalog_ready, catalog_partial,
+        f"{published:,} tracks published.",
+        "The catalogue refresh has not finished yet.",
+        "No catalogue has been published yet.",
+    )
+    job_state, job_text = _readiness_job(
+        prep.get("status") if prep else None,
+        last_error=(prep or {}).get("last_error"),
+        stalled=prep_stalled,
+    )
+    streams.append({
+        "key": "catalogue", "label": "Catalogue",
+        "availability": availability, "availability_text": availability_text,
+        "last_success": catalog.get("completed_at"),
+        "job_state": job_state, "job_text": job_text,
+        "retry_action": "prepare_lumae", "retry_label": "Retry catalogue refresh",
+        "retry_disabled": prep_active or paused,
+    })
+
+    # 2. Analysis projection
+    analysis_ready = catalog_ready and analysis.get("status") == "complete"
+    analysis_partial = prep_active and not analysis_ready
+    availability, availability_text = _readiness_availability(
+        analysis_ready, analysis_partial,
+        f"Projection generation {int(analysis.get('generation') or 0):,} is published.",
+        "The analysis projection has not finished yet.",
+        "No analysis projection has been published yet.",
+    )
+    job_state, job_text = _readiness_job(
+        prep.get("status") if prep else None,
+        last_error=(prep or {}).get("last_error"),
+        stalled=prep_stalled,
+    )
+    streams.append({
+        "key": "analysis", "label": "Analysis projection",
+        "availability": availability, "availability_text": availability_text,
+        "last_success": analysis.get("completed_at"),
+        "job_state": job_state, "job_text": job_text,
+        "retry_action": "prepare_lumae", "retry_label": "Retry analysis projection",
+        "retry_disabled": prep_active or paused,
+    })
+
+    # 3. Waveform profiles
+    total = int((counts or {}).get("total_with_files") or 0)
+    ready_count = int((counts or {}).get("ready_current") or 0)
+    needs = int((counts or {}).get("needs_analysis") or 0)
+    waveform_ready = counts is not None and total > 0 and ready_count >= total
+    waveform_partial = counts is not None and (
+        backfill_active or (total > 0 and 0 < ready_count < total)
+    )
+    availability, availability_text = _readiness_availability(
+        waveform_ready, waveform_partial,
+        f"{ready_count:,} of {total:,} profiles ready.",
+        (f"{ready_count:,} of {total:,} profiles ready; {needs:,} still need analysis."
+         if counts is not None else "Waveform profile counts could not be read."),
+        ("Waveform profile counts could not be read." if counts is None
+         else "No waveform profiles have been published yet."),
+    )
+    next_retry_at = _future_retry_at((backfill or {}).get("next_retry_at"))
+    job_state, job_text = _readiness_job(
+        backfill.get("status") if backfill else None,
+        last_error=(backfill or {}).get("last_error"),
+        next_retry_at=next_retry_at,
+        stalled=backfill_stalled,
+    )
+    streams.append({
+        "key": "waveform", "label": "Waveform profiles",
+        "availability": availability, "availability_text": availability_text,
+        "last_success": (backfill or {}).get("completed_at") or (counts or {}).get("counted_at"),
+        "job_state": job_state, "job_text": job_text,
+        "retry_action": "start_backfill", "retry_label": "Retry waveform profiles",
+        "retry_disabled": backfill_active or needs == 0 or paused,
+    })
+
+    # 4. Edge profiles
+    edge_ready_count = int((edge or {}).get("ready") or 0)
+    edge_active_count = int((edge or {}).get("active") or 0)
+    edge_failed_count = int((edge or {}).get("failed") or 0)
+    edge_ready = (
+        edge is not None and edge_failed_count == 0 and edge_active_count == 0
+        and edge_ready_count > 0
+    )
+    edge_partial = (
+        edge is not None and edge_ready_count > 0
+        and (edge_active_count > 0 or edge_failed_count > 0)
+    )
+    availability, availability_text = _readiness_availability(
+        edge_ready, edge_partial,
+        f"{edge_ready_count:,} edge profiles published.",
+        f"{edge_ready_count:,} published, {edge_active_count:,} in progress, "
+        f"{edge_failed_count:,} failed.",
+        ("Edge profile status could not be read." if edge is None
+         else "No edge profiles have been published yet."),
+    )
+    job_state, job_text = _readiness_job(
+        "running" if edge_active_count else None,
+        last_error=(edge or {}).get("last_error"),
+    )
+    streams.append({
+        "key": "edge", "label": "Edge profiles",
+        "availability": availability, "availability_text": availability_text,
+        "last_success": (edge or {}).get("last_success_at"),
+        "job_state": job_state, "job_text": job_text,
+        "retry_action": "retry_edge_profiles", "retry_label": "Retry edge profiles",
+        "retry_disabled": paused or not edge_profiles_enabled(),
+    })
+
+    # 5. Relationships
+    rel_status = str(
+        (relationship or {}).get("status")
+        or ("unavailable" if relationship is None else "not_initialized")
+    )
+    rel_active = rel_status in ("queued", "running")
+    rel_current = (
+        rel_status == "complete"
+        and int((relationship or {}).get("source_catalog_generation") or 0)
+        == int(catalog.get("generation") or 0)
+        and int((relationship or {}).get("source_analysis_generation") or 0)
+        == int(analysis.get("generation") or 0)
+    )
+    availability, availability_text = _readiness_availability(
+        rel_current,
+        rel_active or rel_status == "waiting_for_index",
+        f"{int((relationship or {}).get('album_count') or 0):,} albums, "
+        f"{int((relationship or {}).get('artist_count') or 0):,} artists.",
+        ("Relationships are being prepared." if rel_active
+         else "Waiting on AudioMuse's index." if rel_status == "waiting_for_index"
+         else "Relationship status could not be read." if relationship is None
+         else "The published relationships are stale."),
+        "No relationships have been built yet.",
+    )
+    job_state, job_text = _readiness_job(
+        rel_status if rel_active else None,
+        last_error=(relationship or {}).get("last_error") if rel_status == "failed" else None,
+    )
+    streams.append({
+        "key": "relationships", "label": "Relationships",
+        "availability": availability, "availability_text": availability_text,
+        "last_success": (relationship or {}).get("completed_at"),
+        "job_state": job_state, "job_text": job_text,
+        "retry_action": "retry_relationships", "retry_label": "Retry relationships",
+        "retry_disabled": rel_active or paused,
+    })
+
+    return streams
+
+
+def render_readiness_streams_panel():
+    try:
+        sources = resolve_catalog_source(get_db())
+    except Exception:
+        logger.exception("lumae_analysis could not render per-stream readiness")
+        return ""
+    if not sources:
+        return ""
+    cards = []
+    live_parts = []
+    for source in sources:
+        catalog_instance_id = source["catalog_instance_id"]
+        server_id = source["server_id"]
+        hidden = (
+            f'<input type="hidden" name="server_id" value="{escape(str(server_id))}">'
+            f'<input type="hidden" name="catalog_instance_id" '
+            f'value="{escape(str(catalog_instance_id))}">'
+        )
+        try:
+            streams = _readiness_stream_status(source)
+        except Exception:
+            logger.exception(
+                "lumae_analysis could not read per-stream readiness for %s",
+                catalog_instance_id,
+            )
+            continue
+        source_name = escape(str(source.get("name") or server_id))
+        for stream in streams:
+            state_class = _READINESS_AVAILABILITY_CLASS[stream["availability"]]
+            state_label = _READINESS_AVAILABILITY_LABEL[stream["availability"]]
+            job_label = _READINESS_JOB_LABEL.get(
+                stream["job_state"], str(stream["job_state"]).title()
+            )
+            disabled = " disabled" if stream["retry_disabled"] else ""
+            cards.append(
+                f"""
+                <article class="lumae-source-card"
+                  data-lumae-source="{escape(str(catalog_instance_id))}"
+                  aria-label="{escape(stream['label'])} readiness for {source_name}">
+                  <header class="lumae-source-header">
+                    <div>
+                      <span class="lumae-kicker">{source_name}</span>
+                      <h4>{escape(stream['label'])}</h4>
+                    </div>
+                    <span class="lumae-source-state {state_class}">{state_label}</span>
+                  </header>
+                  <p class="lumae-help">{escape(stream['availability_text'])}</p>
+                  <p class="lumae-help">Last success:
+                    {escape(_readiness_age_text(stream['last_success']))}.</p>
+                  <p class="lumae-help">Job: {job_label}. {escape(stream['job_text'])}</p>
+                  <form class="lumae-form" method="post">
+                    {hidden}
+                    <div class="lumae-actions">
+                      <button class="lumae-button-secondary" type="submit" name="action"
+                        value="{stream['retry_action']}"{disabled}>{escape(stream['retry_label'])}</button>
+                    </div>
+                  </form>
+                </article>
+                """
+            )
+            live_parts.append(f"{stream['label']}: {state_label}, {job_label}")
+    if not cards:
+        return ""
+    return f"""
+      <section class="lumae-panel" aria-label="Readiness by stream">
+        <span class="lumae-section-priority">Overview</span>
+        <h3>Readiness by stream</h3>
+        <p class="lumae-action-copy">Catalogue, analysis projection, waveform profiles, edge
+          profiles and relationships are independent streams: a delay in one never blocks the
+          others, and each has its own scoped retry below.</p>
+        <p aria-live="polite" class="lumae-help">{escape('; '.join(live_parts))}.</p>
+        {''.join(cards)}
+      </section>
+    """
+
+
 def _reconcile_duration(milliseconds):
     if milliseconds is None:
         return "running"
@@ -6049,6 +6414,7 @@ def render_settings_status_panels(batch_size):
         "waveform": waveform_html,
         "reconcile": render_reconcile_status_panel(),
         "identity": render_provider_identity_panel(),
+        "stream_status": render_readiness_streams_panel(),
     }
 
 
@@ -6533,6 +6899,7 @@ def render_settings(message=None, error=None):
           </header>
 
           {maintenance_html}
+          {panels['stream_status']}
           {panels['reconcile']}
           {panels['catalogue']}
           {panels['identity']}
@@ -6619,6 +6986,46 @@ def settings():
                         else f"Started background enrichment for {source['name']} in batches of "
                         f"{result['batch_size']}. Playback requests are prioritized separately."
                     )
+            elif action == "retry_edge_profiles":
+                # LUM-017 (P3-9): edge profiles had no settings-page retry path;
+                # this reuses the exact enqueue the app-facing backfill API
+                # already uses (P3-7's ``edge_backfill_candidates`` /
+                # ``enqueue_edge_profiles``), just bounded to one batch here.
+                source = resolve_profile_source(
+                    catalog_instance_id=request.form.get("catalog_instance_id"),
+                    server_id=request.form.get("server_id"),
+                )
+                ids = edge_backfill_candidates(get_db(), source["catalog_instance_id"], "", 100)
+                result = enqueue_edge_profiles(
+                    ids, source["catalog_instance_id"], source["server_id"]
+                )
+                if not result.get("available"):
+                    message = "Edge profile upgrades are currently disabled or paused."
+                else:
+                    message = (
+                        f"Queued {format_count(len(result.get('accepted') or []))} edge "
+                        f"profile(s) for {source['name']}; "
+                        f"{format_count(len(result.get('already_ready') or []))} were already ready."
+                    )
+            elif action == "retry_relationships":
+                # LUM-017 (P3-9): relationships had no settings-page retry
+                # path; this wires the existing coalesced request the app API
+                # already uses (``start_relationship_preparation``).
+                source = resolve_profile_source(
+                    catalog_instance_id=request.form.get("catalog_instance_id"),
+                    server_id=request.form.get("server_id"),
+                )
+                result = start_relationship_preparation(
+                    catalog_instance_id=source["catalog_instance_id"],
+                    server_id=source["server_id"],
+                )
+                if result.get("coalesced"):
+                    message = (
+                        f"Relationships for {source['name']}: "
+                        f"{(result.get('reason') or 'already up to date').replace('_', ' ')}."
+                    )
+                else:
+                    message = f"Queued a relationship rebuild for {source['name']}."
             elif action == "repair_profile_publications":
                 result = repair_profile_publications()
                 message = (
