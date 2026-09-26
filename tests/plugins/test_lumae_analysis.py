@@ -229,6 +229,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "scope": "shared",
                 "feed_epoch": True,
                 "contract": 2,
+                "source_scoped_items": True,
             },
             "catalog_mirror": mod.catalog_capability(),
             "credits": mod.credits_service.capability(),
@@ -2059,6 +2060,7 @@ def test_collection_library_route_forwards_scope_search_sort_and_artist(monkeypa
         "sort": "year",
         "page": "2",
         "limit": "24",
+        "catalog_instance_id": None,
     }
 
 
@@ -2235,7 +2237,7 @@ def test_collection_preview_target_keeps_provider_credentials_server_side(monkey
         raising=False,
     )
 
-    target, error = library._resolve_stream_target("track-1")
+    target, error = library._resolve_stream_target("track-1", "jellyfin")
 
     assert error is None
     assert target[0] == "https://music.example/Items/track-1/Download"
@@ -2254,8 +2256,8 @@ def test_collection_preview_uses_emby_base_url_without_legacy_prefix(monkeypatch
         raising=False,
     )
 
-    target, error = library._resolve_stream_target("track-2")
-    art_target = library._resolve_art_target("track-2", 480)
+    target, error = library._resolve_stream_target("track-2", "emby")
+    art_target = library._resolve_art_target("track-2", 480, "emby")
 
     assert error is None
     assert target[0] == "https://emby.example/Items/track-2/Download"

@@ -278,7 +278,7 @@ UNDO_TO_OLDER_SCHEMA = (
     f"DROP INDEX {P}source_profiles_status_idx",
     f"DROP INDEX {P}edge_profile_jobs_orphan_idx",
     "DROP INDEX lumae_shelf_changes_idx",
-    "DROP INDEX lumae_collection_album_key_unique_idx",
+    "DROP INDEX lumae_collection_album_key_scoped_unique_idx",
     "DROP INDEX lumae_metadata_due",
     "DROP INDEX lumae_discovery_changes",
 )

@@ -15,7 +15,13 @@ from flask import Response, abort, current_app, g, jsonify, request
 from plugin.api import config, get_db, get_setting, render_page, table
 
 from . import migrations
-from .collection_library import catalog_track_view_sql, register_collection_library_routes
+from .collection_library import (
+    CatalogScopeError,
+    catalog_track_view_sql,
+    register_collection_library_routes,
+    requested_catalog,
+    resolve_catalog,
+)
 from .collection_ui import render_collection_workbench
 
 
@@ -333,28 +339,80 @@ def migrate_collections(db):
         f"CREATE INDEX IF NOT EXISTS lumae_collection_items_order_idx "
         f"ON {collection_items_table()} (principal, collection_id, kind, position)",
     )
-    migrations.ensure_index(
-        cur,
-        f"CREATE UNIQUE INDEX IF NOT EXISTS lumae_collection_track_unique_idx "
-        f"ON {collection_items_table()} (principal, collection_id, track_id) "
-        "WHERE kind = 'track'",
-    )
-    migrations.ensure_index(
-        cur,
-        f"CREATE UNIQUE INDEX IF NOT EXISTS lumae_collection_album_provider_unique_idx "
-        f"ON {collection_items_table()} (principal, collection_id, provider_album_id) "
-        "WHERE kind = 'album' AND provider_album_id IS NOT NULL",
-    )
-    migrations.ensure_index(
-        cur,
-        f"CREATE UNIQUE INDEX IF NOT EXISTS lumae_collection_album_key_unique_idx "
-        f"ON {collection_items_table()} (principal, collection_id, album_key) "
-        "WHERE kind = 'album' AND provider_album_id IS NULL",
-    )
+    # K10 (LUM-013): the catalogue an item was chosen from. NULL means
+    # unknown (written before 1.3.0 on an install with several catalogues, or
+    # by a client that sent none there); it is never guessed.
+    migrations.ensure_columns(cur, collection_items_table(), "catalog_instance_id TEXT")
+    # Membership is unique per catalogue. COALESCE(..., '') makes NULL one
+    # key of its own ('' is never stored: _normalize_item folds it to NULL),
+    # so two unscoped rows still conflict, as before, while the same track
+    # may sit in a collection once per catalogue. The replacements are built
+    # before the 1.2.5 indexes they supersede are dropped.
+    for name, key, predicate in (
+        ("lumae_collection_track_scoped_unique_idx", "track_id", "kind = 'track'"),
+        ("lumae_collection_album_provider_scoped_unique_idx", "provider_album_id",
+         "kind = 'album' AND provider_album_id IS NOT NULL"),
+        ("lumae_collection_album_key_scoped_unique_idx", "album_key",
+         "kind = 'album' AND provider_album_id IS NULL"),
+    ):
+        migrations.ensure_index(
+            cur,
+            f"CREATE UNIQUE INDEX IF NOT EXISTS {name} ON {collection_items_table()} "
+            f"(principal, collection_id, COALESCE(catalog_instance_id, ''), {key}) "
+            f"WHERE {predicate}",
+        )
+    for name in (
+        "lumae_collection_track_unique_idx",
+        "lumae_collection_album_provider_unique_idx",
+        "lumae_collection_album_key_unique_idx",
+    ):
+        migrations.ensure_no_index(cur, collection_items_table(), name)
+    backfill_item_catalogs(cur)
     # Library search folds accents with unaccent when it can be installed;
     # without it, search still works, accent-sensitively (collection_library).
     migrations.ensure_extension(cur, "unaccent")
     cur.close()
+
+
+def sole_catalog_sql():
+    """SQL for the one catalogue this install has ever had, else NULL.
+
+    Sources are never deleted, so ``catalog_sources`` holds every catalogue
+    that has existed; with more than one, an unscoped item's catalogue is
+    unknowable and stays NULL.
+    """
+    return f"(SELECT MIN(catalog_instance_id) FROM {table('catalog_sources')} HAVING COUNT(*) = 1)"
+
+
+def backfill_item_catalogs(cur):
+    """Scope unscoped items when exactly one catalogue has ever existed (K10).
+
+    Runs on every migrate (row locks only; a no-op when nothing is NULL). An
+    item whose scoped twin exists (written after the catalogue appeared) is
+    left NULL rather than violating the membership index.
+    """
+    cur.execute("SELECT to_regclass(%s) IS NOT NULL", (table("catalog_sources"),))
+    row = cur.fetchone()
+    if not row or not row[0]:
+        return 0
+    items = collection_items_table()
+    cur.execute(
+        f"""
+        UPDATE {items} i SET catalog_instance_id = sole.id
+          FROM (SELECT {sole_catalog_sql()} AS id) sole
+         WHERE sole.id IS NOT NULL AND i.catalog_instance_id IS NULL
+           AND NOT EXISTS (
+               SELECT 1 FROM {items} o
+                WHERE o.principal = i.principal AND o.collection_id = i.collection_id
+                  AND o.kind = i.kind AND o.catalog_instance_id = sole.id
+                  AND CASE WHEN i.kind = 'track' THEN o.track_id = i.track_id
+                           WHEN i.provider_album_id IS NOT NULL
+                             THEN o.provider_album_id = i.provider_album_id
+                           ELSE o.provider_album_id IS NULL AND o.album_key = i.album_key
+                      END)
+        """
+    )
+    return cur.rowcount
 
 
 def _feed_fence_installed(cur):
@@ -441,7 +499,8 @@ def _fetch_items(cur, principal, collection_id):
     cur.execute(
         f"""
         SELECT id, collection_id, kind, track_id, provider_album_id, album_key,
-               title, artist, album, cover_item_id, position, added_at, updated_at
+               title, artist, album, cover_item_id, position, added_at, updated_at,
+               catalog_instance_id
           FROM {collection_items_table()}
          WHERE principal = %s AND collection_id = %s
          ORDER BY kind, position, added_at
@@ -580,12 +639,13 @@ def _normalize_backup_document(document):
             if not isinstance(raw_item, dict):
                 raise ValueError(f"Every item in {name} must be an object.")
             item = _normalize_item(raw_item)
+            scope = item["catalog_instance_id"]
             if item["kind"] == "track":
-                membership_key = ("track", item["track_id"])
+                membership_key = (scope, "track", item["track_id"])
             elif item["provider_album_id"]:
-                membership_key = ("album-id", item["provider_album_id"])
+                membership_key = (scope, "album-id", item["provider_album_id"])
             else:
-                membership_key = ("album-key", item["album_key"].lower())
+                membership_key = (scope, "album-key", item["album_key"].lower())
             if membership_key in membership_keys:
                 raise ValueError(f"{name} contains the same media item more than once.")
             membership_keys.add(membership_key)
@@ -963,7 +1023,7 @@ def _read_snapshot(cur, principal):
         f"""
         SELECT i.id, i.collection_id, i.kind, i.track_id, i.provider_album_id,
                i.album_key, i.title, i.artist, i.album, i.cover_item_id, i.position,
-               i.added_at, i.updated_at
+               i.added_at, i.updated_at, i.catalog_instance_id
           FROM {collection_items_table()} i
           JOIN {collections_table()} c
             ON c.principal = i.principal AND c.id = i.collection_id
@@ -1193,6 +1253,12 @@ def _normalize_item(raw):
         raise ValueError("Track items require track_id.")
     if kind == "album" and not (provider_album_id or album_key):
         raise ValueError("Album items require provider_album_id or album_key.")
+    catalog_instance_id = raw.get("catalog_instance_id")
+    if catalog_instance_id is not None and not isinstance(catalog_instance_id, str):
+        raise ValueError("catalog_instance_id must be a string.")
+    catalog_instance_id = (catalog_instance_id or "").strip() or None
+    if catalog_instance_id and len(catalog_instance_id) > 256:
+        raise ValueError("catalog_instance_id is too long.")
     return {
         "id": str(raw.get("id") or uuid.uuid4()),
         "kind": kind,
@@ -1204,6 +1270,9 @@ def _normalize_item(raw):
         "album": str(raw.get("album") or "").strip() or None,
         "cover_item_id": str(raw.get("cover_item_id") or "").strip() or None,
         "position": max(int(raw.get("position") or 0), 0),
+        # K10: the catalogue the item was chosen from; None lets _upsert_item
+        # keep the stored one or use the install's only catalogue.
+        "catalog_instance_id": catalog_instance_id,
     }
 
 
@@ -1219,26 +1288,45 @@ def _upsert_item(cur, principal, collection_id, item, remap=True):
     the 1.2.5 behaviour: ``item["id"]`` becomes that item's id and it is
     updated. Without ``remap`` (contract 2) nothing is written and that item's
     id is returned. Returns None when the item was written.
+
+    Membership is per catalogue (K10). An item sent without
+    ``catalog_instance_id`` keeps the one its id already has, or else takes
+    the install's only catalogue (NULL when there have been several);
+    ``item["catalog_instance_id"]`` is set to the result.
     """
+    items = collection_items_table()
+    if item.get("catalog_instance_id") is None:
+        cur.execute(
+            f"SELECT (SELECT catalog_instance_id FROM {items} WHERE principal = %s AND id = %s), "
+            "to_regclass(%s) IS NOT NULL",
+            (principal, item["id"], table("catalog_sources")),
+        )
+        stored, has_sources = cur.fetchone() or (None, False)
+        if stored is None and has_sources:
+            cur.execute(f"SELECT {sole_catalog_sql()}")
+            stored = (cur.fetchone() or (None,))[0]
+        item["catalog_instance_id"] = stored
+    scope = "AND catalog_instance_id IS NOT DISTINCT FROM %s"
     if item["kind"] == "track":
         cur.execute(
-            f"SELECT id FROM {collection_items_table()} "
-            "WHERE principal = %s AND collection_id = %s AND kind = 'track' AND track_id = %s",
-            (principal, collection_id, item["track_id"]),
+            f"SELECT id FROM {items} "
+            f"WHERE principal = %s AND collection_id = %s {scope} "
+            "AND kind = 'track' AND track_id = %s",
+            (principal, collection_id, item["catalog_instance_id"], item["track_id"]),
         )
     elif item["provider_album_id"]:
         cur.execute(
-            f"SELECT id FROM {collection_items_table()} "
-            "WHERE principal = %s AND collection_id = %s AND kind = 'album' "
+            f"SELECT id FROM {items} "
+            f"WHERE principal = %s AND collection_id = %s {scope} AND kind = 'album' "
             "AND provider_album_id = %s",
-            (principal, collection_id, item["provider_album_id"]),
+            (principal, collection_id, item["catalog_instance_id"], item["provider_album_id"]),
         )
     else:
         cur.execute(
-            f"SELECT id FROM {collection_items_table()} "
-            "WHERE principal = %s AND collection_id = %s AND kind = 'album' "
+            f"SELECT id FROM {items} "
+            f"WHERE principal = %s AND collection_id = %s {scope} AND kind = 'album' "
             "AND provider_album_id IS NULL AND album_key = %s",
-            (principal, collection_id, item["album_key"]),
+            (principal, collection_id, item["catalog_instance_id"], item["album_key"]),
         )
     existing = cur.fetchone()
     if existing and existing[0] != item["id"]:
@@ -1249,8 +1337,8 @@ def _upsert_item(cur, principal, collection_id, item, remap=True):
         f"""
         INSERT INTO {collection_items_table()} AS target
             (principal, id, collection_id, kind, track_id, provider_album_id, album_key,
-             title, artist, album, cover_item_id, position)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+             title, artist, album, cover_item_id, position, catalog_instance_id)
+        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         ON CONFLICT (principal, id) DO UPDATE SET
             kind = EXCLUDED.kind,
             track_id = EXCLUDED.track_id,
@@ -1261,6 +1349,7 @@ def _upsert_item(cur, principal, collection_id, item, remap=True):
             album = EXCLUDED.album,
             cover_item_id = EXCLUDED.cover_item_id,
             position = EXCLUDED.position,
+            catalog_instance_id = EXCLUDED.catalog_instance_id,
             updated_at = now()
         WHERE target.collection_id = EXCLUDED.collection_id
         RETURNING id
@@ -1278,6 +1367,7 @@ def _upsert_item(cur, principal, collection_id, item, remap=True):
             item["album"],
             item["cover_item_id"],
             item["position"],
+            item["catalog_instance_id"],
         ),
     )
     if cur.fetchone() is None:
@@ -1731,6 +1821,11 @@ def register_collection_routes(bp):
         like = f"%{query}%"
         db = get_db()
         cur = db.cursor()
+        try:
+            catalog, _provider = resolve_catalog(cur, requested_catalog())
+        except CatalogScopeError as exc:
+            cur.close()
+            return jsonify(exc.body()), exc.status
         # ILIKE on the columns: search_u is unused, so unaccent is not needed.
         if kind == "album":
             cur.execute(
@@ -1744,7 +1839,7 @@ def register_collection_routes(bp):
                  GROUP BY album, COALESCE(NULLIF(album_artist, ''), author)
                  ORDER BY lower(album) LIMIT 50
                 """,
-                (like, like, like),
+                (catalog, like, like, like),
             )
             results = _all_dicts(cur)
             for row in results:
@@ -1765,7 +1860,7 @@ def register_collection_routes(bp):
                  WHERE title ILIKE %s OR author ILIKE %s OR album ILIKE %s
                  ORDER BY lower(title) LIMIT 50
                 """,
-                (like, like, like),
+                (catalog, like, like, like),
             )
             results = _all_dicts(cur)
             for row in results:
