@@ -447,6 +447,9 @@ def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, de
             rate = stream.codec_context.sample_rate
             layout = stream.codec_context.layout.name
             codec = stream.codec_context.name
+            # F1: planar to_ndarray() crashes PyAV 16 on 8 channels (see
+            # loudness.PLANAR_MAX_CHANNELS). analyze_edge_blocks rejects every
+            # layout but mono and stereo before this generator runs.
             converter = av.AudioResampler(format="fltp", layout=layout, rate=rate)
 
             def blocks():
