@@ -215,7 +215,7 @@ def test_an_unresolvable_collision_defers_only_that_principal(collections_api, m
     with db.cursor() as cur:
         # Two items of one collection would converge on the new id with no
         # item already holding it: the merge rule cannot choose a survivor.
-        cur.execute("DROP INDEX lumae_collection_track_unique_idx")
+        cur.execute("DROP INDEX lumae_collection_track_scoped_unique_idx")
         for item_id in ("i1", "i2"):
             cur.execute(f"""INSERT INTO {P}collection_items
                                 (principal, id, collection_id, kind, track_id)

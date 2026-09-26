@@ -227,6 +227,30 @@ def ensure_index(cur, statement):
     return True
 
 
+def ensure_no_index(cur, relation, name):
+    """``DROP INDEX`` ``name`` when ``relation``'s schema has an index of that
+    name; absent is fine. Returns whether it was dropped.
+
+    Used to retire an index replaced under a new name (see ``ensure_index``):
+    create the replacement first, so the table is never without it.
+    """
+    name = _identifier(name)
+    cur.execute(
+        """
+        SELECT n.nspname FROM pg_class i
+          JOIN pg_namespace n ON n.oid=i.relnamespace
+         WHERE i.relkind='i' AND i.relname=%s
+           AND i.relnamespace=(SELECT relnamespace FROM pg_class WHERE oid=to_regclass(%s))
+        """,
+        (name, relation),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return False
+    run_ddl(cur, f'DROP INDEX IF EXISTS "{row[0]}".{name}')
+    return True
+
+
 _EXTENSION_SAVEPOINT = "lumae_migration_extension"
 
 

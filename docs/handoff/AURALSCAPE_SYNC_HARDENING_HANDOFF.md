@@ -235,6 +235,12 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
   - Restores are unchanged by the header (fresh ids; key conflicts carry `current: null`).
   - Shelves: with the header, reusing a mutation `id` with another body is `409 {"error":"idempotency_key_conflict"}` (no `current`) and changes nothing; re-read `/api/shelves/changes`. The same body still replays the stored response.
   - A request whose host auth method is neither the session nor the installation bearer (for example a plugin-scoped token) now gets 401 on every collections, shelves and personal-discovery route, instead of the shared library. Health still answers it 200, with `scope: null` on `collections`, `shelves` and `personal_discovery`: treat a null `scope` as "collections unavailable for this caller".
+- **Server note (plugin P3-5a, K10 implemented in 1.3.0, unreleased; contract §5.1 "K10", §5.1a).**
+  - Gate: `capabilities.collections.source_scoped_items: true`. Every item object (write responses, collection detail, feed payloads, snapshot, backups) then has `catalog_instance_id`: a string, or `null` when the server does not know the catalogue.
+  - Send the item's `catalog_instance_id` on every item write. Omitted, the server keeps the stored value for an existing id, or uses the install's only catalogue (else `null`).
+  - Membership is per catalogue: give the v39 unique indexes `COALESCE(catalog_instance_id, '')` after the collection (step 5). A 409 `membership_conflict` now means the same key **in the same catalogue**.
+  - The upgrade backfill (only when exactly one catalogue has ever existed) emits no feed events: when the capability first appears, take one snapshot to pick up the stored values.
+  - Workbench reads (`/library`, `/stats`, `/album`, `/stream`, `/art`, `/api/collections/search`) take `catalog_instance_id`. With several active sources, omitting it is 400 `catalog_instance_required` listing `catalogs`; an unknown or inactive id is 404 `catalog_instance_not_found`.
 
 **C-14 — Readiness UI (LUM-017 client).** Show per-stream states: catalogue, waveform profiles, edge profiles, relationships, collections. Each has availability, freshness and last outcome, including `deferred` from C-3 and truthful partial success, with a scoped retry. Accessibility: screen-reader labels, focus order, and dynamic type or zoom.
 

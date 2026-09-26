@@ -20,6 +20,7 @@ from test_collection_feed_epoch_postgres import (  # noqa: F401 (fixture)
     TRANSCRIPT_HEADERS,
     _checksum,
     _normalized,
+    _without_k10,
     collections_api,
 )
 
@@ -184,7 +185,7 @@ def test_old_client_transcript_is_byte_identical_to_the_pre_k9_golden(conflicts_
     conflicts without ``current``, restores, the feed, and shelf receipts that
     replay whatever the body."""
     golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
-    assert _normalized(_transcript(conflicts_api.call)) == golden
+    assert _normalized(_without_k10(_transcript(conflicts_api.call))) == golden
 
 
 def _c2(api, method, path, body=None, **options):
@@ -786,10 +787,12 @@ def test_library_item_ids_refuse_dot_only_ids(monkeypatch):
     for good in ("a", "a.b", ".a", "a.", "..a", "a..", "track-7", "x~y_z.flac", "a" * 256):
         assert library._ITEM_ID_RE.fullmatch(good) is not None, good
     called = []
+    monkeypatch.setattr(library, "_route_catalog", lambda: ("catalog-a", "navidrome"))
     monkeypatch.setattr(library, "_resolve_stream_target",
-                        lambda item_id: called.append(item_id) or (None, ("unsupported", 501)))
+                        lambda item_id, provider: called.append(item_id)
+                        or (None, ("unsupported", 501)))
     monkeypatch.setattr(library, "_resolve_art_target",
-                        lambda item_id, size: called.append(item_id))
+                        lambda item_id, size, provider: called.append(item_id))
     app = Flask(__name__)
     blueprint = Blueprint("library_ids", __name__)
     library.register_collection_library_routes(blueprint, lambda view: view)

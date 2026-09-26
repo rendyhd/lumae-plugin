@@ -10,7 +10,10 @@ from plugin.api import config, get_db, logger, table
 
 
 LIBRARY_SCOPES = {"all", "albums", "tracks", "artists"}
+# "year" stays accepted for old clients, but the workbench no longer offers
+# it: the catalogue publishes no year yet, so it sorted by title (LUM-015).
 LIBRARY_SORTS = {"title", "artist", "year"}
+CATALOG_PARAM = "catalog_instance_id"
 # A provider item id in a stream or art path. Dot-only ids (".", "..") would
 # walk the provider URL they are placed in, so they are refused.
 _ITEM_ID_RE = re.compile(r"(?!\.+\Z)[A-Za-z0-9._~-]{1,256}")
@@ -41,6 +44,9 @@ def unaccent_available(cur):
 def catalog_track_view_sql(unaccent=True):
     """Current provider catalogue rows with analysis as an optional link.
 
+    The catalogue is the view's one parameter, and it comes first in the
+    query: pass the id ``resolve_catalog`` returns (K10). None reads nothing.
+
     ``search_u`` is the lower-cased search text, accent-folded when
     ``unaccent`` is true (see ``unaccent_available``). A query that does not
     filter on ``search_u`` passes ``unaccent=False`` and needs no extension.
@@ -61,9 +67,8 @@ def catalog_track_view_sql(unaccent=True):
               FROM {sources} s
               JOIN {state} c USING (catalog_instance_id)
               LEFT JOIN {analysis_state} a USING (catalog_instance_id)
-             WHERE s.rebind_status='active' AND c.status='complete'
-             ORDER BY s.is_default DESC, s.server_name, s.catalog_instance_id
-             LIMIT 1
+             WHERE s.catalog_instance_id=%s
+               AND s.rebind_status='active' AND c.status='complete'
         )
         SELECT t.track_id AS item_id, t.title,
                t.artist_display AS author, al.name AS album,
@@ -74,7 +79,7 @@ def catalog_track_view_sql(unaccent=True):
                t.content_kind, t.release_type, t.cover_art_id,
                l.status AS analysis_status,
                lower({search_text}) AS search_u,
-               source.provider_type
+               source.provider_type, source.catalog_instance_id
           FROM selected_source source
           JOIN {tracks} t
             ON t.catalog_instance_id=source.catalog_instance_id
@@ -89,6 +94,74 @@ def catalog_track_view_sql(unaccent=True):
            AND l.projection_generation=source.projection_generation
            AND l.provider_track_id=t.track_id
     """
+
+
+class CatalogScopeError(Exception):
+    """A workbench request whose catalogue cannot be resolved (K10)."""
+
+    def __init__(self, error, status, **extra):
+        super().__init__(error)
+        self.error = error
+        self.status = status
+        self.extra = extra
+
+    def body(self):
+        return {"error": self.error, **self.extra}
+
+
+def requested_catalog():
+    """The request's ``catalog_instance_id`` argument; empty means absent."""
+    return str(request.args.get(CATALOG_PARAM) or "").strip() or None
+
+
+def resolve_catalog(cur, catalog_instance_id=None):
+    """``(catalog_instance_id, provider_type)`` a workbench request reads (K10).
+
+    An explicit id must name an active source, else 404
+    ``catalog_instance_not_found``. Without one, the only active source is
+    used, so a single-source client is unchanged; with several, 400
+    ``catalog_instance_required`` lists them. With none, ``(None, None)``,
+    and reads are empty as before.
+    """
+    sources = table("catalog_sources")
+    if catalog_instance_id is not None:
+        cur.execute(
+            f"SELECT catalog_instance_id, provider_type FROM {sources} "
+            "WHERE catalog_instance_id=%s AND rebind_status='active'",
+            (str(catalog_instance_id),),
+        )
+        row = cur.fetchone()
+        if row is None:
+            raise CatalogScopeError("catalog_instance_not_found", 404)
+        return row[0], str(row[1] or "").lower()
+    cur.execute(
+        f"SELECT catalog_instance_id, provider_type, server_name, is_default "
+        f"FROM {sources} WHERE rebind_status='active' "
+        "ORDER BY is_default DESC, server_name, catalog_instance_id"
+    )
+    rows = cur.fetchall()
+    if len(rows) > 1:
+        raise CatalogScopeError(
+            "catalog_instance_required",
+            400,
+            catalogs=[
+                {"catalog_instance_id": row[0], "provider_type": row[1],
+                 "server_name": row[2], "is_default": bool(row[3])}
+                for row in rows
+            ],
+        )
+    if not rows:
+        return None, None
+    return rows[0][0], str(rows[0][1] or "").lower()
+
+
+def _route_catalog():
+    """Resolve the current request's catalogue on a short-lived cursor."""
+    cur = get_db().cursor()
+    try:
+        return resolve_catalog(cur, requested_catalog())
+    finally:
+        cur.close()
 
 
 def _bounded_int(value, default, minimum, maximum):
@@ -138,7 +211,7 @@ def _library_filters(query, artist=None, unaccent=True):
     return (" AND " + " AND ".join(clauses)) if clauses else "", params
 
 
-def _browse_albums(cur, query, artist, sort, limit, offset, unaccent=True):
+def _browse_albums(cur, query, artist, sort, limit, offset, unaccent=True, catalog=None):
     filters, params = _library_filters(query, artist, unaccent)
     order = {
         "title": "lower(title), lower(artist)",
@@ -163,7 +236,7 @@ def _browse_albums(cur, query, artist, sort, limit, offset, unaccent=True):
          ORDER BY {order}
          LIMIT %s OFFSET %s
         """,
-        tuple(params + [limit, offset]),
+        tuple([catalog] + params + [limit, offset]),
     )
     rows = _all_dicts(cur)
     total = int(rows[0].pop("total_count", 0)) if rows else 0
@@ -179,7 +252,7 @@ def _browse_albums(cur, query, artist, sort, limit, offset, unaccent=True):
     return {"items": rows, "total": total}
 
 
-def _browse_tracks(cur, query, artist, sort, limit, offset, unaccent=True):
+def _browse_tracks(cur, query, artist, sort, limit, offset, unaccent=True, catalog=None):
     filters, params = _library_filters(query, artist, unaccent)
     order = {
         # `artist` is a SELECT alias below. PostgreSQL permits a bare output
@@ -200,7 +273,7 @@ def _browse_tracks(cur, query, artist, sort, limit, offset, unaccent=True):
          ORDER BY {order}
          LIMIT %s OFFSET %s
         """,
-        tuple(params + [limit, offset]),
+        tuple([catalog] + params + [limit, offset]),
     )
     rows = _all_dicts(cur)
     total = int(rows[0].pop("total_count", 0)) if rows else 0
@@ -210,7 +283,7 @@ def _browse_tracks(cur, query, artist, sort, limit, offset, unaccent=True):
     return {"items": rows, "total": total}
 
 
-def _browse_artists(cur, query, sort, limit, offset, unaccent=True):
+def _browse_artists(cur, query, sort, limit, offset, unaccent=True, catalog=None):
     filters, params = _library_filters(query, unaccent=unaccent)
     order = {
         "title": "lower(artist)",
@@ -237,7 +310,7 @@ def _browse_artists(cur, query, sort, limit, offset, unaccent=True):
          ORDER BY {order}
          LIMIT %s OFFSET %s
         """,
-        tuple(params + [limit, offset]),
+        tuple([catalog] + params + [limit, offset]),
     )
     rows = _all_dicts(cur)
     total = int(rows[0].pop("total_count", 0)) if rows else 0
@@ -247,8 +320,12 @@ def _browse_artists(cur, query, sort, limit, offset, unaccent=True):
     return {"items": rows, "total": total}
 
 
-def browse_library(scope="albums", query="", artist=None, sort="title", page=1, limit=36):
-    """Return one page of analyzed media grouped by a stable library scope."""
+def browse_library(scope="albums", query="", artist=None, sort="title", page=1, limit=36,
+                   catalog_instance_id=None):
+    """Return one page of analyzed media grouped by a stable library scope.
+
+    Raises ``CatalogScopeError`` when the catalogue cannot be resolved (K10).
+    """
     scope = scope if scope in LIBRARY_SCOPES else "albums"
     sort = sort if sort in LIBRARY_SORTS else "title"
     page = _bounded_int(page, 1, 1, 100000)
@@ -257,6 +334,7 @@ def browse_library(scope="albums", query="", artist=None, sort="title", page=1, 
     if query and len(query) < 3:
         keys = ("albums", "tracks", "artists") if scope == "all" else (scope,)
         return {
+            "catalog_instance_id": catalog_instance_id,
             "scope": scope,
             "query": query,
             "artist": artist,
@@ -269,24 +347,31 @@ def browse_library(scope="albums", query="", artist=None, sort="title", page=1, 
     db = get_db()
     cur = db.cursor()
     try:
+        catalog, _provider = resolve_catalog(cur, catalog_instance_id)
         folded = unaccent_available(cur)
         if scope == "albums":
-            sections = {"albums": _browse_albums(cur, query, artist, sort, limit, offset, folded)}
+            sections = {"albums": _browse_albums(
+                cur, query, artist, sort, limit, offset, folded, catalog)}
         elif scope == "tracks":
-            sections = {"tracks": _browse_tracks(cur, query, artist, sort, limit, offset, folded)}
+            sections = {"tracks": _browse_tracks(
+                cur, query, artist, sort, limit, offset, folded, catalog)}
         elif scope == "artists":
-            sections = {"artists": _browse_artists(cur, query, sort, limit, offset, folded)}
+            sections = {"artists": _browse_artists(
+                cur, query, sort, limit, offset, folded, catalog)}
         else:
             # A broad search intentionally returns compact categorized sections.
             section_limit = min(limit, 12)
             sections = {
-                "albums": _browse_albums(cur, query, artist, sort, section_limit, 0, folded),
-                "tracks": _browse_tracks(cur, query, artist, sort, section_limit, 0, folded),
-                "artists": _browse_artists(cur, query, sort, section_limit, 0, folded),
+                "albums": _browse_albums(
+                    cur, query, artist, sort, section_limit, 0, folded, catalog),
+                "tracks": _browse_tracks(
+                    cur, query, artist, sort, section_limit, 0, folded, catalog),
+                "artists": _browse_artists(cur, query, sort, section_limit, 0, folded, catalog),
             }
     finally:
         cur.close()
     return {
+        "catalog_instance_id": catalog,
         "scope": scope,
         "query": query,
         "artist": artist,
@@ -297,10 +382,11 @@ def browse_library(scope="albums", query="", artist=None, sort="title", page=1, 
     }
 
 
-def library_stats():
+def library_stats(catalog_instance_id=None):
     db = get_db()
     cur = db.cursor()
     try:
+        catalog, _provider = resolve_catalog(cur, catalog_instance_id)
         cur.execute(
             f"""
             SELECT COUNT(*)::INTEGER AS track_count,
@@ -311,7 +397,8 @@ def library_stats():
                    COUNT(DISTINCT lower(COALESCE(NULLIF(album_artist, ''), author)))::INTEGER
                      AS artist_count
               FROM ({catalog_track_view_sql(unaccent=False)}) score
-            """
+            """,
+            (catalog,),
         )
         row = cur.fetchone() or (0, 0, 0)
     finally:
@@ -392,10 +479,11 @@ def _normalize_provider_track(item, index=0):
     }
 
 
-def _score_album_tracks(title, artist, provider_album_id=None):
+def _score_album_tracks(title, artist, provider_album_id=None, catalog_instance_id=None):
     db = get_db()
     cur = db.cursor()
     try:
+        catalog, _provider = resolve_catalog(cur, catalog_instance_id)
         cur.execute(
             f"""
             SELECT item_id AS track_id, title, author AS artist, album,
@@ -404,14 +492,14 @@ def _score_album_tracks(title, artist, provider_album_id=None):
                    track_number, disc_number,
                    CASE WHEN duration_ms IS NULL THEN NULL ELSE round(duration_ms / 1000.0) END
                      AS duration_seconds,
-                   analysis_status, provider_type
+                   analysis_status, provider_type, catalog_instance_id
               FROM ({catalog_track_view_sql(unaccent=False)}) score
              WHERE ((%s IS NOT NULL AND album_id=%s) OR
                     (%s IS NULL AND lower(album) = lower(%s)
                      AND lower(COALESCE(NULLIF(album_artist, ''), author)) = lower(%s)))
              ORDER BY lower(title), item_id
             """,
-            (provider_album_id, provider_album_id, provider_album_id, title, artist),
+            (catalog, provider_album_id, provider_album_id, provider_album_id, title, artist),
         )
         rows = _all_dicts(cur)
     finally:
@@ -427,9 +515,12 @@ def _score_album_tracks(title, artist, provider_album_id=None):
     return rows
 
 
-def album_detail(title, artist, provider_album_id=None):
+def album_detail(title, artist, provider_album_id=None, catalog_instance_id=None):
     """Load provider-authoritative order and metadata from the published mirror."""
-    tracks = _score_album_tracks(title, artist, provider_album_id=provider_album_id)
+    tracks = _score_album_tracks(
+        title, artist, provider_album_id=provider_album_id,
+        catalog_instance_id=catalog_instance_id,
+    )
     tracks.sort(
         key=lambda item: (
             item.get("disc_number") or 1,
@@ -456,6 +547,11 @@ def album_detail(title, artist, provider_album_id=None):
         ),
     }
     return {
+        "catalog_instance_id": next(
+            (item.get("catalog_instance_id") for item in tracks
+             if item.get("catalog_instance_id")),
+            catalog_instance_id,
+        ),
         "album": album,
         "tracks": tracks,
         "metadata_source": "provider_catalog",
@@ -469,8 +565,10 @@ def _provider_headers(provider_type):
     return {}
 
 
-def _resolve_stream_target(item_id):
-    provider_type = str(getattr(config, "MEDIASERVER_TYPE", "") or "").lower()
+def _resolve_stream_target(item_id, provider_type):
+    """Upstream (url, headers, params) for the catalogue's provider (K10:
+    ``provider_type`` comes from the source row, not the host setting)."""
+    provider_type = str(provider_type or "").lower()
     if provider_type == "jellyfin":
         return (
             f"{str(getattr(config, 'JELLYFIN_URL', '')).rstrip('/')}/Items/{quote(item_id)}/Download",
@@ -577,8 +675,8 @@ def _stream_response(upstream):
     return response
 
 
-def _resolve_art_target(item_id, size):
-    provider_type = str(getattr(config, "MEDIASERVER_TYPE", "") or "").lower()
+def _resolve_art_target(item_id, size, provider_type):
+    provider_type = str(provider_type or "").lower()
     if provider_type == "navidrome":
         from tasks.mediaserver.navidrome import _navidrome_request, get_navidrome_auth_params
 
@@ -669,24 +767,34 @@ def _proxy_art(target):
 
 
 def register_collection_library_routes(bp, require_enabled):
+    """Workbench reads. Each takes ``catalog_instance_id`` (K10); see
+    ``resolve_catalog`` for the answer when it is absent."""
+
     @bp.get("/api/collections/library")
     @require_enabled
     def collection_library_browse():
-        return jsonify(
-            browse_library(
-                scope=str(request.args.get("scope") or "albums").lower(),
-                query=request.args.get("q") or "",
-                artist=request.args.get("artist") or None,
-                sort=str(request.args.get("sort") or "title").lower(),
-                page=request.args.get("page") or 1,
-                limit=request.args.get("limit") or 36,
+        try:
+            return jsonify(
+                browse_library(
+                    scope=str(request.args.get("scope") or "albums").lower(),
+                    query=request.args.get("q") or "",
+                    artist=request.args.get("artist") or None,
+                    sort=str(request.args.get("sort") or "title").lower(),
+                    page=request.args.get("page") or 1,
+                    limit=request.args.get("limit") or 36,
+                    catalog_instance_id=requested_catalog(),
+                )
             )
-        )
+        except CatalogScopeError as exc:
+            return jsonify(exc.body()), exc.status
 
     @bp.get("/api/collections/library/stats")
     @require_enabled
     def collection_library_stats():
-        return jsonify(library_stats())
+        try:
+            return jsonify(library_stats(catalog_instance_id=requested_catalog()))
+        except CatalogScopeError as exc:
+            return jsonify(exc.body()), exc.status
 
     @bp.get("/api/collections/library/album")
     @require_enabled
@@ -695,13 +803,17 @@ def register_collection_library_routes(bp, require_enabled):
         artist = str(request.args.get("artist") or "").strip()
         if not title or not artist:
             return jsonify({"error": "Album title and artist are required"}), 400
-        return jsonify(
-            album_detail(
-                title,
-                artist,
-                provider_album_id=request.args.get("provider_album_id") or None,
+        try:
+            return jsonify(
+                album_detail(
+                    title,
+                    artist,
+                    provider_album_id=request.args.get("provider_album_id") or None,
+                    catalog_instance_id=requested_catalog(),
+                )
             )
-        )
+        except CatalogScopeError as exc:
+            return jsonify(exc.body()), exc.status
 
     @bp.get("/api/collections/library/stream/<path:item_id>")
     @require_enabled
@@ -709,7 +821,10 @@ def register_collection_library_routes(bp, require_enabled):
         if not _ITEM_ID_RE.fullmatch(item_id):
             return jsonify({"error": "Invalid track id"}), 400
         try:
-            target, target_error = _resolve_stream_target(item_id)
+            _catalog, provider_type = _route_catalog()
+            if provider_type is None:
+                return jsonify({"error": "catalog_instance_not_found"}), 404
+            target, target_error = _resolve_stream_target(item_id, provider_type)
             if target_error:
                 message, status = target_error
                 return jsonify({"error": message}), status
@@ -718,6 +833,8 @@ def register_collection_library_routes(bp, require_enabled):
                 message, status = upstream_error
                 return jsonify({"error": message}), status
             return _stream_response(upstream)
+        except CatalogScopeError as exc:
+            return jsonify(exc.body()), exc.status
         except Exception:
             logger.exception("Living Collections preview failed for %s", item_id)
             return jsonify({"error": "Preview failed"}), 500
@@ -729,8 +846,13 @@ def register_collection_library_routes(bp, require_enabled):
             return "", 404
         size = _bounded_int(request.args.get("size"), 320, 48, 1200)
         try:
-            response = _proxy_art(_resolve_art_target(item_id, size))
+            _catalog, provider_type = _route_catalog()
+            if provider_type is None:
+                return "", 404
+            response = _proxy_art(_resolve_art_target(item_id, size, provider_type))
             return response if response is not None else ("", 404)
+        except CatalogScopeError as exc:
+            return jsonify(exc.body()), exc.status
         except Exception:
             logger.warning("Living Collections artwork failed for %s", item_id)
             return "", 404

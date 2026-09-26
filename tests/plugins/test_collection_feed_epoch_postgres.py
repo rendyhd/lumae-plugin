@@ -180,6 +180,19 @@ def _checksum(collections):
     return f"sha256:{hashlib.sha256(encoded).hexdigest()}"
 
 
+# K10 (P3-5a): every collection item carries catalog_instance_id, additively.
+# These installs have no catalogue, so it is null.
+K10_ITEM_KEY = re.compile(rb'"catalog_instance_id":null,')
+
+
+def _without_k10(transcript):
+    """``transcript`` with K10's additive item key removed; it must occur."""
+    rows = [(label, status, K10_ITEM_KEY.sub(b"", body), headers)
+            for label, status, body, headers in transcript]
+    assert any(K10_ITEM_KEY.search(body) for _, _, body, _ in transcript)
+    return rows
+
+
 def _normalized(transcript):
     ids = {}
 
@@ -243,7 +256,7 @@ def test_old_client_transcript_is_byte_identical_to_the_pre_k8_golden(collection
         re.compile(rb'"head_seq":\d+,'),
     )
     stripped = []
-    for label, status, body, headers in _transcript(collections_api.call):
+    for label, status, body, headers in _without_k10(_transcript(collections_api.call)):
         if label.startswith("feed") and status == 200:
             for pattern in new_keys:
                 body, found = pattern.subn(b"", body)

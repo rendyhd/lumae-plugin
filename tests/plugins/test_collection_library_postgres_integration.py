@@ -274,7 +274,7 @@ def test_collection_search_uses_the_active_catalogue_projection(postgres_library
           FROM ({library.catalog_track_view_sql()}) score
          WHERE search_u LIKE unaccent(%s)
         """,
-        ("%meiko%",),
+        ("catalog-a", "%meiko%"),
     )
     plan = "\n".join(row[0] for row in cursor.fetchall())
     cursor.close()

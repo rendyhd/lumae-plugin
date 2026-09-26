@@ -2334,6 +2334,7 @@ def health():
                     "scope": health_scope_mode(),
                     "feed_epoch": True,
                     "contract": COLLECTIONS_CONTRACT,
+                    "source_scoped_items": True,
                 },
                 "catalog_mirror": catalog_capability(),
                 "credits": credits_service.capability(),
