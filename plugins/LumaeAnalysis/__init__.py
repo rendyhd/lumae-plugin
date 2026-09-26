@@ -1447,8 +1447,9 @@ def migrate(db):
     # Must run after the published-profile seed above (marker
     # published_source_profiles_seed_v1): its edge sweep deletes every edge
     # no published profile reaches, which before the seed is every edge of a
-    # 1.2.5 install (P2-3).
-    compact_enrichment_storage(db)
+    # 1.2.5 install (P2-3). After that sweep it withdraws the seed's
+    # orphans and republishes ready-but-unpublished profiles (P3-7).
+    compact_enrichment_storage(db, profile_versions=(ANALYZER_VERSION, SCHEMA_VERSION))
     migrate_collections(db)
     refresh_integrity_snapshot(db)
     refresh_status_summaries(db)
@@ -1923,7 +1924,8 @@ def profiles_unpublished_ready_count(db):
     "Current" means what ``published_profile_current`` checks: an active
     source, the track available in the published generation with the same
     media fingerprint, and the current analyzer and schema versions. An
-    index-driven anti-join; the repair SQL is in docs/runbooks/UPGRADE_1.3.md.
+    anti-join, then one key lookup per unpublished row; the repair is in
+    docs/runbooks/UPGRADE_1.3.md (repair D).
     Returns None before the publication table exists.
     """
     cur = db.cursor()
@@ -1953,12 +1955,17 @@ def profiles_unpublished_ready_count(db):
                AND src.rebind_status='active'
               JOIN {table('catalog_state')} c
                 ON c.catalog_instance_id=s.catalog_instance_id
-              JOIN {table('catalog_tracks')} t
-                ON t.catalog_instance_id=s.catalog_instance_id
-               AND t.published_generation=c.published_generation
-               AND t.track_id=s.track_id
-             WHERE t.available=TRUE AND COALESCE(t.media_fp, '') <> ''
-               AND s.media_signature='catalog-media:' || t.media_fp
+             CROSS JOIN LATERAL (
+                   -- One key lookup per row (P3-7). As a plain join on the
+                   -- source the planner compared every unpublished row with
+                   -- every track: 1,000 rows took 20 s at 132k tracks.
+                   SELECT 1 FROM {table('catalog_tracks')} t
+                    WHERE t.catalog_instance_id=s.catalog_instance_id
+                      AND t.published_generation=c.published_generation
+                      AND t.track_id=s.track_id
+                      AND t.available=TRUE AND COALESCE(t.media_fp, '') <> ''
+                      AND s.media_signature='catalog-media:' || t.media_fp
+                    LIMIT 1) t
             """,
             (ANALYZER_VERSION, SCHEMA_VERSION),
         )
@@ -1973,12 +1980,16 @@ def integrity_state_table():
 
 
 def refresh_integrity_snapshot(db):
-    """Recount ``profiles_unpublished_ready`` and persist it (AUD-05).
+    """Recount ``profiles_unpublished_ready`` and ``profiles_orphaned`` (AUD-05, P3-7).
 
-    The anti-join reads every 'ready' profile (about 80 ms at 94k profiles),
-    so health never runs it: install and web-worker start refresh this row
-    and health reads it by primary key. Runs in the caller's transaction.
+    The anti-joins read every 'ready' and every published profile (together
+    about 250 ms at 94k profiles and 132k tracks), so health never runs them:
+    install, web-worker start and the publication repair refresh these rows
+    and health reads them by primary key. Runs in the caller's transaction. Returns the
+    unpublished-ready count.
     """
+    from .profile_publication import orphaned_publication_count
+
     cur = db.cursor()
     try:
         cur.execute(
@@ -1991,14 +2002,16 @@ def refresh_integrity_snapshot(db):
             """
         )
         count = profiles_unpublished_ready_count(db)
+        orphaned = None if count is None else orphaned_publication_count(cur)
         cur.execute(
             f"""
             INSERT INTO {integrity_state_table()} (name, value, checked_at)
-            VALUES ('profiles_unpublished_ready', %s, now())
+            VALUES ('profiles_unpublished_ready', %s, now()),
+                   ('profiles_orphaned', %s, now())
             ON CONFLICT (name) DO UPDATE
                SET value=EXCLUDED.value, checked_at=EXCLUDED.checked_at
             """,
-            (count,),
+            (count, orphaned),
         )
         return count
     finally:
@@ -2032,14 +2045,36 @@ def upgrade_fences_installed(cur):
     return bool(row[0]) if row else None
 
 
+def _persisted_profile_integrity(cur):
+    """The persisted profile counts and when they were taken ({} before any)."""
+    cur.execute("SELECT to_regclass(%s)", (integrity_state_table(),))
+    if cur.fetchone()[0] is None:
+        return {}
+    cur.execute(
+        f"SELECT name, value, checked_at FROM {integrity_state_table()} "
+        "WHERE name IN ('profiles_unpublished_ready', 'profiles_orphaned')"
+    )
+    result = {}
+    for name, value, checked_at in cur.fetchall():
+        result[name] = int(value) if value is not None else None
+        if name == "profiles_unpublished_ready":
+            result["profiles_checked_at"] = (
+                checked_at.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
+                if checked_at is not None else None
+            )
+    return result
+
+
 def integrity_status(db=None):
     """Health ``integrity``: fail-closed invariants of the 1.3.0 upgrade (AUD-05).
 
     ``collections_feed_ok`` is live: False when a collection change row sits
     past the feed head (collection writes then return 503
-    ``collection_feed_invariant``). ``profiles_unpublished_ready`` is the count
-    persisted by the last install or web-worker start, and
-    ``profiles_checked_at`` is when it was taken. ``fences_installed`` is False
+    ``collection_feed_invariant``). ``profiles_unpublished_ready`` and
+    ``profiles_orphaned`` (P3-7: published profiles whose track the current
+    catalogue generation lacks) are the counts persisted by the last install,
+    web-worker start or publication repair, and ``profiles_checked_at`` is
+    when they were taken. ``fences_installed`` is False
     until the 1.3.0 migration has installed every old-writer fence. Values are
     None when unknown. All reads are index or catalogue lookups.
     """
@@ -2048,6 +2083,7 @@ def integrity_status(db=None):
     result = {
         "collections_feed_ok": None,
         "profiles_unpublished_ready": None,
+        "profiles_orphaned": None,
         "profiles_checked_at": None,
         "fences_installed": None,
     }
@@ -2062,21 +2098,7 @@ def integrity_status(db=None):
         try:
             result["collections_feed_ok"] = collection_feed_integrity(cur)
             result["fences_installed"] = upgrade_fences_installed(cur)
-            cur.execute("SELECT to_regclass(%s)", (integrity_state_table(),))
-            if cur.fetchone()[0] is not None:
-                cur.execute(
-                    f"SELECT value, checked_at FROM {integrity_state_table()} "
-                    "WHERE name='profiles_unpublished_ready'"
-                )
-                row = cur.fetchone()
-                if row is not None:
-                    result["profiles_unpublished_ready"] = (
-                        int(row[0]) if row[0] is not None else None
-                    )
-                    result["profiles_checked_at"] = (
-                        row[1].astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
-                        if row[1] is not None else None
-                    )
+            result.update(_persisted_profile_integrity(cur))
         finally:
             cur.close()
     except Exception:
@@ -2112,7 +2134,64 @@ def log_integrity_on_start(db):
             "repair: docs/runbooks/UPGRADE_1.3.md",
             status["profiles_unpublished_ready"],
         )
+    if status["profiles_orphaned"]:
+        logger.warning(
+            "lumae_analysis found %s published profiles whose tracks are no longer "
+            "in the catalogue; the next catalogue refresh withdraws them, or repair: "
+            "docs/runbooks/UPGRADE_1.3.md",
+            status["profiles_orphaned"],
+        )
     return status
+
+
+def repair_profile_publications(db=None):
+    """Repair D (P3-7): make the published profiles agree with the catalogue.
+
+    For each active source, bounded per run: withdraw published profiles
+    whose track the current catalogue generation lacks (delete events), and
+    republish 'ready' profiles that have no published row (upsert events,
+    through complete_attempt's checks). Each batch is a short transaction
+    under the source's catalog_state row lock, so it is safe while analysis
+    and catalogue refreshes run, and running it again changes nothing. Then
+    recounts the persisted integrity counts, which health reports.
+    """
+    from .profile_publication import republish_ready_profiles, withdraw_orphaned_profiles
+
+    db = db or get_db()
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"SELECT catalog_instance_id FROM {table('catalog_sources')} "
+            "WHERE rebind_status='active' ORDER BY catalog_instance_id"
+        )
+        sources = [str(row[0]) for row in cur.fetchall()]
+    finally:
+        cur.close()
+    db.commit()
+    withdrawn = republished = 0
+    for source in sources:
+        withdrawn += len(withdraw_orphaned_profiles(db, source))
+        republished += len(
+            republish_ready_profiles(db, source, ANALYZER_VERSION, SCHEMA_VERSION)
+        )
+    try:
+        refresh_integrity_snapshot(db)
+        db.commit()
+        cur = db.cursor()
+        try:
+            counts = _persisted_profile_integrity(cur)
+        finally:
+            cur.close()
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        raise
+    return {
+        "withdrawn": withdrawn,
+        "republished": republished,
+        "profiles_unpublished_ready": counts.get("profiles_unpublished_ready"),
+        "profiles_orphaned": counts.get("profiles_orphaned"),
+    }
 
 
 @bp.get("/api/health")
@@ -5898,6 +5977,37 @@ def settings_status():
     return _private_json({"panels": render_settings_status_panels(configured_backfill_limit())})
 
 
+def render_publication_repair_form():
+    """Repair D (P3-7), offered while the persisted integrity counts say so."""
+    try:
+        db = get_db()
+        cur = db.cursor()
+    except Exception:
+        return ""
+    try:
+        counts = _persisted_profile_integrity(cur)
+    except Exception:
+        # A failed statement aborts the transaction the other panels use.
+        _rollback_if_possible(db)
+        return ""
+    finally:
+        cur.close()
+    orphaned = int(counts.get("profiles_orphaned") or 0)
+    unpublished = int(counts.get("profiles_unpublished_ready") or 0)
+    if not orphaned and not unpublished:
+        return ""
+    return f"""
+        <form class="lumae-form" method="post">
+          <p class="lumae-action-copy">{format_count(orphaned)} published profiles belong to
+            tracks no longer in the catalogue and {format_count(unpublished)} ready profiles
+            have no published row (counted {escape(str(counts.get("profiles_checked_at") or "at start"))}).
+            The repair withdraws the first and republishes the second in short batches.</p>
+          <button class="lumae-button-secondary" type="submit" name="action"
+            value="repair_profile_publications">Repair profile publications</button>
+        </form>
+    """
+
+
 def render_settings(message=None, error=None):
     batch_size = configured_backfill_limit()
     paused = maintenance_paused()
@@ -5938,6 +6048,7 @@ def render_settings(message=None, error=None):
             {'Resume background maintenance' if paused else 'Pause background maintenance'}
           </button>
         </form>
+        {render_publication_repair_form()}
       </section>
     """
     return render_page(
@@ -6428,6 +6539,16 @@ def settings():
                         else f"Started background enrichment for {source['name']} in batches of "
                         f"{result['batch_size']}. Playback requests are prioritized separately."
                     )
+            elif action == "repair_profile_publications":
+                result = repair_profile_publications()
+                message = (
+                    f"Withdrew {format_count(result['withdrawn'])} published profiles of "
+                    "tracks no longer in the catalogue and republished "
+                    f"{format_count(result['republished'])} ready profiles. Left: "
+                    f"{format_count(result['profiles_orphaned'] or 0)} orphaned and "
+                    f"{format_count(result['profiles_unpublished_ready'] or 0)} unpublished "
+                    "ready profiles; run the repair again while either is above 0."
+                )
             elif action == "save":
                 batch_size = normalize_backfill_limit(
                     request.form.get("backfill_batch_size") or DEFAULT_BACKFILL_BATCH_SIZE

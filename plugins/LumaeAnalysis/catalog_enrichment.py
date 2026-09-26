@@ -255,15 +255,27 @@ def _profile_floor_hold(cur, catalog_instance_id, epoch):
     return None if row is None or row[0] is None else int(row[0])
 
 
-def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
+def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None,
+                               profile_versions=None):
     """Bound profile and relationship journals during upgrades and maintenance.
 
     Also sweeps edge payloads that no published profile reaches: a catalogue
     publication deletes the edges of the profiles it withdraws only after it
     commits (P2-3), so a failed purge leaves them behind until the next
     publication or this sweep.
+
+    Then it repairs the publication (P3-7), bounded, in the caller's
+    transaction: it withdraws published profiles whose track the current
+    catalogue generation lacks (at install, the 1.2.5 seed's orphans), with
+    their edges, and, given ``profile_versions`` (analyzer, schema),
+    republishes 'ready' profiles that have no published row. Both lock
+    catalog_state before the profile stream state, as every publisher does.
     """
-    from .profile_publication import purge_withdrawn_edges
+    from .profile_publication import (
+        purge_withdrawn_edges,
+        republish_ready_profiles,
+        withdraw_orphaned_profiles,
+    )
 
     cur = cursor or db.cursor()
     cur.execute(
@@ -281,6 +293,10 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
     # Before any stream-state row is locked below, so no publisher waits on it.
     for row in rows:
         purge_withdrawn_edges(cur, str(row[0]))
+    for row in rows:
+        withdraw_orphaned_profiles(db, str(row[0]), commit=False)
+        if profile_versions is not None:
+            republish_ready_profiles(db, str(row[0]), *profile_versions, commit=False)
     for row in rows:
         source_id = str(row[0])
         epoch, head_seq, _floor_seq = _profile_stream_state(
