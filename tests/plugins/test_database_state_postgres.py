@@ -1,7 +1,9 @@
 """P3-10 (LUM-021): ``/database-state`` diagnostics closure, on PostgreSQL.
 
 * Stored ``last_error`` text (catalogue, projection, preparation, backfill) is
-  shown through the redactor: no password, token, API key or file path.
+  shown through the redactor: no password, token, API key or file path. So is
+  every stored error the settings page (``/settings``, ``/settings/status``),
+  ``/api/catalog/health`` and ``/api/catalog/prepare`` show.
 * Every diagnostic read runs in a savepoint under ``SET LOCAL
   statement_timeout``. A read blocked on a lock renders "unavailable" for its
   section while the rest of the page renders, and neither the host's
@@ -580,3 +582,161 @@ def test_the_route_writes_nothing(fixture_db, second_connection, monkeypatch, bl
     savepoints = [sql for sql in connection.statements if sql.startswith("SAVEPOINT")]
     # One bound per read: source resolution plus the twelve diagnostic reads.
     assert len(timeouts) == len(savepoints) == 13
+
+
+# ---------------------------------------------------------------------------
+# Settings page, catalogue health and preparation status (P3-10 follow-up)
+# ---------------------------------------------------------------------------
+
+V2 = CoreCompatibility("v2.6.2", (2, 6, 2), "v2_single_server", "compatible", True)
+
+# One distinct secret per site, so a site without redaction leaks its own.
+RELATIONSHIP_ERROR = "relationship build failed: password=RelPass123 for db"
+RECONCILE_ERROR = "catalog refresh failed: https://bob:EvtPass456@proxy.local:3128 refused"
+POST_ERROR = "provider rejected token=PostTok789xyz"
+TRANSITION_ERROR = "provider recheck failed: PGPASSWORD=TransPass77 psql exited 2"
+DISCOVERY_ERROR = "list_servers failed: Authorization: Basic ZGlzYzpwYXNzd29yZA=="
+SITE_SECRETS = ("RelPass123", "EvtPass456", "bob:", "PostTok789xyz", "TransPass77",
+                "ZGlzYzpwYXNzd29yZA==")
+
+
+def _settings(monkeypatch, db, reconcile_error=RECONCILE_ERROR):
+    mod, client = _route(monkeypatch, db)
+    monkeypatch.setattr(mod, "detect_core", lambda: V2)
+    monkeypatch.setattr(mod, "relationship_status", lambda _db, source: {
+        "catalog_instance_id": source, "status": "failed", "last_error": RELATIONSHIP_ERROR,
+    })
+    monkeypatch.setattr(mod, "read_reconcile_status", lambda _db: {
+        "control": {"mode": "backoff"},
+        "pending": {},
+        "events": [{"action": "catalog_refresh", "status": "failed", "phase": "scan",
+                    "duration_ms": 5, "summary": "{}", "last_error": reconcile_error}],
+    })
+    return mod, client
+
+
+def test_the_settings_page_redacts_every_stored_error(fixture_db, monkeypatch):
+    mod, client = _settings(monkeypatch, fixture_db)
+
+    panels = client.get("/settings/status").get_json()["panels"]
+    # A settings action whose failure text (str(exc)) is shown on the page.
+    def fail_claim(_source):
+        raise RuntimeError(POST_ERROR)
+
+    monkeypatch.setattr(mod, "claim_preparation", fail_claim)
+    page = client.post("/settings", data={
+        "action": "prepare_lumae", "catalog_instance_id": SOURCE, "server_id": SERVER,
+    }).get_data(as_text=True)
+
+    for body in ("".join(panels.values()), page):
+        for secret in (*SECRETS, *SITE_SECRETS):
+            assert secret not in body, secret
+        # Each site rendered, readable around the masks.
+        assert "The last relationship build failed." in body
+        assert "password=[redacted] for db" in body
+        assert "Authorization: [redacted]" in body
+        assert "Volume and ramp preparation: lookup https://api.example.com/v1?api_key=" \
+            "[redacted] failed reading [path]: No such file" in body
+        assert "https://[redacted]@proxy.local:3128 refused" in body
+    assert "provider rejected token=[redacted]" in page
+
+
+def test_the_settings_page_shows_a_safe_code_unchanged(fixture_db, monkeypatch):
+    with fixture_db.cursor() as cur:
+        cur.execute(f"UPDATE {P}profile_backfill_state SET last_error='queue_unavailable'")
+    fixture_db.commit()
+    _mod, client = _settings(monkeypatch, fixture_db, reconcile_error="analysis_timeout")
+
+    body = "".join(client.get("/settings/status").get_json()["panels"].values())
+
+    assert "Volume and ramp preparation: queue_unavailable</p>" in body
+    assert '<div class="lumae-help">analysis_timeout</div>' in body
+
+
+def _health(monkeypatch, db):
+    mod, client = _route(monkeypatch, db)
+    monkeypatch.setattr(mod, "detect_core", lambda: V2)
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", lambda: types.SimpleNamespace(
+        list_servers=lambda: []
+    ))
+    return mod, client
+
+
+def test_catalogue_health_redacts_stored_errors_and_keeps_the_shape(fixture_db, monkeypatch):
+    db = fixture_db
+    with db.cursor() as cur:
+        cur.execute(
+            f"""INSERT INTO {P}provider_identity_transitions
+                (catalog_instance_id, state, detection_reason, required_action, last_error)
+                VALUES (%s, 'normal', 'provider_version_unchanged', 'none', %s)""",
+            (SOURCE, TRANSITION_ERROR),
+        )
+    db.commit()
+    _mod, client = _health(monkeypatch, db)
+
+    response = client.get("/api/catalog/health")
+
+    assert response.status_code == 200
+    text = response.get_data(as_text=True)
+    for secret in (*SECRETS, "TransPass77"):
+        assert secret not in text, secret
+    server = response.get_json()["servers"][0]
+    assert server["catalog"]["last_error"] == (
+        "refresh failed: postgresql://[redacted]@db.internal:5432/audiomuse"
+    )
+    assert server["analysis"]["last_error"].endswith("&t=[redacted]&s=[redacted]&v=1.16.1")
+    assert server["preparation"]["last_error"] == (
+        "provider said 401 to Authorization: [redacted]"
+    )
+    transition = server["provider_identity_transition"]
+    assert transition["last_error"] == (
+        "provider recheck failed: PGPASSWORD=[redacted] psql exited 2"
+    )
+    # Structured codes are untouched.
+    assert transition["detection_reason"] == "provider_version_unchanged"
+    assert transition["required_action"] == "none"
+    assert server["preparation"]["status"] == "failed"
+    assert server["preparation"]["phase"] == "catalog_refresh"
+
+
+def test_catalogue_health_keeps_a_safe_code_and_an_empty_error(fixture_db, monkeypatch):
+    with fixture_db.cursor() as cur:
+        cur.execute(f"UPDATE {P}catalog_state SET last_error=''")
+        cur.execute(f"UPDATE {P}analysis_state SET last_error=NULL")
+        cur.execute(f"UPDATE {P}preparation_state SET last_error='queue_unavailable'")
+    fixture_db.commit()
+    _mod, client = _health(monkeypatch, fixture_db)
+
+    server = client.get("/api/catalog/health").get_json()["servers"][0]
+
+    # The field keeps its type: a string stays a string, null stays null.
+    assert server["catalog"]["last_error"] == ""
+    assert server["analysis"]["last_error"] is None
+    assert server["preparation"]["last_error"] == "queue_unavailable"
+
+
+def test_catalogue_health_redacts_a_server_discovery_failure(fixture_db, monkeypatch):
+    mod, client = _health(monkeypatch, fixture_db)
+
+    def fail(_compatibility):
+        raise RuntimeError(DISCOVERY_ERROR)
+
+    monkeypatch.setattr(mod, "sanitized_server_summaries", fail)
+
+    response = client.get("/api/catalog/health")
+
+    assert response.status_code == 503
+    payload = response.get_json()
+    assert payload["status"] == "server_discovery_failed"
+    assert payload["reason"] == "list_servers failed: Authorization: [redacted]"
+
+
+def test_the_preparation_status_redacts_its_stored_error(fixture_db, monkeypatch):
+    _mod, client = _route(monkeypatch, fixture_db)
+
+    response = client.get(f"/api/catalog/prepare/{SOURCE}")
+
+    assert response.status_code == 200
+    payload = response.get_json()
+    assert payload["last_error"] == "provider said 401 to Authorization: [redacted]"
+    assert "eyJhbGciOiJIUzI1NiJ9" not in response.get_data(as_text=True)

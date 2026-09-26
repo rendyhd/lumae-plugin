@@ -80,6 +80,8 @@ from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
 from .database_state import (
     bounded_reads,
     collect_database_state,
+    redact_source_errors,
+    redact_stored_error,
     render_database_state,
     safe_snapshot_error,
 )
@@ -2188,7 +2190,7 @@ def catalog_health():
                 "sync_contract": sync_contract(compatibility),
                 "servers": [],
                 "status": "server_discovery_failed",
-                "reason": str(exc),
+                "reason": redact_stored_error(str(exc)),
             }
         )
         return jsonify(payload), 503
@@ -2338,7 +2340,7 @@ def catalog_health():
             "capability": catalog_capability(),
             "sync_contract": sync_contract(compatibility),
             "dedup_policy": policy,
-            "servers": servers,
+            "servers": [redact_source_errors(server) for server in servers],
         }
     )
     response = jsonify(payload)
@@ -2463,7 +2465,7 @@ def _preparation_api_payload(source, state=None):
             "worker_catalog_builder_version"
         ),
         "worker_attested": attestation_current,
-        "last_error": (
+        "last_error": redact_stored_error(
             (state or {}).get("last_error")
             or attestation_error
             or catalog.get("last_error")
@@ -5371,7 +5373,7 @@ def render_relationship_status_panel():
             summary = f"""
               <div class="lumae-notice lumae-notice-error" role="alert">
                 <strong>The last relationship build failed.</strong>
-                <span>{escape(str(state.get('last_error') or 'The background worker will retry after the next source update.'))}</span>
+                <span>{escape(redact_stored_error(state.get('last_error')) or 'The background worker will retry after the next source update.')}</span>
               </div>
             """
         else:
@@ -5566,7 +5568,7 @@ def render_source_preparation_sections(batch_size):
                   <strong>{escape(projection_status.replace('_', ' '))}</strong>
                 </div>
               </div>
-              {f'<p class="lumae-notice lumae-notice-error">{escape(last_error)}</p>' if last_error else ''}
+              {f'<p class="lumae-notice lumae-notice-error">{escape(redact_stored_error(last_error))}</p>' if last_error else ''}
               <form class="lumae-form" method="post">
                 {hidden}
                 <div class="lumae-actions">
@@ -5603,7 +5605,7 @@ def render_source_preparation_sections(batch_size):
               <p class="lumae-help">These profiles power volume normalization and SmoothFade
                 ramps. They are prepared from audio waveforms in the background and do not block
                 library sync, AudioMuse source analysis, or Lumae relationships.</p>
-              {f'<p class="lumae-notice lumae-notice-error">Volume and ramp preparation: {escape(backfill_error)}</p>' if backfill_error else ''}
+              {f'<p class="lumae-notice lumae-notice-error">Volume and ramp preparation: {escape(redact_stored_error(backfill_error))}</p>' if backfill_error else ''}
               <form class="lumae-form" method="post">
                 {hidden}
                 <label class="lumae-field">
@@ -5833,7 +5835,7 @@ def render_reconcile_status_panel():
             else ""
         )
         error = (
-            f'<div class="lumae-help">{escape(str(event.get("last_error")))}</div>'
+            f'<div class="lumae-help">{escape(redact_stored_error(event.get("last_error")))}</div>'
             if event.get("last_error")
             else ""
         )
@@ -5907,7 +5909,7 @@ def render_settings(message=None, error=None):
     error_html = (
         f"""
         <div class="lumae-notice lumae-notice-error" role="alert">
-          <strong>{escape(error)}</strong>
+          <strong>{escape(redact_stored_error(error))}</strong>
         </div>
         """
         if error

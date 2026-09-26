@@ -57,6 +57,33 @@ _MAX_DIAGNOSTIC_OPERATIONS = 16
 _MAX_DB_CALL_TIME_MS = 3_600_000
 
 
+def redact_stored_error(value):
+    """Stored error text (``last_error``, ``str(exc)``) as it may be shown.
+
+    Retry category codes (``SAFE_FAILURES``) pass unchanged; any other text is
+    redacted and length-capped (``redaction.redact_error_text``). None stays
+    None and any other value becomes a string, so a field keeps its type.
+    """
+    if value is None:
+        return None
+    return redact_error_text(value, SAFE_FAILURES) or ""
+
+
+# Sections of a source DTO (``resolve_catalog_source``, catalogue health) that
+# carry a stored ``last_error``.
+_SOURCE_ERROR_SECTIONS = ("catalog", "analysis", "preparation", "provider_identity_transition")
+
+
+def redact_source_errors(source):
+    """A copy of a source DTO whose stored ``last_error`` texts are redacted."""
+    source = dict(source)
+    for key in _SOURCE_ERROR_SECTIONS:
+        section = source.get(key)
+        if isinstance(section, dict) and section.get("last_error") is not None:
+            source[key] = {**section, "last_error": redact_stored_error(section["last_error"])}
+    return source
+
+
 class _Unavailable:
     """What a failed or timed-out diagnostic read returns (never zeros)."""
 
@@ -968,7 +995,7 @@ def _error_list(errors):
         detail = f" <small>({escape(metadata)})</small>" if metadata else ""
         # Every message shown here passes the redactor: stored ``last_error``
         # text is free text (P3-10); query errors are fixed messages already.
-        message = redact_error_text(row.get("message"), SAFE_FAILURES) or "Unknown error"
+        message = redact_stored_error(row.get("message")) or "Unknown error"
         rows.append(
             f"<li><strong>{escape(str(row.get('section') or 'Unknown'))}:</strong> "
             f"{escape(message)}{detail}</li>"

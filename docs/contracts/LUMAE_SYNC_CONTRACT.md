@@ -152,6 +152,7 @@ The response shape and values are unchanged. What changed is when its values are
   - catalogue coverage is recounted right after every catalogue refresh and every projection, including one that publishes nothing.
   So an AudioMuse mapping or Chromaprint change appears with the next catalogue refresh or projection; every analysis run and every provider-migration recheck ends with one. For the moment between a publication and its recount, or when no summary describes the published generation and server, the route counts live, read-only, as 1.2.5 did.
 - 1.2.5 answered in about 0.4 s p95 at 94k tracks, and the route wrote to the database on every request. 1.3.0 answers in about 5 ms p95, excluding the provider ping, and performs no write when nothing changed.
+- From 1.3.0 (P3-10, LUM-021) the free-text error fields are redacted and capped at 300 characters: credentials, tokens and file paths are masked. The fields are `servers[].catalog.last_error`, `servers[].analysis.last_error`, `servers[].preparation.last_error` and `servers[].provider_identity_transition.last_error`, plus `reason` of a 503 `server_discovery_failed`; `last_error` of `/api/catalog/prepare` is treated the same way. Field names and types are unchanged, a retry category code is returned as is, and structured codes (`status`, `phase`, `refresh_reason`, `detection_reason`, `required_action`) are untouched.
 
 ---
 
