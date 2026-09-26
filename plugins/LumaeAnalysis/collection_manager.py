@@ -1907,7 +1907,10 @@ def register_collection_routes(bp):
                 "WHERE principal = %s AND collection_id = %s AND id = ANY(%s) RETURNING id",
                 (principal, collection_id, item_ids),
             )
-            removed_ids = [str(row[0]) for row in cur.fetchall()]
+            removed = {str(row[0]) for row in cur.fetchall()}
+            # RETURNING has no defined row order (PostgreSQL 16 and 17 differ
+            # here): answer, and journal the deletes, in request order.
+            removed_ids = [item_id for item_id in item_ids if item_id in removed]
             if removed_ids:
                 cur.execute(
                     f"UPDATE {collections_table()} SET revision = revision + 1, updated_at = now() "

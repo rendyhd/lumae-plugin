@@ -248,6 +248,11 @@ def test_old_client_transcript_is_byte_identical_to_the_pre_k8_golden(collection
     module's ``_transcript``; timestamps and restore-generated ids are
     normalised. Each feed 200 must carry each new key exactly once, and
     removing those bytes must give the old body.
+
+    Amended 2026-09-26: the batch delete's ``deleted`` list and its delete
+    events are now in request order (i2, i3). The recording had PostgreSQL
+    16's arbitrary ``RETURNING`` order (i3, i2), which PostgreSQL 17 does not
+    reproduce.
     """
     new_keys = (
         re.compile(rb'"epoch":"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}",'),
@@ -264,6 +269,23 @@ def test_old_client_transcript_is_byte_identical_to_the_pre_k8_golden(collection
         stripped.append((label, status, body, headers))
     golden = json.loads(GOLDEN.read_text(encoding="utf-8"))
     assert _normalized(stripped) == golden
+
+
+def test_a_batch_delete_answers_and_journals_in_request_order(collections_api):
+    """``DELETE ... RETURNING`` has no defined row order (PostgreSQL 16 and 17
+    differ), so the answer and the delete events follow the request."""
+    assert collections_api.call("POST", "/api/collections",
+                                {"id": "c1", "name": "One"}).status_code == 201
+    _batch(collections_api, "c1", ["t1", "t2", "t3", "t4"])
+    head = _feed(collections_api).get_json()["next_cursor"]
+    requested = ["c1-t3", "c1-t1", "missing", "c1-t4", "c1-t1"]
+    response = collections_api.call("DELETE", "/api/collections/c1/items/batch",
+                                    {"item_ids": requested})
+    assert response.status_code == 200
+    assert response.get_json()["deleted"] == ["c1-t3", "c1-t1", "c1-t4"]
+    events = _feed(collections_api, cursor=head).get_json()["changes"]
+    assert [(e["entity_id"], e["operation"]) for e in events if e["entity_kind"] == "item"] == [
+        ("c1-t3", "delete"), ("c1-t1", "delete"), ("c1-t4", "delete")]
 
 
 def test_feed_reports_epoch_head_floor_and_pages_by_has_more(collections_api):
