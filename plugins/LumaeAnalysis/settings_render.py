@@ -11,9 +11,18 @@ package module at call time as ``_pkg.<name>``, not imported directly. That
 keeps ``monkeypatch.setattr(plugins.LumaeAnalysis, "name", fake)`` in tests
 effective for code that now lives here, since attribute lookups on ``_pkg``
 happen when each function runs, not at import time.
+
+The package is taken from ``sys.modules[__package__]`` rather than imported
+by name: the host installs the plugin under its own package name (for
+example ``plugin/installed/lumae_analysis``), and ``plugins.LumaeAnalysis``
+exists only in this repository's test layout. ``__init__`` imports this
+module part-way through its own body, when the package module is already
+registered in ``sys.modules``.
 """
 
-from plugins import LumaeAnalysis as _pkg
+import sys
+
+_pkg = sys.modules[__package__]
 
 
 def _v3_readiness_sources():

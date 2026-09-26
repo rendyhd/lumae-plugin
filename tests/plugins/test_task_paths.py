@@ -99,3 +99,42 @@ def test_registered_task_and_hook_paths_resolve_and_are_pinned():
         )
 
     assert resolved == EXPECTED_DOTTED_PATHS
+
+
+def test_plugin_modules_do_not_import_the_package_by_repository_name():
+    """The host installs the plugin under its own package name, so
+    ``plugins.LumaeAnalysis`` only exists in this repository's test layout."""
+    import pathlib
+    import re
+
+    package_dir = pathlib.Path(load_plugin().__file__).parent
+    offenders = [
+        path.name
+        for path in sorted(package_dir.glob("*.py"))
+        if re.search(r"^\s*(?:from\s+plugins[\s.]|import\s+plugins\b)",
+                     path.read_text(encoding="utf-8"), re.MULTILINE)
+    ]
+    assert offenders == []
+
+
+def test_extracted_modules_bind_the_package_they_were_loaded_from():
+    """Loaded under a host-style package name, ``settings_render`` must call
+    back into that package, not into a second copy of the plugin."""
+    import importlib.util
+    import pathlib
+    import sys
+
+    package_dir = pathlib.Path(load_plugin().__file__).parent
+    name = "host_installed_lumae_analysis"
+    spec = importlib.util.spec_from_file_location(
+        name, package_dir / "__init__.py", submodule_search_locations=[str(package_dir)]
+    )
+    host_mod = importlib.util.module_from_spec(spec)
+    sys.modules[name] = host_mod
+    try:
+        spec.loader.exec_module(host_mod)
+        assert sys.modules[f"{name}.settings_render"]._pkg is host_mod
+        assert host_mod.render_settings.__module__ == f"{name}.settings_render"
+    finally:
+        for key in [k for k in sys.modules if k == name or k.startswith(name + ".")]:
+            del sys.modules[key]
