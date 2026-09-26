@@ -1104,7 +1104,9 @@ def test_enrichment_change_pages_do_not_read_past_their_pinned_head(monkeypatch)
     profile_cursor = Cursor(
         "profile-epoch",
         10,
-        [(seq, f"t{seq}", "ready", {}, "2026-07-30T12:00:00Z") for seq in (3, 4)],
+        # 6th element: the joined edge payload, attached in Python (P3-2
+        # follow-up); None here, as for any row without a matching edge.
+        [(seq, f"t{seq}", "ready", {}, "2026-07-30T12:00:00Z", None) for seq in (3, 4)],
     )
     profile_db = type("Db", (), {"cursor": lambda _self: profile_cursor})()
     monkeypatch.setattr(
