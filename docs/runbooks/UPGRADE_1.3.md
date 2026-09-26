@@ -86,6 +86,21 @@ is safe to run again. On success it has:
   the text current and skip it (about 1 s). Without the `pg_trgm` extension
   the log has a warning, and search gives the same results without its
   index.
+- added `collection_mutations.created_at` index (F2, growth) and
+  `shelf_mutations.created_at` column and index, for the new periodic
+  retention cleanup (below). `collection_mutations` has never been
+  compacted, so on an install with a long-lived collections feature this can
+  be the slower of the two: building a plain `CREATE INDEX IF NOT EXISTS`
+  (not `CONCURRENTLY`, like every index here) takes a SHARE lock that blocks
+  writers — collection mutations, not reads — for as long as the build
+  takes. `shelf_mutations` gets only a nullable column, added instantly with
+  no default (a `now()` default would rewrite the whole table); its receipts
+  written before this migration have no `created_at` and are simply never
+  swept. Later migrations find both current and skip them.
+- installed the daily `plugin.lumae_analysis.collection_retention` schedule
+  (03:23, enabled). It deletes collection and shelf receipts older than 30
+  days and restore progress untouched for 7 days, in bounded batches. An
+  administrator who disables the row keeps it disabled across upgrades.
 
 Each schema change runs only when it is still missing, so re-running the
 migration on an up-to-date database takes no exclusive table lock. A change
