@@ -6,8 +6,9 @@
   returns, instead of being stranded with no retry and no wake. The attempt
   count is kept.
 * A maintenance pause, a legacy-job migration and an aborted batch release
-  their attempts without using one up.
-* Every cooldown is the slot for the attempts used: 60 s, 300 s, 1800 s.
+  their attempts without using one up and without a cooldown.
+* Every other cooldown is the slot for the attempts used: 60 s, 300 s, 1800 s.
+* ``migrate`` clears the category of rows stranded before 1.3.0, once.
 * A release locks its rows in track-ID order, as admission does, so the two
   cannot deadlock in either order.
 * The scheduler predicates are shared (``profile_publication``) and select
@@ -28,12 +29,14 @@ from test_database_state_postgres import PROFILE_ROWS, fixture_db  # noqa: E402,
 from plugins.LumaeAnalysis import (  # noqa: E402
     catalog_enrichment,
     profile_publication as publication,
+    provider_identity_rekey,
 )
 from plugins.LumaeAnalysis.profile_publication import (  # noqa: E402
     RETRY_ARMED_SQL,
     RETRY_DELAYS_SECONDS,
     RETRY_LIMIT,
     backfill_due_sql,
+    retry_delay_sql,
     scheduler_params,
 )
 
@@ -230,10 +233,23 @@ def test_a_release_without_an_analysis_keeps_the_retry_budget(db, monkeypatch, r
         release(mod, monkeypatch, ids, tokens)
         for track in ids:
             assert _row(db, track)[:4] == ("stale", "queue_unavailable", 0, True)
-            assert _cooldown(db, track) == RETRY_DELAYS_SECONDS[0]
-            _make_due(db, track)
+            assert _cooldown(db, track) == 0
     monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
     assert all(_eligible(track) for track in ids)
+
+
+def test_a_paused_row_with_two_used_attempts_is_due_after_the_pause(db, monkeypatch):
+    mod = load_plugin()
+    _track(db, "late")
+    tokens = publication.admit_attempts(db, SOURCE, ["late"])
+    _sql(db, f"UPDATE {P}source_profiles SET retry_count=%s "
+             "WHERE catalog_instance_id=%s AND track_id='late'", (RETRY_LIMIT - 1, SOURCE))
+    _paused_batch(mod, monkeypatch, ["late"], tokens)
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    assert _row(db, "late")[:4] == ("stale", "queue_unavailable", RETRY_LIMIT - 1, True)
+    assert _eligible("late")
+    wake = mod.next_profile_retry_at(SOURCE, db=db)
+    assert wake is not None and _sql(db, "SELECT %s <= now()", (wake,))[0][0]
 
 
 def test_a_failed_enqueue_still_uses_an_attempt(db):
@@ -257,18 +273,25 @@ def _admitted_with(db, track, used):
     return token
 
 
-@pytest.mark.parametrize("used, count_failure, slot", [
-    (0, True, 0), (1, True, 1), (0, False, 0), (1, False, 1), (2, False, 2),
+def test_the_cooldown_slots(db):
+    assert RETRY_DELAYS_SECONDS == (60, 300, 1800)
+    assert _sql(db, f"""SELECT extract(epoch FROM {retry_delay_sql('used')})::int
+                          FROM unnest(ARRAY[0, 1, 2, 5]) AS used""") == [
+        (60,), (300,), (1800,), (1800,)]
+
+
+@pytest.mark.parametrize("used, count_failure, seconds", [
+    (0, True, 60), (1, True, 300), (0, False, 0), (2, False, 0),
 ])
 def test_a_release_cools_down_for_the_slot_of_its_attempt_count(
-    db, used, count_failure, slot,
+    db, used, count_failure, seconds,
 ):
-    assert RETRY_DELAYS_SECONDS == (60, 300, 1800)
     token = _admitted_with(db, "c", used)
     assert publication.release_attempts(
         db, SOURCE, {"c": token}, "reason", count_failure=count_failure) == 1
-    assert _row(db, "c")[:3] == ("stale", "queue_unavailable", used + int(count_failure))
-    assert _cooldown(db, "c") == RETRY_DELAYS_SECONDS[slot]
+    assert _row(db, "c")[:4] == ("stale", "queue_unavailable", used + int(count_failure), True)
+    assert _cooldown(db, "c") == seconds
+    assert _eligible("c") is (seconds == 0)
 
 
 def test_the_last_counted_release_arms_no_cooldown(db):
@@ -433,3 +456,56 @@ def test_the_shared_predicates_select_what_the_inline_ones_did(fixture_db, monke
     assert [row[0] for row in mod.fetch_backfill_rows(
         10**6, catalog_instance_id=SOURCE, server_id=SERVER)] == due
     fixture_db.rollback()
+
+
+# ---------------------------------------------------------------------------
+# 6. Rows stranded before 1.3.0, and the provider rekey
+# ---------------------------------------------------------------------------
+def _retried_then_admitted(db, track):
+    """Failed once (analysis_error, diagnostics), due, admitted again."""
+    _track(db, track)
+    assert _complete(db, track, publication.admit_attempts(db, SOURCE, [track])[track],
+                     status="failed")
+    _make_due(db, track)
+    return publication.admit_attempts(db, SOURCE, [track])[track]
+
+
+def _strand(db, track):
+    """What a stale transition left before P3-6: the category kept."""
+    _retried_then_admitted(db, track)
+    _sql(db, f"UPDATE {P}source_profiles SET status='stale', attempt_token=NULL "
+             "WHERE catalog_instance_id=%s AND track_id=%s", (SOURCE, track))
+    assert _row(db, track) == ("stale", "analysis_error", 1, False, {"stage": "decode"})
+
+
+def test_migrate_requeues_rows_stranded_before_1_3_0_once(db, run_plugin_migration):
+    _strand(db, "stranded")
+    _track(db, "released")
+    token = publication.admit_attempts(db, SOURCE, ["released"])["released"]
+    assert publication.release_attempts(db, SOURCE, {"released": token}, "reason") == 1
+    _sql(db, f"DELETE FROM {P}profile_migrations WHERE name='stale_retry_category_v1'")
+    assert not _eligible("stranded")
+
+    run_plugin_migration(db)
+    assert _row(db, "stranded") == ("stale", None, 1, False, None)
+    assert _eligible("stranded")
+    # A released row keeps its category and cooldown.
+    assert _row(db, "released")[:4] == ("stale", "queue_unavailable", 1, True)
+    assert not _eligible("released")
+
+    # Once: a second run changes nothing, even a row stranded since.
+    _strand(db, "later")
+    before = _sql(db, f"SELECT * FROM {P}source_profiles ORDER BY track_id")
+    run_plugin_migration(db)
+    assert _sql(db, f"SELECT * FROM {P}source_profiles ORDER BY track_id") == before
+    assert _sql(db, f"SELECT count(*) FROM {P}profile_migrations "
+                    "WHERE name='stale_retry_category_v1'") == [(1,)]
+
+
+def test_the_provider_rekey_requeues_an_attempt_it_abandons(db):
+    _retried_then_admitted(db, "old-id")
+    with db.cursor() as cur:
+        provider_identity_rekey._rekey_plugin_owned_state(
+            cur, SOURCE, [{"entity_type": "track", "old_id": "old-id", "new_id": "new-id"}])
+    db.commit()
+    assert _row(db, "new-id") == ("stale", None, 1, False, None)

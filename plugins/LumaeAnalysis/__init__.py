@@ -1360,6 +1360,31 @@ def migrate(db):
         ON CONFLICT (catalog_instance_id, track_id) DO NOTHING
         """
     )
+    # P3-6 (LUM-007): before 1.3.0 a stale transition kept the category of an
+    # earlier failure, and the scheduler selects a stale row only without one
+    # (or a released one after its cooldown), so such rows were never retried.
+    # Stale transitions now clear it; clear it once on the rows left behind,
+    # keeping retry_count. The marker is read first, so a re-run takes no
+    # lock on source_profiles.
+    cur.execute(
+        f"SELECT 1 FROM {table('profile_migrations')} WHERE name='stale_retry_category_v1'"
+    )
+    if cur.fetchone() is None:
+        cur.execute(
+            f"""
+            WITH migration AS (
+                INSERT INTO {table('profile_migrations')} (name)
+                VALUES ('stale_retry_category_v1')
+                ON CONFLICT (name) DO NOTHING
+                RETURNING name
+            )
+            UPDATE {source_profiles_table()} p
+               SET retry_category=NULL, failure_diagnostics=NULL
+              FROM migration
+             WHERE p.status='stale' AND p.retry_category IS NOT NULL
+               AND p.retry_category <> 'queue_unavailable'
+            """
+        )
     # Published validity is independent of the current analysis attempt. This
     # additive table is seeded once; runtime routing is introduced separately.
     cur.execute(

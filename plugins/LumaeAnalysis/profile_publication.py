@@ -325,14 +325,18 @@ def admit_attempts(db, source, ids, priority="background",
 def release_attempts(db, source, tokens, reason, count_failure=True):
     """Return admitted attempts to the scheduler as ``queue_unavailable``.
 
-    ``count_failure`` uses up an attempt: the job could not be queued or its
-    claim was lost. A maintenance pause, a legacy-job migration or an aborted
-    batch never tried the analysis and passes False (LUM-007). The cooldown
-    is the slot for the attempts used (retry_delay_sql). Rows are locked in
-    track-ID order, as admission locks them, so they cannot deadlock.
+    ``count_failure`` uses up an attempt and cools down for the slot of the
+    attempts used (retry_delay_sql): the job could not be queued or its claim
+    was lost. A maintenance pause, a legacy-job migration or an aborted batch
+    never tried the analysis and passes False: no attempt and no cooldown,
+    the row is due again at once (LUM-007). Rows are locked in track-ID
+    order, as admission locks them, so they cannot deadlock.
     """
     if not tokens:
         return 0
+    # ``now()`` rather than NULL: stale_due_sql selects a queue_unavailable
+    # row once ``retry_after <= now()``, and a NULL cooldown means exhausted.
+    delay = retry_delay_sql("s.retry_count") if count_failure else "interval '0 seconds'"
     ids = sorted(tokens)
     cur = db.cursor()
     try:
@@ -353,7 +357,7 @@ def release_attempts(db, source, tokens, reason, count_failure=True):
                            retry_category='queue_unavailable',
                            retry_count=s.retry_count + %(used)s,
                            retry_after=CASE WHEN s.retry_count + %(used)s < %(retry_limit)s
-                               THEN now() + {retry_delay_sql('s.retry_count')}
+                               THEN now() + {delay}
                                ELSE NULL END,
                            retry_media_signature=s.attempt_media_signature,
                            retry_analyzer_ver=s.attempt_analyzer_ver,
