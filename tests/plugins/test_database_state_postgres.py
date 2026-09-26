@@ -104,6 +104,10 @@ def _profile_rows():
         ("t-queue-exhausted-past", {}, {"status": "stale", "retry_category": "queue_unavailable",
                                         "retry_count": RETRY_LIMIT, "retry_after": past},
          False, "exhausted"),
+        ("t-queue-exhausted-future", {}, {"status": "stale",
+                                          "retry_category": "queue_unavailable",
+                                          "retry_count": RETRY_LIMIT, "retry_after": future},
+         False, "exhausted"),
         # Re-queued with a published baseline: published, but not ready.
         ("t-stale", {}, {"status": "stale"}, True, "due"),
         # LUM-007: a stale transition that kept an earlier category.
@@ -138,6 +142,9 @@ def _profile_rows():
              False, "exhausted"),
             (f"t-{category}-exhausted-past", {},
              {**failed, "retry_count": RETRY_LIMIT, "retry_after": past}, True, "exhausted"),
+            # A future cooldown does not make a used-up row "cooling".
+            (f"t-{category}-exhausted-future", {},
+             {**failed, "retry_count": RETRY_LIMIT, "retry_after": future}, False, "exhausted"),
         ]
     for category in sorted(REVISION_FAILURES):
         failed = {"status": "failed", "retry_category": category, "retry_count": 1}
@@ -349,7 +356,7 @@ def test_a_blocked_read_renders_unavailable_and_the_rest_renders(
     fixture_db, second_connection, monkeypatch
 ):
     db = fixture_db
-    monkeypatch.setattr(database_state, "DIAGNOSTIC_STATEMENT_TIMEOUT_MS", 300)
+    monkeypatch.setattr(database_state, "diagnostic_timeout_ms", lambda: 300)
     logged = []
     monkeypatch.setattr(database_state, "logger", types.SimpleNamespace(
         warning=lambda message, *args, **_kwargs: logged.append(message % args),
@@ -428,7 +435,7 @@ def test_statement_timeout_does_not_leak_to_the_host_connection(fixture_db, auto
 
     assert snapshot["errors"] == []
     # Inside a bounded read the diagnostic timeout applies ...
-    assert seen == [database_state.DIAGNOSTIC_STATEMENT_TIMEOUT_MS]
+    assert seen == [database_state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS]
     # ... and afterwards the connection has its own again.
     assert _show(db, "statement_timeout") == before == "45s"
     if autocommit:
@@ -555,7 +562,7 @@ def test_the_route_writes_nothing(fixture_db, second_connection, monkeypatch, bl
     connection = RecordingConnection(db)
     release = None
     if blocked:
-        monkeypatch.setattr(database_state, "DIAGNOSTIC_STATEMENT_TIMEOUT_MS", 300)
+        monkeypatch.setattr(database_state, "diagnostic_timeout_ms", lambda: 300)
         release = _hold_lock(second_connection, "source_profiles")
     _mod, client = _route(monkeypatch, connection)
     try:
@@ -740,3 +747,29 @@ def test_the_preparation_status_redacts_its_stored_error(fixture_db, monkeypatch
     payload = response.get_json()
     assert payload["last_error"] == "provider said 401 to Authorization: [redacted]"
     assert "eyJhbGciOiJIUzI1NiJ9" not in response.get_data(as_text=True)
+
+
+def test_the_timeout_setting_is_read_before_any_savepoint(fixture_db, monkeypatch):
+    connection = RecordingConnection(fixture_db)
+
+    def get_setting(key, default=None):
+        connection.statements.append(f"GET_SETTING {key}")
+        return "12000"
+
+    monkeypatch.setattr(database_state, "get_setting", get_setting)
+    _mod, client = _route(monkeypatch, connection)
+
+    assert client.get("/database-state").status_code == 200
+
+    statements = connection.statements
+    lookups = [index for index, sql in enumerate(statements) if sql.startswith("GET_SETTING")]
+    # Once for source resolution and once for the snapshot, not per read.
+    assert [statements[index] for index in lookups] == [
+        "GET_SETTING diagnostic_statement_timeout_ms"
+    ] * 2
+    for index in lookups:
+        opened = sum(1 for sql in statements[:index] if sql.startswith("SAVEPOINT"))
+        released = sum(1 for sql in statements[:index] if sql.startswith("RELEASE"))
+        assert opened == released, "a setting lookup ran inside a bounded read"
+    timeouts = [sql for sql in statements if sql.startswith("SET LOCAL")]
+    assert timeouts and set(timeouts) == {"SET LOCAL statement_timeout = 12000"}

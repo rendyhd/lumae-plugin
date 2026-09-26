@@ -6,20 +6,22 @@ metadata, exposes credentials, or mutates database state.
 
 Every diagnostic read runs in a savepoint of the host's request transaction
 (or, on an autocommit connection, in a transaction of its own) under
-``SET LOCAL statement_timeout`` (``DIAGNOSTIC_STATEMENT_TIMEOUT_MS``), and is
-always rolled back to that savepoint. One slow or blocked query therefore
+``SET LOCAL statement_timeout`` (plugin setting
+``diagnostic_statement_timeout_ms``, default 5000), and is always rolled back
+to that savepoint. One slow or blocked query therefore
 cannot hold the web thread, and the host connection keeps its own
 ``statement_timeout``. A section whose query failed or timed out is reported
 as unavailable (``None`` counts), never as zeros.
 """
 
 from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from html import escape
 import re
 from time import monotonic
 
-from plugin.api import logger, table
+from plugin.api import get_setting, logger, table
 
 from .profile_publication import (
     RETRY_LIMIT,
@@ -29,14 +31,49 @@ from .profile_publication import (
 )
 from .redaction import redact_error_text
 
-# Per statement. On the representative fixture (scripts/perf/seed.py --scale 1:
-# 132k tracks, 94k profiles, 76k mappings) the slowest diagnostic reads, the
-# AudioMuse core and waveform work-state aggregates, take 0.34-0.39 s (p50-p95)
-# and the whole page about 1 s. 3 s leaves about 8x headroom for a larger
-# library or a cold cache, and still bounds a read that waits on a lock (a
-# migration's ALTER TABLE) or runs away.
-DIAGNOSTIC_STATEMENT_TIMEOUT_MS = 3000
+# Per statement, from the plugin setting ``diagnostic_statement_timeout_ms``.
+# On the representative fixture (scripts/perf/seed.py --scale 1: 132k tracks,
+# 94k profiles, 76k mappings) the slowest diagnostic reads, the AudioMuse core
+# and waveform work-state aggregates, take 0.34-0.39 s (p50-p95) and the whole
+# page about 1 s. The default leaves more than 10x headroom for a larger
+# library, a cold cache or a slow host, and still bounds a read that waits on a
+# lock (a migration's ALTER TABLE) or runs away. A slower host raises it.
+DIAGNOSTIC_TIMEOUT_SETTING = "diagnostic_statement_timeout_ms"
+DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS = 5000
+MIN_DIAGNOSTIC_STATEMENT_TIMEOUT_MS = 1000
+MAX_DIAGNOSTIC_STATEMENT_TIMEOUT_MS = 30000
 _SAVEPOINT = "lumae_diagnostic_read"
+# The bound of the reads in progress, resolved once per snapshot or block.
+_TIMEOUT_MS = ContextVar("lumae_diagnostic_timeout_ms", default=None)
+
+
+def diagnostic_timeout_ms():
+    """The per-statement bound, clamped; the default on any error.
+
+    Called before any bounded read opens its savepoint, so a setting lookup
+    that reads the database is never inside one.
+    """
+    try:
+        value = int(get_setting(
+            DIAGNOSTIC_TIMEOUT_SETTING, DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS
+        ))
+    except Exception:
+        return DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS
+    return min(max(value, MIN_DIAGNOSTIC_STATEMENT_TIMEOUT_MS),
+               MAX_DIAGNOSTIC_STATEMENT_TIMEOUT_MS)
+
+
+@contextmanager
+def _timeout_scope():
+    """Resolve the bound once for the enclosed reads (the outermost scope wins)."""
+    if _TIMEOUT_MS.get() is not None:
+        yield
+        return
+    token = _TIMEOUT_MS.set(diagnostic_timeout_ms())
+    try:
+        yield
+    finally:
+        _TIMEOUT_MS.reset(token)
 
 _OPERATION_BY_SECTION = {
     "sonic links": "sonic_links_summary",
@@ -180,10 +217,16 @@ def _open_bound(cur, owned):
     return True
 
 
-def _set_bound(cur):
+def _current_timeout_ms():
+    """The bound of the enclosing scope; resolve it before opening a savepoint."""
+    timeout_ms = _TIMEOUT_MS.get()
+    return diagnostic_timeout_ms() if timeout_ms is None else timeout_ms
+
+
+def _set_bound(cur, timeout_ms):
     # SET LOCAL lasts until the savepoint is rolled back, or the owned
     # transaction ends: the host's own statement_timeout is never changed.
-    cur.execute(f"SET LOCAL statement_timeout = {int(DIAGNOSTIC_STATEMENT_TIMEOUT_MS)}")
+    cur.execute(f"SET LOCAL statement_timeout = {int(timeout_ms)}")
 
 
 def _close_bound(db, cur, owned, opened):
@@ -196,11 +239,11 @@ def _close_bound(db, cur, owned, opened):
     """
     if opened:
         try:
-            cur.execute(
-                "ROLLBACK"
-                if owned
-                else f"ROLLBACK TO SAVEPOINT {_SAVEPOINT}; RELEASE SAVEPOINT {_SAVEPOINT}"
-            )
+            if owned:
+                cur.execute("ROLLBACK")
+            else:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {_SAVEPOINT}")
+                cur.execute(f"RELEASE SAVEPOINT {_SAVEPOINT}")
             return None
         except Exception:
             pass
@@ -220,19 +263,21 @@ def bounded_reads(db):
     For reads outside ``collect_database_state`` (source resolution). The
     block's exceptions propagate; the savepoint is always rolled back.
     """
-    owned = _owns_transaction(db)
-    cur = db.cursor()
-    opened = False
-    try:
-        opened = _open_bound(cur, owned)
-        _set_bound(cur)
-        yield
-    finally:
-        _close_bound(db, cur, owned, opened)
+    with _timeout_scope():
+        owned = _owns_transaction(db)
+        cur = db.cursor()
+        opened = False
+        timeout_ms = _current_timeout_ms()
         try:
-            cur.close()
-        except Exception:
-            pass
+            opened = _open_bound(cur, owned)
+            _set_bound(cur, timeout_ms)
+            yield
+        finally:
+            _close_bound(db, cur, owned, opened)
+            try:
+                cur.close()
+            except Exception:
+                pass
 
 
 def _run(db, errors, diagnostics, section, work):
@@ -242,10 +287,11 @@ def _run(db, errors, diagnostics, section, work):
         return UNAVAILABLE
     owned = _owns_transaction(db)
     opened = False
+    timeout_ms = _current_timeout_ms()
     started_at = monotonic()
     try:
         opened = _open_bound(cur, owned)
-        _set_bound(cur)
+        _set_bound(cur, timeout_ms)
         result = work(cur)
         _record_diagnostic(diagnostics, section, started_at)
         return result
@@ -874,45 +920,47 @@ def collect_database_state(
     if not compatibility.supported:
         snapshot["status"] = "core_unsupported"
 
-    for source in sources:
-        source_errors = []
-        source_diagnostics = []
-        links = _link_state(db, source, source_errors, source_diagnostics)
-        items = _analysis_item_state(db, source, source_errors, source_diagnostics)
-        groups = _group_state(db, source, source_errors, source_diagnostics)
-        profiles = _profile_state(db, source, source_errors, source_diagnostics)
-        workflow = _workflow_state(db, source, source_errors, source_diagnostics)
-        journals = _journal_state(db, source, source_errors, source_diagnostics)
-        core = _core_state(db, compatibility, source, source_errors, source_diagnostics)
-        source_readiness = (
-            _readiness_state(db, source, readiness, source_errors, source_diagnostics)
-            if readiness is not None
-            else readiness_by_source.get(source["catalog_instance_id"]) or {}
-        )
-        snapshot["sources"].append(
-            {
-                "identity": {
-                    "catalog_instance_id": source["catalog_instance_id"],
-                    "server_id": source.get("server_id"),
-                    "name": source.get("name") or "Music server",
-                    "provider_type": source.get("provider_type") or "unknown",
-                    "is_default": bool(source.get("is_default")),
-                    "rebind_status": source.get("rebind_status") or "unknown",
-                },
-                "catalog": source.get("catalog") or {},
-                "analysis": source.get("analysis") or {},
-                "links": links,
-                "items": {**items, **groups},
-                "profiles": profiles,
-                "workflow": workflow,
-                "journals": journals,
-                "core": core,
-                "readiness": source_readiness,
-                "diagnostics": {"scope": "server_db_execute_fetch", "unit": "milliseconds", "operations": source_diagnostics},
-                "errors": source_errors,
-            }
-        )
-        snapshot["errors"].extend(source_errors)
+    # One setting lookup for all reads, before any savepoint is opened.
+    with _timeout_scope():
+        for source in sources:
+            source_errors = []
+            source_diagnostics = []
+            links = _link_state(db, source, source_errors, source_diagnostics)
+            items = _analysis_item_state(db, source, source_errors, source_diagnostics)
+            groups = _group_state(db, source, source_errors, source_diagnostics)
+            profiles = _profile_state(db, source, source_errors, source_diagnostics)
+            workflow = _workflow_state(db, source, source_errors, source_diagnostics)
+            journals = _journal_state(db, source, source_errors, source_diagnostics)
+            core = _core_state(db, compatibility, source, source_errors, source_diagnostics)
+            source_readiness = (
+                _readiness_state(db, source, readiness, source_errors, source_diagnostics)
+                if readiness is not None
+                else readiness_by_source.get(source["catalog_instance_id"]) or {}
+            )
+            snapshot["sources"].append(
+                {
+                    "identity": {
+                        "catalog_instance_id": source["catalog_instance_id"],
+                        "server_id": source.get("server_id"),
+                        "name": source.get("name") or "Music server",
+                        "provider_type": source.get("provider_type") or "unknown",
+                        "is_default": bool(source.get("is_default")),
+                        "rebind_status": source.get("rebind_status") or "unknown",
+                    },
+                    "catalog": source.get("catalog") or {},
+                    "analysis": source.get("analysis") or {},
+                    "links": links,
+                    "items": {**items, **groups},
+                    "profiles": profiles,
+                    "workflow": workflow,
+                    "journals": journals,
+                    "core": core,
+                    "readiness": source_readiness,
+                    "diagnostics": {"scope": "server_db_execute_fetch", "unit": "milliseconds", "operations": source_diagnostics},
+                    "errors": source_errors,
+                }
+            )
+            snapshot["errors"].extend(source_errors)
 
     if not sources and snapshot["status"] == "ready":
         snapshot["status"] = "not_initialized"

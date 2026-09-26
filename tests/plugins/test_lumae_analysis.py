@@ -8169,10 +8169,10 @@ def test_database_state_snapshot_is_source_scoped_and_generation_aware():
     assert partial["status"] == "partial"
     # The failed read was rolled back to its savepoint, not the transaction.
     assert failing_db.rollbacks == 0
-    assert (
-        "ROLLBACK TO SAVEPOINT lumae_diagnostic_read; RELEASE SAVEPOINT lumae_diagnostic_read"
-        in failing_db.control
-    )
+    assert failing_db.control[-2:] == [
+        "ROLLBACK TO SAVEPOINT lumae_diagnostic_read",
+        "RELEASE SAVEPOINT lumae_diagnostic_read",
+    ]
     # Unavailable, not zero.
     assert partial["sources"][0]["items"]["items"] is None
     assert partial["sources"][0]["profiles"]["ready"] == 550

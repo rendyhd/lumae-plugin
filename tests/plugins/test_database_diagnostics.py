@@ -69,9 +69,10 @@ def test_safe_error_hides_raw_exception_sql_path_and_token(monkeypatch):
     # The failed read is undone to its savepoint; the host transaction stays.
     assert cursor.statements == [
         "SAVEPOINT lumae_diagnostic_read",
-        f"SET LOCAL statement_timeout = {state.DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
+        f"SET LOCAL statement_timeout = {state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
         "SELECT secret",
-        "ROLLBACK TO SAVEPOINT lumae_diagnostic_read; RELEASE SAVEPOINT lumae_diagnostic_read",
+        "ROLLBACK TO SAVEPOINT lumae_diagnostic_read",
+        "RELEASE SAVEPOINT lumae_diagnostic_read",
     ]
     assert db.rollbacks == 0
 
@@ -87,9 +88,13 @@ def test_timing_success_and_malformed_sqlstate_are_bounded(monkeypatch):
     # A successful read is rolled back to its savepoint too: SET LOCAL ends there.
     assert cursor.statements[:2] == [
         "SAVEPOINT lumae_diagnostic_read",
-        f"SET LOCAL statement_timeout = {state.DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
+        f"SET LOCAL statement_timeout = {state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
     ]
-    assert cursor.statements[-1].startswith("ROLLBACK TO SAVEPOINT lumae_diagnostic_read")
+    # Two statements: nothing relies on several statements per execute.
+    assert cursor.statements[-2:] == [
+        "ROLLBACK TO SAVEPOINT lumae_diagnostic_read",
+        "RELEASE SAVEPOINT lumae_diagnostic_read",
+    ]
 
 
 def test_an_autocommit_connection_reads_in_a_transaction_it_owns_and_rolls_back():
@@ -100,7 +105,7 @@ def test_an_autocommit_connection_reads_in_a_transaction_it_owns_and_rolls_back(
     assert state._fetchone(db, "SELECT 1", (), errors, diagnostics, "analysis items", (0,)) == (3,)
     assert cursor.statements == [
         "BEGIN",
-        f"SET LOCAL statement_timeout = {state.DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
+        f"SET LOCAL statement_timeout = {state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
         "SELECT 1",
         "ROLLBACK",
     ]
@@ -142,3 +147,25 @@ def test_rollback_and_close_failures_do_not_expose_raw_errors():
     assert [row["sqlstate"] for row in errors] == ["42P01", "08006", "08006"]
     assert diagnostics[0]["status"] == "error"
     assert "private-token" not in repr(errors) + repr(diagnostics)
+
+
+def test_the_timeout_setting_is_clamped_and_falls_back_to_the_default(monkeypatch):
+    def setting(value):
+        monkeypatch.setattr(state, "get_setting", lambda key, default=None: value)
+        return state.diagnostic_timeout_ms()
+
+    assert state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS == 5000
+    assert setting("12000") == 12000
+    assert setting(50) == state.MIN_DIAGNOSTIC_STATEMENT_TIMEOUT_MS == 1000
+    assert setting(999999) == state.MAX_DIAGNOSTIC_STATEMENT_TIMEOUT_MS == 30000
+    assert setting("not a number") == 5000
+    assert setting(None) == 5000
+
+    def broken(key, default=None):
+        raise DatabaseError("settings table unavailable", "08006")
+
+    monkeypatch.setattr(state, "get_setting", broken)
+    assert state.diagnostic_timeout_ms() == 5000
+    cursor = Cursor(row=(4,))
+    assert state._fetchone(Db(cursor), "SELECT 1", (), [], [], "analysis items", (0,)) == (4,)
+    assert cursor.statements[1] == "SET LOCAL statement_timeout = 5000"
