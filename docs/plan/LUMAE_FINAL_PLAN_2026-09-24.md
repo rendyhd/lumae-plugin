@@ -635,6 +635,10 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 - **Guards:**
   - Tests patch 264 package-level attributes (70 of them `get_db`). Keep the names resolvable from `__init__`, or move the patches in the same PR.
   - Add a test asserting every registered cron and RQ dotted path is still importable.
+- **Outcome (2026-09-26):** slice 1 done: steps 1 and 2 (`status_model.py` already existed from P2-1), plus the dotted-path guard.
+  - `settings_render.py` holds the 22 panel renderers and helpers, with bodies byte-identical apart from `_pkg.` qualification. It binds its package through `sys.modules[__package__]`, because the host installs the plugin under its own package name.
+  - `tests/plugins/test_task_paths.py` pins every registered task, cron and hook path, forbids importing the package by its repository name, and loads the plugin under a host-style name.
+  - **Deferred to after 1.3.0:** steps 3–6 and the transaction convention. They carry regression risk without user-visible benefit before the release; each stays a behaviour-preserving slice under the same guards.
 
 **P3-12 — LUM-019 documentation.**
 - The README describes current capabilities: catalogue, profiles, edges, the offline bulk copy, collections and the 1.3.0 upgrade runbook. DJ history moves to the changelog.
