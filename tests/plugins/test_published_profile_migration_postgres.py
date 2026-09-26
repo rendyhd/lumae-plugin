@@ -61,6 +61,7 @@ def _setup(db, monkeypatch, mod, *, two_sources):
         "ensure_catalog_reconcile_schedule",
         "ensure_provider_identity_recheck_schedule",
         "ensure_analysis_projection_schedule",
+        "ensure_collection_retention_schedule",
         "disable_legacy_backfill_schedule",
     ):
         monkeypatch.setattr(mod, name, lambda *_args: None)

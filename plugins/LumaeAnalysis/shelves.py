@@ -14,6 +14,12 @@ from . import migrations
 from .collection_manager import contract_v2, current_principal, require_collections_enabled
 
 SHELVES_SCHEMA_VERSION = 1
+# F2 (growth): shelf_mutations receipts are never compacted otherwise
+# (docs/contracts/LUMAE_SYNC_CONTRACT.md, idempotency). A retry with the same
+# mutation id after this age is no longer recognised and simply re-applies.
+RECEIPT_RETENTION_DAYS = 30
+RETENTION_BATCH_ROWS = 5_000
+RETENTION_MAX_BATCHES = 20
 
 
 def migrate_shelves(db):
@@ -34,6 +40,14 @@ def migrate_shelves(db):
             response JSONB NOT NULL, PRIMARY KEY (principal,catalog_id,id))""")
         # 1.3.0: a receipt binds its request body (NULL on older receipts).
         migrations.ensure_columns(cur, table("shelf_mutations"), "request_fingerprint TEXT")
+        # F2 (growth): when a receipt was written, so retention can delete old
+        # ones. No default: a volatile now() default would rewrite the whole
+        # table on this upgrade. A NULL (a receipt from before this column
+        # existed) never matches the retention age filter, so old receipts
+        # are left alone rather than guessed at.
+        migrations.ensure_columns(cur, table("shelf_mutations"), "created_at TIMESTAMPTZ")
+        migrations.ensure_index(cur, f"""CREATE INDEX IF NOT EXISTS lumae_shelf_mutations_created_idx
+            ON {table('shelf_mutations')} (created_at)""")
 
 
 def _text(value, name, maximum=512):
@@ -231,6 +245,42 @@ def rekey_shelves(cur, catalog_id, mapping):
                         (json.dumps(rewritten), *row[:-1]))
 
 
+def purge_expired_shelf_mutations(db, batch_rows=RETENTION_BATCH_ROWS, max_batches=RETENTION_MAX_BATCHES):
+    """Delete shelf receipts older than ``RECEIPT_RETENTION_DAYS`` (F2), oldest
+    first, in bounded batches. A receipt with no ``created_at`` (written
+    before that column existed) never matches and is left alone.
+
+    Each batch locks its candidates' scopes in ``_lock_scopes`` order (sorted
+    (principal, catalog_id), before the row is touched) — the same lock a
+    mutation takes before it reads or writes that scope's receipt — so a
+    receipt is never deleted out from under an in-flight mutation of its
+    scope.
+    """
+    deleted = 0
+    relation = table("shelf_mutations")
+    for _ in range(max_batches):
+        with db.cursor() as cur:
+            cur.execute(
+                f"SELECT principal, catalog_id, id, ctid::text FROM {relation} "
+                "WHERE created_at < now() - %s::interval "
+                "ORDER BY created_at LIMIT %s",
+                (f"{RECEIPT_RETENTION_DAYS} days", batch_rows),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                break
+            _lock_scopes(cur, [(principal, catalog_id) for principal, catalog_id, _, _ in rows])
+            cur.execute(
+                f"DELETE FROM {relation} WHERE ctid = ANY(%s::text[]::tid[])",
+                ([row[3] for row in rows],),
+            )
+            deleted += cur.rowcount
+        db.commit()
+        if len(rows) < batch_rows:
+            break
+    return deleted
+
+
 def register_shelf_routes(bp):
     @bp.get("/api/shelves/changes")
     @bp.get("/api/shelves/snapshot")
@@ -279,7 +329,7 @@ def register_shelf_routes(bp):
                 else:
                     payload, status = apply_mutation(cur, scope, body)
                     if status == 200:
-                        cur.execute(f"INSERT INTO {table('shelf_mutations')} (principal,catalog_id,id,response,request_fingerprint) VALUES (%s,%s,%s,%s::jsonb,%s)", (*scope, body["id"], json.dumps(payload), fingerprint))
+                        cur.execute(f"INSERT INTO {table('shelf_mutations')} (principal,catalog_id,id,response,request_fingerprint,created_at) VALUES (%s,%s,%s,%s::jsonb,%s,now())", (*scope, body["id"], json.dumps(payload), fingerprint))
             db.commit()
         except Exception:
             db.rollback()
