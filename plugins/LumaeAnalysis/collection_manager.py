@@ -61,6 +61,34 @@ UNAVAILABLE_RETRY_AFTER_S = 5
 SNAPSHOT_WAIT_S = 2
 _SNAPSHOT_SLOT = threading.BoundedSemaphore(1)
 
+# F2 (growth): collection_mutations and collection_restores are never
+# compacted (docs/contracts/LUMAE_SYNC_CONTRACT.md, idempotency). A periodic
+# cron task (collection_retention_task in __init__.py) reclaims rows past
+# these windows in bounded batches, so a busy install never holds one long
+# lock or scans the whole table in one query.
+#
+# An idempotency receipt older than this is deleted; a retry with that key
+# afterwards is no longer recognised and simply re-applies as a new request
+# (documented next to the idempotency rules).
+RECEIPT_RETENTION_DAYS = 30
+# A collection_restores row lives only from a chunked restore's first chunk
+# to its last: the last chunk deletes the row in the same transaction that
+# finishes the restore (_RestoreRun.step), so a restore that actually
+# finishes never leaves a row behind — what a row can still hold is one
+# still being resumed, or one abandoned partway (the client crashed, gave up,
+# or the backup was replaced). A client resumes by retrying the same HTTP
+# request, on ordinary retry timescales (seconds to a few minutes), never
+# days; a row whose ``updated_at`` is older than this has no realistic
+# resumer left. Using the same window as receipts keeps one retention story
+# for both tables and leaves generous slack over any legitimate retry.
+RESTORE_STALE_DAYS = 7
+# One retention pass deletes at most this many rows per batch (a bounded
+# ``ctid`` delete, never a table-wide scan under one lock), and at most this
+# many batches, so one cron tick's worst case is bounded and never holds a
+# lock past a single small batch.
+RETENTION_BATCH_ROWS = 5_000
+RETENTION_MAX_BATCHES = 20
+
 
 class FeedProtocolUnavailable(RuntimeError):
     """The committed collection feed frontier is absent or incompatible."""
@@ -334,6 +362,15 @@ def migrate_collections(db):
         cur,
         f"CREATE INDEX IF NOT EXISTS lumae_collections_changed_idx "
         f"ON {collection_changes_table()} (principal, seq)",
+    )
+    # F2 (growth): the retention cleanup scans this column oldest-first; the
+    # table has no other index that orders by it. collection_restores stays
+    # small (only currently in-progress or recently abandoned restores), so a
+    # plain scan there needs no index.
+    migrations.ensure_index(
+        cur,
+        f"CREATE INDEX IF NOT EXISTS lumae_collection_mutations_created_idx "
+        f"ON {collection_mutations_table()} (created_at)",
     )
     migrations.ensure_index(
         cur,
@@ -1322,6 +1359,18 @@ def _key_conflict(db, cur, principal, collection_id):
     return jsonify(body), 409
 
 
+def _key_lock_id(principal, key):
+    """The transaction advisory lock id serialising every mutation of ``key``.
+
+    Shared with the retention cleanup (F2), which takes this same lock,
+    in this same order (before touching the row), so it can never delete a
+    receipt or restore progress row out from under an in-flight request for
+    the same key.
+    """
+    identity = json.dumps((1, principal, key), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
+
+
 def _begin_mutation(db, cur, principal, key, fingerprint):
     """Open one mutation transaction; a response here ends the request.
 
@@ -1340,9 +1389,7 @@ def _begin_mutation(db, cur, principal, key, fingerprint):
     cur.execute(f"SET LOCAL lock_timeout = '{MUTATION_LOCK_TIMEOUT}'")
     if not key:
         return None
-    identity = json.dumps((1, principal, key), ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-    lock_id = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
-    cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+    cur.execute("SELECT pg_advisory_xact_lock(%s)", (_key_lock_id(principal, key),))
     cur.execute(
         f"SELECT response_payload::text, status_code, request_fingerprint, fingerprint_version, "
         f"collection_id FROM {collection_mutations_table()} "
@@ -1372,6 +1419,69 @@ def _begin_mutation(db, cur, principal, key, fingerprint):
         headers = {"Idempotency-Replayed": "true"}
     db.rollback()
     return jsonify(json.loads(payload_text)), status, headers
+
+
+def _purge_expired_rows(db, relation, age_column, retention_days,
+                         batch_rows=RETENTION_BATCH_ROWS, max_batches=RETENTION_MAX_BATCHES):
+    """Delete ``relation`` rows past ``retention_days`` old, oldest first, in
+    bounded batches of at most ``batch_rows``, capped at ``max_batches`` this
+    call (F2). Never a table-wide scan under one lock: each batch is its own
+    short transaction, selected then deleted by ``ctid``.
+
+    Every candidate row's per-key advisory lock (``_key_lock_id``, the same
+    lock ``_begin_mutation`` takes, in the same order: lock first, then touch
+    the row) is taken before it is deleted, so a row still involved in an
+    in-flight mutation for that key is never pulled out from under it — the
+    delete simply waits for that transaction, exactly as another mutation
+    under the same key would.
+
+    Returns the number of rows deleted.
+    """
+    deleted = 0
+    for _ in range(max_batches):
+        with db.cursor() as cur:
+            cur.execute(
+                f"SELECT principal, idempotency_key, ctid::text FROM {relation} "
+                f"WHERE {age_column} < now() - %s::interval "
+                f"ORDER BY {age_column} LIMIT %s",
+                (f"{retention_days} days", batch_rows),
+            )
+            rows = cur.fetchall()
+            if not rows:
+                break
+            for lock_id in sorted({_key_lock_id(principal, key) for principal, key, _ in rows}):
+                cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+            cur.execute(
+                f"DELETE FROM {relation} WHERE ctid = ANY(%s::text[]::tid[])",
+                ([row[2] for row in rows],),
+            )
+            deleted += cur.rowcount
+        db.commit()
+        if len(rows) < batch_rows:
+            break
+    return deleted
+
+
+def purge_expired_collection_mutations(db):
+    """Delete idempotency receipts older than ``RECEIPT_RETENTION_DAYS`` (F2).
+
+    A retry with the deleted key afterwards finds no receipt and simply
+    re-applies as a new request (docs/contracts/LUMAE_SYNC_CONTRACT.md).
+    """
+    return _purge_expired_rows(
+        db, collection_mutations_table(), "created_at", RECEIPT_RETENTION_DAYS
+    )
+
+
+def purge_stale_collection_restores(db):
+    """Delete abandoned ``collection_restores`` progress older than
+    ``RESTORE_STALE_DAYS`` since it last moved (F2). A row still being resumed
+    keeps a recent ``updated_at`` (every chunk updates it) and always
+    survives, whatever its ``chunks_done``; see ``RESTORE_STALE_DAYS``.
+    """
+    return _purge_expired_rows(
+        db, collection_restores_table(), "updated_at", RESTORE_STALE_DAYS
+    )
 
 
 def _mutation_response(handler, collection_id=None):

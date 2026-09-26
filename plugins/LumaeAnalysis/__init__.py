@@ -29,7 +29,12 @@ from . import analysis_isolation
 from . import migrations
 from . import optional_storage
 from . import credits_service, credits_store, personal_discovery, music_metadata
-from .shelves import SHELVES_SCHEMA_VERSION, migrate_shelves, register_shelf_routes
+from .shelves import (
+    SHELVES_SCHEMA_VERSION,
+    migrate_shelves,
+    purge_expired_shelf_mutations,
+    register_shelf_routes,
+)
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -118,6 +123,8 @@ from .collection_manager import (
     collections_enabled,
     health_scope_mode,
     migrate_collections,
+    purge_expired_collection_mutations,
+    purge_stale_collection_restores,
     register_collection_routes,
     render_collections_settings_panel,
 )
@@ -1178,6 +1185,31 @@ def provider_identity_recheck_task(server_id=None):
             result["error"] = str(exc)
         results.append(result)
     return {"checked": len(results), "results": results}
+
+
+def collection_retention_task():
+    """Delete idempotency receipts and stale restore progress past their
+    retention window, in bounded batches (F2, docs/plan P3-4 item 6:
+    collections growth). Runs from the same cron watchdog as the other
+    periodic maintenance tasks; see collection_manager and shelves for
+    the retention windows, batch limits and lock order."""
+    if maintenance_paused():
+        return {"status": "paused", "reason": "maintenance_paused"}
+    db = get_db()
+    try:
+        mutations_deleted = purge_expired_collection_mutations(db)
+        restores_deleted = purge_stale_collection_restores(db)
+        shelf_deleted = purge_expired_shelf_mutations(db)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis collection retention cleanup failed")
+        return {"status": "error"}
+    return {
+        "status": "ok",
+        "collection_mutations_deleted": mutations_deleted,
+        "collection_restores_deleted": restores_deleted,
+        "shelf_mutations_deleted": shelf_deleted,
+    }
 
 
 def observe_provider_identities_on_start():
@@ -5462,3 +5494,4 @@ def register(ctx):
         "provider_identity_recheck", provider_identity_recheck_task, queue="default"
     )
     ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")
+    ctx.add_cron_task("collection_retention", collection_retention_task, queue="default")
