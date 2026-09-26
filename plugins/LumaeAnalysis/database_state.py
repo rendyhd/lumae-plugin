@@ -3,14 +3,77 @@
 The dashboard deliberately uses aggregate queries against the currently
 published catalogue and analysis generations.  It never enumerates track
 metadata, exposes credentials, or mutates database state.
+
+Every diagnostic read runs in a savepoint of the host's request transaction
+(or, on an autocommit connection, in a transaction of its own) under
+``SET LOCAL statement_timeout`` (plugin setting
+``diagnostic_statement_timeout_ms``, default 5000), and is always rolled back
+to that savepoint. One slow or blocked query therefore
+cannot hold the web thread, and the host connection keeps its own
+``statement_timeout``. A section whose query failed or timed out is reported
+as unavailable (``None`` counts), never as zeros.
 """
 
+from contextlib import contextmanager
+from contextvars import ContextVar
 from datetime import datetime, timezone
 from html import escape
 import re
 from time import monotonic
 
-from plugin.api import table
+from plugin.api import get_setting, logger, table
+
+from .profile_publication import (
+    RETRY_LIMIT,
+    REVISION_FAILURES,
+    SAFE_FAILURES,
+    TRANSIENT_FAILURES,
+)
+from .redaction import redact_error_text
+
+# Per statement, from the plugin setting ``diagnostic_statement_timeout_ms``.
+# On the representative fixture (scripts/perf/seed.py --scale 1: 132k tracks,
+# 94k profiles, 76k mappings) the slowest diagnostic reads, the AudioMuse core
+# and waveform work-state aggregates, take 0.34-0.39 s (p50-p95) and the whole
+# page about 1 s. The default leaves more than 10x headroom for a larger
+# library, a cold cache or a slow host, and still bounds a read that waits on a
+# lock (a migration's ALTER TABLE) or runs away. A slower host raises it.
+DIAGNOSTIC_TIMEOUT_SETTING = "diagnostic_statement_timeout_ms"
+DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS = 5000
+MIN_DIAGNOSTIC_STATEMENT_TIMEOUT_MS = 1000
+MAX_DIAGNOSTIC_STATEMENT_TIMEOUT_MS = 30000
+_SAVEPOINT = "lumae_diagnostic_read"
+# The bound of the reads in progress, resolved once per snapshot or block.
+_TIMEOUT_MS = ContextVar("lumae_diagnostic_timeout_ms", default=None)
+
+
+def diagnostic_timeout_ms():
+    """The per-statement bound, clamped; the default on any error.
+
+    Called before any bounded read opens its savepoint, so a setting lookup
+    that reads the database is never inside one.
+    """
+    try:
+        value = int(get_setting(
+            DIAGNOSTIC_TIMEOUT_SETTING, DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS
+        ))
+    except Exception:
+        return DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS
+    return min(max(value, MIN_DIAGNOSTIC_STATEMENT_TIMEOUT_MS),
+               MAX_DIAGNOSTIC_STATEMENT_TIMEOUT_MS)
+
+
+@contextmanager
+def _timeout_scope():
+    """Resolve the bound once for the enclosed reads (the outermost scope wins)."""
+    if _TIMEOUT_MS.get() is not None:
+        yield
+        return
+    token = _TIMEOUT_MS.set(diagnostic_timeout_ms())
+    try:
+        yield
+    finally:
+        _TIMEOUT_MS.reset(token)
 
 _OPERATION_BY_SECTION = {
     "sonic links": "sonic_links_summary",
@@ -24,10 +87,50 @@ _OPERATION_BY_SECTION = {
     "analysis journal": "analysis_journal_summary",
     "bootstrap leases": "bootstrap_leases_summary",
     "AudioMuse core": "audiomuse_core_summary",
+    "release readiness": "release_readiness_summary",
 }
 _SQLSTATE_RE = re.compile(r"[0-9A-Z]{5}")
 _MAX_DIAGNOSTIC_OPERATIONS = 16
 _MAX_DB_CALL_TIME_MS = 3_600_000
+
+
+def redact_stored_error(value):
+    """Stored error text (``last_error``, ``str(exc)``) as it may be shown.
+
+    Retry category codes (``SAFE_FAILURES``) pass unchanged; any other text is
+    redacted and length-capped (``redaction.redact_error_text``). None stays
+    None and any other value becomes a string, so a field keeps its type.
+    """
+    if value is None:
+        return None
+    return redact_error_text(value, SAFE_FAILURES) or ""
+
+
+# Sections of a source DTO (``resolve_catalog_source``, catalogue health) that
+# carry a stored ``last_error``.
+_SOURCE_ERROR_SECTIONS = ("catalog", "analysis", "preparation", "provider_identity_transition")
+
+
+def redact_source_errors(source):
+    """A copy of a source DTO whose stored ``last_error`` texts are redacted."""
+    source = dict(source)
+    for key in _SOURCE_ERROR_SECTIONS:
+        section = source.get(key)
+        if isinstance(section, dict) and section.get("last_error") is not None:
+            source[key] = {**section, "last_error": redact_stored_error(section["last_error"])}
+    return source
+
+
+class _Unavailable:
+    """What a failed or timed-out diagnostic read returns (never zeros)."""
+
+    def __repr__(self):
+        return "UNAVAILABLE"
+
+
+UNAVAILABLE = _Unavailable()
+# A workflow row that could not be read (no row at all is None, "not started").
+WORKFLOW_UNAVAILABLE = {"status": None, "unavailable": True}
 
 
 def _iso_now():
@@ -81,66 +184,157 @@ def safe_snapshot_error(exc):
     }
 
 
+def _log_failure(section, exc):
+    # The error class and SQLSTATE only: driver messages can carry SQL, DSN
+    # fragments or paths.
+    metadata = _error_metadata(exc)
+    logger.warning(
+        "lumae_analysis diagnostic read %s unavailable (%s, %s%s)",
+        _OPERATION_BY_SECTION[section],
+        type(exc).__name__,
+        metadata["error_class"],
+        f", SQLSTATE {metadata['sqlstate']}" if metadata.get("sqlstate") else "",
+    )
+
+
 def _cursor_or_error(db, errors, section):
     try:
         return db.cursor()
     except Exception as exc:
         _error(errors, section, exc)
+        _log_failure(section, exc)
         return None
 
 
-def _cleanup_query(db, cur, errors, section, failed):
-    if failed:
-        rollback = getattr(db, "rollback", None)
-        if callable(rollback):
+def _owns_transaction(db):
+    # An autocommit connection has no transaction to hold a savepoint.
+    return getattr(db, "autocommit", False) is True
+
+
+def _open_bound(cur, owned):
+    """Start the savepoint (or owned transaction); True once it exists."""
+    cur.execute("BEGIN" if owned else f"SAVEPOINT {_SAVEPOINT}")
+    return True
+
+
+def _current_timeout_ms():
+    """The bound of the enclosing scope; resolve it before opening a savepoint."""
+    timeout_ms = _TIMEOUT_MS.get()
+    return diagnostic_timeout_ms() if timeout_ms is None else timeout_ms
+
+
+def _set_bound(cur, timeout_ms):
+    # SET LOCAL lasts until the savepoint is rolled back, or the owned
+    # transaction ends: the host's own statement_timeout is never changed.
+    cur.execute(f"SET LOCAL statement_timeout = {int(timeout_ms)}")
+
+
+def _close_bound(db, cur, owned, opened):
+    """Undo everything since the savepoint, the SET LOCAL included.
+
+    Rolling back to the savepoint also recovers the transaction after a failed
+    or cancelled read, without discarding the host's transaction. Without a
+    savepoint to return to, the transaction is rolled back instead. Returns
+    the exception that prevented recovery, or None.
+    """
+    if opened:
+        try:
+            if owned:
+                cur.execute("ROLLBACK")
+            else:
+                cur.execute(f"ROLLBACK TO SAVEPOINT {_SAVEPOINT}")
+                cur.execute(f"RELEASE SAVEPOINT {_SAVEPOINT}")
+            return None
+        except Exception:
+            pass
+    rollback = getattr(db, "rollback", None)
+    if callable(rollback):
+        try:
+            rollback()
+        except Exception as exc:
+            return exc
+    return None
+
+
+@contextmanager
+def bounded_reads(db):
+    """Run the block's read-only statements under the diagnostic timeout.
+
+    For reads outside ``collect_database_state`` (source resolution). The
+    block's exceptions propagate; the savepoint is always rolled back.
+    """
+    with _timeout_scope():
+        owned = _owns_transaction(db)
+        cur = db.cursor()
+        opened = False
+        timeout_ms = _current_timeout_ms()
+        try:
+            opened = _open_bound(cur, owned)
+            _set_bound(cur, timeout_ms)
+            yield
+        finally:
+            _close_bound(db, cur, owned, opened)
             try:
-                rollback()
-            except Exception as exc:
-                _error(errors, section, exc)
+                cur.close()
+            except Exception:
+                pass
+
+
+def _run(db, errors, diagnostics, section, work):
+    """Run ``work(cursor)`` bounded; its result, or UNAVAILABLE on failure."""
+    cur = _cursor_or_error(db, errors, section)
+    if cur is None:
+        return UNAVAILABLE
+    owned = _owns_transaction(db)
+    opened = False
+    timeout_ms = _current_timeout_ms()
+    started_at = monotonic()
     try:
-        cur.close()
+        opened = _open_bound(cur, owned)
+        _set_bound(cur, timeout_ms)
+        result = work(cur)
+        _record_diagnostic(diagnostics, section, started_at)
+        return result
     except Exception as exc:
         _error(errors, section, exc)
+        _record_diagnostic(diagnostics, section, started_at, exc)
+        _log_failure(section, exc)
+        return UNAVAILABLE
+    finally:
+        failure = _close_bound(db, cur, owned, opened)
+        if failure is not None:
+            _error(errors, section, failure)
+        try:
+            cur.close()
+        except Exception as exc:
+            _error(errors, section, exc)
 
 
 def _fetchone(db, sql, params, errors, diagnostics, section, default):
-    cur = _cursor_or_error(db, errors, section)
-    if cur is None:
-        return default
-    started_at = monotonic()
-    failed = False
-    try:
+    """The first row, ``default`` when there is none, UNAVAILABLE on failure."""
+
+    def work(cur):
         cur.execute(sql, params)
-        result = cur.fetchone() or default
-        _record_diagnostic(diagnostics, section, started_at)
-        return result
-    except Exception as exc:
-        failed = True
-        _error(errors, section, exc)
-        _record_diagnostic(diagnostics, section, started_at, exc)
-        return default
-    finally:
-        _cleanup_query(db, cur, errors, section, failed)
+        return cur.fetchone() or default
+
+    return _run(db, errors, diagnostics, section, work)
 
 
 def _fetchall(db, sql, params, errors, diagnostics, section):
-    cur = _cursor_or_error(db, errors, section)
-    if cur is None:
-        return []
-    started_at = monotonic()
-    failed = False
-    try:
+    """All rows, or UNAVAILABLE on failure."""
+
+    def work(cur):
         cur.execute(sql, params)
-        result = cur.fetchall()
-        _record_diagnostic(diagnostics, section, started_at)
-        return result
-    except Exception as exc:
-        failed = True
-        _error(errors, section, exc)
-        _record_diagnostic(diagnostics, section, started_at, exc)
-        return []
-    finally:
-        _cleanup_query(db, cur, errors, section, failed)
+        return cur.fetchall()
+
+    return _run(db, errors, diagnostics, section, work)
+
+
+def _counts(keys, row):
+    """Integer counts by key; every count is None when the read failed."""
+    if row is UNAVAILABLE:
+        return {key: None for key in keys}
+    return {key: int(value or 0) for key, value in zip(keys, row)}
 
 
 def _link_state(db, source, errors, diagnostics):
@@ -186,7 +380,7 @@ def _link_state(db, source, errors, diagnostics):
         "missing",
         "usable_analysis_ids",
     )
-    return {key: int(value or 0) for key, value in zip(keys, row)}
+    return _counts(keys, row)
 
 
 def _analysis_item_state(db, source, errors, diagnostics):
@@ -208,11 +402,7 @@ def _analysis_item_state(db, source, errors, diagnostics):
         "analysis items",
         (0, 0, 0),
     )
-    return {
-        "items": int(row[0] or 0),
-        "musicnn_vectors": int(row[1] or 0),
-        "clap_vectors": int(row[2] or 0),
-    }
+    return _counts(("items", "musicnn_vectors", "clap_vectors"), row)
 
 
 def _group_state(db, source, errors, diagnostics):
@@ -239,54 +429,223 @@ def _group_state(db, source, errors, diagnostics):
         "analysis groups",
         (0, 0, 0),
     )
+    return _counts(("analysis_groups", "shared_groups", "largest_group"), row)
+
+
+# ---- waveform profile work states -------------------------------------------
+#
+# Each available track of the published catalogue is in exactly one state.
+# ``due`` is the background scheduler's selection: ``fetch_backfill_rows``
+# (``__init__.py``) called with a ``catalog_instance_id``, mirrored predicate by
+# predicate. The categories, attempt limit and version slots come from the
+# retry model (``profile_publication``), so a new category is classified here
+# as soon as it is added there. The scheduler still spells its predicates
+# inline; tests/plugins/test_database_state_postgres.py pins that both select
+# the same rows in every state. The one deliberate difference: cooldowns are
+# compared with ``statement_timestamp()`` (this read) where the scheduler uses
+# ``now()`` (its own short transaction).
+
+PROFILE_WORK_STATES = (
+    # The scheduler picks it on its next batch.
+    "due",
+    # An admitted attempt (``pending`` / ``pending_interactive``).
+    "pending",
+    # Waiting for a catalogue media fingerprint (``deferred_no_media_revision``).
+    "deferred_no_media_revision",
+    # ``ready`` and current, or no fingerprint to compare with.
+    "ready",
+    # Released back to the queue (``queue_unavailable``), in its cooldown.
+    "deferred",
+    # A transient failure in its cooldown (``retry_after`` in the future).
+    "cooling",
+    # A transient failure with ``RETRY_LIMIT`` attempts used.
+    "exhausted",
+    # A failure retried only for new media, analyzer or profile schema.
+    "awaiting_revision",
+    # Nothing in the scheduler will pick it up (LUM-007 stranded rows).
+    "unscheduled",
+)
+
+_MEDIA_KNOWN = "NULLIF(t.media_fp, '') IS NOT NULL"
+_REVISION_CHANGED = f"""({_MEDIA_KNOWN}
+                 AND p.retry_media_signature IS NOT NULL
+                 AND p.retry_media_signature IS DISTINCT FROM
+                     ('catalog-media:' || t.media_fp))"""
+# fetch_backfill_rows(catalog_instance_id=...): its WHERE clause after the
+# catalogue join, with ``retry_category IN (...)`` from TRANSIENT_FAILURES and
+# the literal ``retry_count < 3`` from RETRY_LIMIT.
+_DUE = f"""(
+            (COALESCE(p.status, '') NOT IN
+                 ('pending', 'pending_interactive', 'deferred_no_media_revision')
+             OR (p.status='deferred_no_media_revision' AND {_MEDIA_KNOWN}))
+            AND (
+                p.track_id IS NULL
+                OR p.analyzer_ver IS NULL
+                OR p.analyzer_ver < %(analyzer_version)s
+                OR (p.status='stale' AND (
+                        p.retry_category IS NULL
+                        OR (p.retry_category='queue_unavailable'
+                            AND p.retry_count < %(retry_limit)s
+                            AND p.retry_after <= statement_timestamp())
+                        OR {_REVISION_CHANGED}))
+                OR (p.status='deferred_no_media_revision' AND {_MEDIA_KNOWN})
+                OR (p.status='ready' AND {_MEDIA_KNOWN}
+                    AND p.media_signature IS DISTINCT FROM
+                        ('catalog-media:' || COALESCE(t.media_fp, '')))
+                OR (p.status IN ('failed', 'skipped_no_file') AND (
+                        {_REVISION_CHANGED}
+                        OR (p.retry_analyzer_ver IS NOT NULL
+                            AND p.retry_analyzer_ver < %(analyzer_version)s)
+                        OR (p.retry_profile_schema_ver IS NOT NULL
+                            AND p.retry_profile_schema_ver < %(schema_version)s)
+                        OR (p.retry_category IS NULL AND p.retry_count=0)
+                        OR (p.retry_category = ANY(%(transient)s)
+                            AND p.retry_count < %(retry_limit)s
+                            AND p.retry_after <= statement_timestamp())))
+            ))"""
+
+
+def _profile_work_sql(select):
+    """``select`` over ``work``: one row per available published track.
+
+    ``work`` has ``track_id``, ``eligible``, ``stored``, ``status``,
+    ``retry_category``, ``state`` (NULL for a track that is not
+    analysis-eligible; the scheduler never selects those) and ``schedulable``
+    (the scheduler only selects from an active source with a complete
+    catalogue, otherwise nothing is due).
+    """
+    return f"""
+        WITH source AS (
+            SELECT s.catalog_instance_id, c.published_generation,
+                   (s.rebind_status='active' AND c.status='complete') AS schedulable
+              FROM {table("catalog_sources")} s
+              JOIN {table("catalog_state")} c USING (catalog_instance_id)
+             WHERE s.catalog_instance_id=%(source)s
+        ),
+        work AS (
+            SELECT t.track_id, source.schedulable,
+                   t.analysis_eligible IS TRUE AS eligible,
+                   p.track_id IS NOT NULL AS stored,
+                   p.status, p.retry_category,
+                   CASE
+                     WHEN t.analysis_eligible IS NOT TRUE THEN NULL
+                     WHEN {_DUE} THEN 'due'
+                     WHEN p.status IN ('pending', 'pending_interactive') THEN 'pending'
+                     WHEN p.status='deferred_no_media_revision'
+                       THEN 'deferred_no_media_revision'
+                     WHEN p.status='ready' THEN 'ready'
+                     WHEN p.status='stale' AND p.retry_category='queue_unavailable'
+                          AND p.retry_count < %(retry_limit)s
+                          AND p.retry_after > statement_timestamp()
+                       THEN 'deferred'
+                     WHEN p.status IN ('failed', 'skipped_no_file')
+                          AND p.retry_category = ANY(%(transient)s)
+                          AND p.retry_count < %(retry_limit)s
+                          AND p.retry_after > statement_timestamp()
+                       THEN 'cooling'
+                     WHEN p.status IN ('failed', 'skipped_no_file', 'stale')
+                          AND p.retry_category = ANY(%(transient)s)
+                          AND p.retry_count >= %(retry_limit)s
+                       THEN 'exhausted'
+                     WHEN p.status IN ('failed', 'skipped_no_file', 'stale')
+                          AND p.retry_category = ANY(%(revision)s)
+                       THEN 'awaiting_revision'
+                     ELSE 'unscheduled'
+                   END AS state
+              FROM source
+              JOIN {table("catalog_tracks")} t
+                ON t.catalog_instance_id=source.catalog_instance_id
+               AND t.published_generation=source.published_generation
+              LEFT JOIN {table("source_profiles")} p
+                ON p.track_id=t.track_id
+               AND p.catalog_instance_id=source.catalog_instance_id
+             WHERE t.available=TRUE
+        )
+        {select}
+    """
+
+
+_PROFILE_COUNT_KEYS = (
+    "catalogue_tracks", "eligible_tracks", "stored", "published", *PROFILE_WORK_STATES,
+)
+
+
+def _profile_counts_select():
+    states = ",\n               ".join(
+        f"count(*) FILTER (WHERE state='{state}') AS {state}"
+        for state in PROFILE_WORK_STATES
+    )
+    return f"""
+        SELECT count(*) AS catalogue_tracks,
+               count(*) FILTER (WHERE eligible) AS eligible_tracks,
+               count(*) FILTER (WHERE eligible AND stored) AS stored,
+               (SELECT count(*) FROM {table("published_source_profiles")}
+                 WHERE catalog_instance_id=%(source)s) AS published,
+               {states},
+               (SELECT bool_or(schedulable) FROM source) AS schedulable,
+               (SELECT COALESCE(jsonb_object_agg(category, tracks), '{{}}'::jsonb)
+                  FROM (SELECT COALESCE(retry_category, '') AS category,
+                               count(*) AS tracks
+                          FROM work
+                         WHERE eligible AND status IN ('failed', 'skipped_no_file')
+                         GROUP BY 1) categories) AS failure_categories
+          FROM work
+    """
+
+
+def profile_work_params(catalog_instance_id):
+    # The package defines the analyzer and schema versions after importing
+    # this module; read them when the diagnostics run, as the scheduler does.
+    from . import ANALYZER_VERSION, SCHEMA_VERSION
+
     return {
-        "analysis_groups": int(row[0] or 0),
-        "shared_groups": int(row[1] or 0),
-        "largest_group": int(row[2] or 0),
+        "source": catalog_instance_id,
+        "analyzer_version": int(ANALYZER_VERSION),
+        "schema_version": int(SCHEMA_VERSION),
+        "retry_limit": int(RETRY_LIMIT),
+        "transient": sorted(TRANSIENT_FAILURES),
+        "revision": sorted(REVISION_FAILURES),
     }
+
+
+def _category_retry(category):
+    if category in TRANSIENT_FAILURES:
+        return "transient"
+    if category in REVISION_FAILURES:
+        return "revision"
+    return "unknown"
 
 
 def _profile_state(db, source, errors, diagnostics):
     row = _fetchone(
         db,
-        f"""
-        SELECT count(*) AS catalogue_tracks,
-               count(p.track_id) AS stored,
-               count(*) FILTER (WHERE p.status='ready') AS ready,
-               count(*) FILTER (
-                 WHERE p.status IN ('pending', 'pending_interactive')
-               ) AS pending,
-               count(*) FILTER (WHERE p.status='failed') AS failed,
-               count(*) FILTER (WHERE p.status='skipped_no_file') AS skipped,
-               count(*) FILTER (
-                 WHERE p.track_id IS NULL OR p.status IN ('stale', 'missing')
-               ) AS needs_attention
-          FROM {table("catalog_tracks")} t
-          LEFT JOIN {table("source_profiles")} p
-            ON p.catalog_instance_id=t.catalog_instance_id
-           AND p.track_id=t.track_id
-         WHERE t.catalog_instance_id=%s AND t.published_generation=%s
-           AND t.available=TRUE
-        """,
-        (
-            source["catalog_instance_id"],
-            source.get("catalog", {}).get("generation", 0),
-        ),
+        _profile_work_sql(_profile_counts_select()),
+        profile_work_params(source["catalog_instance_id"]),
         errors,
         diagnostics,
         "waveform profiles",
-        (0,) * 7,
+        None,
     )
-    keys = (
-        "catalogue_tracks",
-        "stored",
-        "ready",
-        "pending",
-        "failed",
-        "skipped",
-        "needs_attention",
-    )
-    return {key: int(value or 0) for key, value in zip(keys, row)}
+    if row is UNAVAILABLE or row is None:
+        return {
+            **{key: None for key in _PROFILE_COUNT_KEYS},
+            "schedulable": None,
+            "failure_categories": None,
+        }
+    counts = _counts(_PROFILE_COUNT_KEYS, row)
+    categories = row[len(_PROFILE_COUNT_KEYS) + 1] or {}
+    return {
+        **counts,
+        "schedulable": bool(row[len(_PROFILE_COUNT_KEYS)]),
+        "failure_categories": [
+            {
+                "category": str(category) or "uncategorized",
+                "tracks": int(tracks or 0),
+                "retry": _category_retry(category),
+            }
+            for category, tracks in sorted(categories.items())
+        ],
+    }
 
 
 def _workflow_state(db, source, errors, diagnostics):
@@ -333,42 +692,47 @@ def _workflow_state(db, source, errors, diagnostics):
         diagnostics,
         "analysis run workflow",
     )
+    # No row is "not started" (None); a failed read is WORKFLOW_UNAVAILABLE.
+    if preparation is UNAVAILABLE:
+        preparation = dict(WORKFLOW_UNAVAILABLE)
+    elif preparation:
+        preparation = {
+            "status": preparation[0],
+            "phase": preparation[1],
+            "queued_profiles": int(preparation[2] or 0),
+            "profile_jobs": int(preparation[3] or 0),
+            "last_error": preparation[4],
+            "started_at": preparation[5],
+            "completed_at": preparation[6],
+            "updated_at": preparation[7],
+        }
+    if backfill is UNAVAILABLE:
+        backfill = dict(WORKFLOW_UNAVAILABLE)
+    elif backfill:
+        backfill = {
+            "status": backfill[0],
+            "processed_profiles": int(backfill[1] or 0),
+            "queued_profiles": int(backfill[2] or 0),
+            "last_error": backfill[3],
+            "started_at": backfill[4],
+            "completed_at": backfill[5],
+            "updated_at": backfill[6],
+        }
     return {
-        "preparation": (
-            {
-                "status": preparation[0],
-                "phase": preparation[1],
-                "queued_profiles": int(preparation[2] or 0),
-                "profile_jobs": int(preparation[3] or 0),
-                "last_error": preparation[4],
-                "started_at": preparation[5],
-                "completed_at": preparation[6],
-                "updated_at": preparation[7],
-            }
-            if preparation
-            else None
+        "preparation": preparation or None,
+        "backfill": backfill or None,
+        "analysis_runs": (
+            None
+            if runs is UNAVAILABLE
+            else [
+                {
+                    "status": str(row[0]),
+                    "count": int(row[1] or 0),
+                    "updated_at": row[2],
+                }
+                for row in runs
+            ]
         ),
-        "backfill": (
-            {
-                "status": backfill[0],
-                "processed_profiles": int(backfill[1] or 0),
-                "queued_profiles": int(backfill[2] or 0),
-                "last_error": backfill[3],
-                "started_at": backfill[4],
-                "completed_at": backfill[5],
-                "updated_at": backfill[6],
-            }
-            if backfill
-            else None
-        ),
-        "analysis_runs": [
-            {
-                "status": str(row[0]),
-                "count": int(row[1] or 0),
-                "updated_at": row[2],
-            }
-            for row in runs
-        ],
     }
 
 
@@ -422,18 +786,15 @@ def _journal_state(db, source, errors, diagnostics):
             "epoch": catalog.get("epoch"),
             "head": int(catalog.get("head_seq") or 0),
             "floor": int(catalog.get("floor_seq") or 0),
-            "rows": int(catalog_rows[0] or 0),
+            "rows": _counts(("rows",), catalog_rows)["rows"],
         },
         "analysis": {
             "epoch": analysis.get("epoch"),
             "head": int(analysis.get("head_seq") or 0),
             "floor": int(analysis.get("floor_seq") or 0),
-            "rows": int(analysis_rows[0] or 0),
+            "rows": _counts(("rows",), analysis_rows)["rows"],
         },
-        "bootstrap_leases": {
-            "active": int(leases[0] or 0),
-            "completed": int(leases[1] or 0),
-        },
+        "bootstrap_leases": _counts(("active", "completed"), leases),
     }
 
 
@@ -474,22 +835,28 @@ def _core_state(db, compatibility, source, errors, diagnostics=None):
         )
         return {
             "mode": "source_scoped",
-            "mapping_rows": int(row[0] or 0),
-            "canonical_analysis_ids": int(row[1] or 0),
-            "scored": int(row[2] or 0),
-            "musicnn_vectors": int(row[3] or 0),
-            "clap_vectors": int(row[4] or 0),
-            "chromaprint": int(row[5] or 0),
+            **_counts(
+                (
+                    "mapping_rows",
+                    "canonical_analysis_ids",
+                    "scored",
+                    "musicnn_vectors",
+                    "clap_vectors",
+                    "chromaprint",
+                ),
+                row,
+            ),
         }
 
     if compatibility.adapter != "v2_single_server":
+        # No supported adapter: nothing was counted.
         return {
             "mode": "unavailable",
-            "mapping_rows": 0,
-            "canonical_analysis_ids": 0,
-            "scored": 0,
-            "musicnn_vectors": 0,
-            "clap_vectors": 0,
+            "mapping_rows": None,
+            "canonical_analysis_ids": None,
+            "scored": None,
+            "musicnn_vectors": None,
+            "clap_vectors": None,
             "chromaprint": None,
         }
 
@@ -506,19 +873,33 @@ def _core_state(db, compatibility, source, errors, diagnostics=None):
         "AudioMuse core",
         (0, 0, 0),
     )
+    counts = _counts(("scored", "musicnn_vectors", "clap_vectors"), row)
     return {
         "mode": "single_server",
-        "mapping_rows": int(row[0] or 0),
-        "canonical_analysis_ids": int(row[0] or 0),
-        "scored": int(row[0] or 0),
-        "musicnn_vectors": int(row[1] or 0),
-        "clap_vectors": int(row[2] or 0),
+        "mapping_rows": counts["scored"],
+        "canonical_analysis_ids": counts["scored"],
+        **counts,
         "chromaprint": None,
     }
 
 
-def collect_database_state(db, compatibility, sources, readiness_by_source=None):
-    """Collect a resilient logical snapshot using aggregate, read-only queries."""
+def _readiness_state(db, source, readiness, errors, diagnostics):
+    """The release readiness of one source, bounded like the other reads."""
+    result = _run(
+        db, errors, diagnostics, "release readiness", lambda _cur: readiness(source)
+    )
+    return {} if result is UNAVAILABLE else (result or {})
+
+
+def collect_database_state(
+    db, compatibility, sources, readiness_by_source=None, readiness=None
+):
+    """Collect a resilient logical snapshot using aggregate, read-only queries.
+
+    ``readiness``, when given, is called with each source and runs under the
+    same statement timeout; ``readiness_by_source`` supplies precomputed
+    results instead.
+    """
     readiness_by_source = readiness_by_source or {}
     snapshot = {
         "captured_at": _iso_now(),
@@ -539,41 +920,47 @@ def collect_database_state(db, compatibility, sources, readiness_by_source=None)
     if not compatibility.supported:
         snapshot["status"] = "core_unsupported"
 
-    for source in sources:
-        source_errors = []
-        source_diagnostics = []
-        links = _link_state(db, source, source_errors, source_diagnostics)
-        items = _analysis_item_state(db, source, source_errors, source_diagnostics)
-        groups = _group_state(db, source, source_errors, source_diagnostics)
-        profiles = _profile_state(db, source, source_errors, source_diagnostics)
-        workflow = _workflow_state(db, source, source_errors, source_diagnostics)
-        journals = _journal_state(db, source, source_errors, source_diagnostics)
-        core = _core_state(db, compatibility, source, source_errors, source_diagnostics)
-        readiness = readiness_by_source.get(source["catalog_instance_id"]) or {}
-        snapshot["sources"].append(
-            {
-                "identity": {
-                    "catalog_instance_id": source["catalog_instance_id"],
-                    "server_id": source.get("server_id"),
-                    "name": source.get("name") or "Music server",
-                    "provider_type": source.get("provider_type") or "unknown",
-                    "is_default": bool(source.get("is_default")),
-                    "rebind_status": source.get("rebind_status") or "unknown",
-                },
-                "catalog": source.get("catalog") or {},
-                "analysis": source.get("analysis") or {},
-                "links": links,
-                "items": {**items, **groups},
-                "profiles": profiles,
-                "workflow": workflow,
-                "journals": journals,
-                "core": core,
-                "readiness": readiness,
-                "diagnostics": {"scope": "server_db_execute_fetch", "unit": "milliseconds", "operations": source_diagnostics},
-                "errors": source_errors,
-            }
-        )
-        snapshot["errors"].extend(source_errors)
+    # One setting lookup for all reads, before any savepoint is opened.
+    with _timeout_scope():
+        for source in sources:
+            source_errors = []
+            source_diagnostics = []
+            links = _link_state(db, source, source_errors, source_diagnostics)
+            items = _analysis_item_state(db, source, source_errors, source_diagnostics)
+            groups = _group_state(db, source, source_errors, source_diagnostics)
+            profiles = _profile_state(db, source, source_errors, source_diagnostics)
+            workflow = _workflow_state(db, source, source_errors, source_diagnostics)
+            journals = _journal_state(db, source, source_errors, source_diagnostics)
+            core = _core_state(db, compatibility, source, source_errors, source_diagnostics)
+            source_readiness = (
+                _readiness_state(db, source, readiness, source_errors, source_diagnostics)
+                if readiness is not None
+                else readiness_by_source.get(source["catalog_instance_id"]) or {}
+            )
+            snapshot["sources"].append(
+                {
+                    "identity": {
+                        "catalog_instance_id": source["catalog_instance_id"],
+                        "server_id": source.get("server_id"),
+                        "name": source.get("name") or "Music server",
+                        "provider_type": source.get("provider_type") or "unknown",
+                        "is_default": bool(source.get("is_default")),
+                        "rebind_status": source.get("rebind_status") or "unknown",
+                    },
+                    "catalog": source.get("catalog") or {},
+                    "analysis": source.get("analysis") or {},
+                    "links": links,
+                    "items": {**items, **groups},
+                    "profiles": profiles,
+                    "workflow": workflow,
+                    "journals": journals,
+                    "core": core,
+                    "readiness": source_readiness,
+                    "diagnostics": {"scope": "server_db_execute_fetch", "unit": "milliseconds", "operations": source_diagnostics},
+                    "errors": source_errors,
+                }
+            )
+            snapshot["errors"].extend(source_errors)
 
     if not sources and snapshot["status"] == "ready":
         snapshot["status"] = "not_initialized"
@@ -584,6 +971,22 @@ def collect_database_state(db, compatibility, sources, readiness_by_source=None)
 
 def _number(value):
     return f"{int(value or 0):,}"
+
+
+UNAVAILABLE_TEXT = "unavailable"
+
+
+def _count(value):
+    """A diagnostic count; None means its read failed, never zero."""
+    return UNAVAILABLE_TEXT if value is None else _number(value)
+
+
+def _total(values):
+    """The sum of per-source counts, unavailable if any one is."""
+    values = list(values)
+    if any(value is None for value in values):
+        return None
+    return sum(int(value) for value in values)
 
 
 def _percent(numerator, denominator):
@@ -609,6 +1012,12 @@ def _metric(label, value, tone=""):
 
 
 def _meter(label, numerator, denominator):
+    if numerator is None or denominator is None:
+        return f"""
+      <div class="db-progress">
+        <div><span>{escape(label)}</span><strong>{UNAVAILABLE_TEXT}</strong></div>
+      </div>
+    """
     percent = _percent(numerator, denominator)
     return f"""
       <div class="db-progress">
@@ -632,9 +1041,12 @@ def _error_list(errors):
             if row.get(key)
         )
         detail = f" <small>({escape(metadata)})</small>" if metadata else ""
+        # Every message shown here passes the redactor: stored ``last_error``
+        # text is free text (P3-10); query errors are fixed messages already.
+        message = redact_stored_error(row.get("message")) or "Unknown error"
         rows.append(
             f"<li><strong>{escape(str(row.get('section') or 'Unknown'))}:</strong> "
-            f"{escape(str(row.get('message') or 'Unknown error'))}{detail}</li>"
+            f"{escape(message)}{detail}</li>"
         )
     return '<ul class="db-errors">' + "".join(rows) + "</ul>"
 
@@ -675,9 +1087,33 @@ def _coverage_list(coverage):
     return f'<ul class="db-coverage-list">{"".join(rows)}</ul>'
 
 
+_CATEGORY_RETRY_TEXT = {
+    "transient": f"retried after a cooldown, up to {RETRY_LIMIT} attempts",
+    "revision": "retried when the media, analyzer or profile schema changes",
+    "unknown": "not a retry category the scheduler knows",
+}
+
+
+def _failure_category_list(categories):
+    if categories is None:
+        return f'<p class="db-muted">Failure categories: {UNAVAILABLE_TEXT}.</p>'
+    if not categories:
+        return '<p class="db-muted">No failed waveform profiles.</p>'
+    rows = [
+        f"<li><span>{escape(str(row['category']).replace('_', ' '))}</span>"
+        f"<strong>{_number(row['tracks'])} · "
+        f"{escape(_CATEGORY_RETRY_TEXT.get(row.get('retry'), _CATEGORY_RETRY_TEXT['unknown']))}"
+        "</strong></li>"
+        for row in categories
+    ]
+    return '<ul class="db-workflows">' + "".join(rows) + "</ul>"
+
+
 def _workflow_line(label, state):
     if not state:
         return f"<li><span>{escape(label)}</span><strong>not started</strong></li>"
+    if state.get("unavailable"):
+        return f"<li><span>{escape(label)}</span><strong>{UNAVAILABLE_TEXT}</strong></li>"
     phase = f" · {state.get('phase')}" if state.get("phase") else ""
     updated = _timestamp(state.get("updated_at"))
     return (
@@ -769,11 +1205,22 @@ def _source_html(source):
         else ""
     )
     chromaprint = core.get("chromaprint")
-    core_mapped = core.get("mapping_rows") or 0
-    analysis_runs = workflow.get("analysis_runs") or []
-    run_text = ", ".join(
-        f"{row['status']}: {_number(row['count'])}" for row in analysis_runs
-    ) or "none recorded"
+    core_mapped = core.get("mapping_rows")
+    analysis_runs = workflow.get("analysis_runs")
+    run_text = (
+        UNAVAILABLE_TEXT
+        if analysis_runs is None
+        else ", ".join(
+            f"{row['status']}: {_number(row['count'])}" for row in analysis_runs
+        ) or "none recorded"
+    )
+    profile_note = ""
+    if profiles.get("schedulable") is False:
+        profile_note = (
+            '<p class="db-muted">The background scheduler selects nothing while the '
+            "source is not active or its catalogue is not complete; due tracks wait "
+            "for that.</p>"
+        )
     errors = list(source.get("errors") or [])
     for label, state in (
         ("catalogue", catalog),
@@ -843,19 +1290,19 @@ def _source_html(source):
           </div>
           {_meter("Usable sonic coverage", links["usable"], tracks)}
           <div class="db-metrics">
-            {_metric("Usable links", _number(links["usable"]), "ready")}
-            {_metric("Verified", _number(links["verified"]), "ready")}
-            {_metric("Provisional", _number(links["provisional"]), "pending")}
-            {_metric("Pending", _number(links["pending"]), "pending")}
-            {_metric("Usable but flagged", _number(links["suspect"]), "danger")}
-            {_metric("Missing", _number(links["missing"]))}
+            {_metric("Usable links", _count(links["usable"]), "ready")}
+            {_metric("Verified", _count(links["verified"]), "ready")}
+            {_metric("Provisional", _count(links["provisional"]), "pending")}
+            {_metric("Pending", _count(links["pending"]), "pending")}
+            {_metric("Usable but flagged", _count(links["suspect"]), "danger")}
+            {_metric("Missing", _count(links["missing"]))}
           </div>
           <div class="db-metrics">
-            {_metric("Analysis items", _number(items["items"]))}
-            {_metric("MusiCNN vectors", _number(items["musicnn_vectors"]))}
-            {_metric("CLAP vectors", _number(items["clap_vectors"]))}
-            {_metric("Shared groups", _number(items["shared_groups"]))}
-            {_metric("Largest group", _number(items["largest_group"]))}
+            {_metric("Analysis items", _count(items["items"]))}
+            {_metric("MusiCNN vectors", _count(items["musicnn_vectors"]))}
+            {_metric("CLAP vectors", _count(items["clap_vectors"]))}
+            {_metric("Shared groups", _count(items["shared_groups"]))}
+            {_metric("Largest group", _count(items["largest_group"]))}
             {_metric("Projection generation", _number(analysis.get("generation")))}
           </div>
           <p class="db-muted">Readiness: {escape(str(readiness_status))}. Published
@@ -871,11 +1318,11 @@ def _source_html(source):
             <span class="db-state">{escape(str(core['mode']).replace('_', ' '))}</span>
           </div>
           <div class="db-metrics">
-            {_metric("Provider mappings", _number(core_mapped))}
-            {_metric("Canonical analysis IDs", _number(core["canonical_analysis_ids"]))}
-            {_metric("Scores", _number(core["scored"]))}
-            {_metric("MusiCNN embeddings", _number(core["musicnn_vectors"]))}
-            {_metric("CLAP embeddings", _number(core["clap_vectors"]))}
+            {_metric("Provider mappings", _count(core_mapped))}
+            {_metric("Canonical analysis IDs", _count(core["canonical_analysis_ids"]))}
+            {_metric("Scores", _count(core["scored"]))}
+            {_metric("MusiCNN embeddings", _count(core["musicnn_vectors"]))}
+            {_metric("CLAP embeddings", _count(core["clap_vectors"]))}
             {chromaprint_metric}
           </div>
           {chromaprint_meter}
@@ -885,15 +1332,32 @@ def _source_html(source):
           <div class="db-section-heading">
             <div><span class="db-kicker">Optional playback enhancements</span><h3>4. Loudness &amp; SmoothFade</h3></div>
           </div>
-          {_meter("Ready waveform profiles", profiles["ready"], profiles["catalogue_tracks"])}
+          {_meter("Published waveform profiles", profiles.get("published"), profiles.get("eligible_tracks"))}
           <div class="db-metrics">
-            {_metric("Stored", _number(profiles["stored"]))}
-            {_metric("Ready", _number(profiles["ready"]), "ready")}
-            {_metric("Queued", _number(profiles["pending"]), "pending")}
-            {_metric("Failed", _number(profiles["failed"]), "danger")}
-            {_metric("No source audio", _number(profiles["skipped"]))}
-            {_metric("Missing / stale", _number(profiles["needs_attention"]))}
+            {_metric("Published", _count(profiles.get("published")), "ready")}
+            {_metric("Ready", _count(profiles.get("ready")), "ready")}
+            {_metric("Due for analysis", _count(profiles.get("due")), "pending")}
+            {_metric("In progress", _count(profiles.get("pending")), "pending")}
+            {_metric("Deferred", _count(profiles.get("deferred")), "pending")}
+            {_metric("Cooling down", _count(profiles.get("cooling")), "pending")}
+            {_metric("Retries exhausted", _count(profiles.get("exhausted")), "danger")}
+            {_metric("Awaiting new media", _count(profiles.get("awaiting_revision")), "danger")}
+            {_metric("No media fingerprint", _count(profiles.get("deferred_no_media_revision")))}
+            {_metric("Not scheduled", _count(profiles.get("unscheduled")), "danger")}
           </div>
+          {profile_note}
+          <details>
+            <summary>Waveform profile states and failure categories</summary>
+            <p class="db-muted">Each analysis-eligible track is in one state, as the
+              background scheduler sees it. Due: picked on its next batch. Deferred:
+              released back to the queue, waiting out its cooldown. Cooling down: a
+              transient failure waiting for its retry time. Retries exhausted: the
+              attempt limit is used. Awaiting new media: a failure that is retried only
+              when the media, analyzer or profile schema changes. No media fingerprint:
+              waiting for the catalogue to fingerprint the file. Not scheduled: no retry
+              path applies.</p>
+            {_failure_category_list(profiles.get("failure_categories"))}
+          </details>
           <ul class="db-workflows">
             {_workflow_line("Prepare Lumae", preparation_workflow)}
             {_workflow_line("Profile backfill", workflow.get("backfill"))}
@@ -908,12 +1372,12 @@ def _source_html(source):
             <div><span class="db-kicker">Incremental sync retention</span><h3>Journals &amp; leases</h3></div>
           </div>
           <div class="db-metrics">
-            {_metric("Catalogue journal rows", _number(journals["catalog"]["rows"]))}
+            {_metric("Catalogue journal rows", _count(journals["catalog"]["rows"]))}
             {_metric("Catalogue head / floor", f'{_number(journals["catalog"]["head"])} / {_number(journals["catalog"]["floor"])}')}
-            {_metric("Analysis journal rows", _number(journals["analysis"]["rows"]))}
+            {_metric("Analysis journal rows", _count(journals["analysis"]["rows"]))}
             {_metric("Analysis head / floor", f'{_number(journals["analysis"]["head"])} / {_number(journals["analysis"]["floor"])}')}
-            {_metric("Active bootstrap leases", _number(journals["bootstrap_leases"]["active"]))}
-            {_metric("Completed bootstraps", _number(journals["bootstrap_leases"]["completed"]))}
+            {_metric("Active bootstrap leases", _count(journals["bootstrap_leases"]["active"]))}
+            {_metric("Completed bootstraps", _count(journals["bootstrap_leases"]["completed"]))}
           </div>
         </section>
 
@@ -937,8 +1401,8 @@ def render_database_state(snapshot):
     """Render the database snapshot as a standalone responsive admin screen."""
     sources = snapshot.get("sources") or []
     total_tracks = sum(_catalogue_track_count(row) for row in sources)
-    total_usable = sum(int(row.get("links", {}).get("usable") or 0) for row in sources)
-    total_profiles = sum(int(row.get("profiles", {}).get("ready") or 0) for row in sources)
+    total_usable = _total((row.get("links") or {}).get("usable") for row in sources)
+    total_profiles = _total((row.get("profiles") or {}).get("published") for row in sources)
     ready_sources = sum(1 for row in sources if _app_sync_ready(row))
     overall_app_state = (
         "ready" if sources and ready_sources == len(sources) else "not ready"
@@ -1109,8 +1573,8 @@ def render_database_state(snapshot):
           {_metric("Sources", _number(len(sources)))}
           {_metric("App-ready sources", f"{ready_sources} / {len(sources)}", "ready" if ready_sources == len(sources) and sources else "danger")}
           {_metric("Published tracks", _number(total_tracks), "ready" if total_tracks else "danger")}
-          {_metric("Usable sonic links", _number(total_usable), "ready" if total_usable else "")}
-          {_metric("Ready waveform profiles", _number(total_profiles), "ready" if total_profiles else "")}
+          {_metric("Usable sonic links", _count(total_usable), "ready" if total_usable else "")}
+          {_metric("Published waveform profiles", _count(total_profiles), "ready" if total_profiles else "")}
           {_metric("Query / workflow errors", _number(total_errors), "danger" if total_errors else "")}
         </section>
         {source_html}
