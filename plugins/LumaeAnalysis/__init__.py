@@ -410,7 +410,11 @@ def configured_backfill_limit():
 
 
 def analysis_time_limit_seconds():
-    """Hard wall-clock limit per analyzed file (setting ``analysis_time_limit_seconds``)."""
+    """Per-file time limit (setting ``analysis_time_limit_seconds``).
+
+    It is the analyzers' soft deadline; the analysis child is killed 30 s
+    after it (``analysis_isolation.HARD_LIMIT_HEADROOM_SECONDS``).
+    """
     return analysis_isolation.normalize_limit(
         get_setting("analysis_time_limit_seconds", analysis_isolation.DEFAULT_LIMIT_SECONDS)
     )

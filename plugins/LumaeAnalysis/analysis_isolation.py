@@ -16,20 +16,36 @@ wall-clock bound on one file. A host cancel still ends the child: the child
 stays in the job's process group, which the host's cancel kills, and it dies
 with its parent (``PR_SET_PDEATHSIG`` on Linux, a parent watchdog elsewhere).
 
-Design:
+Two ways to start the child, with the same limits, classification and
+diagnostics:
 
-* ``subprocess`` (fork and exec of ``sys.executable``), never a bare ``fork``:
-  the parent may run threads and hold a database connection. ``close_fds``
-  (the default) keeps every descriptor except the three pipes out of the child,
-  so it can neither see nor use the parent's connection.
-* The child loads this file and the analyzer modules through a stand-in package
-  for the plugin directory. The plugin ``__init__`` (Flask, the host API, the
-  database) is never imported there.
-* One worker per parent process is started on first use and reused for later
-  files: starting one costs about 1 s (numpy, scipy.signal and av imports),
-  about as much as a whole 4-minute waveform analysis. A killed or crashed
-  worker is reaped and replaced on the next call. A call made while another
-  thread uses the worker gets a one-off worker of its own.
+* Fork path (``_use_fork``): when the calling process has one Python thread,
+  the one running, the child is an ``os.fork()`` of it. AudioMuse runs every
+  job in a freshly forked, single-threaded process, so this is the host's
+  path. The child already has the analyzers imported and costs a fork (about
+  5 ms), not a new interpreter. It inherits every descriptor, database sockets
+  included, and never uses or closes one: closing a psycopg2 connection would
+  send Terminate on the parent's socket. It resets the parent's Python signal
+  handlers, turns the garbage collector off (no inherited object is finalized
+  there), binds itself to the parent's death, writes one JSON answer to a pipe
+  and leaves with ``os._exit`` (no atexit handlers, finalizers or stdio
+  flushes). Native threads (OpenBLAS, ONNX Runtime) are not counted; the child
+  uses neither their locks nor their pools.
+* Exec path (``_Worker``), for a process with more threads (the web tier,
+  threaded tests): ``subprocess`` (fork and exec of ``sys.executable``), never
+  a bare ``fork`` of a threaded process. ``close_fds`` keeps every descriptor
+  but its three pipes out of the child. The child loads this file and the
+  analyzers through a stand-in package for the plugin directory; the plugin
+  ``__init__`` (Flask, the host API, the database) is never imported there.
+  Starting one costs about 1 s (mostly ``import scipy.signal``), so one worker
+  is pooled and reused for later files. It acknowledges each request; a worker
+  that died while idle (before it acknowledged) is replaced and the file sent
+  again, uncounted. A killed or crashed worker is reaped and replaced. The
+  pooled worker is reused only by the thread that started it, because its
+  ``PR_SET_PDEATHSIG`` fires when that thread exits; a call made while another
+  thread uses it gets a one-off worker. Its environment omits credential-like
+  variables. That is hygiene, not a security boundary: it runs as the same
+  user and could read the parent's ``/proc/<pid>/environ``.
 * Only the path and keyword arguments go to the child, and only the result
   comes back, as one JSON line (bytes, tuples and dataclasses are tagged). No
   audio crosses the process boundary, so nothing is held twice.
@@ -59,6 +75,7 @@ loads it on its own, outside the plugin package.
 import atexit
 import base64
 import dataclasses
+import gc
 import importlib
 import inspect
 import json
@@ -328,7 +345,11 @@ def _module_ref(module, name, plugin_prefix):
 def _resolve(ref, plugin_package):
     module = ref["module"]
     name = ref["name"]
-    if not _IDENTIFIER.fullmatch(name) or not _MODULE.fullmatch(module):
+    if (
+        not _IDENTIFIER.fullmatch(name) or not _MODULE.fullmatch(module)
+        or any(part.startswith("__") for part in (*module.split("."), name))
+    ):
+        # No dunder part: "__init__" would run the plugin package in the child.
         raise ValueError("invalid isolated analysis target")
     if ref.get("plugin"):
         module = f"{plugin_package}.{module}"
@@ -344,7 +365,7 @@ def _child_target(target, plugin_package):
     loaded = sys.modules.get(module)
     if loaded is None or getattr(loaded, name, None) is not target:
         return None
-    if module == "__main__":
+    if module == "__main__" or module == plugin_package:
         return None
     return _module_ref(module, name, plugin_package)
 
@@ -419,31 +440,42 @@ def _accepts(func, name):
         return False
 
 
-def _serve(request, send):
+def _error_message(exc, probe):
+    category = failure_category(exc)
+    facts = probe.snapshot()
+    facts["error_type"] = type(exc).__name__
+    code = getattr(exc, "errno", None)
+    if "FFmpegError" in _mro_names(exc) and isinstance(code, int):
+        facts["errno"] = code
+    message = {
+        "event": "error",
+        "category": category,
+        "error_type": type(exc).__name__,
+        "diagnostics": safe_diagnostics(facts),
+    }
+    # A MemoryError may leave the process unusable: report, then exit.
+    return message, category == ANALYSIS_CRASH
+
+
+def _run_target(target, path, kwargs, send, plugin_prefix):
+    """(message, fatal) for one analysis; runs in the child on both paths."""
     probe = DecodeProbe(send)
-    target_ref = request["target"]
     try:
-        target = _resolve(target_ref, CHILD_PACKAGE)
-        kwargs = dict(request.get("kwargs") or {})
+        kwargs = dict(kwargs or {})
         if _accepts(target, "observer"):
             kwargs["observer"] = probe
-        value = target(request["path"], **kwargs)
-        return {"event": "result", "value": _encode(value, CHILD_PACKAGE)}, False
+        value = target(path, **kwargs)
+        return {"event": "result", "value": _encode(value, plugin_prefix)}, False
     except Exception as exc:
-        category = failure_category(exc)
-        facts = probe.snapshot()
-        facts["error_type"] = type(exc).__name__
-        code = getattr(exc, "errno", None)
-        if "FFmpegError" in _mro_names(exc) and isinstance(code, int):
-            facts["errno"] = code
-        message = {
-            "event": "error",
-            "category": category,
-            "error_type": type(exc).__name__,
-            "diagnostics": safe_diagnostics(facts),
-        }
-        # A MemoryError may leave the worker unusable: report, then exit.
-        return message, category == ANALYSIS_CRASH
+        return _error_message(exc, probe)
+
+
+def _serve(request, send):
+    try:
+        target = _resolve(request["target"], CHILD_PACKAGE)
+    except Exception as exc:
+        return _error_message(exc, DecodeProbe())
+    return _run_target(target, request["path"], request.get("kwargs"), send, CHILD_PACKAGE)
 
 
 def _bind_to_parent_death(parent_pid):
@@ -481,14 +513,13 @@ def _child_main():
     The protocol uses a private copy of the original stdout; file descriptor 1
     is pointed at stderr so stray prints cannot corrupt it.
     """
-    protocol = os.fdopen(os.dup(1), "wb", buffering=0)
+    protocol = os.dup(1)
     os.dup2(2, 1)
     lock = threading.Lock()
 
     def send(message):
-        data = json.dumps(message, separators=(",", ":"), allow_nan=True).encode("utf-8") + b"\n"
         with lock:
-            protocol.write(data)
+            _write_all(protocol, _line(message))
 
     hello = json.loads(sys.stdin.buffer.readline() or b"{}")
     _bind_to_parent_death(int(hello.get("parent_pid") or os.getppid()))
@@ -509,6 +540,8 @@ def _child_main():
     for line in sys.stdin.buffer:
         if not line.strip():
             continue
+        # Taken: from here on, the worker dying is this request's crash.
+        send({"event": "accepted"})
         message, fatal = _serve(json.loads(line), send)
         try:
             send(message)
@@ -517,6 +550,73 @@ def _child_main():
         if fatal:
             os._exit(_EXIT_AFTER_CRASH)
     os._exit(0)
+
+
+def _line(message):
+    return json.dumps(message, separators=(",", ":"), allow_nan=True).encode("utf-8") + b"\n"
+
+
+def _write_all(fd, data):
+    """``os.write`` until every byte is written (a pipe write can be partial)."""
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _enable_faulthandler():
+    try:
+        import faulthandler
+
+        faulthandler.enable()
+    except Exception:
+        pass
+
+
+def _default_signal_handlers():
+    """Default dispositions for every signal the parent handles in Python.
+
+    A fork inherits the parent's Python handlers (the host worker's SIGTERM
+    handler, SIGINT's KeyboardInterrupt); the kill must not reach them.
+    """
+    for number in signal.valid_signals():
+        try:
+            handler = signal.getsignal(number)
+        except (ValueError, OSError):
+            continue
+        if callable(handler) or number in (signal.SIGTERM, signal.SIGINT):
+            try:
+                signal.signal(number, signal.SIG_DFL)
+            except (ValueError, OSError):
+                pass
+
+
+def _fork_child_main(read_fd, write_fd, parent_pid, run):
+    """The fork path's child: run one analysis, report, ``os._exit``. Never returns.
+
+    It shares every descriptor the parent had, database sockets included, and
+    must never use or close one: closing a psycopg2 connection here would send
+    Terminate on the parent's socket. ``os._exit`` skips atexit handlers,
+    finalizers and stdio flushes, and the garbage collector is off, so no
+    inherited object is finalized in this process.
+    """
+    code = _EXIT_AFTER_CRASH
+    try:
+        gc.disable()
+        os.close(read_fd)
+        _default_signal_handlers()
+        _bind_to_parent_death(parent_pid)
+        _enable_faulthandler()
+
+        def send(message):
+            _write_all(write_fd, _line(message))
+
+        message, fatal = run(send)
+        send(message)
+        code = _EXIT_AFTER_CRASH if fatal else 0
+    except BaseException:
+        code = _EXIT_AFTER_CRASH
+    finally:
+        os._exit(code)
 
 
 # ---------------------------------------------------------------- parent side
@@ -534,12 +634,15 @@ _BOOTSTRAP = (
     "module._child_main()\n"
 )
 _PRELOAD = ("loudness", "edge_profiles", "av")
-# The child needs no credentials: it reads one local file and computes.
+# Hygiene, not a security boundary: the worker runs as the same user and could
+# read /proc/<parent>/environ. It simply has no use for credentials.
 _SECRET_ENV = re.compile(
     r"PASSWORD|PASSWD|SECRET|TOKEN|CREDENTIAL|API_?KEY|PRIVATE_?KEY|ACCESS_?KEY"
     r"|DATABASE_URL|DSN|AUTH|^PG|^POSTGRES",
     re.IGNORECASE,
 )
+# The fork path; tests and the benchmark switch it off to use the exec path.
+FORK_FAST_PATH = True
 
 
 def _child_environment():
@@ -551,7 +654,7 @@ class _WorkerUnavailable(Exception):
 
 
 class _WorkerGone(Exception):
-    """The worker exited or broke its protocol before answering."""
+    """The child exited or broke its protocol before answering."""
 
 
 def _signal_name(number):
@@ -561,7 +664,51 @@ def _signal_name(number):
         return f"SIG{number}"
 
 
+def _exit_facts_of(code):
+    if code is None:
+        return {}
+    if code < 0:
+        return {"signal": _signal_name(-code)}
+    return {"exit_code": code}
+
+
+class _LineReader:
+    """JSON lines from a pipe, each read bounded by a monotonic deadline."""
+
+    def __init__(self, fd):
+        self.fd = fd
+        self._buffer = b""
+        # poll, not select: a busy host process can hold descriptors >= 1024.
+        self._poller = select.poll()
+        self._poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
+
+    def read(self, deadline):
+        """The next message, or None at ``deadline``. Raises ``_WorkerGone``."""
+        while b"\n" not in self._buffer:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return None
+            if not self._poller.poll(max(1, math.ceil(remaining * 1000))):
+                continue  # timed out (or a signal): the loop re-checks the deadline
+            chunk = os.read(self.fd, 65536)
+            if not chunk:
+                raise _WorkerGone()
+            self._buffer += chunk
+            if len(self._buffer) > MAX_MESSAGE_BYTES:
+                raise _WorkerGone()
+        line, self._buffer = self._buffer.split(b"\n", 1)
+        try:
+            message = json.loads(line)
+        except ValueError as exc:
+            raise _WorkerGone() from exc
+        if not isinstance(message, dict):
+            raise _WorkerGone()
+        return message
+
+
 class _Worker:
+    """The exec path: a pooled ``sys.executable`` worker serving many files."""
+
     def __init__(self, startup_timeout):
         command = [sys.executable, "-c", _BOOTSTRAP, os.path.abspath(__file__)]
         try:
@@ -575,10 +722,13 @@ class _Worker:
             raise _WorkerUnavailable(type(exc).__name__) from exc
         self.pid = self.proc.pid
         self.owner_pid = os.getpid()
-        self._buffer = b""
+        # PR_SET_PDEATHSIG fires when this thread exits, not the process.
+        self.creator = threading.get_ident()
+        self.healthy = False
+        self._reader = _LineReader(self.proc.stdout.fileno())
         path = [os.getcwd() if entry == "" else entry for entry in sys.path]
         try:
-            self._write({
+            self.send({
                 "parent_pid": os.getpid(),
                 "plugin_dir": os.path.dirname(os.path.abspath(__file__)),
                 "sys_path": path,
@@ -595,43 +745,14 @@ class _Worker:
     def alive(self):
         return self.owner_pid == os.getpid() and self.proc.poll() is None
 
-    def _write(self, message):
-        data = json.dumps(message, separators=(",", ":")).encode("utf-8") + b"\n"
-        try:
-            self.proc.stdin.write(data)
-            self.proc.stdin.flush()
-        except (BrokenPipeError, OSError, ValueError) as exc:
-            raise _WorkerGone() from exc
-
     def send(self, message):
-        self._write(message)
+        try:
+            _write_all(self.proc.stdin.fileno(), _line(message))
+        except (OSError, ValueError) as exc:
+            raise _WorkerGone() from exc
 
     def read(self, deadline):
-        """The next message, or None at ``deadline``. Raises ``_WorkerGone``."""
-        fd = self.proc.stdout.fileno()
-        # poll, not select: a busy host process can hold descriptors >= 1024.
-        poller = select.poll()
-        poller.register(fd, select.POLLIN | select.POLLHUP | select.POLLERR)
-        while b"\n" not in self._buffer:
-            remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                return None
-            if not poller.poll(max(1, math.ceil(remaining * 1000))):
-                continue  # timed out (or a signal): the loop re-checks the deadline
-            chunk = os.read(fd, 65536)
-            if not chunk:
-                raise _WorkerGone()
-            self._buffer += chunk
-            if len(self._buffer) > MAX_MESSAGE_BYTES:
-                raise _WorkerGone()
-        line, self._buffer = self._buffer.split(b"\n", 1)
-        try:
-            message = json.loads(line)
-        except ValueError as exc:
-            raise _WorkerGone() from exc
-        if not isinstance(message, dict):
-            raise _WorkerGone()
-        return message
+        return self._reader.read(deadline)
 
     def exit_facts(self, wait_seconds=5.0):
         """Reap the exited worker (killing it if it lingers); exit code or signal."""
@@ -641,11 +762,7 @@ class _Worker:
             self.kill(0)
             code = self.proc.returncode
         self._close_pipes()
-        if code is None:
-            return {}
-        if code < 0:
-            return {"signal": _signal_name(-code)}
-        return {"exit_code": code}
+        return _exit_facts_of(code)
 
     def kill(self, grace):
         """SIGTERM, then SIGKILL after ``grace`` seconds; always reaps."""
@@ -682,6 +799,108 @@ class _Worker:
                 pipe.close()
             except (OSError, ValueError):
                 pass
+
+
+class _ForkedChild:
+    """The fork path: one analysis in a fork of this single-threaded process."""
+
+    def __init__(self, run):
+        read_fd, write_fd = os.pipe()
+        parent_pid = os.getpid()
+        try:
+            pid = os.fork()
+        except OSError:
+            os.close(read_fd)
+            os.close(write_fd)
+            raise
+        if pid == 0:
+            _fork_child_main(read_fd, write_fd, parent_pid, run)
+        os.close(write_fd)
+        self.pid = pid
+        self.healthy = False
+        self._fd = read_fd
+        self._reader = _LineReader(read_fd)
+        self._code = None
+        self._reaped = False
+        # A pidfd (Linux 5.3+) becomes readable the moment the child exits, so
+        # reaping waits exactly as long as needed. Unreaped, the pid is ours.
+        self._pidfd = None
+        if hasattr(os, "pidfd_open"):
+            try:
+                self._pidfd = os.pidfd_open(pid)
+            except OSError:
+                pass
+
+    def read(self, deadline):
+        return self._reader.read(deadline)
+
+    def _poll(self, block=False):
+        """True once the child is reaped (by this process or by SIGCHLD=SIG_IGN)."""
+        if not self._reaped:
+            try:
+                pid, status = os.waitpid(self.pid, 0 if block else os.WNOHANG)
+            except ChildProcessError:
+                self._reaped = True  # reaped elsewhere: exit status unknown
+            else:
+                if pid:
+                    self._reaped = True
+                    self._code = os.waitstatus_to_exitcode(status)
+        return self._reaped
+
+    def _wait(self, seconds):
+        deadline = time.monotonic() + max(0.0, seconds)
+        pause = 0.0005
+        while not self._poll():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False
+            if self._pidfd is not None:
+                poller = select.poll()
+                poller.register(self._pidfd, select.POLLIN)
+                poller.poll(max(1, math.ceil(remaining * 1000)))
+            else:
+                time.sleep(min(pause, remaining))
+                pause = min(pause * 2, 0.02)
+        return True
+
+    def alive(self):
+        return not self._poll()
+
+    def exit_facts(self, wait_seconds=5.0):
+        if not self._wait(wait_seconds):
+            self.kill(0)
+        self._close()
+        return _exit_facts_of(self._code)
+
+    def kill(self, grace):
+        """SIGTERM, then SIGKILL after ``grace`` seconds; always reaps."""
+        if not self._poll():
+            for number, wait in ((signal.SIGTERM, grace), (signal.SIGKILL, None)):
+                try:
+                    os.kill(self.pid, number)
+                except ProcessLookupError:
+                    pass
+                if wait is None:
+                    self._poll(block=True)
+                elif self._wait(wait):
+                    break
+        self._close()
+
+    def close(self):
+        """Reap a child that answered (it exits right after); kill a lingering one."""
+        if not self._wait(5.0):
+            self.kill(0)
+        self._close()
+
+    def _close(self):
+        for name in ("_fd", "_pidfd"):
+            fd = getattr(self, name)
+            if fd is not None:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                setattr(self, name, None)
 
 
 _pool_lock = threading.Lock()
@@ -730,45 +949,72 @@ def _isolation_available():
     return (
         os.name == "posix"
         and hasattr(select, "poll")
-        and bool(sys.executable)
         and not getattr(sys, "frozen", False)
-        and _unavailable is None
+    )
+
+
+def _use_fork():
+    """The fork path needs a process with one Python thread, and it on the main thread.
+
+    Another Python thread could hold a lock (logging, an import) that the
+    fork child would inherit locked. Native threads (OpenBLAS, ONNX Runtime)
+    are not counted: the child uses neither their locks nor their pools, and a
+    child that deadlocks anyway is killed at the hard limit.
+    """
+    return (
+        FORK_FAST_PATH
+        and hasattr(os, "fork")
+        and threading.active_count() == 1
+        and threading.current_thread() is threading.main_thread()
     )
 
 
 def _checkout(startup_timeout):
-    """(worker, pooled): the pooled worker, or a one-off when it is busy."""
+    """(worker, pooled): the pooled worker, or a one-off when it is busy.
+
+    The pooled worker is reused only by the thread that started it: its
+    ``PR_SET_PDEATHSIG`` fires when that thread exits. Another thread gets a
+    fresh pooled worker (the idle one is stopped).
+    """
     global _pooled
     if not _pool_lock.acquire(blocking=False):
+        if _unavailable is not None:
+            raise _WorkerUnavailable(_unavailable)
         return _Worker(startup_timeout), False
     try:
         worker = _pooled
-        if worker is not None and not worker.alive():
+        if worker is not None and not (
+            worker.creator == threading.get_ident() and worker.alive()
+        ):
+            _pooled = None
             if worker.owner_pid == os.getpid():
-                worker.exit_facts(0.1)
-            worker = _pooled = None
+                worker.kill(0)
+            worker = None
         if worker is None:
+            if _unavailable is not None:
+                raise _WorkerUnavailable(_unavailable)
             worker = _pooled = _Worker(startup_timeout)
     except BaseException:
         _pool_lock.release()
         raise
+    worker.healthy = False
     return worker, True
 
 
-def _checkin(worker, pooled, broken, grace):
+def _checkin(worker, pooled, grace):
     """Return the worker. A broken one is killed and reaped, never reused.
 
-    This is the one place a worker is killed: SIGTERM, then SIGKILL after
+    Workers are killed here and only here: SIGTERM, then SIGKILL after
     ``grace`` seconds.
     """
     global _pooled
-    if broken:
+    if not worker.healthy:
         worker.kill(grace)
     if not pooled:
-        if not broken:
+        if worker.healthy:
             worker.close()
         return
-    if broken and _pooled is worker:
+    if not worker.healthy and _pooled is worker:
         _pooled = None
     _pool_lock.release()
 
@@ -799,21 +1045,122 @@ def _byte_size(path):
         return None
 
 
+def _await_answer(child, facts, limit_seconds, headroom, plugin_package, accepted):
+    """The child's answer, or ``IsolatedAnalysisError``. Same on both paths.
+
+    Sets ``child.healthy`` when the child answered and may be reused. Raises
+    ``_WorkerGone`` when an exec worker died before it accepted the request.
+    """
+    started = time.monotonic()
+    kill_at = started + max(0.0, float(limit_seconds)) + max(0.0, float(headroom))
+    while True:
+        try:
+            message = child.read(kill_at)
+        except _WorkerGone:
+            if not accepted:
+                raise
+            # Exited (or broke the protocol) without an answer.
+            facts.update(child.exit_facts())
+            facts["elapsed_seconds"] = time.monotonic() - started
+            raise IsolatedAnalysisError(ANALYSIS_CRASH, None, facts, child.pid)
+        if message is None:
+            # Hard limit: the child is killed on the way out.
+            facts["elapsed_seconds"] = time.monotonic() - started
+            facts["limit_seconds"] = int(limit_seconds)
+            raise IsolatedAnalysisError(ANALYSIS_TIMEOUT, None, facts, child.pid)
+        event = message.get("event")
+        if event == "accepted":
+            accepted = True
+            continue
+        reported = message.get("diagnostics")
+        if isinstance(reported, dict):
+            facts.update(reported)
+        if event == "progress":
+            continue
+        if event == "error":
+            category = _identifier_or(message.get("category"), "analysis_error")
+            facts["elapsed_seconds"] = time.monotonic() - started
+            if category == ANALYSIS_CRASH:
+                # The child exits after reporting a MemoryError.
+                facts.update(child.exit_facts())
+            else:
+                child.healthy = True
+            raise IsolatedAnalysisError(
+                category, _identifier_or(message.get("error_type"), None),
+                facts, child.pid,
+            )
+        if event != "result":
+            raise IsolatedAnalysisError(ANALYSIS_CRASH, None, facts, child.pid)
+        child.healthy = True
+        try:
+            return _decode(message.get("value"), plugin_package)
+        except Exception as exc:
+            raise IsolatedAnalysisError(
+                "analysis_error", type(exc).__name__, facts, child.pid,
+            ) from None
+
+
+def _run_forked(target, path, kwargs, plugin_package, facts, limit_seconds, headroom, grace):
+    child = _ForkedChild(
+        lambda send: _run_target(target, path, kwargs, send, plugin_package)
+    )
+    try:
+        return _await_answer(child, facts, limit_seconds, headroom, plugin_package, True)
+    finally:
+        if child.healthy:
+            child.close()
+        else:
+            child.kill(grace)
+
+
+def _run_exec(target, path, kwargs, reference, plugin_package, facts, limit_seconds,
+              headroom, grace, startup):
+    global _unavailable
+    request = {"target": reference, "path": path, "kwargs": kwargs}
+    for attempt in (1, 2):
+        try:
+            worker, pooled = _checkout(startup)
+        except _WorkerUnavailable as exc:
+            if _unavailable is None:
+                _unavailable = str(exc)
+                logger.warning(
+                    "lumae_analysis analysis worker unavailable (%s); this process "
+                    "analyzes in-process without the hard time limit", exc,
+                )
+            return target(path, **kwargs)
+        try:
+            try:
+                worker.send(request)
+                return _await_answer(
+                    worker, facts, limit_seconds, headroom, plugin_package, False,
+                )
+            except _WorkerGone:
+                # Gone before it accepted the request (killed while idle, e.g.
+                # by the OOM killer): replace it and send once more, uncounted.
+                if attempt == 1:
+                    continue
+                facts.update(worker.exit_facts(0.5))
+                raise IsolatedAnalysisError(ANALYSIS_CRASH, None, facts, worker.pid)
+        finally:
+            _checkin(worker, pooled, grace)
+    raise AssertionError("unreachable")  # pragma: no cover
+
+
 def run_isolated(target, path, *, limit_seconds, headroom_seconds=None,
                  term_grace_seconds=None, startup_timeout_seconds=None, **kwargs):
-    """``target(path, **kwargs)`` in the worker, killed after the hard limit.
+    """``target(path, **kwargs)`` in a child process, killed after the hard limit.
 
     ``limit_seconds`` is the soft deadline (``deadline_seconds``, for a target
     that takes it); the hard limit is ``limit_seconds`` plus
-    ``headroom_seconds``. Returns the target's result. A failure in the child
-    raises ``IsolatedAnalysisError`` with its category (``failure_category``):
-    exceptions keep their category, the hard limit is ``analysis_timeout``, and
-    a worker that dies without answering (non-zero exit, a signal, a
-    MemoryError) is ``analysis_crash``. Targets that cannot run in the child run
-    in-process and raise their own exceptions (see the module docstring).
-    ``kwargs`` must be JSON-serializable.
+    ``headroom_seconds``. The child is a fork of this process when it has one
+    Python thread (``_use_fork``), else the pooled exec worker. Returns the
+    target's result. A failure in the child raises ``IsolatedAnalysisError``
+    with its category (``failure_category``): exceptions keep their category,
+    the hard limit is ``analysis_timeout``, and a child that dies without
+    answering (non-zero exit, a signal, a MemoryError) is ``analysis_crash``.
+    Targets that cannot run in the child run in-process and raise their own
+    exceptions (see the module docstring). ``kwargs`` must be JSON-serializable.
     """
-    global _unavailable
     kwargs = with_deadline(target, kwargs, limit_seconds)
     plugin_package = __package__ or ""
     reference = _child_target(target, plugin_package) if plugin_package else None
@@ -822,76 +1169,16 @@ def run_isolated(target, path, *, limit_seconds, headroom_seconds=None,
     headroom = HARD_LIMIT_HEADROOM_SECONDS if headroom_seconds is None else headroom_seconds
     grace = TERM_GRACE_SECONDS if term_grace_seconds is None else term_grace_seconds
     startup = STARTUP_TIMEOUT_SECONDS if startup_timeout_seconds is None else startup_timeout_seconds
-    request = {"target": reference, "path": os.fspath(path), "kwargs": kwargs}
+    path = os.fspath(path)  # both paths hand the analyzer a str
     facts = {"analyzer": reference["module"].rsplit(".", 1)[-1], "phase": "start"}
     size = _byte_size(path)
     if size is not None:
         facts["byte_size"] = size
-
-    for attempt in (1, 2):
-        try:
-            worker, pooled = _checkout(startup)
-        except _WorkerUnavailable as exc:
-            _unavailable = str(exc)
-            logger.warning(
-                "lumae_analysis analysis worker unavailable (%s); this process "
-                "analyzes in-process without the hard time limit", exc,
-            )
-            return target(path, **kwargs)
-        broken = True
-        try:
-            try:
-                worker.send(request)
-            except _WorkerGone:
-                if attempt == 1:
-                    continue  # an idle worker had died; start a fresh one
-                facts.update(worker.exit_facts(0.5))
-                raise IsolatedAnalysisError(ANALYSIS_CRASH, None, facts, worker.pid)
-            started = time.monotonic()
-            kill_at = started + max(0.0, float(limit_seconds)) + max(0.0, float(headroom))
-            while True:
-                try:
-                    message = worker.read(kill_at)
-                except _WorkerGone:
-                    # Exited (or broke the protocol) without an answer.
-                    facts.update(worker.exit_facts())
-                    facts["elapsed_seconds"] = time.monotonic() - started
-                    raise IsolatedAnalysisError(ANALYSIS_CRASH, None, facts, worker.pid)
-                if message is None:
-                    # Hard limit: the worker is killed on the way out.
-                    facts["elapsed_seconds"] = time.monotonic() - started
-                    facts["limit_seconds"] = int(limit_seconds)
-                    raise IsolatedAnalysisError(ANALYSIS_TIMEOUT, None, facts, worker.pid)
-                event = message.get("event")
-                reported = message.get("diagnostics")
-                if isinstance(reported, dict):
-                    facts.update(reported)
-                if event == "progress":
-                    continue
-                if event == "error":
-                    category = _identifier_or(message.get("category"), "analysis_error")
-                    facts["elapsed_seconds"] = time.monotonic() - started
-                    if category == ANALYSIS_CRASH:
-                        # The worker exits after reporting a MemoryError.
-                        facts.update(worker.exit_facts())
-                    else:
-                        broken = False
-                    raise IsolatedAnalysisError(
-                        category, _identifier_or(message.get("error_type"), None),
-                        facts, worker.pid,
-                    )
-                if event != "result":
-                    raise IsolatedAnalysisError(ANALYSIS_CRASH, None, facts, worker.pid)
-                broken = False
-                try:
-                    return _decode(message.get("value"), plugin_package)
-                except Exception as exc:
-                    raise IsolatedAnalysisError(
-                        "analysis_error", type(exc).__name__, facts, worker.pid,
-                    ) from None
-        finally:
-            _checkin(worker, pooled, broken, grace)
-    raise AssertionError("unreachable")  # pragma: no cover
+    if _use_fork():
+        return _run_forked(target, path, kwargs, plugin_package, facts,
+                           limit_seconds, headroom, grace)
+    return _run_exec(target, path, kwargs, reference, plugin_package, facts,
+                     limit_seconds, headroom, grace, startup)
 
 
 atexit.register(shutdown)

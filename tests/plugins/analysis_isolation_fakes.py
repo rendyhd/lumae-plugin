@@ -1,11 +1,12 @@
 """Fake analyzers for the LUM-018 isolation tests (P3-8).
 
-They run inside the analysis child, which imports them by module name through
-the parent's ``sys.path``. Each takes the analyzed path first, like the real
-analyzers.
+They run inside the analysis child: a fork of the test process (fork path) or
+the exec worker, which imports them by module name through the parent's
+``sys.path``. Each takes the analyzed path first, like the real analyzers.
 """
 import os
 import signal
+import sys
 import time
 
 
@@ -19,6 +20,22 @@ def sleep_forever(path, pid_file=None):
     """A decoder stuck in native code: never returns, never checks a deadline."""
     _note_pid(pid_file)
     time.sleep(3600)
+
+
+def allocate(path):
+    """An analysis that allocates enough containers to trigger automatic
+    garbage collection, at the default thresholds, if it is enabled."""
+    import gc
+
+    gc.set_threshold(700, 10, 10)
+    return len([[index] for index in range(50_000)])
+
+
+def stall(path, stall_seconds=8.0):
+    """Hangs for a while, then returns nothing usable. Killed well before that
+    when isolated; run in-process (a regression), it wastes ``stall_seconds``
+    and then fails the caller's assertions instead of hanging the suite."""
+    time.sleep(stall_seconds)
 
 
 def ignore_term_and_sleep(path, pid_file=None):
@@ -91,7 +108,13 @@ def describe_process(path):
             continue
         if target.startswith("socket:"):
             sockets.append(target)
-    return {"pid": os.getpid(), "sockets": sockets, "environment": sorted(os.environ)}
+    return {
+        "pid": os.getpid(), "ppid": os.getppid(), "sockets": sockets,
+        "environment": sorted(os.environ),
+        # The exec worker loads the isolation module under this name; a fork
+        # of the test process does not have it.
+        "exec_worker": "_lumae_analysis_isolation" in sys.modules,
+    }
 
 
 def echo(path, **kwargs):
