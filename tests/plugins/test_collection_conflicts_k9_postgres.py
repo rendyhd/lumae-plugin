@@ -413,7 +413,7 @@ def test_contract_2_membership_conflicts_write_nothing(conflicts_api):
 
 @pytest.mark.parametrize("value,strict", [
     ("2", True), (" 2 ", True), ("1", False), ("3", False), ("two", False), ("", False),
-    (None, False),
+    (None, False), ("2.0", False), ("02", False),
 ])
 def test_only_the_contract_header_value_2_opts_in(conflicts_api, value, strict):
     api = conflicts_api
@@ -509,6 +509,29 @@ def test_shelf_receipts_bind_the_request_body_under_contract_2(conflicts_api):
     for headers in (None, CONTRACT):
         legacy = api.call("POST", SHELVES, changed, headers=headers)
         assert (legacy.status_code, legacy.get_json()) == (200, first.get_json())
+
+
+@pytest.mark.parametrize("headers", [None, CONTRACT])
+def test_a_rejected_shelf_mutation_is_never_stored_or_replayed(conflicts_api, headers):
+    """A 409 is never stored: its retry is applied again, never replayed as 200."""
+    api = conflicts_api
+    shelves = api.shelves
+    remove = {"id": "remove-ghost", "operation": "remove", "memberId": "ghost", "at": 20}
+    for _attempt in range(2):
+        rejected = api.call("POST", SHELVES, remove, headers=headers)
+        assert (rejected.status_code, rejected.get_json()) == (
+            409, {"error": "unknown_membership_period"})
+    db = api.connect()
+    with db.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {shelves.table('shelf_mutations')}")
+        assert cur.fetchone()[0] == 0
+    db.rollback()
+    db.close()
+    # Once the member exists, the same mutation id applies instead of replaying.
+    assert api.call("POST", SHELVES, _shelf_add("ghost"), headers=headers).status_code == 200
+    applied = api.call("POST", SHELVES, remove, headers=headers)
+    assert applied.status_code == 200
+    assert applied.get_json()["records"][0]["value"]["deletedAt"] == 20
 
 
 def _shelf_member(identifier, entity):

@@ -299,12 +299,7 @@ def _update_by_mapping(cur, table_name, column, mappings, where_sql="", where_pa
 
 def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings):
     tracks = [row for row in mappings if row["entity_type"] == "track"]
-    albums = [row for row in mappings if row["entity_type"] == "album"]
     exact = _exact_mapping(mappings)
-    combined = [
-        {"old_id": old_id, "new_id": new_id}
-        for old_id, new_id in sorted(exact.items())
-    ]
 
     _update_by_mapping(
         cur,
@@ -340,37 +335,29 @@ def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings):
             (old_ids, new_ids),
         )
 
-    _update_by_mapping(cur, "collection_items", "track_id", tracks)
-    _update_by_mapping(cur, "collection_items", "provider_album_id", albums)
-    _update_by_mapping(cur, "collection_items", "cover_item_id", combined)
-
+    # Collection items rekey through the collections protocol, late in the
+    # publication (_rekey_collections). Delivered collection_changes rows and
+    # collection receipts are history and are never rewritten (P3-4c).
     from .shelves import rekey_shelves
     rekey_shelves(cur, catalog_instance_id, exact)
 
-    json_tables = (
-        ("collection_changes", ("seq",), "payload"),
-        ("collection_mutations", ("principal", "idempotency_key"), "response_payload"),
+
+def _rekey_collections(cur, mappings):
+    """Rekey collection items as new feed events; ``(changes, deferrals)``.
+
+    Runs at the end of the publication so that the parent collections stay
+    locked only for its tail. The caller records ``changes`` with
+    ``collection_manager._record_changes`` just before its commit.
+    """
+    from .collection_manager import rekey_collection_items
+
+    by_type = {"track": {}, "album": {}}
+    for row in mappings:
+        if row["entity_type"] in by_type:
+            by_type[row["entity_type"]][row["old_id"]] = row["new_id"]
+    return rekey_collection_items(
+        cur, by_type["track"], by_type["album"], _exact_mapping(mappings)
     )
-    for table_name, key_columns, payload_column in json_tables:
-        cur.execute(
-            f"SELECT {', '.join(key_columns)}, {payload_column} FROM {t(table_name)}"
-        )
-        for row in cur.fetchall():
-            keys = row[: len(key_columns)]
-            raw_payload = row[len(key_columns)]
-            payload = raw_payload
-            if isinstance(raw_payload, str):
-                payload = json.loads(raw_payload)
-            rewritten = _replace_exact(payload, exact)
-            if rewritten != payload:
-                cur.execute(
-                    f"UPDATE {t(table_name)} SET {payload_column}=%s::jsonb "
-                    f"WHERE {' AND '.join(f'{column}=%s' for column in key_columns)}",
-                    (
-                        json.dumps(rewritten, sort_keys=True, separators=(",", ":")),
-                        *keys,
-                    ),
-                )
 
 
 def _load_analysis_links(cur, catalog_instance_id, generation):
@@ -462,6 +449,12 @@ def _copy_analysis_generation(
     ]
     if params:
         cur.executemany(sql, params)
+    # Statistics for the new generation before commit, as the projection
+    # does (P2-2). Without them _load_relationship_inputs can plan a quadratic
+    # nested loop after a rekey. Same order: analysis_items, then links.
+    from .catalog_analysis import _analyze_generation_keys
+
+    _analyze_generation_keys(cur)
 
     changes = []
     for old_id, new_id in sorted(track_mapping.items()):
@@ -804,6 +797,7 @@ def _publish_provider_identity_rekey(
     )
 
     audiomuse_health = inspect_audiomuse_health(cur, adapter, server_id, carried_links)
+    collection_events, collection_deferrals = _rekey_collections(cur, plan.mappings)
     manifest = {
         "contract": "provider_identity_rekey_v1",
         "transition_id": transition_id,
@@ -859,6 +853,7 @@ def _publish_provider_identity_rekey(
                first_seq=%s, last_seq=%s, analysis_baseline=%s::jsonb,
                baseline_integrity=TRUE, audiomuse_health=%s,
                manifest_sha256=%s, last_checked_provider_version=%s,
+               collection_deferrals=collection_deferrals || %s::jsonb,
                applied_at=now(), checked_at=now(), last_error=NULL,
                updated_at=now()
          WHERE catalog_instance_id=%s AND transition_id=%s
@@ -872,6 +867,12 @@ def _publish_provider_identity_rekey(
             audiomuse_health,
             manifest_sha256,
             current_provider_version,
+            # Appended: an entry stays until an operator resolves it
+            # (docs/runbooks/UPGRADE_1.3.md, repair E); the transition_id
+            # names the manifest that holds its old-to-new mappings.
+            canonical_json([
+                {**entry, "transition_id": transition_id} for entry in collection_deferrals
+            ]),
             catalog_instance_id,
             transition_id,
         ),
@@ -905,6 +906,10 @@ def _publish_provider_identity_rekey(
     from .status_model import persist_analysis_summary, refresh_status_summary
 
     persist_analysis_summary(cur, catalog_instance_id, next_analysis_generation)
+    # Last: the feed head stays locked only for the event insert (P3-4a).
+    from .collection_manager import _record_changes
+
+    _record_changes(cur, collection_events)
     cur.close()
     db.commit()
     refresh_status_summary(db, catalog_instance_id, adapter)

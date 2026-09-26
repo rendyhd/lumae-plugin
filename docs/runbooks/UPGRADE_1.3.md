@@ -336,6 +336,44 @@ or repair, and it should be 0. A withdrawal does not change
 `profiles_unpublished_ready` (the withdrawn track's attempt becomes `stale`,
 not `ready`).
 
+### E. Collection items deferred by a provider-identity rekey
+
+A provider-identity rekey moves collection items to the new provider ids and
+sends the change to clients as feed events. If one user's items collide in a
+way the merge cannot resolve, the rekey skips that user and moves everyone
+else. A collision is unresolvable when several items of one collection would
+take the same new id and no item already holds it. The skipped user's items
+keep the old ids. Each skipped user is listed on the transition row, and the
+list grows across rekeys until an operator clears an entry:
+
+```sql
+SELECT catalog_instance_id, jsonb_pretty(collection_deferrals)
+  FROM plugin_lumae_analysis__provider_identity_transitions
+ WHERE collection_deferrals <> '[]'::jsonb;
+```
+
+Each entry has `principal`, `transition_id`, `reason` and `collisions`, a list
+of `{collection_id, kind, provider_id, item_ids}`, where `provider_id` is the
+new id. To resolve an entry:
+
+1. Signed in as that user, remove the listed `item_ids` from the collection,
+   then add the track or album again from the library. These are ordinary
+   writes, so every client receives them as events.
+2. Remove the entry:
+
+```sql
+UPDATE plugin_lumae_analysis__provider_identity_transitions
+   SET collection_deferrals = COALESCE((
+         SELECT jsonb_agg(entry) FROM jsonb_array_elements(collection_deferrals) entry
+          WHERE NOT (entry->>'principal' = '<principal>'
+                     AND entry->>'transition_id' = '<transition_id>')), '[]'::jsonb)
+ WHERE catalog_instance_id = '<catalog_instance_id>';
+```
+
+Do not rewrite the items in SQL. A direct write sends no event, and synced
+clients would keep the old ids unless you also rotate the epoch (repair C).
+A later rekey does not retry a skipped user.
+
 ## Known gap: 1.2.5 fingerprint rebase
 
 The `catalog_changes` fence stops a 1.2.5 catalogue publication only when it

@@ -9620,6 +9620,8 @@ class PublisherCursor(FakeCursor):
             self.rows = []
         elif normalized.startswith("SELECT principal, idempotency_key"):
             self.rows = []
+        elif "current_setting('lock_timeout')" in normalized:
+            self.rows = [("0",)]
         elif "SELECT COUNT(*) FROM task_status" in normalized:
             self.rows = [(0,)]
         else:

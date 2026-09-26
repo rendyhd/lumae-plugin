@@ -505,6 +505,8 @@ Payloads:
 - item upsert: the normalised item plus `collection_revision` and `collection_updated_at`;
 - item delete: `{id, collection_id, collection_revision, collection_updated_at}`.
 
+**Provider-identity rekey (1.3.0, unreleased, P3-4c).** When a provider-identity rekey maps old provider ids to new ones, collection items reach clients as ordinary feed events in the same transaction as the catalogue rekey. Each rewritten item (`track_id`, `provider_album_id` or `cover_item_id`) gets an item upsert with its new ids. If the collection already holds an item with the new id, the rekeyed item is a duplicate: it is removed with an item delete, and the item that already held the id stays. Each affected collection's `revision` goes up by one, and every event carries the new `collection_revision`. Earlier events and idempotency receipts are left exactly as they were delivered, with the old ids. 1.2.5 rewrote them in place and sent no events, so a synced client kept the old ids. In 1.3.0 a client that applies the feed in order ends with the server's state. A principal whose items would collide in a way the merge cannot resolve is left unchanged for now; an operator diagnostic is recorded, and the rest of the installation's rekey proceeds. Tombstoned collections are rekeyed with no events.
+
 ### 5.2a `GET /api/collections/snapshot` (1.3.0, unreleased, K8, P3-4a)
 
 The full path is `GET /plugins/lumae_analysis/api/collections/snapshot`. 1.2.5 has no such route (Flask 404). Auth, principal and the 404 `collection_manager_disabled` rule are the same as the feed's. No parameters.

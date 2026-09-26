@@ -128,6 +128,7 @@ def migrate_provider_identity(db):
             audiomuse_health TEXT,
             projection_reconcile_required BOOLEAN NOT NULL DEFAULT FALSE,
             manifest_sha256 TEXT,
+            collection_deferrals JSONB NOT NULL DEFAULT '[]'::jsonb,
             detected_at TIMESTAMPTZ,
             applied_at TIMESTAMPTZ,
             checked_at TIMESTAMPTZ,
@@ -148,6 +149,8 @@ def migrate_provider_identity(db):
         "projection_reconcile_required BOOLEAN NOT NULL DEFAULT FALSE",
         "manifest_sha256 TEXT",
         "applied_at TIMESTAMPTZ",
+        # P3-4c: principals whose collection rekey was deferred, with why.
+        "collection_deferrals JSONB NOT NULL DEFAULT '[]'::jsonb",
     )
     cur.execute(
         f"""

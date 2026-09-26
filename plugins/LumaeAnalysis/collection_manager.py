@@ -643,6 +643,13 @@ def _plan_restore(collections, restore_id, chunk_rows):
     return chunks
 
 
+# The one order in which a statement locks several collections: a restore
+# chunk and the provider-identity rekey both use it (principal, then id, in
+# byte order), so neither can deadlock with the other. Single-collection
+# mutations lock one row and need no order.
+_MULTI_COLLECTION_LOCK_ORDER = 'ORDER BY c.principal COLLATE "C", c.id COLLATE "C" FOR UPDATE OF c'
+
+
 def _restore_principal_collections(cur, principal, collections):
     """Write one restore chunk in the caller's transaction.
 
@@ -657,6 +664,15 @@ def _restore_principal_collections(cur, principal, collections):
     restored = []
     item_count = 0
     staged_changes = []
+    # Lock every existing collection of the chunk first, in the shared order
+    # (_MULTI_COLLECTION_LOCK_ORDER), so a chunk and a rekey cannot deadlock.
+    existing = sorted({source["id"] for source in collections if not source.get("create", True)})
+    if existing:
+        cur.execute(
+            f"SELECT c.id FROM {collections_table()} c "
+            f"WHERE c.principal = %s AND c.id = ANY(%s) {_MULTI_COLLECTION_LOCK_ORDER}",
+            (principal, existing),
+        )
     for source in collections:
         collection_id = source.get("id") or str(uuid.uuid4())
         create = source.get("create", True)
@@ -863,6 +879,192 @@ def _record_change(cur, principal, collection_id, entity_kind, entity_id, operat
     _record_changes(
         cur, [(principal, collection_id, entity_kind, entity_id, operation, payload)]
     )
+
+
+_ITEM_EVENT_FIELDS = (
+    "id", "kind", "track_id", "provider_album_id", "album_key", "title", "artist",
+    "album", "cover_item_id", "position",
+)
+
+
+def _plan_item_rekey(rows, tracks, albums, covers):
+    """``(rewrites, duplicates, collisions)`` for one principal's candidate items.
+
+    Items are grouped by the membership they hold after the rekey. A group
+    with one item is rewritten when its ids change. A group of rekeyed items
+    and exactly one item that already holds the new id merges: that item
+    stays, and the rekeyed ones are duplicates. Any other group is a
+    collision the merge rule cannot resolve.
+    """
+    groups = {}
+    for row in rows:
+        column, mapping = (
+            ("track_id", tracks) if row["kind"] == "track" else ("provider_album_id", albums)
+        )
+        moved = row[column] is not None and row[column] in mapping
+        target = mapping.get(row[column], row[column])
+        # An album kept by album_key alone has no provider membership to rekey.
+        key = (row["collection_id"], row["kind"], target) if target else (
+            row["collection_id"], "item", row["id"])
+        groups.setdefault(key, []).append((moved, column, target, row))
+    rewrites, duplicates, collisions = [], [], []
+    for key in sorted(groups):
+        group = groups[key]
+        movers = [row for moved, _, _, row in group if moved]
+        holders = [entry for entry in group if not entry[0]]
+        if len(group) > 1 and movers:
+            if len(holders) != 1:
+                collisions.append({
+                    "collection_id": key[0], "kind": key[1], "provider_id": key[2],
+                    "item_ids": sorted(row["id"] for _, _, _, row in group),
+                })
+                continue
+            duplicates.extend(movers)
+            group = holders
+        for _, column, target, row in group:
+            rewritten = {**row, column: target,
+                         "cover_item_id": covers.get(row["cover_item_id"], row["cover_item_id"])}
+            if rewritten != row:
+                rewrites.append(rewritten)
+    return rewrites, duplicates, collisions
+
+
+def rekey_collection_items(cur, tracks, albums, covers):
+    """Rekey collection items through the collections protocol (P3-4c).
+
+    ``tracks``, ``albums`` and ``covers`` map old provider ids to new ones for
+    track membership, album membership and ``cover_item_id``. The parent
+    collections are locked in sorted order. When the new id is already a
+    member of the same collection, the rekeyed item is the duplicate: it is
+    deleted with a delete event. Each rewritten item gets an upsert event, and
+    each live affected collection's revision is bumped once. Delivered events
+    and receipts are never rewritten; clients see the rekey as new events.
+    Items of a deleted collection are rewritten without revision or events.
+
+    A principal with a collision the merge rule cannot resolve is deferred:
+    none of its items is written and one diagnostic is returned for it. The
+    other principals proceed.
+
+    Returns ``(changes, deferred)``. ``changes`` are ``_record_changes``
+    tuples that the caller records just before its commit, so the feed head
+    is held only for the event insert.
+    """
+    if not (tracks or albums or covers):
+        return [], []
+    old_tracks, old_albums, old_covers = sorted(tracks), sorted(albums), sorted(covers)
+    # One statement finds and locks the parents, in the shared order.
+    # TODO(P3-5, K10): scope to the rekeyed catalogue once items carry it.
+    cur.execute(
+        f"""
+        SELECT c.principal, c.id, c.deleted_at IS NOT NULL
+          FROM {collections_table()} c
+         WHERE EXISTS (
+               SELECT 1 FROM {collection_items_table()} i
+                WHERE i.principal = c.principal AND i.collection_id = c.id
+                  AND ((i.kind = 'track' AND i.track_id = ANY(%s))
+                       OR (i.kind = 'album' AND i.provider_album_id = ANY(%s))
+                       OR i.cover_item_id = ANY(%s)))
+         {_MULTI_COLLECTION_LOCK_ORDER}
+        """,
+        (old_tracks, old_albums, old_covers),
+    )
+    deleted = {(row[0], row[1]): row[2] for row in cur.fetchall()}
+    if not deleted:
+        return [], []
+    principals, collection_ids = (list(column) for column in zip(*deleted))
+    # Read again under the locks: a mutation may have committed meanwhile.
+    cur.execute(
+        f"""
+        SELECT i.principal, i.collection_id, i.id, i.kind, i.track_id,
+               i.provider_album_id, i.album_key, i.title, i.artist, i.album,
+               i.cover_item_id, i.position
+          FROM {collection_items_table()} i
+          JOIN unnest(%s::text[], %s::text[]) AS parent(principal, id)
+            ON i.principal = parent.principal AND i.collection_id = parent.id
+         WHERE (i.kind = 'track' AND i.track_id = ANY(%s))
+            OR (i.kind = 'album' AND i.provider_album_id = ANY(%s))
+            OR i.cover_item_id = ANY(%s)
+        """,
+        (
+            principals, collection_ids, old_tracks + sorted(set(tracks.values())),
+            old_albums + sorted(set(albums.values())), old_covers,
+        ),
+    )
+    by_principal = {}
+    for row in _all_dicts(cur):
+        by_principal.setdefault(row["principal"], []).append(row)
+    rewrites, duplicates, deferred = [], [], []
+    for principal in sorted(by_principal):
+        planned, merged, collisions = _plan_item_rekey(
+            by_principal[principal], tracks, albums, covers)
+        if collisions:
+            deferred.append({"principal": principal, "reason": "unresolved_membership_collision",
+                             "collisions": collisions})
+            continue
+        rewrites.extend(planned)
+        duplicates.extend(merged)
+    if duplicates:
+        cur.execute(
+            f"""
+            DELETE FROM {collection_items_table()} target
+             USING unnest(%s::text[], %s::text[]) AS gone(principal, id)
+             WHERE target.principal = gone.principal AND target.id = gone.id
+            """,
+            ([row["principal"] for row in duplicates], [row["id"] for row in duplicates]),
+        )
+    if rewrites:
+        cur.execute(
+            f"""
+            UPDATE {collection_items_table()} target
+               SET track_id = changed.track_id,
+                   provider_album_id = changed.provider_album_id,
+                   cover_item_id = changed.cover_item_id,
+                   updated_at = now()
+              FROM unnest(%s::text[], %s::text[], %s::text[], %s::text[], %s::text[])
+                   AS changed(principal, id, track_id, provider_album_id, cover_item_id)
+             WHERE target.principal = changed.principal AND target.id = changed.id
+            """,
+            tuple(
+                [row[name] for row in rewrites]
+                for name in ("principal", "id", "track_id", "provider_album_id", "cover_item_id")
+            ),
+        )
+    touched = sorted({
+        (row["principal"], row["collection_id"]) for row in duplicates + rewrites
+        if not deleted.get((row["principal"], row["collection_id"]), True)
+    })
+    if not touched:
+        return [], deferred
+    cur.execute(
+        f"""
+        UPDATE {collections_table()} target
+           SET revision = revision + 1, updated_at = now()
+          FROM unnest(%s::text[], %s::text[]) AS bumped(principal, id)
+         WHERE target.principal = bumped.principal AND target.id = bumped.id
+        RETURNING target.principal, target.id, target.revision, target.updated_at
+        """,
+        tuple(list(column) for column in zip(*touched)),
+    )
+    revisions = {
+        (row[0], row[1]): {"collection_revision": row[2],
+                           "collection_updated_at": _json_value(row[3])}
+        for row in cur.fetchall()
+    }
+    # Per collection: the merged duplicates' deletes, then the upserts; the
+    # payloads are those of the item delete and item write routes.
+    staged = {}
+    for operation, rows in (("delete", duplicates), ("upsert", rewrites)):
+        for row in sorted(rows, key=lambda row: row["id"]):
+            staged.setdefault((row["principal"], row["collection_id"]), []).append((operation, row))
+    changes = []
+    for parent in touched:
+        for operation, row in staged[parent]:
+            payload = (
+                {"id": row["id"], "collection_id": parent[1]} if operation == "delete"
+                else {name: row[name] for name in _ITEM_EVENT_FIELDS}
+            )
+            changes.append((*parent, "item", row["id"], operation, {**payload, **revisions[parent]}))
+    return changes, deferred
 
 
 def collection_feed_integrity(cur):
