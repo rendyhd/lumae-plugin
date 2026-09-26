@@ -1,5 +1,7 @@
 """Media-library browsing and credential-safe preview routes for collections."""
 
+import base64
+import json
 import re
 from urllib.parse import quote
 
@@ -19,6 +21,9 @@ CATALOG_PARAM = "catalog_instance_id"
 _ITEM_ID_RE = re.compile(r"(?!\.+\Z)[A-Za-z0-9._~-]{1,256}")
 _REQUEST_TIMEOUT = (10, 60)
 _unaccent_warned = False
+_stale_search_warned = False
+# Section totals are exact up to this many rows, then "1000+" (LUM-016).
+TOTAL_CAP = 1000
 
 
 def unaccent_available(cur):
@@ -41,7 +46,20 @@ def unaccent_available(cur):
     return available
 
 
-def catalog_track_view_sql(unaccent=True):
+def search_text_sql(folded=True, tracks="t", album_name="al.name"):
+    """The workbench search text of a catalogue track, as SQL.
+
+    ``lower([unaccent](concat_ws(' ', title, artist, album artist, album
+    name)))``: what ``catalog_tracks.search_text`` stores (LUM-016, written
+    at publication by ``catalog_search``) and what a search computes inline
+    while the stored text is not usable (see ``_search_state``).
+    """
+    text = (f"concat_ws(' ', {tracks}.title, {tracks}.artist_display, "
+            f"{tracks}.album_artist_display, {album_name})")
+    return f"lower(unaccent({text}))" if folded else f"lower({text})"
+
+
+def catalog_track_view_sql(unaccent=True, stored=False):
     """Current provider catalogue rows with analysis as an optional link.
 
     The catalogue is the view's one parameter, and it comes first in the
@@ -50,10 +68,10 @@ def catalog_track_view_sql(unaccent=True):
     ``search_u`` is the lower-cased search text, accent-folded when
     ``unaccent`` is true (see ``unaccent_available``). A query that does not
     filter on ``search_u`` passes ``unaccent=False`` and needs no extension.
+    ``stored=True`` reads it from ``catalog_tracks.search_text`` instead;
+    only when ``_search_state`` says it was folded the same way.
     """
-    search_text = "concat_ws(' ', t.title, t.artist_display, t.album_artist_display, al.name)"
-    if unaccent:
-        search_text = f"unaccent({search_text})"
+    search_u = "t.search_text" if stored else search_text_sql(unaccent)
     sources = table("catalog_sources")
     state = table("catalog_state")
     tracks = table("catalog_tracks")
@@ -79,7 +97,7 @@ def catalog_track_view_sql(unaccent=True):
                t.track_number, t.disc_number, t.duration_ms,
                t.content_kind, t.release_type, t.cover_art_id,
                l.status AS analysis_status,
-               lower({search_text}) AS search_u,
+               {search_u} AS search_u,
                source.provider_type, source.catalog_instance_id
           FROM selected_source source
           JOIN {tracks} t
@@ -219,43 +237,291 @@ def album_artist_sql(over=""):
             f"MIN(COALESCE(NULLIF(album_artist, ''), author)) {over})")
 
 
-def _browse_albums(cur, query, artist, sort, limit, offset, unaccent=True, catalog=None):
-    """One row per catalogue album of the current generation (LUM-014).
+def encode_cursor(sort_key, item_id):
+    """An opaque keyset position: the last row's sort key and id (LUM-016)."""
+    raw = json.dumps([sort_key, item_id], ensure_ascii=False, separators=(",", ":"))
+    return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
 
-    Rows are grouped by ``album_id``, so same-name editions are separate
-    albums, and each carries its id as ``provider_album_id``. ``album_key``
-    is for display and legacy callers only.
+
+def decode_cursor(value):
+    """``(sort_key, id)`` of a cursor, None when absent; 400 when unreadable."""
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        key, item_id = json.loads(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)))
+    except (ValueError, TypeError):
+        raise CatalogScopeError("invalid_cursor", 400) from None
+    if not isinstance(key, str) or not isinstance(item_id, str):
+        raise CatalogScopeError("invalid_cursor", 400)
+    return key, item_id
+
+
+def _search_state(cur, catalog, query, artist):
+    """What one browse request reads, or None when the catalogue is not published.
+
+    ``stored`` is whether ``catalog_tracks.search_text`` of the published
+    generation was folded the way this request folds its query: written at
+    publication (or by the migration) with ``unaccent`` exactly when it is
+    available now. Otherwise the text is computed inline, as before LUM-016,
+    and cannot use the trigram index (logged once).
     """
-    filters, params = _library_filters(query, artist, unaccent)
-    order = {
-        "title": "lower(title), lower(artist), album_id",
-        "artist": "lower(artist), lower(title), album_id",
-        "year": "year DESC NULLS LAST, lower(title), album_id",
-    }[sort]
+    global _stale_search_warned
+    if catalog is None:
+        return None
     cur.execute(
-        f"""
-        SELECT album_id, title, artist, cover_item_id, track_count, year, rating,
-               COUNT(*) OVER()::INTEGER AS total_count
-          FROM (
+        "SELECT c.published_generation, c.search_text_generation, c.search_text_folded, "
+        f"c.entity_counts FROM {table('catalog_state')} c "
+        f"JOIN {table('catalog_sources')} s USING (catalog_instance_id) "
+        "WHERE c.catalog_instance_id=%s AND s.rebind_status='active' AND c.status='complete'",
+        (catalog,),
+    )
+    row = cur.fetchone()
+    if row is None:
+        return None
+    folded = unaccent_available(cur)
+    stored = row[1] is not None and row[1] == row[0] and row[2] is not None and bool(row[2]) == folded
+    tokens = str(query or "").casefold().split()[:8]
+    if tokens and folded:
+        cur.execute(
+            "SELECT unaccent(u.token) FROM unnest(%s::text[]) WITH ORDINALITY AS u(token, n) "
+            "ORDER BY u.n",
+            (tokens,),
+        )
+        tokens = [item[0] for item in cur.fetchall()]
+    if tokens and not stored and not _stale_search_warned:
+        _stale_search_warned = True
+        logger.warning(
+            "Living Collections search reads catalogue %s without its stored search text "
+            "(not written for this generation, or folded without unaccent); it is written "
+            "at the next publication or migration",
+            catalog,
+        )
+    counts = row[3]
+    if isinstance(counts, str):
+        try:
+            counts = json.loads(counts)
+        except ValueError:
+            counts = {}
+    return {
+        "catalog": catalog, "generation": row[0], "stored": stored, "folded": folded,
+        "tokens": tokens, "artist": artist,
+        "counts": counts if isinstance(counts, dict) else {},
+    }
+
+
+def _track_filters(ctx, tracks="t", album_name="al.name"):
+    """The search and artist filters on catalogue tracks, as `` AND ...``."""
+    text = f"{tracks}.search_text" if ctx["stored"] else search_text_sql(
+        ctx["folded"], tracks, album_name)
+    clauses, params = [], []
+    for token in ctx["tokens"]:
+        # AND-ed tokens, as before. A token under three characters has no
+        # trigram: `|| ''` keeps it a filter instead of a full index scan.
+        clauses.append(f"{text} LIKE %s" if len(token) >= 3 else f"({text} || '') LIKE %s")
+        params.append(f"%{token}%")
+    if ctx["artist"]:
+        clauses.append(
+            f"({tracks}.album_artist_display = %s OR (NULLIF({tracks}.album_artist_display, '')"
+            f" IS NULL AND {tracks}.artist_display = %s))"
+        )
+        params.extend([str(ctx["artist"])] * 2)
+    return "".join(f" AND {clause}" for clause in clauses), params
+
+
+def _album_join(kind="LEFT JOIN"):
+    return (f"{kind} {table('catalog_albums')} al "
+            "ON al.catalog_instance_id=t.catalog_instance_id "
+            "AND al.published_generation=t.published_generation "
+            "AND al.album_id=t.album_id AND al.available")
+
+
+def _after(key_sql, id_sql, after):
+    if after is None:
+        return "", []
+    return f" AND ({key_sql}, {id_sql}) > (%s, %s)", list(after)
+
+
+def _paged(cur, sql, params, limit, offset):
+    """``limit`` rows of a keyset query and the cursor after them, if more.
+
+    The query selects ``sort_key`` and ``sort_id`` (removed here) and has its
+    ORDER BY. OFFSET is added only for a legacy ``page`` request: a cursor
+    page never has one.
+    """
+    tail = " LIMIT %s" + (" OFFSET %s" if offset else "")
+    cur.execute(sql + tail, tuple(params + [limit + 1] + ([offset] if offset else [])))
+    rows = _all_dicts(cur)
+    more = len(rows) > limit
+    rows = rows[:limit]
+    cursor = encode_cursor(rows[-1]["sort_key"], rows[-1]["sort_id"]) if more else None
+    keys = [(row.pop("sort_key"), row.pop("sort_id")) for row in rows]
+    return rows, cursor, keys
+
+
+def _section(cur, rows, cursor, first_page, count_sql, params, exact=None):
+    """Items, total and paging for one section, without an unbounded count.
+
+    A first page that holds everything is its own exact total; so is an
+    ``exact`` count from ``catalog_state.entity_counts``. Otherwise matching
+    rows are counted up to ``TOTAL_CAP``: beyond it the total is ``TOTAL_CAP``
+    with ``total_exact`` false ("1000+").
+    """
+    if first_page and cursor is None:
+        total = len(rows)
+    elif exact is not None:
+        total = int(exact)
+    else:
+        cur.execute(f"SELECT count(*) FROM ({count_sql} LIMIT %s) capped",
+                    tuple(params + [TOTAL_CAP + 1]))
+        total = int(cur.fetchone()[0])
+    capped = exact is None and total > TOTAL_CAP
+    return {"items": rows, "total": TOTAL_CAP if capped else total,
+            "total_exact": not capped, "next_cursor": cursor}
+
+
+def _keyset_tracks(cur, ctx, limit, offset, after):
+    """Tracks by ``(lower(title), track_id)``."""
+    filters, params = _track_filters(ctx)
+    base = (f"FROM {table('catalog_tracks')} t {_album_join()} "
+            "WHERE t.catalog_instance_id=%s AND t.published_generation=%s AND t.available "
+            f"AND NULLIF(t.title, '') IS NOT NULL{filters}")
+    params = [ctx["catalog"], ctx["generation"]] + params
+    keyset, keyset_params = _after("lower(t.title)", "t.track_id", after)
+    rows, cursor, _keys = _paged(
+        cur,
+        "SELECT t.track_id, t.title, t.artist_display AS artist, al.name AS album, "
+        "COALESCE(NULLIF(t.album_artist_display, ''), t.artist_display) AS album_artist, "
+        "NULL::INTEGER AS year, NULL::INTEGER AS rating, t.track_id AS cover_item_id, "
+        f"lower(t.title) AS sort_key, t.track_id AS sort_id {base}{keyset} "
+        "ORDER BY lower(t.title), t.track_id",
+        params + keyset_params, limit, offset,
+    )
+    for row in rows:
+        row["kind"] = "track"
+    # Every published track is available and titled (the normalizer refuses
+    # an untitled one), so the unfiltered total is the published count.
+    exact = None
+    if not ctx["tokens"] and not ctx["artist"]:
+        exact = ctx["counts"].get("track")
+    return _section(cur, rows, cursor, offset == 0 and after is None,
+                    f"SELECT 1 {base}", params, exact)
+
+
+def _keyset_albums(cur, ctx, limit, offset, after):
+    """Catalogue albums with a matching track, by ``(lower(name), album_id)``."""
+    filters, params = _track_filters(ctx)
+    base = (f"FROM {table('catalog_albums')} al "
+            "WHERE al.catalog_instance_id=%s AND al.published_generation=%s AND al.available "
+            "AND NULLIF(al.name, '') IS NOT NULL "
+            f"AND EXISTS (SELECT 1 FROM {table('catalog_tracks')} t "
+            "WHERE t.catalog_instance_id=al.catalog_instance_id "
+            "AND t.published_generation=al.published_generation "
+            f"AND t.album_id=al.album_id AND t.available{filters})")
+    base_params = [ctx["catalog"], ctx["generation"]] + params
+    keyset, keyset_params = _after("lower(al.name)", "al.album_id", after)
+    rows, cursor, _keys = _paged(
+        cur,
+        "SELECT al.album_id, al.name AS title, al.album_artist_display AS album_row_artist, "
+        f"lower(al.name) AS sort_key, al.album_id AS sort_id {base}{keyset} "
+        "ORDER BY lower(al.name), al.album_id",
+        base_params + keyset_params, limit, offset,
+    )
+    details = {}
+    if rows:
+        # Aggregates over the page's albums only, through the album_id index.
+        cur.execute(
+            "SELECT t.album_id, MIN(t.track_id), COUNT(*)::INTEGER, "
+            "MIN(COALESCE(NULLIF(t.album_artist_display, ''), t.artist_display)) "
+            f"FROM {table('catalog_tracks')} t {_album_join('JOIN')} "
+            "WHERE t.catalog_instance_id=%s AND t.published_generation=%s AND t.available "
+            f"AND t.album_id = ANY(%s){filters} GROUP BY t.album_id",
+            tuple([ctx["catalog"], ctx["generation"], [row["album_id"] for row in rows]]
+                  + params),
+        )
+        details = {item[0]: item[1:] for item in cur.fetchall()}
+    items = []
+    for row in rows:
+        cover, count, track_artist = details.get(row["album_id"], (None, 0, None))
+        artist = row["album_row_artist"] or track_artist
+        items.append({
+            "title": row["title"], "artist": artist, "cover_item_id": cover,
+            "track_count": count, "year": None, "rating": None, "kind": "album",
+            "album_key": _album_key(row["title"], artist),
+            "provider_album_id": str(row["album_id"]),
+        })
+    return _section(cur, items, cursor, offset == 0 and after is None,
+                    f"SELECT 1 {base}", base_params)
+
+
+ARTIST_KEY_SQL = "COALESCE(NULLIF(t.album_artist_display, ''), t.artist_display)"
+
+
+def _keyset_artists(cur, ctx, limit, offset, after):
+    """Artist names (album artist, else track artist) by ``(lower(name), name)``."""
+    key = ARTIST_KEY_SQL
+    filters, params = _track_filters(ctx)
+    base = (f"FROM {table('catalog_tracks')} t {_album_join()} "
+            "WHERE t.catalog_instance_id=%s AND t.published_generation=%s AND t.available "
+            f"AND NULLIF({key}, '') IS NOT NULL{filters}")
+    base_params = [ctx["catalog"], ctx["generation"]] + params
+    keyset, keyset_params = _after(f"lower({key})", key, after)
+    _rows, cursor, keys = _paged(
+        cur,
+        f"SELECT DISTINCT lower({key}) AS sort_key, {key} AS sort_id {base}{keyset} "
+        f"ORDER BY lower({key}), {key}",
+        base_params + keyset_params, limit, offset,
+    )
+    details = {}
+    if keys:
+        cur.execute(
+            f"SELECT {key}, MIN(t.track_id), "
+            "COUNT(DISTINCT t.album_id) FILTER (WHERE NULLIF(al.name, '') IS NOT NULL)::INTEGER, "
+            f"COUNT(*)::INTEGER {base} AND lower({key}) = ANY(%s) AND {key} = ANY(%s) "
+            f"GROUP BY {key}",
+            tuple(base_params + [[k for k, _ in keys], [name for _, name in keys]]),
+        )
+        details = {item[0]: item[1:] for item in cur.fetchall()}
+    items = []
+    for _key, name in keys:
+        cover, albums, tracks = details.get(name, (None, 0, 0))
+        items.append({
+            "artist": name, "title": name, "cover_item_id": cover, "album_count": albums,
+            "track_count": tracks, "first_year": None, "latest_year": None, "kind": "artist",
+        })
+    return _section(cur, items, cursor, offset == 0 and after is None,
+                    f"SELECT DISTINCT lower({key}), {key} {base}", base_params)
+
+
+def _legacy_view(ctx):
+    return catalog_track_view_sql(ctx["folded"], stored=ctx["stored"])
+
+
+def _browse_albums(cur, ctx, sort, limit, offset):
+    """Albums by artist: the pre-LUM-016 query, paged by OFFSET (legacy).
+
+    One row per catalogue album of the current generation (LUM-014), grouped
+    by ``album_id``; ``album_key`` is for display and legacy callers only.
+    """
+    filters, params = _library_filters(" ".join(ctx["tokens"]), ctx["artist"], ctx["folded"])
+    inner = f"""
             SELECT album_id, MIN(album) AS title,
                    {album_artist_sql()} AS artist,
                    MIN(item_id) AS cover_item_id,
                    COUNT(*)::INTEGER AS track_count,
                    MIN(year)::INTEGER AS year,
                    MAX(rating)::INTEGER AS rating
-              FROM ({catalog_track_view_sql(unaccent)}) score
+              FROM ({_legacy_view(ctx)}) score
              WHERE NULLIF(album, '') IS NOT NULL {filters}
-             GROUP BY album_id
-          ) albums
-         ORDER BY {order}
-         LIMIT %s OFFSET %s
-        """,
-        tuple([catalog] + params + [limit, offset]),
+             GROUP BY album_id"""
+    params = [ctx["catalog"]] + params
+    cur.execute(
+        f"SELECT * FROM ({inner}) albums "
+        "ORDER BY lower(artist), lower(title), album_id LIMIT %s OFFSET %s",
+        tuple(params + [limit, offset]),
     )
     rows = _all_dicts(cur)
-    total = int(rows[0].pop("total_count", 0)) if rows else 0
     for row in rows:
-        row.pop("total_count", None)
         row.update(
             {
                 "kind": "album",
@@ -263,89 +529,78 @@ def _browse_albums(cur, query, artist, sort, limit, offset, unaccent=True, catal
                 "provider_album_id": str(row.pop("album_id")),
             }
         )
-    return {"items": rows, "total": total}
+    return _section(cur, rows, None, offset == 0 and len(rows) < limit,
+                    f"SELECT 1 FROM ({inner}) albums", params)
 
 
-def _browse_tracks(cur, query, artist, sort, limit, offset, unaccent=True, catalog=None):
-    filters, params = _library_filters(query, artist, unaccent)
+def _browse_tracks(cur, ctx, sort, limit, offset):
+    """Tracks by artist (or the retired year sort): the pre-LUM-016 query,
+    paged by OFFSET (legacy)."""
+    filters, params = _library_filters(" ".join(ctx["tokens"]), ctx["artist"], ctx["folded"])
     order = {
         # `artist` is a SELECT alias below. PostgreSQL permits a bare output
         # alias in ORDER BY, but not one nested inside lower(...), so sort on
         # the source column here rather than raising UndefinedColumn at runtime.
-        "title": "lower(title), lower(COALESCE(author, '')), lower(COALESCE(album, ''))",
         "artist": "lower(COALESCE(author, '')), lower(COALESCE(album, '')), lower(title)",
         "year": "year DESC NULLS LAST, lower(COALESCE(author, '')), lower(title)",
     }[sort]
+    inner = f"FROM ({_legacy_view(ctx)}) score WHERE NULLIF(title, '') IS NOT NULL {filters}"
+    params = [ctx["catalog"]] + params
     cur.execute(
         f"""
         SELECT item_id AS track_id, title, author AS artist, album,
                COALESCE(NULLIF(album_artist, ''), author) AS album_artist,
-               year, rating, item_id AS cover_item_id,
-               COUNT(*) OVER()::INTEGER AS total_count
-          FROM ({catalog_track_view_sql(unaccent)}) score
-         WHERE NULLIF(title, '') IS NOT NULL {filters}
+               year, rating, item_id AS cover_item_id
+          {inner}
          ORDER BY {order}
          LIMIT %s OFFSET %s
         """,
-        tuple([catalog] + params + [limit, offset]),
+        tuple(params + [limit, offset]),
     )
     rows = _all_dicts(cur)
-    total = int(rows[0].pop("total_count", 0)) if rows else 0
     for row in rows:
-        row.pop("total_count", None)
         row["kind"] = "track"
-    return {"items": rows, "total": total}
+    return _section(cur, rows, None, offset == 0 and len(rows) < limit,
+                    f"SELECT 1 {inner}", params)
 
 
-def _browse_artists(cur, query, sort, limit, offset, unaccent=True, catalog=None):
-    filters, params = _library_filters(query, unaccent=unaccent)
-    order = {
-        "title": "lower(artist)",
-        "artist": "lower(artist)",
-        "year": "latest_year DESC NULLS LAST, lower(artist)",
-    }[sort]
-    cur.execute(
-        f"""
-        SELECT artist, cover_item_id, album_count, track_count,
-               first_year, latest_year,
-               COUNT(*) OVER()::INTEGER AS total_count
-          FROM (
-            SELECT COALESCE(NULLIF(album_artist, ''), author) AS artist,
-                   MIN(item_id) AS cover_item_id,
-                   COUNT(DISTINCT album_id)
-                     FILTER (WHERE NULLIF(album, '') IS NOT NULL)::INTEGER AS album_count,
-                   COUNT(*)::INTEGER AS track_count,
-                   MIN(year)::INTEGER AS first_year,
-                   MAX(year)::INTEGER AS latest_year
-              FROM ({catalog_track_view_sql(unaccent)}) score
-             WHERE NULLIF(COALESCE(NULLIF(album_artist, ''), author), '') IS NOT NULL
-                   {filters}
-             GROUP BY COALESCE(NULLIF(album_artist, ''), author)
-          ) artists
-         ORDER BY {order}
-         LIMIT %s OFFSET %s
-        """,
-        tuple([catalog] + params + [limit, offset]),
-    )
-    rows = _all_dicts(cur)
-    total = int(rows[0].pop("total_count", 0)) if rows else 0
-    for row in rows:
-        row.pop("total_count", None)
-        row.update({"kind": "artist", "title": row.get("artist")})
-    return {"items": rows, "total": total}
+def _browse_section(cur, ctx, key, sort, limit, offset, after):
+    if ctx is None:
+        return {"items": [], "total": 0, "total_exact": True, "next_cursor": None}
+    if key == "albums":
+        if sort == "artist":
+            return _browse_albums(cur, ctx, sort, limit, offset)
+        # "year" is title order: the catalogue publishes no year (LUM-015).
+        return _keyset_albums(cur, ctx, limit, offset, after)
+    if key == "tracks":
+        if sort in ("artist", "year"):
+            return _browse_tracks(cur, ctx, sort, limit, offset)
+        return _keyset_tracks(cur, ctx, limit, offset, after)
+    # Every artist sort is by name: artists have no year (LUM-015).
+    return _keyset_artists(cur, ctx, limit, offset, after)
 
 
 def browse_library(scope="albums", query="", artist=None, sort="title", page=1, limit=36,
-                   catalog_instance_id=None):
+                   catalog_instance_id=None, cursor=None):
     """Return one page of analyzed media grouped by a stable library scope.
 
-    Raises ``CatalogScopeError`` when the catalogue cannot be resolved (K10).
+    Paging (LUM-016): each section returns ``next_cursor``; pass it back as
+    ``cursor`` for the next page, which is read by keyset on ``(lower(key),
+    id)``. ``page`` is the legacy offset paging for old clients: it is ignored
+    when a cursor is given, and costs OFFSET on deep pages. Totals are exact
+    up to ``TOTAL_CAP``; above it ``total`` is ``TOTAL_CAP`` and
+    ``total_exact`` is false, except the unfiltered track count, which is the
+    published ``entity_counts``.
+
+    Raises ``CatalogScopeError`` when the catalogue cannot be resolved (K10)
+    or the cursor is unreadable (400 ``invalid_cursor``).
     """
     scope = scope if scope in LIBRARY_SCOPES else "albums"
     sort = sort if sort in LIBRARY_SORTS else "title"
     page = _bounded_int(page, 1, 1, 100000)
     limit = _bounded_int(limit, 36, 1, 100)
     query = str(query or "").strip()
+    after = decode_cursor(cursor)
     if query and len(query) < 3:
         keys = ("albums", "tracks", "artists") if scope == "all" else (scope,)
         return {
@@ -356,32 +611,23 @@ def browse_library(scope="albums", query="", artist=None, sort="title", page=1, 
             "sort": sort,
             "page": page,
             "limit": limit,
-            "sections": {key: {"items": [], "total": 0} for key in keys},
+            "sections": {key: {"items": [], "total": 0, "total_exact": True,
+                               "next_cursor": None} for key in keys},
         }
-    offset = (page - 1) * limit
+    offset = 0 if after is not None else (page - 1) * limit
     db = get_db()
     cur = db.cursor()
     try:
         catalog, _provider = resolve_catalog(cur, catalog_instance_id)
-        folded = unaccent_available(cur)
-        if scope == "albums":
-            sections = {"albums": _browse_albums(
-                cur, query, artist, sort, limit, offset, folded, catalog)}
-        elif scope == "tracks":
-            sections = {"tracks": _browse_tracks(
-                cur, query, artist, sort, limit, offset, folded, catalog)}
-        elif scope == "artists":
-            sections = {"artists": _browse_artists(
-                cur, query, sort, limit, offset, folded, catalog)}
+        ctx = _search_state(cur, catalog, query, artist)
+        if scope != "all":
+            sections = {scope: _browse_section(cur, ctx, scope, sort, limit, offset, after)}
         else:
             # A broad search intentionally returns compact categorized sections.
             section_limit = min(limit, 12)
             sections = {
-                "albums": _browse_albums(
-                    cur, query, artist, sort, section_limit, 0, folded, catalog),
-                "tracks": _browse_tracks(
-                    cur, query, artist, sort, section_limit, 0, folded, catalog),
-                "artists": _browse_artists(cur, query, sort, section_limit, 0, folded, catalog),
+                key: _browse_section(cur, ctx, key, sort, section_limit, 0, None)
+                for key in ("albums", "tracks", "artists")
             }
     finally:
         cur.close()
@@ -832,6 +1078,7 @@ def register_collection_library_routes(bp, require_enabled):
                     page=request.args.get("page") or 1,
                     limit=request.args.get("limit") or 36,
                     catalog_instance_id=requested_catalog(),
+                    cursor=request.args.get("cursor") or None,
                 )
             )
         except CatalogScopeError as exc:

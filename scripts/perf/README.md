@@ -83,6 +83,7 @@ Each bench prints one JSON line. You can run any of them on its own.
 | Script | Measures | Budget key |
 |---|---|---|
 | `route_bench.py [ROUTES] [N]` | Flask test-client latency of `/api/health`, `/api/catalog/health` and `/settings/status`, plus statements per request | `health`, `settings_status` |
+| `wb_bench.py [N]` | Workbench library browse, search and deep-page latency (`collection_library.browse_library`), median and max of N runs per case; the deep page by legacy `page` and, with LUM-016, by `cursor` | LUM-016 budgets: browse ≤100 ms, search `all` ≤300 ms, deep page ≤100 ms |
 | `pub_bench.py [N]` | Publication critical section: `complete_attempt` from an admitted attempt to the committed publication, which holds the `catalog_state` row lock throughout and includes the journal append and compaction at 50k retained events. It also times `record_profile_change` with and without commit, and the compaction `DELETE` alone. | `publication` |
 | `proj_bench.py full\|nochange\|delta` | One `project_analysis` run: elapsed time, statements, WAL, peak RSS (`VmHWM`) and table sizes. `delta` changes one `score` row first. | `projection_nochange`, `projection_delta` |
 | `boot_bench.py [--page-size 50] [--max-pages N] [--no-lift]` | v2 `create_session`: time, WAL, snapshot size, and the longest hold of the global creator advisory lock (110094, 10), sampled from `pg_locks` every ~2 ms. Then `snapshot_page` for every page, and the setup cost of the plugin-owned connection. | `bootstrap_create`, `bootstrap_page` |
