@@ -4370,6 +4370,19 @@ def profile_backfill_is_active(state, now=None):
         return True
 
 
+def _future_retry_at(value, now=None):
+    """``value`` while that cooldown is still ahead of ``now``, else None."""
+    if not value:
+        return None
+    try:
+        at = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if at.tzinfo is None:
+        at = at.replace(tzinfo=timezone.utc)
+    return value if at > (now or datetime.now(timezone.utc)) else None
+
+
 def claim_profile_backfill(source, db=None):
     """Atomically admit one durable background workflow per catalogue source."""
     db = db or get_db()
@@ -5967,10 +5980,13 @@ def _readiness_job(status, *, last_error=None, next_retry_at=None, stalled=False
     ``last_error`` is redacted here (P3-10's ``redact_stored_error``) so every
     caller gets safe text; the render site still HTML-escapes it.
     """
-    if status in ("queued", "running") and not stalled:
-        return status, ("Running now." if status == "running" else "Queued to start shortly.")
+    if status == "running" and not stalled:
+        return "running", "Running now."
+    # A queued row with a cooldown still ahead is cooling, not about to start.
     if next_retry_at:
         return "cooling", f"Waiting to retry after a transient failure, until {next_retry_at}."
+    if status == "queued" and not stalled:
+        return "queued", "Queued to start shortly."
     if last_error:
         return "failed", redact_stored_error(last_error) or "Failed."
     return "idle", "Nothing queued."
@@ -6082,7 +6098,7 @@ def _readiness_stream_status(source):
         ("Waveform profile counts could not be read." if counts is None
          else "No waveform profiles have been published yet."),
     )
-    next_retry_at = (backfill or {}).get("next_retry_at") if not backfill_active else None
+    next_retry_at = _future_retry_at((backfill or {}).get("next_retry_at"))
     job_state, job_text = _readiness_job(
         backfill.get("status") if backfill else None,
         last_error=(backfill or {}).get("last_error"),

@@ -10301,6 +10301,13 @@ def test_settings_readiness_streams_panel_redacts_a_failed_stream(monkeypatch):
     assert not _a11y_lint(body)
 
 
+from datetime import datetime, timedelta, timezone  # noqa: E402
+
+_READINESS_NOW = datetime.now(timezone.utc).isoformat()
+_READINESS_FUTURE = (datetime.now(timezone.utc) + timedelta(minutes=5)).isoformat()
+_READINESS_PAST = (datetime.now(timezone.utc) - timedelta(minutes=5)).isoformat()
+
+
 def test_settings_readiness_streams_panel_shows_waveform_cooling(monkeypatch):
     mod = load_plugin()
     source = _readiness_ready_source()
@@ -10309,7 +10316,9 @@ def test_settings_readiness_streams_panel_shows_waveform_cooling(monkeypatch):
         mod, monkeypatch, preparation=_READINESS_READY_PREPARATION,
         backfill={
             **_READINESS_READY_BACKFILL, "status": "queued",
-            "next_retry_at": "2026-09-26T10:00:00Z", "updated_at": "2020-01-01T00:00:00Z",
+            # A fresh row (the worker just wrote it) with a cooldown ahead:
+            # review P3-9 HIGH-1, "cooling" must not hide behind "queued".
+            "next_retry_at": _READINESS_FUTURE, "updated_at": _READINESS_NOW,
         },
         counts={
             **_READINESS_READY_COUNTS, "ready_current": 40, "failed": 10, "needs_analysis": 50,
@@ -10320,8 +10329,28 @@ def test_settings_readiness_streams_panel_shows_waveform_cooling(monkeypatch):
     body = mod.render_readiness_streams_panel()
 
     assert "Cooling down" in body
-    assert "2026-09-26T10:00:00Z" in body
+    assert _READINESS_FUTURE in body
     assert not _a11y_lint(body)
+
+
+def test_settings_readiness_streams_panel_expired_cooldown_is_not_cooling(monkeypatch):
+    mod = load_plugin()
+    source = _readiness_ready_source()
+    monkeypatch.setattr(mod, "resolve_catalog_source", lambda _db: [source])
+    _patch_readiness_streams(
+        mod, monkeypatch, preparation=_READINESS_READY_PREPARATION,
+        backfill={
+            **_READINESS_READY_BACKFILL, "status": "queued",
+            "next_retry_at": _READINESS_PAST, "updated_at": _READINESS_NOW,
+        },
+        counts=_READINESS_READY_COUNTS,
+        edge=_READINESS_READY_EDGE, relationship=_READINESS_READY_RELATIONSHIP,
+    )
+
+    body = mod.render_readiness_streams_panel()
+
+    assert "Cooling down" not in body
+    assert "Queued to start shortly." in body
 
 
 def test_settings_readiness_streams_panel_shows_one_stream_unavailable(monkeypatch):
