@@ -231,8 +231,49 @@ def test_cursor_pages_and_legacy_pages_walk_the_old_order(migrated_db, lib):
     migrated_db.rollback()
 
 
+def test_a_cursor_is_bound_to_its_section_and_order(migrated_db, lib):
+    publish_small(migrated_db)
+    tracks = _new(lib, "tracks", limit=2)[2]["next_cursor"]
+    albums = _new(lib, "albums", limit=1)[2]["next_cursor"]
+    assert tracks and albums
+    for scope, sort, cursor in (("albums", "title", tracks), ("artists", "title", tracks),
+                                ("tracks", "artist", tracks), ("tracks", "title", albums),
+                                ("albums", "artist", albums)):
+        with pytest.raises(lib.CatalogScopeError) as bad:
+            lib.browse_library(scope=scope, sort=sort, limit=2, cursor=cursor)
+        assert (bad.value.error, bad.value.status) == ("invalid_cursor", 400), (scope, sort)
+    # Albums by "year" are read in title order, so a title cursor carries over.
+    page = lib.browse_library(scope="albums", sort="year", limit=1, cursor=albums)
+    assert page["sections"]["albums"]["items"] == _new(lib, "albums", limit=1, page=2)[0]
+    # scope=all returns capped previews and no cursors.
+    everything = lib.browse_library(scope="all", query="e e", limit=1)["sections"]
+    assert any(section["items"] for section in everything.values())
+    assert [section["next_cursor"] for section in everything.values()] == [None, None, None]
+    migrated_db.rollback()
+
+
+def test_offset_sorts_page_by_cursor_like_legacy_pages(migrated_db, lib):
+    """Albums by artist and tracks by artist or year have no keyset order:
+    their cursor carries the next offset, so "Load more" keeps working."""
+    publish_small(migrated_db)
+    for scope, sort in (("albums", "artist"), ("tracks", "artist"), ("tracks", "year")):
+        expected = _new(lib, scope, sort=sort)[0]
+        assert len(expected) > 2, (scope, sort)
+        walked, cursor = [], None
+        for _ in expected:
+            items, _total, section = _new(lib, scope, sort=sort, limit=2, cursor=cursor)
+            walked += items
+            cursor = section["next_cursor"]
+            if cursor is None:
+                break
+        assert walked == expected, (scope, sort)
+        assert _new(lib, scope, sort=sort, limit=2, page=2)[0] == expected[2:4], (scope, sort)
+    migrated_db.rollback()
+
+
 def test_totals_are_capped_or_published_counts(migrated_db, lib, monkeypatch):
     publish_small(migrated_db)
+    assert lib.TOTAL_CAP == 1000  # the contract's "1000+" (section 5.1b)
     monkeypatch.setattr(lib, "TOTAL_CAP", 4)
     with migrated_db.cursor() as cur:
         cur.execute(f"UPDATE {t('catalog_state')} SET entity_counts='{{\"track\": 12}}'")
@@ -343,7 +384,7 @@ def test_plans_use_the_trigram_keyset_and_album_indexes(migrated_db, lib, monkey
         cur.execute(f"SELECT lower(title), track_id FROM {t('catalog_tracks')} "
                     "WHERE catalog_instance_id=%s AND published_generation=2 "
                     "ORDER BY 1, 2 OFFSET 25000 LIMIT 1", (CAT,))
-        cursor = lib.encode_cursor(*cur.fetchone())
+        cursor = lib.encode_cursor("tracks", "title", *cur.fetchone())
     recording.statements.clear()
     page = lib.browse_library(scope="tracks", cursor=cursor, catalog_instance_id=CAT)
     assert len(page["sections"]["tracks"]["items"]) == 36
@@ -360,7 +401,7 @@ def test_plans_use_the_trigram_keyset_and_album_indexes(migrated_db, lib, monkey
 
     # Albums: name keyset, and the album_id index for their tracks.
     recording.statements.clear()
-    lib.browse_library(scope="albums", cursor=lib.encode_cursor("album 8", "al-01000"),
+    lib.browse_library(scope="albums", cursor=lib.encode_cursor("albums", "name", "album 8", "al-01000"),
                        catalog_instance_id=CAT)
     plan = _plan(migrated_db, *_page_sql(recording, "lower(al.name) AS sort_key"))
     assert f"{t('idx_catalog_albums_name_keyset')}" in plan, plan

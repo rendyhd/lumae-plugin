@@ -78,7 +78,14 @@ is safe to run again. On success it has:
   republished current `ready` profiles that have no published row (repair
   D, which runs here too);
 - recounted ready-but-unpublished and orphaned profiles into
-  `integrity_state`.
+  `integrity_state`;
+- added `catalog_tracks.search_text` and filled it for the published
+  generation, and built the workbench search and paging indexes (LUM-016).
+  This is the slowest step: about 15 s at 132k tracks, once. Reads continue
+  while it runs; catalogue publication waits for it. Later migrations find
+  the text current and skip it (about 1 s). Without the `pg_trgm` extension
+  the log has a warning, and search gives the same results without its
+  index.
 
 Each schema change runs only when it is still missing, so re-running the
 migration on an up-to-date database takes no exclusive table lock. A change

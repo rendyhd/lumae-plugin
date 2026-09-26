@@ -237,24 +237,52 @@ def album_artist_sql(over=""):
             f"MIN(COALESCE(NULLIF(album_artist, ''), author)) {over})")
 
 
-def encode_cursor(sort_key, item_id):
-    """An opaque keyset position: the last row's sort key and id (LUM-016)."""
-    raw = json.dumps([sort_key, item_id], ensure_ascii=False, separators=(",", ":"))
+MAX_CURSOR_OFFSET = 10_000_000
+
+
+def section_order(section, sort):
+    """How ``section`` pages under ``sort``: its keyset order, or "offset" for
+    the legacy sorts whose order is not indexable (LUM-016)."""
+    if section == "albums":
+        return "offset" if sort == "artist" else "name"
+    if section == "tracks":
+        return "offset" if sort in ("artist", "year") else "title"
+    return "name"
+
+
+def encode_cursor(section, order, *position):
+    """An opaque paging position, bound to the section and order it was issued
+    for (LUM-016): the last row's ``(sort key, id)`` for a keyset order, or
+    the next row's offset for the "offset" order."""
+    raw = json.dumps([section, order, *position], ensure_ascii=False, separators=(",", ":"))
     return base64.urlsafe_b64encode(raw.encode("utf-8")).decode("ascii").rstrip("=")
 
 
-def decode_cursor(value):
-    """``(sort_key, id)`` of a cursor, None when absent; 400 when unreadable."""
+def decode_cursor(value, section=None, order=None):
+    """A cursor's position: ``(sort_key, id)``, or an offset for the "offset"
+    order; None when absent. 400 ``invalid_cursor`` when it is unreadable or
+    was issued for another section or order (``section`` None checks only
+    that it is readable)."""
     text = str(value or "").strip()
     if not text:
         return None
     try:
-        key, item_id = json.loads(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)))
+        data = json.loads(base64.urlsafe_b64decode(text + "=" * (-len(text) % 4)))
     except (ValueError, TypeError):
         raise CatalogScopeError("invalid_cursor", 400) from None
-    if not isinstance(key, str) or not isinstance(item_id, str):
+    if not isinstance(data, list) or len(data) < 3:
         raise CatalogScopeError("invalid_cursor", 400)
-    return key, item_id
+    issued_section, issued_order, *position = data
+    if section is not None and (issued_section, issued_order) != (section, order):
+        raise CatalogScopeError("invalid_cursor", 400)
+    if issued_order == "offset":
+        valid = (len(position) == 1 and type(position[0]) is int
+                 and 0 < position[0] <= MAX_CURSOR_OFFSET)
+        if valid:
+            return position[0]
+    elif len(position) == 2 and all(isinstance(part, str) for part in position):
+        return tuple(position)
+    raise CatalogScopeError("invalid_cursor", 400)
 
 
 def _search_state(cur, catalog, query, artist):
@@ -354,7 +382,7 @@ def _paged(cur, sql, params, limit, offset):
     rows = _all_dicts(cur)
     more = len(rows) > limit
     rows = rows[:limit]
-    cursor = encode_cursor(rows[-1]["sort_key"], rows[-1]["sort_id"]) if more else None
+    cursor = (rows[-1]["sort_key"], rows[-1]["sort_id"]) if more else None
     keys = [(row.pop("sort_key"), row.pop("sort_id")) for row in rows]
     return rows, cursor, keys
 
@@ -518,9 +546,11 @@ def _browse_albums(cur, ctx, sort, limit, offset):
     cur.execute(
         f"SELECT * FROM ({inner}) albums "
         "ORDER BY lower(artist), lower(title), album_id LIMIT %s OFFSET %s",
-        tuple(params + [limit, offset]),
+        tuple(params + [limit + 1, offset]),
     )
     rows = _all_dicts(cur)
+    more = len(rows) > limit
+    rows = rows[:limit]
     for row in rows:
         row.update(
             {
@@ -529,7 +559,7 @@ def _browse_albums(cur, ctx, sort, limit, offset):
                 "provider_album_id": str(row.pop("album_id")),
             }
         )
-    return _section(cur, rows, None, offset == 0 and len(rows) < limit,
+    return _section(cur, rows, (offset + limit,) if more else None, offset == 0,
                     f"SELECT 1 FROM ({inner}) albums", params)
 
 
@@ -555,16 +585,27 @@ def _browse_tracks(cur, ctx, sort, limit, offset):
          ORDER BY {order}
          LIMIT %s OFFSET %s
         """,
-        tuple(params + [limit, offset]),
+        tuple(params + [limit + 1, offset]),
     )
     rows = _all_dicts(cur)
+    more = len(rows) > limit
+    rows = rows[:limit]
     for row in rows:
         row["kind"] = "track"
-    return _section(cur, rows, None, offset == 0 and len(rows) < limit,
+    return _section(cur, rows, (offset + limit,) if more else None, offset == 0,
                     f"SELECT 1 {inner}", params)
 
 
 def _browse_section(cur, ctx, key, sort, limit, offset, after):
+    """One section's page, its ``next_cursor`` bound to the section and order."""
+    section = _read_section(cur, ctx, key, sort, limit, offset, after)
+    if section["next_cursor"] is not None:
+        section["next_cursor"] = encode_cursor(key, section_order(key, sort),
+                                               *section["next_cursor"])
+    return section
+
+
+def _read_section(cur, ctx, key, sort, limit, offset, after):
     if ctx is None:
         return {"items": [], "total": 0, "total_exact": True, "next_cursor": None}
     if key == "albums":
@@ -600,7 +641,8 @@ def browse_library(scope="albums", query="", artist=None, sort="title", page=1, 
     page = _bounded_int(page, 1, 1, 100000)
     limit = _bounded_int(limit, 36, 1, 100)
     query = str(query or "").strip()
-    after = decode_cursor(cursor)
+    order = section_order(scope, sort) if scope != "all" else None
+    after = decode_cursor(cursor, scope if scope != "all" else None, order)
     if query and len(query) < 3:
         keys = ("albums", "tracks", "artists") if scope == "all" else (scope,)
         return {
@@ -614,7 +656,10 @@ def browse_library(scope="albums", query="", artist=None, sort="title", page=1, 
             "sections": {key: {"items": [], "total": 0, "total_exact": True,
                                "next_cursor": None} for key in keys},
         }
-    offset = 0 if after is not None else (page - 1) * limit
+    if order == "offset" and after is not None:
+        offset, after = after, None
+    else:
+        offset = 0 if after is not None else (page - 1) * limit
     db = get_db()
     cur = db.cursor()
     try:
@@ -629,6 +674,8 @@ def browse_library(scope="albums", query="", artist=None, sort="title", page=1, 
                 key: _browse_section(cur, ctx, key, sort, section_limit, 0, None)
                 for key in ("albums", "tracks", "artists")
             }
+            for section in sections.values():
+                section["next_cursor"] = None
     finally:
         cur.close()
     return {
