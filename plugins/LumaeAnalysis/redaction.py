@@ -66,11 +66,11 @@ _PATTERNS = (
     # may hold spaces, " (", ": " and, inside double quotes, apostrophes. The
     # scan ends at the next unescaped quote of the same kind.
     (
-        re.compile(r"'" + _PATH_START + r"(?:[^'\\]|\\.)*'"),
+        re.compile(r"(?<!\\)'" + _PATH_START + r"(?:[^'\\]|\\.)*'"),
         "'" + PATH + "'",
     ),
     (
-        re.compile(r'"' + _PATH_START + r'(?:[^"\\]|\\.)*"'),
+        re.compile(r'(?<!\\)"' + _PATH_START + r'(?:[^"\\]|\\.)*"'),
         '"' + PATH + '"',
     ),
     # Authorization headers: the scheme and its credentials.

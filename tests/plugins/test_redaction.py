@@ -265,11 +265,15 @@ ADVERSARIAL_UNITS = [
     "eyJ-", "eyJa.", "Bearer ", "bearer a", "https://", "a://", "a@", "x x",
     " /a", "/a", "'/", "\"/", "\\\\a", "\\", "C:\\", "a:\\", "~/", "file://",
     "Authorization: ", "cookie=", "aA0", "+/", "'", "\"", ":/",
+    # Escaped quotes before a path start (review R2-1: quadratic before the
+    # opening quote got a (?<!\\) guard).
+    "'/\\", "\"/\\", "'~/\\", "'file://\\",
 ]
 ADVERSARIAL_BYTES = 100_000
-# The worst measured case is about 17 ms; the bound leaves room for a slow
-# CI runner, and a super-linear pattern takes seconds.
-PATTERN_BUDGET_S = 0.05
+# The worst measured case is about 20-40 ms under load; 0.25 s leaves room for a
+# slow CI runner and still fails a regression (a lost lookbehind costs 0.4-1.2 s,
+# a quadratic pattern seconds and trips the alarm).
+PATTERN_BUDGET_S = 0.25
 
 
 # A super-linear pattern on 100 KB runs for hours; the regex engine checks for
