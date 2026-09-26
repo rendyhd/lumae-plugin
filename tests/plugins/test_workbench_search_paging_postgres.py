@@ -195,7 +195,11 @@ def test_results_equal_the_old_queries_through_the_stored_text(migrated_db, lib)
     _assert_matches_oracle(migrated_db, lib)
     # Spot checks that the fixture exercises accents and case.
     assert [i["track_id"] for i in _new(lib, "tracks", query="BEYONCÉ")[0]] == ["t06", "t07", "t05"]
-    assert [i["provider_album_id"] for i in _new(lib, "albums", query="cafe")[0]] == ["al-2", "al-1"]
+    # Both albums match "cafe". Their order is the database collation's (C.UTF-8
+    # puts "cafe society" first, a linguistic collation "café del mar"); the
+    # oracle comparison above already checks the order under either.
+    albums = _new(lib, "albums", query="cafe")[0]
+    assert sorted(i["provider_album_id"] for i in albums) == ["al-1", "al-2"]
 
 
 def test_results_equal_the_old_queries_through_the_inline_fallback(migrated_db, lib):

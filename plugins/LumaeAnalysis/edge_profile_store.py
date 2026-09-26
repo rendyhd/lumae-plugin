@@ -7,6 +7,7 @@ import uuid
 
 from plugin.api import table
 
+from . import migrations
 from .edge_profiles import METHOD, SCHEMA_VERSION, canonical_json, opaque_revision, profile_digest
 
 
@@ -33,6 +34,14 @@ def migrate_edge_profiles(db):
         updated_at TIMESTAMP NOT NULL DEFAULT now(),
         PRIMARY KEY (catalog_instance_id, track_id)
     )""")
+    # The settings poll counts a source's edges and reads the newest one
+    # (edge_profile_status): an index-only scan of this narrow index instead
+    # of two scans of the wide table.
+    migrations.ensure_index(
+        cur,
+        f"CREATE INDEX IF NOT EXISTS {table('edge_profiles')}_updated_idx "
+        f"ON {table('edge_profiles')} (catalog_instance_id, updated_at)",
+    )
     cur.close()
 
 
@@ -169,25 +178,25 @@ def publish_edge_profile(db, catalog_id, job, payload, signature):
 def edge_profile_status(db, catalog_id):
     """Read-only counts and freshness for one source's edge upgrade (P3-9).
 
-    One small, source-scoped aggregate (``catalog_instance_id`` is the leading
-    column of both tables' primary keys): published edge profiles, jobs
-    in progress, failed jobs, the most recent failed job's ``last_error``
-    (free text; callers redact it) and the latest published edge's
-    ``updated_at``. Never mutates anything.
+    Source-scoped aggregates: published edge profiles, jobs in progress,
+    failed jobs, the most recent failed job's ``last_error`` (free text;
+    callers redact it) and the latest published edge's ``updated_at``. The
+    edge count and the latest edge come from one index-only scan of
+    ``(catalog_instance_id, updated_at)``; the jobs table is small. Never
+    mutates anything.
     """
     cur = db.cursor()
     cur.execute(f"""
-        SELECT
-          (SELECT count(*) FROM {table('edge_profiles')} WHERE catalog_instance_id=%s) AS ready,
-          count(*) FILTER (WHERE status IN ('pending', 'running')) AS active,
-          count(*) FILTER (WHERE status='failed') AS failed,
-          (SELECT last_error FROM {table('edge_profile_jobs')}
-             WHERE catalog_instance_id=%s AND status='failed'
-             ORDER BY updated_at DESC LIMIT 1) AS last_error,
-          (SELECT max(updated_at) FROM {table('edge_profiles')}
-             WHERE catalog_instance_id=%s) AS last_success_at
-          FROM {table('edge_profile_jobs')} WHERE catalog_instance_id=%s
-    """, (catalog_id, catalog_id, catalog_id, catalog_id))
+        SELECT edges.ready, jobs.active, jobs.failed, jobs.last_error, edges.last_success_at
+          FROM (SELECT count(*) AS ready, max(updated_at) AS last_success_at
+                  FROM {table('edge_profiles')} WHERE catalog_instance_id=%s) edges,
+               (SELECT count(*) FILTER (WHERE status IN ('pending', 'running')) AS active,
+                       count(*) FILTER (WHERE status='failed') AS failed,
+                       (SELECT last_error FROM {table('edge_profile_jobs')}
+                         WHERE catalog_instance_id=%s AND status='failed'
+                         ORDER BY updated_at DESC LIMIT 1) AS last_error
+                  FROM {table('edge_profile_jobs')} WHERE catalog_instance_id=%s) jobs
+    """, (catalog_id, catalog_id, catalog_id))
     row = cur.fetchone()
     cur.close()
     ready, active, failed, last_error, last_success_at = row or (0, 0, 0, None, None)
