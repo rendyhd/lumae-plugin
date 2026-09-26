@@ -28,6 +28,11 @@ MAX_BACKUP_ITEMS = 100_000
 GLOBAL_PRINCIPAL = "__global__"
 FINGERPRINT_VERSION = 1
 FEED_PROTOCOL_VERSION = 1
+# K9: a request that sends this header with the value "2" opts in to
+# contract 2 (conflicts answer 409 with the server's state instead of being
+# absorbed). Health advertises the highest contract as collections.contract.
+COLLECTIONS_CONTRACT = 2
+CONTRACT_HEADER = "X-Lumae-Collections-Contract"
 # Every mutation transaction waits at most this long for any one lock (the
 # idempotency key, the collection row, the feed head); then it answers 503
 # collection_busy with Retry-After instead of queueing indefinitely.
@@ -94,19 +99,57 @@ def collections_enabled():
     return bool(value)
 
 
-def current_principal():
-    """JWT/session users are isolated; bearer-token installs share one library."""
-    if getattr(g, "auth_method", None) == "bearer":
+def _resolve_principal():
+    """The request's principal, or None when its host auth method is unknown.
+
+    Only the host's own methods name a principal: ``session`` (a user),
+    ``bearer`` (the installation token, shared) and no method at all (auth
+    disabled, shared). Anything else, such as a plugin-scoped token, names
+    none rather than a default principal.
+    """
+    method = getattr(g, "auth_method", None)
+    if method == "bearer":
         return GLOBAL_PRINCIPAL
+    if method not in (None, "session"):
+        return None
     username = getattr(g, "auth_user", None)
     if username:
         return f"user:{username}"
-    if getattr(g, "auth_method", None) == "session":
+    if method == "session":
         # Fail closed if host authentication ever presents a malformed session.
         # Falling back to the shared bearer principal here would expose another
         # account's collections.
         abort(401)
     return GLOBAL_PRINCIPAL
+
+
+def current_principal():
+    """JWT/session users are isolated; bearer-token installs share one library.
+
+    An unknown host auth method is denied (401), never mapped to a default
+    principal.
+    """
+    principal = _resolve_principal()
+    if principal is None:
+        abort(401)
+    return principal
+
+
+def health_scope_mode():
+    """The collections ``scope`` for health: "shared", "personal", or None when
+    the host auth method names no principal (the collection, shelf and
+    discovery routes answer 401 then). Health keeps answering 200 for such a
+    caller; a malformed session still aborts with 401, as in 1.2.5.
+    """
+    principal = _resolve_principal()
+    if principal is None:
+        return None
+    return current_collection_scope()["mode"]
+
+
+def contract_v2():
+    """The request opted in to collections contract 2 (K9)."""
+    return (request.headers.get(CONTRACT_HEADER) or "").strip() == str(COLLECTIONS_CONTRACT)
 
 
 def current_collection_scope():
@@ -246,10 +289,14 @@ def migrate_collections(db):
         )
         """
     )
+    # collection_id (1.3.0, K9): the collection a receipt's request applied
+    # to, so a key conflict can answer with its current state. NULL for a
+    # restore and for receipts written before 1.3.0.
     migrations.ensure_columns(
         cur, collection_mutations_table(),
         "request_fingerprint TEXT",
         "fingerprint_version INTEGER",
+        "collection_id TEXT",
     )
     # Progress of a keyed restore that spans several transactions. The row
     # lives from its first chunk until the chunk that stores the receipt.
@@ -304,6 +351,9 @@ def migrate_collections(db):
         f"ON {collection_items_table()} (principal, collection_id, album_key) "
         "WHERE kind = 'album' AND provider_album_id IS NULL",
     )
+    # Library search folds accents with unaccent when it can be installed;
+    # without it, search still works, accent-sensitively (collection_library).
+    migrations.ensure_extension(cur, "unaccent")
     cur.close()
 
 
@@ -982,6 +1032,23 @@ def _idempotency_key():
 CONTINUE = "continue"
 
 
+def _key_conflict(db, cur, principal, collection_id):
+    """409 ``idempotency_key_conflict``; the transaction is rolled back.
+
+    Under contract 2 the body adds ``current``: the collection the key's
+    receipt applied to as it stands now (tombstones included), or null when
+    the key belongs to a restore, the receipt predates 1.3.0, or the
+    collection does not exist.
+    """
+    body = {"error": "idempotency_key_conflict"}
+    if contract_v2():
+        body["current"] = None if collection_id is None else _fetch_collection(
+            cur, principal, collection_id, include_deleted=True
+        )
+    db.rollback()
+    return jsonify(body), 409
+
+
 def _begin_mutation(db, cur, principal, key, fingerprint):
     """Open one mutation transaction; a response here ends the request.
 
@@ -1004,8 +1071,8 @@ def _begin_mutation(db, cur, principal, key, fingerprint):
     lock_id = int.from_bytes(hashlib.sha256(identity).digest()[:8], "big", signed=True)
     cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
     cur.execute(
-        f"SELECT response_payload::text, status_code, request_fingerprint, fingerprint_version "
-        f"FROM {collection_mutations_table()} "
+        f"SELECT response_payload::text, status_code, request_fingerprint, fingerprint_version, "
+        f"collection_id FROM {collection_mutations_table()} "
         "WHERE principal = %s AND idempotency_key = %s",
         (principal, key),
     )
@@ -1020,23 +1087,24 @@ def _begin_mutation(db, cur, principal, key, fingerprint):
         )
         restoring = cur.fetchone()
         if restoring is not None and restoring[0] != fingerprint:
-            db.rollback()
-            return jsonify({"error": "idempotency_key_conflict"}), 409
+            return _key_conflict(db, cur, principal, None)
         return None
-    payload_text, status, saved_digest, saved_version = saved
+    payload_text, status, saved_digest, saved_version, saved_collection = saved
     if saved_digest is None and saved_version is None:
         current_app.logger.warning("Replaying legacy unbound collection receipt")
         headers = {"Idempotency-Replayed": "true", "Idempotency-Fingerprint": "legacy-unbound"}
     elif saved_version != FINGERPRINT_VERSION or saved_digest != fingerprint:
-        db.rollback()
-        return jsonify({"error": "idempotency_key_conflict"}), 409
+        return _key_conflict(db, cur, principal, saved_collection)
     else:
         headers = {"Idempotency-Replayed": "true"}
     db.rollback()
     return jsonify(json.loads(payload_text)), status, headers
 
 
-def _mutation_response(handler):
+def _mutation_response(handler, collection_id=None):
+    """Run ``handler`` as one keyed, bounded mutation; ``collection_id`` is the
+    collection the request applies to (None for a restore), kept with its
+    receipt."""
     principal = current_principal()
     key = _idempotency_key()
     fingerprint = _request_fingerprint()
@@ -1058,9 +1126,10 @@ def _mutation_response(handler):
                 cur.execute(
                     f"INSERT INTO {collection_mutations_table()} "
                     "(principal, idempotency_key, response_payload, status_code, "
-                    "request_fingerprint, fingerprint_version) "
-                    "VALUES (%s, %s, %s::jsonb, %s, %s, %s)",
-                    (principal, key, json.dumps(payload), status, fingerprint, FINGERPRINT_VERSION),
+                    "request_fingerprint, fingerprint_version, collection_id) "
+                    "VALUES (%s, %s, %s::jsonb, %s, %s, %s, %s)",
+                    (principal, key, json.dumps(payload), status, fingerprint,
+                     FINGERPRINT_VERSION, collection_id),
                 )
             db.commit()
             return jsonify(payload), status
@@ -1142,7 +1211,15 @@ class ForeignItemConflict(Exception):
     pass
 
 
-def _upsert_item(cur, principal, collection_id, item):
+def _upsert_item(cur, principal, collection_id, item, remap=True):
+    """Write one normalised item into a locked collection.
+
+    When another item of the collection already holds the same membership
+    (track id, provider album id, or album key without one), ``remap`` keeps
+    the 1.2.5 behaviour: ``item["id"]`` becomes that item's id and it is
+    updated. Without ``remap`` (contract 2) nothing is written and that item's
+    id is returned. Returns None when the item was written.
+    """
     if item["kind"] == "track":
         cur.execute(
             f"SELECT id FROM {collection_items_table()} "
@@ -1164,7 +1241,9 @@ def _upsert_item(cur, principal, collection_id, item):
             (principal, collection_id, item["album_key"]),
         )
     existing = cur.fetchone()
-    if existing:
+    if existing and existing[0] != item["id"]:
+        if not remap:
+            return existing[0]
         item["id"] = existing[0]
     cur.execute(
         f"""
@@ -1203,6 +1282,7 @@ def _upsert_item(cur, principal, collection_id, item):
     )
     if cur.fetchone() is None:
         raise ForeignItemConflict()
+    return None
 
 
 def register_collection_routes(bp):
@@ -1266,13 +1346,13 @@ def register_collection_routes(bp):
     @require_collections_enabled
     def collection_create():
         body = request.get_json(silent=True) or {}
+        collection_id = str(body.get("id") or uuid.uuid4())
 
         def mutate(cur, principal):
             try:
                 name, description = _clean_collection_body(body)
             except ValueError as exc:
                 return _error(str(exc), 400)
-            collection_id = str(body.get("id") or uuid.uuid4())
             cur.execute(
                 f"""
                 INSERT INTO {collections_table()} (principal, id, name, description)
@@ -1283,6 +1363,12 @@ def register_collection_routes(bp):
                 (principal, collection_id, name, description),
             )
             inserted = cur.fetchone() is not None
+            if not inserted and contract_v2():
+                # K9: the id is taken; answer with the collection holding it.
+                existing = _fetch_collection(cur, principal, collection_id, include_deleted=True)
+                deleted = existing is not None and existing["deleted_at"] is not None
+                return _error("collection_deleted" if deleted else "collection_exists", 409,
+                              current=existing)
             collection = _fetch_collection(cur, principal, collection_id)
             if inserted:
                 _record_change(
@@ -1290,7 +1376,7 @@ def register_collection_routes(bp):
                 )
             return {"collection": collection}, 201
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.get("/api/collections/<collection_id>")
     @require_collections_enabled
@@ -1351,7 +1437,7 @@ def register_collection_routes(bp):
             )
             return {"collection": updated}, 200
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.delete("/api/collections/<collection_id>")
     @require_collections_enabled
@@ -1381,7 +1467,7 @@ def register_collection_routes(bp):
             )
             return {"deleted": True, **payload}, 200
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.put("/api/collections/<collection_id>/items/<item_id>")
     @require_collections_enabled
@@ -1413,8 +1499,16 @@ def register_collection_routes(bp):
             expected = _expected_revision(body)
             if expected is not None and expected != current["revision"]:
                 return _error("revision_conflict", 409, current=current)
+            remap = not contract_v2()
+            conflicts = []
             for item in items:
-                _upsert_item(cur, principal, collection_id, item)
+                existing_id = _upsert_item(cur, principal, collection_id, item, remap=remap)
+                if existing_id is not None:
+                    conflicts.append({"item_id": item["id"], "existing_item_id": existing_id})
+            if conflicts:
+                # K9: nothing is written (the transaction rolls back).
+                return _error("membership_conflict", 409, **conflicts[0],
+                              conflicts=conflicts, current=current)
             cur.execute(
                 f"""
                 UPDATE {collections_table()}
@@ -1441,7 +1535,7 @@ def register_collection_routes(bp):
             ])
             return {"collection": updated, "items": items}, success_status
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.delete("/api/collections/<collection_id>/items/<item_id>")
     @require_collections_enabled
@@ -1485,7 +1579,7 @@ def register_collection_routes(bp):
                 )
             return {"deleted": removed, "collection": updated}, 200
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.delete("/api/collections/<collection_id>/items/batch")
     @require_collections_enabled
@@ -1540,7 +1634,7 @@ def register_collection_routes(bp):
                 "collection": updated,
             }, 200
 
-        return _mutation_response(mutate)
+        return _mutation_response(mutate, collection_id)
 
     @bp.get("/api/collections/changes")
     @require_collections_enabled
@@ -1637,13 +1731,14 @@ def register_collection_routes(bp):
         like = f"%{query}%"
         db = get_db()
         cur = db.cursor()
+        # ILIKE on the columns: search_u is unused, so unaccent is not needed.
         if kind == "album":
             cur.execute(
                 f"""
                 SELECT MIN(item_id) AS cover_item_id, album,
                        COALESCE(NULLIF(album_artist, ''), author) AS artist,
                        COUNT(*)::INTEGER AS track_count
-                  FROM ({catalog_track_view_sql()}) score
+                  FROM ({catalog_track_view_sql(unaccent=False)}) score
                  WHERE album IS NOT NULL
                    AND (album ILIKE %s OR album_artist ILIKE %s OR author ILIKE %s)
                  GROUP BY album, COALESCE(NULLIF(album_artist, ''), author)
@@ -1666,7 +1761,7 @@ def register_collection_routes(bp):
                 f"""
                 SELECT item_id AS track_id, title, author AS artist, album,
                        item_id AS cover_item_id
-                  FROM ({catalog_track_view_sql()}) score
+                  FROM ({catalog_track_view_sql(unaccent=False)}) score
                  WHERE title ILIKE %s OR author ILIKE %s OR album ILIKE %s
                  ORDER BY lower(title) LIMIT 50
                 """,

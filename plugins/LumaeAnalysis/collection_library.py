@@ -1,7 +1,6 @@
 """Media-library browsing and credential-safe preview routes for collections."""
 
 import re
-from functools import lru_cache
 from urllib.parse import quote
 
 import requests as http_requests
@@ -12,12 +11,43 @@ from plugin.api import config, get_db, logger, table
 
 LIBRARY_SCOPES = {"all", "albums", "tracks", "artists"}
 LIBRARY_SORTS = {"title", "artist", "year"}
-_ITEM_ID_RE = re.compile(r"[A-Za-z0-9._~-]{1,256}")
+# A provider item id in a stream or art path. Dot-only ids (".", "..") would
+# walk the provider URL they are placed in, so they are refused.
+_ITEM_ID_RE = re.compile(r"(?!\.+\Z)[A-Za-z0-9._~-]{1,256}")
 _REQUEST_TIMEOUT = (10, 60)
+_unaccent_warned = False
 
 
-def catalog_track_view_sql():
-    """Current provider catalogue rows with analysis as an optional link."""
+def unaccent_available(cur):
+    """Whether ``unaccent(text)`` resolves on this connection's search_path.
+
+    The migration creates the extension when the role may; without it, search
+    matches case-insensitively but not accent-insensitively (logged once).
+    """
+    global _unaccent_warned
+    cur.execute("SELECT to_regprocedure('unaccent(text)') IS NOT NULL")
+    row = cur.fetchone()
+    available = bool(row and row[0])
+    if not available and not _unaccent_warned:
+        _unaccent_warned = True
+        logger.warning(
+            "Living Collections search is not accent-insensitive: the PostgreSQL "
+            "unaccent extension is not installed (a database owner can run "
+            "CREATE EXTENSION unaccent)"
+        )
+    return available
+
+
+def catalog_track_view_sql(unaccent=True):
+    """Current provider catalogue rows with analysis as an optional link.
+
+    ``search_u`` is the lower-cased search text, accent-folded when
+    ``unaccent`` is true (see ``unaccent_available``). A query that does not
+    filter on ``search_u`` passes ``unaccent=False`` and needs no extension.
+    """
+    search_text = "concat_ws(' ', t.title, t.artist_display, t.album_artist_display, al.name)"
+    if unaccent:
+        search_text = f"unaccent({search_text})"
     sources = table("catalog_sources")
     state = table("catalog_state")
     tracks = table("catalog_tracks")
@@ -43,8 +73,7 @@ def catalog_track_view_sql():
                t.track_number, t.disc_number, t.duration_ms,
                t.content_kind, t.release_type, t.cover_art_id,
                l.status AS analysis_status,
-               lower(unaccent(concat_ws(' ', t.title, t.artist_display,
-                                        t.album_artist_display, al.name))) AS search_u,
+               lower({search_text}) AS search_u,
                source.provider_type
           FROM selected_source source
           JOIN {tracks} t
@@ -85,24 +114,21 @@ def _all_dicts(cur):
     ]
 
 
-def _normal(value):
-    return re.sub(r"[^a-z0-9]+", " ", str(value or "").casefold()).strip()
-
-
 def _album_key(title, artist):
     return f"{str(artist or '').casefold()}::{str(title or '').casefold()}"
 
 
-def _library_filters(query, artist=None):
+def _library_filters(query, artist=None, unaccent=True):
     clauses = []
     params = []
     query = str(query or "").strip()
     if query:
-        # AudioMuse maintains a lower-cased, unaccented trigram search column.
-        # AND-ing normalized tokens makes multi-word queries useful without
-        # returning the huge partial-word scans that froze the original UI.
+        # search_u is the lower-cased (and, with unaccent, accent-folded)
+        # catalogue text. AND-ing normalized tokens makes multi-word queries
+        # useful without returning the huge partial-word scans that froze the
+        # original UI.
         for token in query.casefold().split()[:8]:
-            clauses.append("search_u LIKE unaccent(%s)")
+            clauses.append("search_u LIKE unaccent(%s)" if unaccent else "search_u LIKE %s")
             params.append(f"%{token}%")
     if artist:
         clauses.append(
@@ -112,8 +138,8 @@ def _library_filters(query, artist=None):
     return (" AND " + " AND ".join(clauses)) if clauses else "", params
 
 
-def _browse_albums(cur, query, artist, sort, limit, offset):
-    filters, params = _library_filters(query, artist)
+def _browse_albums(cur, query, artist, sort, limit, offset, unaccent=True):
+    filters, params = _library_filters(query, artist, unaccent)
     order = {
         "title": "lower(title), lower(artist)",
         "artist": "lower(artist), lower(title)",
@@ -130,7 +156,7 @@ def _browse_albums(cur, query, artist, sort, limit, offset):
                    COUNT(*)::INTEGER AS track_count,
                    MIN(year)::INTEGER AS year,
                    MAX(rating)::INTEGER AS rating
-              FROM ({catalog_track_view_sql()}) score
+              FROM ({catalog_track_view_sql(unaccent)}) score
              WHERE NULLIF(album, '') IS NOT NULL {filters}
              GROUP BY album, COALESCE(NULLIF(album_artist, ''), author)
           ) albums
@@ -153,8 +179,8 @@ def _browse_albums(cur, query, artist, sort, limit, offset):
     return {"items": rows, "total": total}
 
 
-def _browse_tracks(cur, query, artist, sort, limit, offset):
-    filters, params = _library_filters(query, artist)
+def _browse_tracks(cur, query, artist, sort, limit, offset, unaccent=True):
+    filters, params = _library_filters(query, artist, unaccent)
     order = {
         # `artist` is a SELECT alias below. PostgreSQL permits a bare output
         # alias in ORDER BY, but not one nested inside lower(...), so sort on
@@ -169,7 +195,7 @@ def _browse_tracks(cur, query, artist, sort, limit, offset):
                COALESCE(NULLIF(album_artist, ''), author) AS album_artist,
                year, rating, item_id AS cover_item_id,
                COUNT(*) OVER()::INTEGER AS total_count
-          FROM ({catalog_track_view_sql()}) score
+          FROM ({catalog_track_view_sql(unaccent)}) score
          WHERE NULLIF(title, '') IS NOT NULL {filters}
          ORDER BY {order}
          LIMIT %s OFFSET %s
@@ -184,8 +210,8 @@ def _browse_tracks(cur, query, artist, sort, limit, offset):
     return {"items": rows, "total": total}
 
 
-def _browse_artists(cur, query, sort, limit, offset):
-    filters, params = _library_filters(query)
+def _browse_artists(cur, query, sort, limit, offset, unaccent=True):
+    filters, params = _library_filters(query, unaccent=unaccent)
     order = {
         "title": "lower(artist)",
         "artist": "lower(artist)",
@@ -203,7 +229,7 @@ def _browse_artists(cur, query, sort, limit, offset):
                    COUNT(*)::INTEGER AS track_count,
                    MIN(year)::INTEGER AS first_year,
                    MAX(year)::INTEGER AS latest_year
-              FROM ({catalog_track_view_sql()}) score
+              FROM ({catalog_track_view_sql(unaccent)}) score
              WHERE NULLIF(COALESCE(NULLIF(album_artist, ''), author), '') IS NOT NULL
                    {filters}
              GROUP BY COALESCE(NULLIF(album_artist, ''), author)
@@ -243,19 +269,20 @@ def browse_library(scope="albums", query="", artist=None, sort="title", page=1, 
     db = get_db()
     cur = db.cursor()
     try:
+        folded = unaccent_available(cur)
         if scope == "albums":
-            sections = {"albums": _browse_albums(cur, query, artist, sort, limit, offset)}
+            sections = {"albums": _browse_albums(cur, query, artist, sort, limit, offset, folded)}
         elif scope == "tracks":
-            sections = {"tracks": _browse_tracks(cur, query, artist, sort, limit, offset)}
+            sections = {"tracks": _browse_tracks(cur, query, artist, sort, limit, offset, folded)}
         elif scope == "artists":
-            sections = {"artists": _browse_artists(cur, query, sort, limit, offset)}
+            sections = {"artists": _browse_artists(cur, query, sort, limit, offset, folded)}
         else:
             # A broad search intentionally returns compact categorized sections.
             section_limit = min(limit, 12)
             sections = {
-                "albums": _browse_albums(cur, query, artist, sort, section_limit, 0),
-                "tracks": _browse_tracks(cur, query, artist, sort, section_limit, 0),
-                "artists": _browse_artists(cur, query, sort, section_limit, 0),
+                "albums": _browse_albums(cur, query, artist, sort, section_limit, 0, folded),
+                "tracks": _browse_tracks(cur, query, artist, sort, section_limit, 0, folded),
+                "artists": _browse_artists(cur, query, sort, section_limit, 0, folded),
             }
     finally:
         cur.close()
@@ -283,7 +310,7 @@ def library_stats():
                    )) FILTER (WHERE NULLIF(album, '') IS NOT NULL)::INTEGER AS album_count,
                    COUNT(DISTINCT lower(COALESCE(NULLIF(album_artist, ''), author)))::INTEGER
                      AS artist_count
-              FROM ({catalog_track_view_sql()}) score
+              FROM ({catalog_track_view_sql(unaccent=False)}) score
             """
         )
         row = cur.fetchone() or (0, 0, 0)
@@ -378,7 +405,7 @@ def _score_album_tracks(title, artist, provider_album_id=None):
                    CASE WHEN duration_ms IS NULL THEN NULL ELSE round(duration_ms / 1000.0) END
                      AS duration_seconds,
                    analysis_status, provider_type
-              FROM ({catalog_track_view_sql()}) score
+              FROM ({catalog_track_view_sql(unaccent=False)}) score
              WHERE ((%s IS NOT NULL AND album_id=%s) OR
                     (%s IS NULL AND lower(album) = lower(%s)
                      AND lower(COALESCE(NULLIF(album_artist, ''), author)) = lower(%s)))
@@ -398,69 +425,6 @@ def _score_album_tracks(title, artist, provider_album_id=None):
             }
         )
     return rows
-
-
-def _analyzed_track_ids(track_ids):
-    ids = [str(track_id) for track_id in track_ids if track_id]
-    if not ids:
-        return set()
-    db = get_db()
-    cur = db.cursor()
-    try:
-        cur.execute(
-            f"SELECT item_id FROM ({catalog_track_view_sql()}) score "
-            "WHERE item_id = ANY(%s) AND analysis_status IN ('ready', 'suspect')",
-            (ids,),
-        )
-        return {str(row[0]) for row in cur.fetchall()}
-    finally:
-        cur.close()
-
-
-@lru_cache(maxsize=512)
-def resolve_provider_album(title, artist):
-    """Resolve AudioMuse's title/artist grouping to the provider's album id."""
-    try:
-        from tasks.mediaserver import search_albums
-
-        matches = search_albums(str(title), provider_type=getattr(config, "MEDIASERVER_TYPE", None))
-    except Exception:
-        logger.exception("Living Collections could not search the media server for album metadata")
-        return None
-    wanted_title = _normal(title)
-    wanted_artist = _normal(artist)
-    exact_title = [match for match in matches or [] if _normal(match.get("name")) == wanted_title]
-    exact_both = [
-        match for match in exact_title if not wanted_artist or _normal(match.get("artist")) == wanted_artist
-    ]
-    chosen = (exact_both or exact_title or list(matches or []))[:1]
-    return dict(chosen[0]) if chosen else None
-
-
-def _provider_album_tracks(provider_type, album_id):
-    if provider_type == "lyrion":
-        # AudioMuse's general Lyrion mapper intentionally drops disc/track
-        # fields used by analysis. The collection album view needs the raw
-        # CLI metadata, whose documented `track` and `disc` values are returned
-        # when titles are sorted by track number.
-        from tasks.mediaserver.lyrion import _jsonrpc_request, _lyrion_is_remote
-
-        response = _jsonrpc_request(
-            "titles",
-            [
-                0,
-                999999,
-                f"album_id:{album_id}",
-                "tags:galduAyRJ",
-                "sort:tracknum",
-            ],
-        )
-        rows = (response or {}).get("titles_loop") if isinstance(response, dict) else response
-        return [row for row in (rows or []) if not _lyrion_is_remote(row)]
-
-    from tasks.mediaserver import get_tracks_from_album
-
-    return get_tracks_from_album(str(album_id), provider_type=provider_type or None)
 
 
 def album_detail(title, artist, provider_album_id=None):

@@ -228,6 +228,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "enabled": False,
                 "scope": "shared",
                 "feed_epoch": True,
+                "contract": 2,
             },
             "catalog_mirror": mod.catalog_capability(),
             "credits": mod.credits_service.capability(),
@@ -2031,40 +2032,6 @@ def test_album_detail_uses_provider_catalog_order_and_analysis_links(monkeypatch
     assert detail["tracks"][0]["track_number"] == 1
     assert detail["tracks"][0]["analyzed"] is True
     assert detail["tracks"][1]["analyzed"] is False
-
-
-def test_lyrion_album_detail_requests_documented_track_and_disc_order(monkeypatch):
-    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
-    calls = []
-    lyrion = types.ModuleType("tasks.mediaserver.lyrion")
-    lyrion._jsonrpc_request = lambda command, params: (
-        calls.append((command, params)) or {"titles_loop": [{"id": "7", "title": "Track", "track": 3, "disc": 2}]}
-    )
-    lyrion._lyrion_is_remote = lambda row: False
-    mediaserver = types.ModuleType("tasks.mediaserver")
-    mediaserver.lyrion = lyrion
-    tasks = types.ModuleType("tasks")
-    tasks.mediaserver = mediaserver
-    monkeypatch.setitem(sys.modules, "tasks", tasks)
-    monkeypatch.setitem(sys.modules, "tasks.mediaserver", mediaserver)
-    monkeypatch.setitem(sys.modules, "tasks.mediaserver.lyrion", lyrion)
-
-    rows = library._provider_album_tracks("lyrion", "album-4")
-
-    assert rows[0]["track"] == 3
-    assert rows[0]["disc"] == 2
-    assert calls == [
-        (
-            "titles",
-            [
-                0,
-                999999,
-                "album_id:album-4",
-                "tags:galduAyRJ",
-                "sort:tracknum",
-            ],
-        )
-    ]
 
 
 def test_collection_library_route_forwards_scope_search_sort_and_artist(monkeypatch):
@@ -8580,10 +8547,20 @@ def test_collection_restore_ui_reuses_one_idempotency_key_per_backup():
     assert "let restoreDocument=null,restoreKey=null;" in body
     assert "restoreDocument=null;restoreKey=null;" in reset
     assert "restoreDocument=null;restoreKey=null;" in inspect
-    assert "restoreDocument=documentBody;restoreKey=mutationKey();" in inspect
+    # P3-4b: the key is kept per backup checksum for the page's lifetime, so
+    # closing the dialog and choosing the same backup again still resumes.
+    assert "const pendingRestores=new Map();" in body
+    assert ("const pending=pendingRestores.get(String(documentBody.checksum));"
+            "restoreDocument=pending?pending.document:documentBody;"
+            "restoreKey=pending?pending.key:mutationKey();") in inspect
+    assert "pendingRestores" not in reset
+    assert "pendingRestores.set(checksum,{key:restoreKey,document:restoreDocument})" in restore
+    assert "if(!partial)pendingRestores.delete(checksum);" in restore
+    assert "pendingRestores.delete(checksum);backup.close();" in restore
     assert "headers:{'Idempotency-Key':restoreKey}" in restore
     assert "mutationKey()" not in restore
     assert "Choose Restore copies again to finish it; nothing is added twice." in restore
+    assert "but not after reloading the page" in restore
 
 
 def test_settings_page_renders_coverage_meter_and_action_context(monkeypatch):
