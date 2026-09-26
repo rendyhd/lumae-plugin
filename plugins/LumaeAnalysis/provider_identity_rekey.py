@@ -318,7 +318,8 @@ def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings):
     rekey_published_profiles(cur, catalog_instance_id, tracks)
     if tracks:
         cur.execute(
-            f"""UPDATE {t('source_profiles')} SET attempt_token=NULL, status='stale'
+            f"""UPDATE {t('source_profiles')} SET attempt_token=NULL, status='stale',
+                       retry_category=NULL, failure_diagnostics=NULL
                  WHERE catalog_instance_id=%s AND track_id=ANY(%s::text[])
                    AND attempt_token IS NOT NULL""",
             (catalog_instance_id, [row["new_id"] for row in tracks]),

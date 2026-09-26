@@ -3752,9 +3752,10 @@ def test_find_backfill_ids_applies_limit_after_eligibility_filtering(monkeypatch
 
     assert mod.find_backfill_ids(limit=2) == ["eligible-missing", "eligible-stale"]
     sql, params = db.cursor_obj.executed[-1]
-    assert "LIMIT %s" in sql
-    assert params[-2] is True
-    assert params[-1] == 2
+    assert "LIMIT %(limit)s" in sql
+    # A skipped row stays retryable on the legacy table.
+    assert "OR p.status='skipped_no_file'" in sql
+    assert params["limit"] == 2
 
 
 def test_explicit_prepare_retry_includes_failed_profiles(monkeypatch):
@@ -4281,8 +4282,9 @@ def test_profile_backfill_task_releases_claimed_rows_when_batch_crashes(monkeypa
     monkeypatch.setattr(
         mod,
         "release_pending",
-        lambda ids, catalog_instance_id=None, reason=None, tokens=None: calls.append(
-            ("release", ids, catalog_instance_id, reason)
+        lambda ids, catalog_instance_id=None, reason=None, tokens=None,
+        count_failure=True: calls.append(
+            ("release", ids, catalog_instance_id, reason, count_failure)
         ),
     )
 
@@ -4291,6 +4293,8 @@ def test_profile_backfill_task_releases_claimed_rows_when_batch_crashes(monkeypa
 
     assert calls[-2][0:3] == ("release", ["track-a"], "catalog-a")
     assert "decoder crashed" in calls[-2][3]
+    # The aborted batch never tried the analysis: no attempt is used (LUM-007).
+    assert calls[-2][4] is False
     assert calls[-1][0] == "state"
     assert calls[-1][1][2] == "failed"
 
@@ -4792,6 +4796,7 @@ def test_maintenance_pause_blocks_background_work_but_preserves_control_state(
                 "catalog_instance_id": "catalog-a",
                 "reason": "Lumae background maintenance is paused",
                 "tokens": None,
+                "count_failure": False,
             },
         ),
         (
@@ -4800,6 +4805,7 @@ def test_maintenance_pause_blocks_background_work_but_preserves_control_state(
                 "catalog_instance_id": "catalog-a",
                 "reason": "Lumae background maintenance is paused",
                 "tokens": None,
+                "count_failure": False,
             },
         ),
     ]

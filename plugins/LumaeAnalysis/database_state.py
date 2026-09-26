@@ -28,6 +28,8 @@ from .profile_publication import (
     REVISION_FAILURES,
     SAFE_FAILURES,
     TRANSIENT_FAILURES,
+    backfill_due_sql,
+    scheduler_params,
 )
 from .redaction import redact_error_text
 
@@ -436,12 +438,12 @@ def _group_state(db, source, errors, diagnostics):
 #
 # Each available track of the published catalogue is in exactly one state.
 # ``due`` is the background scheduler's selection: ``fetch_backfill_rows``
-# (``__init__.py``) called with a ``catalog_instance_id``, mirrored predicate by
-# predicate. The categories, attempt limit and version slots come from the
-# retry model (``profile_publication``), so a new category is classified here
-# as soon as it is added there. The scheduler still spells its predicates
-# inline; tests/plugins/test_database_state_postgres.py pins that both select
-# the same rows in every state. The one deliberate difference: cooldowns are
+# (``__init__.py``) called with a ``catalog_instance_id``. Both use the same
+# predicate, ``profile_publication.backfill_due_sql`` (P3-6), with the
+# categories, attempt limit and version slots of the retry model, so a new
+# category is classified here as soon as it is added there;
+# tests/plugins/test_database_state_postgres.py pins that both select the
+# same rows in every state. The one deliberate difference: cooldowns are
 # compared with ``statement_timestamp()`` (this read) where the scheduler uses
 # ``now()`` (its own short transaction).
 
@@ -466,43 +468,7 @@ PROFILE_WORK_STATES = (
     "unscheduled",
 )
 
-_MEDIA_KNOWN = "NULLIF(t.media_fp, '') IS NOT NULL"
-_REVISION_CHANGED = f"""({_MEDIA_KNOWN}
-                 AND p.retry_media_signature IS NOT NULL
-                 AND p.retry_media_signature IS DISTINCT FROM
-                     ('catalog-media:' || t.media_fp))"""
-# fetch_backfill_rows(catalog_instance_id=...): its WHERE clause after the
-# catalogue join, with ``retry_category IN (...)`` from TRANSIENT_FAILURES and
-# the literal ``retry_count < 3`` from RETRY_LIMIT.
-_DUE = f"""(
-            (COALESCE(p.status, '') NOT IN
-                 ('pending', 'pending_interactive', 'deferred_no_media_revision')
-             OR (p.status='deferred_no_media_revision' AND {_MEDIA_KNOWN}))
-            AND (
-                p.track_id IS NULL
-                OR p.analyzer_ver IS NULL
-                OR p.analyzer_ver < %(analyzer_version)s
-                OR (p.status='stale' AND (
-                        p.retry_category IS NULL
-                        OR (p.retry_category='queue_unavailable'
-                            AND p.retry_count < %(retry_limit)s
-                            AND p.retry_after <= statement_timestamp())
-                        OR {_REVISION_CHANGED}))
-                OR (p.status='deferred_no_media_revision' AND {_MEDIA_KNOWN})
-                OR (p.status='ready' AND {_MEDIA_KNOWN}
-                    AND p.media_signature IS DISTINCT FROM
-                        ('catalog-media:' || COALESCE(t.media_fp, '')))
-                OR (p.status IN ('failed', 'skipped_no_file') AND (
-                        {_REVISION_CHANGED}
-                        OR (p.retry_analyzer_ver IS NOT NULL
-                            AND p.retry_analyzer_ver < %(analyzer_version)s)
-                        OR (p.retry_profile_schema_ver IS NOT NULL
-                            AND p.retry_profile_schema_ver < %(schema_version)s)
-                        OR (p.retry_category IS NULL AND p.retry_count=0)
-                        OR (p.retry_category = ANY(%(transient)s)
-                            AND p.retry_count < %(retry_limit)s
-                            AND p.retry_after <= statement_timestamp())))
-            ))"""
+_DUE = backfill_due_sql("statement_timestamp()")
 
 
 def _profile_work_sql(select):
@@ -599,11 +565,8 @@ def profile_work_params(catalog_instance_id):
     from . import ANALYZER_VERSION, SCHEMA_VERSION
 
     return {
+        **scheduler_params(ANALYZER_VERSION, SCHEMA_VERSION),
         "source": catalog_instance_id,
-        "analyzer_version": int(ANALYZER_VERSION),
-        "schema_version": int(SCHEMA_VERSION),
-        "retry_limit": int(RETRY_LIMIT),
-        "transient": sorted(TRANSIENT_FAILURES),
         "revision": sorted(REVISION_FAILURES),
     }
 
