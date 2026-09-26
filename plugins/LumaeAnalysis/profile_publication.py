@@ -8,8 +8,8 @@ RETRY_LIMIT = 3
 RETRY_DELAYS_SECONDS = (60, 300, 1800)
 # Transient: retried after a RETRY_DELAYS_SECONDS cooldown while retry_count < RETRY_LIMIT.
 # Revision: retried only for new media, a new analyzer or a new schema.
-# fetch_backfill_rows and next_profile_retry_at select TRANSIENT_FAILURES
-# themselves, so a category added here is retried there too.
+# The scheduler predicates below select TRANSIENT_FAILURES, so a category
+# added here is retried by fetch_backfill_rows and next_profile_retry_at too.
 TRANSIENT_FAILURES = frozenset((
     "download_unavailable", "media_unavailable", "analysis_timeout",
     "analysis_error", "queue_unavailable",
@@ -24,6 +24,104 @@ SAFE_FAILURES = TRANSIENT_FAILURES | REVISION_FAILURES
 # after 1.2.5 are reported as the reason 1.2.5 gave for the same failure, so
 # clients never see a new value without a capability gate (contract §8.5).
 _PUBLIC_REASONS = {"media_error": "unsupported_media", "analysis_crash": "analysis_error"}
+
+
+# P3-6: the cooldown after a used attempt, by the attempts used before it:
+# RETRY_DELAYS_SECONDS[retry_count], the last slot once they run out. Every
+# path that arms ``retry_after`` (a failure, a release, a recovered claim)
+# uses it with the row's retry_count before the update.
+def retry_delay_sql(count="retry_count"):
+    first, second, rest = RETRY_DELAYS_SECONDS
+    return (f"make_interval(secs => CASE {count} WHEN 0 THEN {int(first)} "
+            f"WHEN 1 THEN {int(second)} ELSE {int(rest)} END)")
+
+
+# P3-6: the scheduler's predicates, shared by fetch_backfill_rows (what a
+# batch selects), next_profile_retry_at (when to wake for a cooldown) and the
+# /database-state work states, so the three cannot drift. Fragments over the
+# attempt row ``p`` (source_profiles) and its occurrence ``t`` in the
+# published catalogue generation, with the named parameters
+# scheduler_params() gives. ``clock`` is what a cooldown is compared with.
+MEDIA_KNOWN_SQL = "NULLIF(t.media_fp, '') IS NOT NULL"
+RETRY_REVISION_CHANGED_SQL = f"""({MEDIA_KNOWN_SQL}
+                 AND p.retry_media_signature IS NOT NULL
+                 AND p.retry_media_signature IS DISTINCT FROM
+                     ('catalog-media:' || t.media_fp))"""
+
+
+def scheduler_params(analyzer_version, schema_version):
+    return {
+        "analyzer_version": int(analyzer_version),
+        "schema_version": int(schema_version),
+        "retry_limit": int(RETRY_LIMIT),
+        "transient": sorted(TRANSIENT_FAILURES),
+    }
+
+
+def stale_due_sql(clock="now()"):
+    """A 'stale' row is due while it has attempts left, unless it was
+    released and is in its cooldown; new media is always due (a fresh
+    budget). Stale transitions clear ``retry_category``, so only a release
+    (``queue_unavailable``) keeps one; they keep ``retry_count``, so an
+    exhausted row stays exhausted for the same media (LUM-007)."""
+    return f"""(p.status='stale' AND (
+                        (p.retry_category IS NULL
+                         AND p.retry_count < %(retry_limit)s)
+                        OR (p.retry_category='queue_unavailable'
+                            AND p.retry_count < %(retry_limit)s
+                            AND p.retry_after <= {clock})
+                        OR {RETRY_REVISION_CHANGED_SQL}))"""
+
+
+def failure_due_sql(clock="now()"):
+    """A failure is due for a new revision, analyzer or schema, and a
+    transient one after its cooldown while attempts remain."""
+    return f"""(p.status IN ('failed', 'skipped_no_file') AND (
+                        {RETRY_REVISION_CHANGED_SQL}
+                        OR (p.retry_analyzer_ver IS NOT NULL
+                            AND p.retry_analyzer_ver < %(analyzer_version)s)
+                        OR (p.retry_profile_schema_ver IS NOT NULL
+                            AND p.retry_profile_schema_ver < %(schema_version)s)
+                        OR (p.retry_category IS NULL AND p.retry_count=0)
+                        OR (p.retry_category = ANY(%(transient)s)
+                            AND p.retry_count < %(retry_limit)s
+                            AND p.retry_after <= {clock})))"""
+
+
+def backfill_due_sql(clock="now()", *, stale=None, failure=None):
+    """What a backfill batch selects among available, analysis-eligible
+    occurrences; ``p`` is NULL for a track without an attempt row. The
+    legacy (pre-registry) table passes its own ``stale``/``failure`` terms."""
+    stale = stale_due_sql(clock) if stale is None else stale
+    failure = failure_due_sql(clock) if failure is None else failure
+    return f"""(
+            (COALESCE(p.status, '') NOT IN
+                 ('pending', 'pending_interactive', 'deferred_no_media_revision')
+             OR (p.status='deferred_no_media_revision' AND {MEDIA_KNOWN_SQL}))
+            AND (
+                p.track_id IS NULL
+                OR p.analyzer_ver IS NULL
+                OR p.analyzer_ver < %(analyzer_version)s
+                OR {stale}
+                OR (p.status='deferred_no_media_revision' AND {MEDIA_KNOWN_SQL})
+                OR (p.status='ready' AND {MEDIA_KNOWN_SQL}
+                    AND p.media_signature IS DISTINCT FROM
+                        ('catalog-media:' || COALESCE(t.media_fp, '')))
+                OR {failure}
+            ))"""
+
+
+# A transient retry with an armed cooldown: next_profile_retry_at wakes the
+# backfill at the earliest such ``retry_after``.
+RETRY_ARMED_SQL = """(p.status IN ('failed', 'skipped_no_file', 'stale')
+                        AND p.retry_category = ANY(%(transient)s)
+                        AND p.retry_count < %(retry_limit)s
+                        AND p.retry_after IS NOT NULL)"""
+# What a stale transition (an attempt or occurrence abandoned, not a failed
+# analysis) resets: an earlier failure's category would otherwise keep the
+# row out of stale_due_sql with no cooldown to wake it (LUM-007). The count
+# is kept, so the attempt budget still holds.
+STALE_RETRY_RESET_SQL = "retry_category=NULL, failure_diagnostics=NULL"
 
 
 def public_failure_reason(code):
@@ -228,29 +326,56 @@ def admit_attempts(db, source, ids, priority="background",
 
 
 def release_attempts(db, source, tokens, reason, count_failure=True):
+    """Return admitted attempts to the scheduler as ``queue_unavailable``.
+
+    ``count_failure`` uses up an attempt and cools down for the slot of the
+    attempts used (retry_delay_sql): the job could not be queued or its claim
+    was lost. A maintenance pause, a legacy-job migration or an aborted batch
+    never tried the analysis and passes False: no attempt and no cooldown,
+    the row is due again at once (LUM-007). Rows are locked in track-ID
+    order, as admission locks them, so they cannot deadlock.
+    """
     if not tokens:
         return 0
+    # ``now()`` rather than NULL: stale_due_sql selects a queue_unavailable
+    # row once ``retry_after <= now()``, and a NULL cooldown means exhausted.
+    delay = retry_delay_sql("s.retry_count") if count_failure else "interval '0 seconds'"
+    ids = sorted(tokens)
     cur = db.cursor()
     try:
-        count = 0
-        for track_id, token in tokens.items():
-            cur.execute(
-                f"""UPDATE {table('source_profiles')}
+        cur.execute(
+            f"""WITH released AS MATERIALIZED (
+                    SELECT s.track_id
+                      FROM {table('source_profiles')} s
+                      JOIN unnest(%(ids)s::text[], %(tokens)s::text[]) AS r(track_id, token)
+                        ON s.track_id=r.track_id AND s.attempt_token=r.token
+                     WHERE s.catalog_instance_id=%(source)s
+                       AND s.status IN ('pending', 'pending_interactive')
+                     ORDER BY s.track_id COLLATE "C"
+                       FOR UPDATE OF s
+                ), updated AS (
+                    UPDATE {table('source_profiles')} s
                        SET status='stale', last_error='queue_unavailable',
                            analyzed_at=now(), attempt_token=NULL,
                            retry_category='queue_unavailable',
-                           retry_count=retry_count + %s,
-                           retry_after=CASE WHEN retry_count + %s < %s
-                               THEN now() + interval '60 seconds' ELSE NULL END,
-                           retry_media_signature=attempt_media_signature,
-                           retry_analyzer_ver=attempt_analyzer_ver,
-                           retry_profile_schema_ver=attempt_profile_schema_ver
-                     WHERE catalog_instance_id=%s AND track_id=%s AND attempt_token=%s
-                       AND status IN ('pending', 'pending_interactive')""",
-                (int(count_failure), int(count_failure), RETRY_LIMIT,
-                 source, track_id, token),
-            )
-            count += max(0, cur.rowcount)
+                           retry_count=s.retry_count + %(used)s,
+                           retry_after=CASE WHEN s.retry_count + %(used)s < %(retry_limit)s
+                               THEN now() + {delay}
+                               ELSE NULL END,
+                           retry_media_signature=s.attempt_media_signature,
+                           retry_analyzer_ver=s.attempt_analyzer_ver,
+                           retry_profile_schema_ver=s.attempt_profile_schema_ver
+                      FROM released
+                     WHERE s.catalog_instance_id=%(source)s
+                       AND s.track_id=released.track_id
+                 RETURNING 1
+                )
+                SELECT count(*) FROM updated""",
+            {"ids": ids, "tokens": [tokens[track_id] for track_id in ids],
+             "source": source, "used": int(bool(count_failure)),
+             "retry_limit": int(RETRY_LIMIT)},
+        )
+        count = int(cur.fetchone()[0])
         db.commit()
         return count
     except Exception:
@@ -333,7 +458,7 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
             cur.execute(
                 f"""UPDATE {table('source_profiles')}
                        SET status='stale', last_error='Catalogue media revision changed',
-                           attempt_token=NULL
+                           attempt_token=NULL, {STALE_RETRY_RESET_SQL}
                      WHERE catalog_instance_id=%s AND track_id=%s""",
                 (source, track_id),
             )
@@ -390,14 +515,13 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
                        SET retry_category=%s, retry_count=retry_count+1,
                            retry_after=CASE
                                WHEN %s AND retry_count+1 < %s
-                               THEN now() + make_interval(secs => CASE retry_count
-                                   WHEN 0 THEN %s WHEN 1 THEN %s ELSE %s END)
+                               THEN now() + {retry_delay_sql()}
                                ELSE NULL END,
                            retry_media_signature=%s, retry_analyzer_ver=%s,
                            retry_profile_schema_ver=%s, failure_diagnostics=%s::jsonb
                      WHERE catalog_instance_id=%s AND track_id=%s""",
                 (code, code in TRANSIENT_FAILURES, RETRY_LIMIT,
-                 *RETRY_DELAYS_SECONDS, attempt[1], analyzer_version,
+                 attempt[1], analyzer_version,
                  schema_version,
                  json.dumps(diagnostics, sort_keys=True) if diagnostics else None,
                  source, track_id),
@@ -576,7 +700,7 @@ def withdraw_catalog_changes(cur, plan):
         cur.execute(
             f"""UPDATE {table('source_profiles')}
                    SET status='stale', last_error='Catalogue epoch changed',
-                       attempt_token=NULL
+                       attempt_token=NULL, {STALE_RETRY_RESET_SQL}
                  WHERE catalog_instance_id=%s AND attempt_token IS NOT NULL""",
             (source,),
         )
@@ -602,7 +726,7 @@ def withdraw_catalog_changes(cur, plan):
                 UPDATE {table('source_profiles')} s
                    SET status='stale',
                        last_error='Catalogue media revision changed or track removed',
-                       attempt_token=NULL
+                       attempt_token=NULL, {STALE_RETRY_RESET_SQL}
                   FROM stale
                  WHERE s.catalog_instance_id=%(source)s AND s.track_id=stale.track_id
             ), withdrawn AS (
@@ -759,7 +883,7 @@ def _withdraw_orphans(cur, source, track_ids):
             ), staled AS (
                 UPDATE {table('source_profiles')} s
                    SET status='stale', last_error='Track removed from the catalogue',
-                       attempt_token=NULL
+                       attempt_token=NULL, {STALE_RETRY_RESET_SQL}
                   FROM stale
                  WHERE s.catalog_instance_id=%(source)s AND s.track_id=stale.track_id
             ), withdrawn AS (

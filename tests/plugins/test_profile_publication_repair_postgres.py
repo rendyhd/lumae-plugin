@@ -314,6 +314,26 @@ def test_the_orphan_predicate_reads_the_generation_published_now(migrated_db):
     _consistent(migrated_db)
 
 
+def test_an_unavailable_track_is_an_orphan(migrated_db):
+    """The generation keeps y's row with ``available=false`` (the provider
+    no longer serves it): as orphaned as a track the generation lacks."""
+    _library(migrated_db, ["a", "y"])
+    with migrated_db.cursor() as cur:
+        cur.execute(f"UPDATE {P}catalog_tracks SET available=FALSE "
+                    "WHERE catalog_instance_id=%s AND track_id='y'", (SOURCE,))
+        assert publication.orphaned_publication_count(cur) == 1
+    migrated_db.commit()
+    head = _head(migrated_db)
+    assert publication.withdraw_orphaned_profiles(migrated_db, SOURCE) == ["y"]
+    assert _published(migrated_db) == ["a"]
+    assert _events(migrated_db, "y") == ["delete"]
+    assert _attempt(migrated_db, "y") == ("stale", None)
+    assert _edges(migrated_db) == ["a"]
+    assert _head(migrated_db) == head + 1
+    assert publication.withdraw_orphaned_profiles(migrated_db, SOURCE) == []
+    _consistent(migrated_db)
+
+
 def test_orphan_withdrawal_is_bounded_per_run_and_idempotent(migrated_db):
     _library(migrated_db, ["a", "b"], orphans=["x1", "x2", "x3"])
     head = _head(migrated_db)
@@ -696,6 +716,49 @@ def test_repair_skips_a_row_admitted_after_the_candidates_were_read(
     )
     assert _events(migrated_db, "r") == ["upsert"]
     assert _published(migrated_db) == ["a", "r"]
+
+
+def test_repair_skips_a_row_another_repair_publishes_meanwhile(
+    migrated_db, second_connection, connections, monkeypatch,
+):
+    """Between the candidate read and the batch, a second connection
+    publishes r and holds its transaction open. The batch queues behind it
+    on catalog_state; after the commit, the published-row check (``SELECT
+    ... FOR UPDATE``) finds r published and leaves it: one upsert, no
+    duplicate key, no second event."""
+    _ready_unpublished_fixture(migrated_db)
+    real = publication._ready_unpublished
+    outcome = {}
+
+    def candidates_then_publication(cur, source, analyzer, schema, limit):
+        found = real(cur, source, analyzer, schema, limit)
+        if found:
+            with second_connection.cursor() as other:
+                generation = publication._source_state(other, SOURCE)[0]
+                outcome["other"] = publication._republish_ready(
+                    other, SOURCE, generation, "r", 1, 1)
+            waiter.start()
+        return found
+
+    def commit_when_waiting():
+        try:
+            _wait_until_waiting(migrated_db.get_backend_pid())
+        finally:
+            second_connection.commit()
+
+    waiter = threading.Thread(target=commit_when_waiting)
+    monkeypatch.setattr(publication, "_ready_unpublished", candidates_then_publication)
+    head = _head(migrated_db)
+    try:
+        assert publication.republish_ready_profiles(migrated_db, SOURCE, 1, 1) == []
+    finally:
+        waiter.join(30)
+    assert not waiter.is_alive()
+    assert outcome["other"] is True
+    assert _events(migrated_db, "r") == ["upsert"]
+    assert _head(migrated_db) == head + 1
+    assert _published(migrated_db) == ["a", "r"]
+    assert _edges(migrated_db) == ["a"]
 
 
 def test_install_maintenance_runs_the_repair(migrated_db, run_plugin_migration):

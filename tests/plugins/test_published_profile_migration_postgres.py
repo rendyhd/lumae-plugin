@@ -119,7 +119,8 @@ def test_published_seed_copies_only_ready_source_rows_once(lumae_postgres_db, mo
     with db.cursor() as cur:
         cur.execute(f"SELECT name FROM {MARKERS} ORDER BY name")
         assert [row[0] for row in cur.fetchall()] == [
-            "legacy_default_profiles_v1", "published_source_profiles_seed_v1"
+            "legacy_default_profiles_v1", "published_source_profiles_seed_v1",
+            "stale_retry_category_v1",
         ]
         cur.execute(
             f"DELETE FROM {PUBLISHED} WHERE catalog_instance_id='source-b'"

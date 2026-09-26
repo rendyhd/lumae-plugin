@@ -98,13 +98,17 @@ from .provider_identity_guard import (
 )
 from .provider_identity_rekey import read_transition_manifest, refresh_audiomuse_health
 from .profile_publication import (
-    TRANSIENT_FAILURES,
+    RETRY_ARMED_SQL,
+    RETRY_LIMIT,
     admit_attempts,
+    backfill_due_sql,
     complete_attempt,
     migrate_attempts,
     public_failure_reason,
     published_profile_current,
     release_attempts,
+    retry_delay_sql,
+    scheduler_params,
 )
 from . import profile_bootstrap
 from .collection_manager import (
@@ -1357,6 +1361,33 @@ def migrate(db):
         ON CONFLICT (catalog_instance_id, track_id) DO NOTHING
         """
     )
+    # P3-6 (LUM-007): before 1.3.0 a stale transition kept the category of an
+    # earlier failure, and the scheduler selects a stale row only without one
+    # (or a released one after its cooldown), so such rows were never retried.
+    # Stale transitions now clear it; clear it once on the rows left behind
+    # with attempts left, keeping retry_count (an exhausted row stays so). The marker is read first, so a re-run takes no
+    # lock on source_profiles.
+    cur.execute(
+        f"SELECT 1 FROM {table('profile_migrations')} WHERE name='stale_retry_category_v1'"
+    )
+    if cur.fetchone() is None:
+        cur.execute(
+            f"""
+            WITH migration AS (
+                INSERT INTO {table('profile_migrations')} (name)
+                VALUES ('stale_retry_category_v1')
+                ON CONFLICT (name) DO NOTHING
+                RETURNING name
+            )
+            UPDATE {source_profiles_table()} p
+               SET retry_category=NULL, failure_diagnostics=NULL
+              FROM migration
+             WHERE p.status='stale' AND p.retry_category IS NOT NULL
+               AND p.retry_category <> 'queue_unavailable'
+               AND p.retry_count < %s
+            """,
+            (RETRY_LIMIT,),
+        )
     # Published validity is independent of the current analysis attempt. This
     # additive table is seeded once; runtime routing is introduced separately.
     cur.execute(
@@ -1729,7 +1760,11 @@ def mark_pending(ids, catalog_instance_id=None, priority="background"):
     return {}
 
 def release_pending(ids, catalog_instance_id=None,
-                    reason="Profile job could not be queued", tokens=None):
+                    reason="Profile job could not be queued", tokens=None,
+                    count_failure=True):
+    """Release admitted attempts. ``count_failure=False`` for a release that
+    never tried the analysis (pause, legacy migration, batch abort), so it
+    does not use up the retry budget (LUM-007)."""
     if not ids:
         return
     if catalog_instance_id:
@@ -1737,6 +1772,7 @@ def release_pending(ids, catalog_instance_id=None,
             get_db(), catalog_instance_id,
             {track_id: tokens[track_id] for track_id in ids if tokens and track_id in tokens},
             reason,
+            count_failure=count_failure,
         )
     db = get_db()
     cur = db.cursor()
@@ -3398,6 +3434,7 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
             [track_id], catalog_instance_id=catalog_instance_id,
             reason="Lumae background maintenance is paused",
             tokens={track_id: attempt_token} if attempt_token else None,
+            count_failure=False,
         )
         return {"track_id": track_id, "status": "skipped_maintenance_paused"}
     if catalog_instance_id and not attempt_token:
@@ -3802,6 +3839,7 @@ def analyze_tracks_task(
             catalog_instance_id=catalog_instance_id,
             reason="Lumae background maintenance is paused",
             tokens=attempt_tokens,
+            count_failure=False,
         )
         return {
             "attempted": 0,
@@ -3830,6 +3868,7 @@ def analyze_tracks_task(
             catalog_instance_id=catalog_instance_id,
             reason="Migrated to bounded 0.8.1 background enrichment",
             tokens=attempt_tokens,
+            count_failure=False,
         )
         if catalog_instance_id or server_id:
             try:
@@ -3862,6 +3901,7 @@ def analyze_tracks_task(
                 catalog_instance_id=catalog_instance_id,
                 reason="Lumae background maintenance was paused during the batch",
                 tokens=attempt_tokens,
+                count_failure=False,
             )
             results.extend(
                 {"track_id": item_id, "status": "skipped_maintenance_paused"}
@@ -3993,55 +4033,27 @@ def fetch_backfill_rows(
         "AND p.catalog_instance_id=source.catalog_instance_id" if catalog_instance_id else ""
     )
     source_filters = ""
-    params = []
+    params = scheduler_params(ANALYZER_VERSION, SCHEMA_VERSION)
+    params.update(
+        source=catalog_instance_id, server_id=server_id,
+        include_failed=bool(include_failed), limit=max(1, int(limit)),
+    )
     if catalog_instance_id or server_id:
         source_filters = """
-               AND (%s IS NULL OR s.catalog_instance_id=%s)
-               AND (%s IS NULL OR s.current_core_server_id=%s)
+               AND (%(source)s IS NULL OR s.catalog_instance_id=%(source)s)
+               AND (%(server_id)s IS NULL OR s.current_core_server_id=%(server_id)s)
         """
-        params.extend((catalog_instance_id, catalog_instance_id, server_id, server_id))
+    # The source table's predicates are profile_publication's, shared with
+    # next_profile_retry_at and the /database-state work states (LUM-007).
     # Published catalogue occurrences are downloaded through
-    # ProviderCatalogBridge. This must remain retryable even when a v3 registry
-    # source has no matching legacy global MEDIASERVER_* configuration.
-    retry_skipped = True
-    stale_clause = (
-        """(p.status='stale' AND (
-                    p.retry_category IS NULL
-                    OR (p.retry_category='queue_unavailable'
-                        AND p.retry_count < 3 AND p.retry_after <= now())
-                    OR (NULLIF(t.media_fp, '') IS NOT NULL
-                        AND p.retry_media_signature IS NOT NULL
-                        AND p.retry_media_signature IS DISTINCT FROM
-                            ('catalog-media:' || t.media_fp))
-                ))"""
-        if catalog_instance_id else "p.status='stale'"
+    # ProviderCatalogBridge, so a skipped row stays retryable on the legacy
+    # table even when a v3 registry source has no matching legacy global
+    # MEDIASERVER_* configuration.
+    due = backfill_due_sql() if catalog_instance_id else backfill_due_sql(
+        stale="p.status='stale'",
+        failure="((%(include_failed)s AND p.status='failed') "
+                "OR p.status='skipped_no_file')",
     )
-    retry_clause = (
-        """OR (p.status IN ('failed', 'skipped_no_file')
-                AND (
-                    (NULLIF(t.media_fp, '') IS NOT NULL
-                     AND p.retry_media_signature IS NOT NULL
-                     AND p.retry_media_signature IS DISTINCT FROM
-                         ('catalog-media:' || t.media_fp))
-                    OR (p.retry_analyzer_ver IS NOT NULL
-                        AND p.retry_analyzer_ver < %s)
-                    OR (p.retry_profile_schema_ver IS NOT NULL
-                        AND p.retry_profile_schema_ver < %s)
-                    OR (p.retry_category IS NULL AND p.retry_count=0)
-                    OR (p.retry_category = ANY(%s)
-                        AND p.retry_count < %s AND p.retry_after <= now())
-                ))"""
-        if catalog_instance_id else
-        "OR (%s AND p.status='failed') OR (%s AND p.status='skipped_no_file')"
-    )
-    params.append(ANALYZER_VERSION)
-    if catalog_instance_id:
-        # The transient categories come from the set complete_attempt uses to
-        # arm retry_after, so SQL and Python cannot disagree (LUM-007).
-        params.extend((ANALYZER_VERSION, SCHEMA_VERSION, sorted(TRANSIENT_FAILURES), 3))
-    else:
-        params.extend((bool(include_failed), retry_skipped))
-    params.append(max(1, int(limit)))
     cur.execute(
         f"""
         WITH source AS (
@@ -4062,31 +4074,11 @@ def fetch_backfill_rows(
           LEFT JOIN {profile_table} p ON p.track_id=t.track_id
                {profile_source_join}
          WHERE t.available=TRUE AND t.analysis_eligible=TRUE
-           AND (
-                COALESCE(p.status, '') NOT IN
-                    ('pending', 'pending_interactive', 'deferred_no_media_revision')
-                OR (p.status='deferred_no_media_revision'
-                    AND NULLIF(t.media_fp, '') IS NOT NULL)
-           )
-           AND (
-                p.track_id IS NULL
-                OR p.analyzer_ver IS NULL
-                OR p.analyzer_ver < %s
-                OR {stale_clause}
-                OR (p.status='deferred_no_media_revision'
-                    AND NULLIF(t.media_fp, '') IS NOT NULL)
-                OR (
-                    p.status='ready'
-                    AND NULLIF(t.media_fp, '') IS NOT NULL
-                    AND p.media_signature IS DISTINCT FROM
-                        ('catalog-media:' || COALESCE(t.media_fp, ''))
-                )
-                {retry_clause}
-           )
+           AND {due}
          ORDER BY t.track_id
-         LIMIT %s
+         LIMIT %(limit)s
         """,
-        tuple(params),
+        params,
     )
     rows = cur.fetchall()
     cur.close()
@@ -4404,6 +4396,9 @@ def claim_profile_backfill(source, db=None):
     return claimed
 
 
+BACKFILL_ABORT_RETRY_SECONDS = 60
+
+
 def claim_profile_backfill_batch(catalog_instance_id, db=None):
     """Claim one queued or interrupted batch for exclusive execution."""
     db = db or get_db()
@@ -4458,8 +4453,11 @@ def update_profile_backfill_state(
     last_error=None,
     completed=False,
     next_retry_at=None,
+    retry_after_seconds=None,
     db=None,
 ):
+    """``retry_after_seconds`` sets ``next_retry_at`` from the database clock
+    when ``next_retry_at`` is not given."""
     db = db or get_db()
     cur = db.cursor()
     cur.execute(
@@ -4469,7 +4467,8 @@ def update_profile_backfill_state(
              queued_profiles, last_error, started_at, completed_at,
              next_retry_at, updated_at)
         VALUES (%s, %s, %s, %s, %s, %s, now(),
-                CASE WHEN %s THEN now() ELSE NULL END, %s, now())
+                CASE WHEN %s THEN now() ELSE NULL END,
+                COALESCE(%s, now() + %s::float8 * interval '1 second'), now())
         ON CONFLICT (catalog_instance_id) DO UPDATE SET
             server_id=EXCLUDED.server_id,
             status=CASE WHEN EXCLUDED.status='complete'
@@ -4481,7 +4480,11 @@ def update_profile_backfill_state(
             queued_profiles=EXCLUDED.queued_profiles,
             last_error=EXCLUDED.last_error,
             completed_at=EXCLUDED.completed_at,
+            -- A wake (a catalogue refresh, or the recovery arm of this
+            -- batch's own admissions) runs now, except after an explicit
+            -- retry delay: an aborted batch waits it out (LUM-007).
             next_retry_at=CASE WHEN {profile_backfill_state_table()}.refresh_wake_pending
+                                    AND %s::float8 IS NULL
                                   THEN NULL ELSE EXCLUDED.next_retry_at END,
             updated_at=now()
         """,
@@ -4494,6 +4497,8 @@ def update_profile_backfill_state(
             str(last_error)[:2000] if last_error else None,
             bool(completed),
             next_retry_at,
+            retry_after_seconds,
+            retry_after_seconds,
         ),
     )
     db.commit()
@@ -4571,17 +4576,16 @@ def next_profile_retry_at(catalog_instance_id, db=None):
                     ON t.catalog_instance_id=p.catalog_instance_id
                    AND t.published_generation=c.published_generation
                    AND t.track_id=p.track_id
-                 WHERE p.catalog_instance_id=%s
+                 WHERE p.catalog_instance_id=%(source)s
                    AND s.rebind_status='active'
                    AND t.available=TRUE
                    AND t.analysis_eligible=TRUE
                    AND (
                        p.status IN ('pending', 'pending_interactive')
-                       OR (p.status IN ('failed', 'skipped_no_file', 'stale')
-                           AND p.retry_category = ANY(%s)
-                           AND p.retry_count < 3 AND p.retry_after IS NOT NULL)
+                       OR {RETRY_ARMED_SQL}
                    )""",
-            (catalog_instance_id, sorted(TRANSIENT_FAILURES)),
+            {**scheduler_params(ANALYZER_VERSION, SCHEMA_VERSION),
+             "source": catalog_instance_id},
         )
         row = cur.fetchone()
     return row[0] if row else None
@@ -4677,6 +4681,7 @@ def profile_backfill_task(server_id, catalog_instance_id):
                     catalog_instance_id=catalog_instance_id,
                     reason=f"Background enrichment batch failed: {exc}",
                     tokens=claim_tokens,
+                    count_failure=False,
                 )
             except Exception:
                 logger.exception("lumae_analysis could not release a failed background batch")
@@ -4686,6 +4691,10 @@ def profile_backfill_task(server_id, catalog_instance_id):
             "failed",
             last_error=exc,
             completed=True,
+            # Its rows are due at once (an uncounted release), so a persistent
+            # error would abort a batch on every reconcile tick: retry the
+            # batch after a fixed minute instead (LUM-007).
+            retry_after_seconds=BACKFILL_ABORT_RETRY_SECONDS,
         )
         raise
 
@@ -4950,25 +4959,40 @@ def claim_preparation_run(catalog_instance_id, db=None):
 
 
 def recover_stale_pending_profiles(catalog_instance_id, db=None):
+    """Release claims older than PREPARATION_STALE_HOURS as a used attempt,
+    locking the rows in track-ID order (as admission and release do)."""
     db = db or get_db()
     cur = db.cursor()
     cur.execute(
         f"""
-        UPDATE {source_profiles_table()}
-           SET status='stale', last_error='queue_unavailable',
-               attempt_token=NULL, retry_category='queue_unavailable',
-               retry_count=retry_count+1,
-               retry_after=CASE WHEN retry_count+1 < 3
-                   THEN now() + interval '60 seconds' ELSE NULL END,
-               retry_media_signature=attempt_media_signature,
-               retry_analyzer_ver=attempt_analyzer_ver,
-               retry_profile_schema_ver=attempt_profile_schema_ver
-         WHERE catalog_instance_id=%s AND status IN ('pending', 'pending_interactive')
-           AND analyzed_at < now() - interval '{PREPARATION_STALE_HOURS} hours'
+        WITH recovered AS MATERIALIZED (
+            SELECT track_id FROM {source_profiles_table()}
+             WHERE catalog_instance_id=%(source)s
+               AND status IN ('pending', 'pending_interactive')
+               AND analyzed_at < now() - interval '{PREPARATION_STALE_HOURS} hours'
+             ORDER BY track_id COLLATE "C"
+               FOR UPDATE
+        ), updated AS (
+            UPDATE {source_profiles_table()} p
+               SET status='stale', last_error='queue_unavailable',
+                   attempt_token=NULL, retry_category='queue_unavailable',
+                   retry_count=p.retry_count+1,
+                   retry_after=CASE WHEN p.retry_count+1 < %(retry_limit)s
+                       THEN now() + {retry_delay_sql('p.retry_count')} ELSE NULL END,
+                   retry_media_signature=p.attempt_media_signature,
+                   retry_analyzer_ver=p.attempt_analyzer_ver,
+                   retry_profile_schema_ver=p.attempt_profile_schema_ver
+              FROM recovered
+             WHERE p.catalog_instance_id=%(source)s AND p.track_id=recovered.track_id
+         RETURNING 1
+        )
+        SELECT count(*) FROM updated
         """,
-        (catalog_instance_id,),
+        {**scheduler_params(ANALYZER_VERSION, SCHEMA_VERSION),
+         "source": catalog_instance_id},
     )
-    recovered = max(0, int(getattr(cur, "rowcount", 0) or 0))
+    row = cur.fetchone()
+    recovered = max(0, int(row[0] if row else 0))
     db.commit()
     cur.close()
     return recovered
