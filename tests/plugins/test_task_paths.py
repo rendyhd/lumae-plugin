@@ -65,6 +65,7 @@ class RecordingCtx:
 EXPECTED_DOTTED_PATHS = {
     "cron:analysis_projection": "plugins.LumaeAnalysis.analysis_projection_task",
     "cron:catalog_reconcile": "plugins.LumaeAnalysis.catalog_reconcile_task",
+    "cron:collection_retention": "plugins.LumaeAnalysis.collection_retention_task",
     "cron:catalog_refresh": "plugins.LumaeAnalysis.catalog_refresh_task",
     "cron:music_metadata": "plugins.LumaeAnalysis.music_metadata.run_one",
     "cron:provider_identity_recheck": "plugins.LumaeAnalysis.provider_identity_recheck_task",

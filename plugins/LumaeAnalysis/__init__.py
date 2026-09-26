@@ -219,6 +219,7 @@ CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
 PROVIDER_IDENTITY_RECHECK_TASK_TYPE = "plugin.lumae_analysis.provider_identity_recheck"
 ANALYSIS_PROJECTION_TASK_TYPE = "plugin.lumae_analysis.analysis_projection"
+COLLECTION_RETENTION_TASK_TYPE = "plugin.lumae_analysis.collection_retention"
 DEFAULT_BACKFILL_BATCH_SIZE = 3
 MAX_BACKFILL_BATCH_SIZE = 10
 INTERACTIVE_PROFILE_CHUNK_SIZE = 3
@@ -544,6 +545,19 @@ def ensure_analysis_projection_schedule(db):
         "INSERT INTO cron (name, task_type, cron_expr, enabled) "
         "VALUES (%s, %s, %s, FALSE) ON CONFLICT (task_type) DO NOTHING",
         (ANALYSIS_PROJECTION_TASK_TYPE, ANALYSIS_PROJECTION_TASK_TYPE, "47 */6 * * *"),
+    )
+    cur.close()
+
+
+def ensure_collection_retention_schedule(db):
+    """Daily bounded cleanup of expired collection and shelf receipts and
+    abandoned restore progress (F2). Enabled on install; an administrator's
+    later change to the row is kept."""
+    cur = db.cursor()
+    cur.execute(
+        "INSERT INTO cron (name, task_type, cron_expr, enabled) "
+        "VALUES (%s, %s, %s, TRUE) ON CONFLICT (task_type) DO NOTHING",
+        (COLLECTION_RETENTION_TASK_TYPE, COLLECTION_RETENTION_TASK_TYPE, "23 3 * * *"),
     )
     cur.close()
 
@@ -1587,6 +1601,7 @@ def migrate(db):
     ensure_catalog_reconcile_schedule(db)
     ensure_provider_identity_recheck_schedule(db)
     ensure_analysis_projection_schedule(db)
+    ensure_collection_retention_schedule(db)
     disable_legacy_backfill_schedule(db)
     db.commit()
     # Installation is schema work, not a reason to rebuild the full analysis

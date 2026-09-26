@@ -241,3 +241,103 @@ def test_shelf_receipts_old_deleted_recent_kept(migrated_db):
         cur.execute(f"SELECT id FROM {relation} ORDER BY id")
         remaining = {row[0] for row in cur.fetchall()}
     assert remaining == {"legacy", "recent"}
+
+
+class _RecordingDb:
+    """``db`` for the purge helpers that records every statement they run."""
+
+    def __init__(self, db):
+        self._db = db
+        self.statements = []
+
+    def cursor(self):
+        real, statements = self._db.cursor(), self.statements
+
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                real.close()
+
+            def execute(self, sql, params=None):
+                statements.append(sql)
+                return real.execute(sql, params)
+
+            def __getattr__(self, name):
+                return getattr(real, name)
+
+        return Cursor()
+
+    def commit(self):
+        self._db.commit()
+
+    def rollback(self):
+        self._db.rollback()
+
+
+def test_receipt_purge_takes_no_key_locks_and_restore_batches_stay_small(migrated_db):
+    """Each advisory lock holds a slot in the server-wide lock table until
+    commit, so a 5,000-row receipt batch must not take one per row; restore
+    rows, which do take their key lock, are purged in small batches."""
+    manager, _shelves = _load()
+    with migrated_db.cursor() as cur:
+        for n in range(5):
+            _insert_mutation(cur, manager, "user:a", f"old-{n}", age_days=40)
+        for n in range(manager.RESTORE_BATCH_ROWS + 3):
+            _insert_restore(cur, manager, "user:a", f"r-{n}", 1, 3, age_days=10)
+    migrated_db.commit()
+
+    recording = _RecordingDb(migrated_db)
+    assert manager.purge_expired_collection_mutations(recording) == 5
+    assert not [sql for sql in recording.statements if "advisory" in sql]
+
+    recording = _RecordingDb(migrated_db)
+    assert manager.purge_stale_collection_restores(recording) == manager.RESTORE_BATCH_ROWS + 3
+    deletes = [sql for sql in recording.statements if sql.startswith("DELETE")]
+    locks = [sql for sql in recording.statements if "pg_advisory_xact_lock" in sql]
+    assert len(deletes) == 2 and len(locks) == manager.RESTORE_BATCH_ROWS + 3
+    assert manager.RESTORE_BATCH_ROWS <= 500
+
+
+def test_a_receipt_touched_after_selection_is_not_deleted(migrated_db):
+    """The delete repeats the age filter: a row refreshed between the batch's
+    SELECT and its DELETE survives."""
+    manager, _shelves = _load()
+    with migrated_db.cursor() as cur:
+        _insert_mutation(cur, manager, "user:a", "old", age_days=40)
+    migrated_db.commit()
+
+    class Refreshing(_RecordingDb):
+        def cursor(self):
+            inner = super().cursor()
+            db = self._db
+            original = inner.execute
+
+            def execute(sql, params=None):
+                if sql.startswith("DELETE"):
+                    with db.cursor() as other:
+                        other.execute(f"UPDATE {manager.collection_mutations_table()} "
+                                      "SET created_at = now()")
+                return original(sql, params)
+
+            inner.execute = execute
+            return inner
+
+    assert manager.purge_expired_collection_mutations(Refreshing(migrated_db)) == 0
+    with migrated_db.cursor() as cur:
+        assert _count(cur, manager.collection_mutations_table()) == 1
+
+
+def test_migration_schedules_the_retention_task_and_keeps_an_admin_change(
+        migrated_db, run_plugin_migration):
+    task_type = "plugin.lumae_analysis.collection_retention"
+    with migrated_db.cursor() as cur:
+        cur.execute("SELECT cron_expr, enabled FROM cron WHERE task_type=%s", (task_type,))
+        assert cur.fetchall() == [("23 3 * * *", True)]
+        cur.execute("UPDATE cron SET enabled=FALSE WHERE task_type=%s", (task_type,))
+    migrated_db.commit()
+    run_plugin_migration(migrated_db)
+    with migrated_db.cursor() as cur:
+        cur.execute("SELECT enabled FROM cron WHERE task_type=%s", (task_type,))
+        assert cur.fetchall() == [(False,)]

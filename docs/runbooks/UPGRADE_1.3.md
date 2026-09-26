@@ -97,6 +97,10 @@ is safe to run again. On success it has:
   no default (a `now()` default would rewrite the whole table); its receipts
   written before this migration have no `created_at` and are simply never
   swept. Later migrations find both current and skip them.
+- installed the daily `plugin.lumae_analysis.collection_retention` schedule
+  (03:23, enabled). It deletes collection and shelf receipts older than 30
+  days and restore progress untouched for 7 days, in bounded batches. An
+  administrator who disables the row keeps it disabled across upgrades.
 
 Each schema change runs only when it is still missing, so re-running the
 migration on an up-to-date database takes no exclusive table lock. A change

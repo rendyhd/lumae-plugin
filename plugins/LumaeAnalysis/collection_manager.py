@@ -88,6 +88,11 @@ RESTORE_STALE_DAYS = 7
 # lock past a single small batch.
 RETENTION_BATCH_ROWS = 5_000
 RETENTION_MAX_BATCHES = 20
+# Restore rows are deleted under their per-key advisory lock (see
+# _purge_expired_rows). Each advisory lock takes a slot in the server-wide lock
+# table (max_locks_per_transaction x max_connections, about 6,400 by default,
+# shared with every other session), so a batch that locks keys stays small.
+RESTORE_BATCH_ROWS = 100
 
 
 class FeedProtocolUnavailable(RuntimeError):
@@ -1422,18 +1427,26 @@ def _begin_mutation(db, cur, principal, key, fingerprint):
 
 
 def _purge_expired_rows(db, relation, age_column, retention_days,
-                         batch_rows=RETENTION_BATCH_ROWS, max_batches=RETENTION_MAX_BATCHES):
+                         batch_rows=RETENTION_BATCH_ROWS, max_batches=RETENTION_MAX_BATCHES,
+                         lock_keys=False):
     """Delete ``relation`` rows past ``retention_days`` old, oldest first, in
     bounded batches of at most ``batch_rows``, capped at ``max_batches`` this
     call (F2). Never a table-wide scan under one lock: each batch is its own
     short transaction, selected then deleted by ``ctid``.
 
-    Every candidate row's per-key advisory lock (``_key_lock_id``, the same
-    lock ``_begin_mutation`` takes, in the same order: lock first, then touch
-    the row) is taken before it is deleted, so a row still involved in an
-    in-flight mutation for that key is never pulled out from under it — the
-    delete simply waits for that transaction, exactly as another mutation
-    under the same key would.
+    The delete repeats the age filter, and a row a concurrent transaction
+    updated has a new ``ctid``, so a row that moved since it was selected is
+    never deleted.
+
+    With ``lock_keys`` (restore progress, which a resuming request reads and
+    then updates), every candidate row's per-key advisory lock
+    (``_key_lock_id``, the same lock ``_begin_mutation`` takes, in the same
+    order: lock first, then touch the row) is taken before it is deleted, so a
+    restore being resumed is never pulled out from under its request. Keep
+    such batches small (``RESTORE_BATCH_ROWS``): each advisory lock holds a
+    slot in the server-wide lock table until commit. Receipts need no key
+    lock: they are written once and never updated, and a replay that loses
+    the race simply re-applies, as it would after the TTL anyway.
 
     Returns the number of rows deleted.
     """
@@ -1449,11 +1462,13 @@ def _purge_expired_rows(db, relation, age_column, retention_days,
             rows = cur.fetchall()
             if not rows:
                 break
-            for lock_id in sorted({_key_lock_id(principal, key) for principal, key, _ in rows}):
-                cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
+            if lock_keys:
+                for lock_id in sorted({_key_lock_id(principal, key) for principal, key, _ in rows}):
+                    cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_id,))
             cur.execute(
-                f"DELETE FROM {relation} WHERE ctid = ANY(%s::text[]::tid[])",
-                ([row[2] for row in rows],),
+                f"DELETE FROM {relation} WHERE ctid = ANY(%s::text[]::tid[]) "
+                f"AND {age_column} < now() - %s::interval",
+                ([row[2] for row in rows], f"{retention_days} days"),
             )
             deleted += cur.rowcount
         db.commit()
@@ -1480,7 +1495,8 @@ def purge_stale_collection_restores(db):
     survives, whatever its ``chunks_done``; see ``RESTORE_STALE_DAYS``.
     """
     return _purge_expired_rows(
-        db, collection_restores_table(), "updated_at", RESTORE_STALE_DAYS
+        db, collection_restores_table(), "updated_at", RESTORE_STALE_DAYS,
+        batch_rows=RESTORE_BATCH_ROWS, lock_keys=True,
     )
 
 

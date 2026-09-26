@@ -4632,6 +4632,11 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
             mod.ANALYSIS_PROJECTION_TASK_TYPE,
             "47 */6 * * *",
         ),
+        (
+            mod.COLLECTION_RETENTION_TASK_TYPE,
+            mod.COLLECTION_RETENTION_TASK_TYPE,
+            "23 3 * * *",
+        ),
     ]
     migration_sql = "\n".join(sql for sql, _params in db.cursor_obj.executed)
     assert "rebind_status='active' AND provider_type='navidrome'" in migration_sql
@@ -7842,6 +7847,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
+        ("collection_retention", mod.collection_retention_task, "default"),
     ]
     assert ctx.menu_items == []
 
