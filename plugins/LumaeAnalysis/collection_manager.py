@@ -17,6 +17,7 @@ from plugin.api import config, get_db, get_setting, render_page, table
 from . import migrations
 from .collection_library import (
     CatalogScopeError,
+    album_artist_sql,
     catalog_track_view_sql,
     register_collection_library_routes,
     requested_catalog,
@@ -943,7 +944,7 @@ def _record_change(cur, principal, collection_id, entity_kind, entity_id, operat
 
 _ITEM_EVENT_FIELDS = (
     "id", "kind", "track_id", "provider_album_id", "album_key", "title", "artist",
-    "album", "cover_item_id", "position",
+    "album", "cover_item_id", "position", "catalog_instance_id",
 )
 
 
@@ -963,9 +964,12 @@ def _plan_item_rekey(rows, tracks, albums, covers):
         )
         moved = row[column] is not None and row[column] in mapping
         target = mapping.get(row[column], row[column])
-        # An album kept by album_key alone has no provider membership to rekey.
-        key = (row["collection_id"], row["kind"], target) if target else (
-            row["collection_id"], "item", row["id"])
+        # Membership is per catalogue (K10), NULL being one of its own, as in
+        # the unique indexes. An album kept by album_key alone has no
+        # provider membership to rekey.
+        scope = row.get("catalog_instance_id") or ""
+        key = (row["collection_id"], row["kind"], target, scope) if target else (
+            row["collection_id"], "item", row["id"], scope)
         groups.setdefault(key, []).append((moved, column, target, row))
     rewrites, duplicates, collisions = [], [], []
     for key in sorted(groups):
@@ -989,11 +993,14 @@ def _plan_item_rekey(rows, tracks, albums, covers):
     return rewrites, duplicates, collisions
 
 
-def rekey_collection_items(cur, tracks, albums, covers):
+def rekey_collection_items(cur, catalog_instance_id, tracks, albums, covers):
     """Rekey collection items through the collections protocol (P3-4c).
 
     ``tracks``, ``albums`` and ``covers`` map old provider ids to new ones for
-    track membership, album membership and ``cover_item_id``. The parent
+    track membership, album membership and ``cover_item_id``. Only items of
+    the rekeyed catalogue ``catalog_instance_id``, or of none (NULL), are
+    touched; another catalogue's items never are, even with the same ids
+    (K10). The parent
     collections are locked in sorted order. When the new id is already a
     member of the same collection, the rekeyed item is the duplicate: it is
     deleted with a delete event. Each rewritten item gets an upsert event, and
@@ -1012,8 +1019,9 @@ def rekey_collection_items(cur, tracks, albums, covers):
     if not (tracks or albums or covers):
         return [], []
     old_tracks, old_albums, old_covers = sorted(tracks), sorted(albums), sorted(covers)
+    # K10: the rekeyed catalogue's items and unscoped (NULL) ones only.
+    scoped = "(i.catalog_instance_id = %s OR i.catalog_instance_id IS NULL)"
     # One statement finds and locks the parents, in the shared order.
-    # TODO(P3-5, K10): scope to the rekeyed catalogue once items carry it.
     cur.execute(
         f"""
         SELECT c.principal, c.id, c.deleted_at IS NOT NULL
@@ -1021,12 +1029,13 @@ def rekey_collection_items(cur, tracks, albums, covers):
          WHERE EXISTS (
                SELECT 1 FROM {collection_items_table()} i
                 WHERE i.principal = c.principal AND i.collection_id = c.id
+                  AND {scoped}
                   AND ((i.kind = 'track' AND i.track_id = ANY(%s))
                        OR (i.kind = 'album' AND i.provider_album_id = ANY(%s))
                        OR i.cover_item_id = ANY(%s)))
          {_MULTI_COLLECTION_LOCK_ORDER}
         """,
-        (old_tracks, old_albums, old_covers),
+        (catalog_instance_id, old_tracks, old_albums, old_covers),
     )
     deleted = {(row[0], row[1]): row[2] for row in cur.fetchall()}
     if not deleted:
@@ -1037,16 +1046,18 @@ def rekey_collection_items(cur, tracks, albums, covers):
         f"""
         SELECT i.principal, i.collection_id, i.id, i.kind, i.track_id,
                i.provider_album_id, i.album_key, i.title, i.artist, i.album,
-               i.cover_item_id, i.position
+               i.cover_item_id, i.position, i.catalog_instance_id
           FROM {collection_items_table()} i
           JOIN unnest(%s::text[], %s::text[]) AS parent(principal, id)
             ON i.principal = parent.principal AND i.collection_id = parent.id
-         WHERE (i.kind = 'track' AND i.track_id = ANY(%s))
-            OR (i.kind = 'album' AND i.provider_album_id = ANY(%s))
-            OR i.cover_item_id = ANY(%s)
+         WHERE {scoped}
+           AND ((i.kind = 'track' AND i.track_id = ANY(%s))
+                OR (i.kind = 'album' AND i.provider_album_id = ANY(%s))
+                OR i.cover_item_id = ANY(%s))
         """,
         (
-            principals, collection_ids, old_tracks + sorted(set(tracks.values())),
+            principals, collection_ids, catalog_instance_id,
+            old_tracks + sorted(set(tracks.values())),
             old_albums + sorted(set(albums.values())), old_covers,
         ),
     )
@@ -2032,25 +2043,27 @@ def register_collection_routes(bp):
         if kind == "album":
             cur.execute(
                 f"""
-                SELECT MIN(item_id) AS cover_item_id, album,
-                       COALESCE(NULLIF(album_artist, ''), author) AS artist,
-                       COUNT(*)::INTEGER AS track_count
+                SELECT MIN(item_id) AS cover_item_id, MIN(album) AS album,
+                       {album_artist_sql()} AS artist,
+                       COUNT(*)::INTEGER AS track_count, album_id
                   FROM ({catalog_track_view_sql(unaccent=False)}) score
                  WHERE album IS NOT NULL
                    AND (album ILIKE %s OR album_artist ILIKE %s OR author ILIKE %s)
-                 GROUP BY album, COALESCE(NULLIF(album_artist, ''), author)
-                 ORDER BY lower(album) LIMIT 50
+                 GROUP BY album_id
+                 ORDER BY lower(MIN(album)), album_id LIMIT 50
                 """,
                 (catalog, like, like, like),
             )
             results = _all_dicts(cur)
             for row in results:
                 album_title = row.pop("album")
+                # LUM-014: one row per catalogue album, with its id.
                 row.update(
                     {
                         "kind": "album",
                         "title": album_title,
                         "album_key": f"{str(row['artist']).lower()}::{str(album_title).lower()}",
+                        "provider_album_id": str(row.pop("album_id")),
                     }
                 )
         else:

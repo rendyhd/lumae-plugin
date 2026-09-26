@@ -2000,7 +2000,7 @@ def test_album_detail_uses_provider_catalog_order_and_analysis_links(monkeypatch
     monkeypatch.setattr(
         library,
         "_score_album_tracks",
-        lambda *args, **kwargs: [
+        lambda *args, **kwargs: ([
             {
                 "track_id": "track-2",
                 "title": "Second",
@@ -2023,7 +2023,7 @@ def test_album_detail_uses_provider_catalog_order_and_analysis_links(monkeypatch
                 "album_id": "album-1",
                 "provider_type": "navidrome",
             },
-        ],
+        ], ("Album", "Artist")),
     )
 
     detail = library.album_detail("Album", "Artist", provider_album_id="album-1")

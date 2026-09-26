@@ -89,6 +89,7 @@ def postgres_library():
             published_generation BIGINT NOT NULL,
             album_id TEXT NOT NULL,
             name TEXT NOT NULL,
+            album_artist_display TEXT,
             available BOOLEAN NOT NULL,
             PRIMARY KEY (catalog_instance_id, published_generation, album_id)
         );

@@ -343,11 +343,12 @@ def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings):
     rekey_shelves(cur, catalog_instance_id, exact)
 
 
-def _rekey_collections(cur, mappings):
+def _rekey_collections(cur, catalog_instance_id, mappings):
     """Rekey collection items as new feed events; ``(changes, deferrals)``.
 
-    Runs at the end of the publication so that the parent collections stay
-    locked only for its tail. The caller records ``changes`` with
+    Only items of ``catalog_instance_id`` or of no catalogue are rekeyed
+    (K10). Runs at the end of the publication so that the parent collections
+    stay locked only for its tail. The caller records ``changes`` with
     ``collection_manager._record_changes`` just before its commit.
     """
     from .collection_manager import rekey_collection_items
@@ -357,7 +358,7 @@ def _rekey_collections(cur, mappings):
         if row["entity_type"] in by_type:
             by_type[row["entity_type"]][row["old_id"]] = row["new_id"]
     return rekey_collection_items(
-        cur, by_type["track"], by_type["album"], _exact_mapping(mappings)
+        cur, catalog_instance_id, by_type["track"], by_type["album"], _exact_mapping(mappings)
     )
 
 
@@ -798,7 +799,8 @@ def _publish_provider_identity_rekey(
     )
 
     audiomuse_health = inspect_audiomuse_health(cur, adapter, server_id, carried_links)
-    collection_events, collection_deferrals = _rekey_collections(cur, plan.mappings)
+    collection_events, collection_deferrals = _rekey_collections(
+        cur, catalog_instance_id, plan.mappings)
     manifest = {
         "contract": "provider_identity_rekey_v1",
         "transition_id": transition_id,

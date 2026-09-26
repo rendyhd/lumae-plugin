@@ -241,6 +241,44 @@ def test_an_unresolvable_collision_defers_only_that_principal(collections_api, m
                           WHERE seq > %s ORDER BY seq""", (head,)) == [(bob, "i1", "upsert")]
 
 
+def test_a_rekey_touches_only_its_catalogue_and_unscoped_items(collections_api, migrated_db):
+    """K10 (P3-5b): two catalogues hold the same old ids. The rekey of one
+    rewrites its items and unscoped (NULL) ones, never the other's."""
+    db = migrated_db
+    source = _publish_old_catalogue(db)
+
+    def scoped(item, catalog):
+        return {**item, "catalog_instance_id": catalog}
+
+    _seed(collections_api, "alice", {
+        "c1": [scoped(_track("mine", OLD["track"]), source),
+               scoped({**_track("theirs", OLD["track"], position=1),
+                       "cover_item_id": OLD["track"]}, "catalog-other"),
+               scoped(_track("legacy", OLD["track"], position=2), "unscoped-below")],
+        "c2": [scoped(_album("their-album", OLD["album"]), "catalog-other")],
+    })
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {P}collection_items SET catalog_instance_id=NULL WHERE id='legacy'")
+    db.commit()
+    alice = _principal(db, "c1")
+    before, head, revisions = _items(db, alice), _head(db), _revisions(db)
+
+    _rekey(db, source)
+
+    after = _items(db, alice)
+    assert after[("c1", "theirs")] == before[("c1", "theirs")]
+    assert after[("c2", "their-album")] == before[("c2", "their-album")]
+    assert after[("c1", "mine")]["track_id"] == after[("c1", "legacy")]["track_id"] == _new("track")
+    appended = _rows(db, f"""SELECT entity_id, operation, payload FROM {P}collection_changes
+                              WHERE seq > %s ORDER BY seq""", (head,))
+    # The same new id in two scopes (source and NULL) is no collision (K10).
+    assert [(row[0], row[1], row[2]["catalog_instance_id"]) for row in appended] == [
+        ("legacy", "upsert", None), ("mine", "upsert", source)]
+    assert _revisions(db) == {**revisions, (alice, "c1"): revisions[(alice, "c1")] + 1}
+    assert _rows(db, f"SELECT collection_deferrals FROM {P}provider_identity_transitions") == [
+        ([],)]
+
+
 def test_a_tombstoned_collection_is_rekeyed_without_events_or_revision(
     collections_api, migrated_db
 ):
@@ -307,7 +345,7 @@ def test_a_restore_chunk_and_a_rekey_lock_collections_in_one_order(collections_a
 
     def rekey(cur):
         changes, _ = manager.rekey_collection_items(
-            cur, {OLD["track"]: _new("track")}, {}, {OLD["track"]: _new("track")})
+            cur, "catalog-a", {OLD["track"]: _new("track")}, {}, {OLD["track"]: _new("track")})
         manager._record_changes(cur, changes)
 
     def waiting(connection):
