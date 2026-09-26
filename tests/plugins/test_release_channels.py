@@ -15,6 +15,11 @@ builder = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(builder)
 
 
+def _lumae_release_policy():
+    policy = json.loads((ROOT / "release-sources.json").read_text())
+    return policy["plugins"]["LumaeAnalysis"]
+
+
 @pytest.fixture
 def release_root(tmp_path):
     for folder in ("LumaeAnalysis", "FederatedAlbums"):
@@ -136,8 +141,10 @@ def test_current_release_contains_supported_source_only():
         assert "edge_profiles.py" in names
         assert "personal_discovery.py" in names
         assert "music_metadata.py" in names
-        assert package.read("__init__.py") == (ROOT / "plugins/LumaeAnalysis/__init__.py").read_bytes()
         assert b"PLUGIN_VERSION = \"1.2.5\"" in package.read("__init__.py")
+        if _lumae_release_policy()["mode"] == "source":
+            # Only a source-mode release must match the working source.
+            assert package.read("__init__.py") == (ROOT / "plugins/LumaeAnalysis/__init__.py").read_bytes()
         assert b"def _drop_dj_tables" in package.read("__init__.py")
     previous = next(item for item in metadata["versions"] if item["version"] == "1.2.4")
     assert hashlib.md5((ROOT / "dist/lumae_analysis/lumae_analysis_1.2.4.zip").read_bytes()).hexdigest() == previous["checksum"]
@@ -154,7 +161,15 @@ def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, pl
     candidate = tmp_path / "release.zip"
     builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
     published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
-    assert builder.same_zip_contents(candidate, published)
+    if _lumae_release_policy()["mode"] == "source":
+        assert builder.same_zip_contents(candidate, published)
+    else:
+        # A pinned release is verified by checksum, not against working source,
+        # so check the platform-independent header fields directly.
+        with zipfile.ZipFile(candidate) as package:
+            for info in package.infolist():
+                assert info.create_system == 0
+                assert info.external_attr == 0o644 << 16
     builder.build_catalog(ROOT, repository="rendyhd/lumae-plugin", check=True)
 
 
@@ -182,3 +197,24 @@ def test_source_validation_preserves_archive_with_different_compression(release_
     source.write_bytes(b"changed source")
     with pytest.raises(ValueError, match="immutable"):
         builder.build_catalog(release_root, repository="owner/repo")
+
+
+def test_pinned_release_ignores_working_source_changes(tmp_path):
+    pinned = _lumae_release_policy()
+    if pinned["mode"] != "pinned-artifact":
+        pytest.skip("main is not pinned")
+    for folder in ("LumaeAnalysis", "FederatedAlbums"):
+        target = tmp_path / "plugins" / folder
+        target.mkdir(parents=True)
+        shutil.copyfile(ROOT / "plugins" / folder / "plugin.json", target / "plugin.json")
+    shutil.copyfile(ROOT / "release-sources.json", tmp_path / "release-sources.json")
+    name = f"lumae_analysis_{pinned['version']}.zip"
+    (tmp_path / "dist" / "lumae_analysis").mkdir(parents=True)
+    shutil.copyfile(ROOT / "dist/lumae_analysis" / name, tmp_path / "dist/lumae_analysis" / name)
+    archive = tmp_path / "dist/lumae_analysis" / name
+    before = archive.read_bytes()
+    assert hashlib.md5(before).hexdigest() == pinned["checksum"]
+    (tmp_path / "plugins/LumaeAnalysis/__init__.py").write_text("CHANGED = 1\n")
+    builder.build_catalog(tmp_path, repository="owner/repo", check=True)
+    builder.build_catalog(tmp_path, repository="owner/repo")
+    assert archive.read_bytes() == before

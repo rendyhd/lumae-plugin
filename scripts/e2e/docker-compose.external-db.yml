@@ -1,0 +1,40 @@
+# Run the stock host against an existing PostgreSQL instead of the bundled one,
+# e.g. the database the local runner already seeded:
+#
+#   E2E_PG_HOST=127.0.0.1 E2E_PG_PORT=55432 E2E_PG_USER=lumae_test E2E_PG_DB=e2e_rep \
+#     docker compose -f docker-compose.yml -f docker-compose.external-db.yml run --rm lumae-install init
+#
+# The host uses the host network (it reaches a PostgreSQL on 127.0.0.1 and
+# serves on 127.0.0.1:8000); seed with --navidrome-url http://127.0.0.1:4533.
+# The bundled postgres service is not started.
+x-external-db: &external-db
+  POSTGRES_HOST: ${E2E_PG_HOST:-127.0.0.1}
+  POSTGRES_PORT: ${E2E_PG_PORT:-5432}
+  POSTGRES_USER: ${E2E_PG_USER:-audiomuse}
+  POSTGRES_PASSWORD: ${E2E_PG_PASSWORD:-audiomusepassword}
+  POSTGRES_DB: ${E2E_PG_DB:-audiomusedb}
+
+services:
+  postgres:
+    profiles: ["bundled-db"]
+
+  navidrome-stub:
+    network_mode: host
+
+  lumae-install:
+    network_mode: host
+    environment: *external-db
+    depends_on: !reset {}
+
+  audiomuse-ai-flask:
+    network_mode: host
+    environment: *external-db
+    ports: !reset []
+    depends_on: !override
+      navidrome-stub:
+        condition: service_started
+
+  audiomuse-ai-worker:
+    network_mode: host
+    environment: *external-db
+    depends_on: !reset {}

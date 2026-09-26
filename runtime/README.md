@@ -1,5 +1,13 @@
 # Lumae plugin runtime and upgrades
 
+> **Historical.** This file documents the retired private DJ architecture and
+> the Friend Album Discovery host contract as they stood before Radio DJ's
+> removal in 1.2.1. It is kept for reference when reading old archives or
+> reviews. For current capabilities, settings and the 1.2.5 → 1.3.0 upgrade
+> procedure, see the top-level [`README.md`](../README.md),
+> [`CHANGELOG.md`](../CHANGELOG.md) and
+> [`docs/runbooks/UPGRADE_1.3.md`](../docs/runbooks/UPGRADE_1.3.md).
+
 Radio DJ has been retired. Current source provides catalog, profile, SmoothFade,
 relationship, and collection services without DJ workers or model dependencies.
 

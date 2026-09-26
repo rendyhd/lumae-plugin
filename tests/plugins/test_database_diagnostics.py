@@ -26,11 +26,17 @@ class DatabaseError(Exception):
         self.pgcode = code
 
 
+CONTROL = ("SAVEPOINT", "SET LOCAL", "ROLLBACK", "RELEASE", "BEGIN")
+
+
 class Cursor:
+    """Fails the diagnostic query; the savepoint statements succeed."""
     def __init__(self, error=None, row=(7,)):
         self.error, self.row, self.closed = error, row, False
-    def execute(self, sql, params):
-        if self.error:
+        self.statements = []
+    def execute(self, sql, params=None):
+        self.statements.append(sql)
+        if self.error and not sql.startswith(CONTROL):
             raise self.error
     def fetchone(self):
         return self.row
@@ -53,11 +59,22 @@ def test_safe_error_hides_raw_exception_sql_path_and_token(monkeypatch):
     errors, diagnostics = [], []
     clocks = iter((10.0, 10.025))
     monkeypatch.setattr(state, "monotonic", lambda: next(clocks))
-    assert state._fetchone(Db(cursor), "SELECT secret", (secret,), errors, diagnostics, "sonic links", (0,)) == (0,)
+    db = Db(cursor)
+    # A failed read is unavailable, never the zero default.
+    assert state._fetchone(db, "SELECT secret", (secret,), errors, diagnostics, "sonic links", (0,)) is state.UNAVAILABLE
     assert cursor.closed
     assert errors == [{"section": "sonic links", "operation": "sonic_links_summary", "message": "Database diagnostic query failed.", "error_class": "database_error", "sqlstate": "42P01"}]
     assert diagnostics == [{"operation": "sonic_links_summary", "server_db_execute_fetch_ms": 25, "status": "error", "error_class": "database_error", "sqlstate": "42P01"}]
     assert secret not in repr(errors) + repr(diagnostics)
+    # The failed read is undone to its savepoint; the host transaction stays.
+    assert cursor.statements == [
+        "SAVEPOINT lumae_diagnostic_read",
+        f"SET LOCAL statement_timeout = {state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
+        "SELECT secret",
+        "ROLLBACK TO SAVEPOINT lumae_diagnostic_read",
+        "RELEASE SAVEPOINT lumae_diagnostic_read",
+    ]
+    assert db.rollbacks == 0
 
 
 def test_timing_success_and_malformed_sqlstate_are_bounded(monkeypatch):
@@ -68,6 +85,31 @@ def test_timing_success_and_malformed_sqlstate_are_bounded(monkeypatch):
     assert state._fetchone(Db(cursor), "SELECT 1", (), errors, diagnostics, "analysis items", (0,)) == (9,)
     assert diagnostics == [{"operation": "analysis_items_summary", "server_db_execute_fetch_ms": 11, "status": "ok"}]
     assert state._safe_sqlstate(DatabaseError("bad", "not-a-code")) is None
+    # A successful read is rolled back to its savepoint too: SET LOCAL ends there.
+    assert cursor.statements[:2] == [
+        "SAVEPOINT lumae_diagnostic_read",
+        f"SET LOCAL statement_timeout = {state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
+    ]
+    # Two statements: nothing relies on several statements per execute.
+    assert cursor.statements[-2:] == [
+        "ROLLBACK TO SAVEPOINT lumae_diagnostic_read",
+        "RELEASE SAVEPOINT lumae_diagnostic_read",
+    ]
+
+
+def test_an_autocommit_connection_reads_in_a_transaction_it_owns_and_rolls_back():
+    cursor = Cursor(row=(3,))
+    db = Db(cursor)
+    db.autocommit = True
+    errors, diagnostics = [], []
+    assert state._fetchone(db, "SELECT 1", (), errors, diagnostics, "analysis items", (0,)) == (3,)
+    assert cursor.statements == [
+        "BEGIN",
+        f"SET LOCAL statement_timeout = {state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
+        "SELECT 1",
+        "ROLLBACK",
+    ]
+    assert errors == []
 
 
 def test_cursor_creation_failure_and_record_bound_are_safe():
@@ -77,7 +119,7 @@ def test_cursor_creation_failure_and_record_bound_are_safe():
         def rollback(self):
             raise AssertionError("must not run")
     errors, diagnostics = [], []
-    assert state._fetchall(BadDb(), "SELECT x", (), errors, diagnostics, "analysis run workflow") == []
+    assert state._fetchall(BadDb(), "SELECT x", (), errors, diagnostics, "analysis run workflow") is state.UNAVAILABLE
     assert errors[0]["error_class"] == "connection"
     assert diagnostics == []
     for _ in range(30):
@@ -86,6 +128,10 @@ def test_cursor_creation_failure_and_record_bound_are_safe():
 
 def test_rollback_and_close_failures_do_not_expose_raw_errors():
     class BrokenCursor(Cursor):
+        def execute(self, sql, params=None):
+            super().execute(sql, params)
+            if sql.startswith("ROLLBACK TO"):
+                raise DatabaseError("savepoint-private-token", "08006")
         def close(self):
             raise DatabaseError("close-private-token", "08006")
 
@@ -95,7 +141,31 @@ def test_rollback_and_close_failures_do_not_expose_raw_errors():
 
     errors, diagnostics = [], []
     db = BrokenDb(BrokenCursor(DatabaseError("query-private-token", "42P01")))
-    assert state._fetchone(db, "SELECT secret", (), errors, diagnostics, "sonic links", (0,)) == (0,)
+    assert state._fetchone(db, "SELECT secret", (), errors, diagnostics, "sonic links", (0,)) is state.UNAVAILABLE
+    # The query; the transaction rollback tried after the savepoint rollback
+    # failed; close.
     assert [row["sqlstate"] for row in errors] == ["42P01", "08006", "08006"]
     assert diagnostics[0]["status"] == "error"
     assert "private-token" not in repr(errors) + repr(diagnostics)
+
+
+def test_the_timeout_setting_is_clamped_and_falls_back_to_the_default(monkeypatch):
+    def setting(value):
+        monkeypatch.setattr(state, "get_setting", lambda key, default=None: value)
+        return state.diagnostic_timeout_ms()
+
+    assert state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS == 5000
+    assert setting("12000") == 12000
+    assert setting(50) == state.MIN_DIAGNOSTIC_STATEMENT_TIMEOUT_MS == 1000
+    assert setting(999999) == state.MAX_DIAGNOSTIC_STATEMENT_TIMEOUT_MS == 30000
+    assert setting("not a number") == 5000
+    assert setting(None) == 5000
+
+    def broken(key, default=None):
+        raise DatabaseError("settings table unavailable", "08006")
+
+    monkeypatch.setattr(state, "get_setting", broken)
+    assert state.diagnostic_timeout_ms() == 5000
+    cursor = Cursor(row=(4,))
+    assert state._fetchone(Db(cursor), "SELECT 1", (), [], [], "analysis items", (0,)) == (4,)
+    assert cursor.statements[1] == "SET LOCAL statement_timeout = 5000"

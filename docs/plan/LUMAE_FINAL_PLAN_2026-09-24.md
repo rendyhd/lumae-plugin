@@ -61,11 +61,12 @@ This plan replaces Sections 12–14 of the old overview. It covers **every** aud
 4. **Review loop.** A reviewer agent runs. Fix CHANGES_REQUIRED and re-review until PASS. At most 3 rounds, then escalate to the user.
 5. **Performance WPs** must add before/after numbers from `scripts/perf/` (P0-3), plus an equivalence test showing identical outputs.
 6. **Contract WPs** update `docs/contracts/LUMAE_SYNC_CONTRACT.md` (P0-4) in the same PR and keep old clients working.
-7. **PR.**
-   - Open a PR to `main`. Commit messages are `fix|perf|feat(<area>): <WP-ID> — <title>`, ending with the session attribution lines.
-   - The orchestrator merges only after CI is green and the review is PASS. Squash-merge. `main` is pinned (P0-1), so merges never publish.
+7. **Integration: one PR per phase** (changed 2026-09-24 at the user's request, to cut PR noise for repo watchers).
+   - Implementers push an internal `wp/<ID>-<slug>` branch. No PR is opened for it.
+   - After review PASS, the orchestrator merges the WP into the phase branch (`phase/<n>-<slug>`) with `git merge --no-ff`, so each WP stays one identifiable unit. Commit messages are `fix|perf|feat(<area>): <WP-ID> — <title>`, ending with the session attribution lines.
+   - Each phase has **one** PR to `main`. It is opened as a draft when the phase's first WP lands, CI runs on every push, and it is marked ready and merged (merge commit, not squash) only when the phase exit gate passes. `main` is pinned (P0-1), so merges never publish.
    - Never use `[skip ci]` on code, and never force-push `main`.
-8. **Status.** Update the task, and add one line to `docs/STATUS.md` (WP, PR, merge SHA, tests). No separate bookkeeping commits.
+8. **Status.** Update the task, and add one line to `docs/STATUS.md` (WP, phase PR, WP merge SHA, tests). No separate bookkeeping commits.
 
 ### 1.3 File-conflict groups (serialize within a group)
 
@@ -130,6 +131,26 @@ Where different groups touch one file, keep each WP to the functions listed and 
 | K9 | **Collections conflicts:** with header `X-Lumae-Collections-Contract: 2`, `idempotency_key_conflict` includes `current`, and a duplicate membership returns 409 `membership_conflict {existing_item_id}` instead of a silent id remap. Create with an existing id returns 409. | P3-4 | Handle both; freeze reorder bodies at enqueue (C-13) | `capabilities.collections.contract:2` | 3 |
 | K10 | Collection items carry `catalog_instance_id` (LUM-013, additive); workbench routes take an explicit catalogue | P3-5 | Store and scope items (C-13) | `capabilities.collections.source_scoped_items:true` | 3 |
 | K11 | Profiles may carry `analyzer_ver:2` (BS.1770-4 `ref_lufs` and new ramps) | P3-1 | Accept v1 and v2; normalise by version (C-11) | `capabilities.lumae_analysis_profiles.analyzer_versions:[1,2]`, `loudness_method:"bs1770-4"` | 3 |
+
+**Contract findings from P0-4 (2026-09-24), folded into the WPs below:**
+
+| # | Finding in 1.2.5 | Handled by |
+|---|---|---|
+| 1 | `lumae_analysis_profiles` is only in `plugin.json`, not in the health payload, so the K11 gate needs a new health key | P3-1 adds `capabilities.lumae_analysis_profiles` to health |
+| 2 | `capabilities.transport` and `capabilities.profile_stream` don't exist | P1-4 and P3-2 add them as new objects |
+| 3 | v2 never returns 404 or 409; 404 only means an older plugin without the route | Contract; client treats a v2 404 as "unavailable" |
+| 4 | v2 expiry is a hard-coded 60 minutes in SQL; `SESSION_MINUTES` is unused | P1-6 uses one constant for absolute and sliding expiry |
+| 5 | Releasing an expired or stale session returns 410 and leaves the row, which holds a slot | P1-6 item 2 (release always deletes and returns 200) |
+| 6 | Health `available` is `bool(DATABASE_URL)`; `auth` says host_authenticated even when auth is off | P1-6 item 4 (K4) |
+| 7 | `/profiles/changes` cursor ahead of head returns 400 `invalid_cursor`; the collections feed returns an empty 200 and never 410 | Kept for v1; P3-4 (K8) adds 410 for collections |
+| 8 | `ref_lufs` is float64 in change events but float4 in reads and snapshots; only events pass the string sanitizer | P1-1 normalises to float4 and applies one serializer on every path |
+| 9 | Per-publication retention is a fixed 50k; maintenance keeps max(1000, 2×count) | P1-2 (one persisted retention limit, at least 50k) |
+| 10 | `/api/profiles` silently drops ids past 500 without listing them in `missing` | P3-2 lists truncated ids in `missing` (additive); client batches ≤100 (C-10) |
+| 11 | Timestamps mix no-zone and server-offset formats | P1-6 item 8 (UTC with `Z` for new fields; `analyzed_at` unchanged, documented) |
+| 12 | Collections: create with an existing id returns 201; duplicate membership remaps; no `current`; epoch not returned; journal and receipts never compacted | P3-4 (K8, K9, growth) |
+| 13 | Shelves idempotency is keyed by mutation id only | P3-4 item 5 (bind the body fingerprint, K9-gated) |
+
+1.2.5 ignores unknown body fields, query parameters and headers, so every opt-in signal is safe to send to old servers. The exception is `page_size` on v2 page, catch-up and release requests, which returns 400: clients send `page_size` only on create.
 
 **Unchanged by design:**
 - v2 `page_size` stays client-chosen (1–500). Byte-sized pages are a client choice: use `page_size` about 50 when edges are present.
@@ -230,6 +251,8 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - the floor hold keeps an open session's `snapshot_seq` readable;
   - the statement plan uses the primary-key index (assert via `EXPLAIN` in the test).
 - Performance: publication critical section ≤5 ms at 50k retained events (P0-3).
+- **Decision (2026-09-24, orchestrator):** measured after P1-1 + P1-2, the critical section is 8.2 ms at p95 (it was 20.9 ms). About 1.9 ms of that is the edge that P1-1 now keeps and embeds (≈16 KB per event), and about 3.5 ms is 17 statement round-trips. Phase 1 accepts this. The ≤5 ms budget is re-checked after P3-2 (K6 edge references). If it still misses then, collapse the stream-state and compaction statements into CTEs (≈1 ms) and merge the two `source_profiles` updates (≈0.4 ms). No-op re-analysis, the common case, no longer publishes at all.
+- The `pub_bench.py` `compaction_delete_ms` figure still times the old OR delete. Update it together with the P3-2 re-check.
 
 **P1-3 — Fail-closed fences against old workers; version 1.3.0 (AUD-05).**
 - Files:
@@ -258,7 +281,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 **P1-4 — Transport compression and private headers (AUD-02, K1).**
 - Files: `__init__.py` (`_private_json` 2041, `_catalog_error` 2050, `profiles()` 2507-2551, blueprint registration).
 - Change:
-  - Add a blueprint `after_request` that gzips (level 6) when all of these hold: the request's `Accept-Encoding` contains gzip, the response is `application/json`, the body is ≥1 KiB, the status is 200, and there is no existing `Content-Encoding`. Set `Content-Encoding`, `Vary: Accept-Encoding` (merged with existing values) and `Content-Length`.
+  - Add a blueprint `after_request` that gzips (level 4: about 99% of level 6's ratio for about 80% of its CPU, measured on 1 MB and 20 MB edge pages) when all of these hold: the request's `Accept-Encoding` contains gzip, the response is `application/json`, the body is ≥1 KiB, the status is 200, and there is no existing `Content-Encoding`. Set `Content-Encoding`, `Vary: Accept-Encoding` (merged with existing values) and `Content-Length`.
   - `profiles()` uses `_private_json`, so it gets private cache headers.
   - Health: `capabilities.transport:{gzip:true}`.
 - Tests: gzipped and plain responses round-trip; headers are correct; v2 pages, `/changes`, `/bootstrap` and `/api/profiles` are compressed; small responses are not.
@@ -269,7 +292,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 - Change:
   1. The capture stores the waveform payload plus `edge_ref(media_revision, profile_digest)` from `edge_join()`. `MAX_SNAPSHOT_BYTES` counts waveform bytes only, and each row is serialized once.
   2. `snapshot_page` joins `edge_profiles` on `(catalog_instance_id, track_id, media_revision, profile_digest)`. If the reference is present, it embeds the edge; if the reference is gone (replaced or withdrawn after capture), the row is returned without `edge_profile`. The catch-up interval contains the replacing event.
-  3. Catch-up capture stores event payloads the same way, as a waveform part plus an edge reference. `MAX_CATCHUP_BYTES` excludes edges, and `MAX_CATCHUP_EVENTS` is raised to the retention limit from P1-2.
+  3. Catch-up capture stores event payloads the same way, as a waveform part plus an edge reference. `MAX_CATCHUP_BYTES` excludes edges, and `MAX_CATCHUP_EVENTS` is raised to at least 4 × `retention_limit` from P1-2 (the floor-hold cap). Otherwise a held session's catch-up returns 413 and the hold never helps (P1-2 review F1). Remove the `MAX_CATCHUP_EVENTS` monkeypatch in `test_profile_journal_compaction_postgres.py` once this lands.
   4. Additive migration: new column `edge_ref JSONB`; existing sessions are left as they are.
 - Tests:
   - create for 10k profiles with real 19 KB edges succeeds (previously 413);
@@ -287,6 +310,8 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
      - Admission runs in a short transaction under `pg_advisory_xact_lock(110094,10)`: purge expired **and identity-stale** rows (core server, epochs, inactive source); count slots; insert a session in state `capturing`.
      - Capture then runs under a **per-source** `pg_advisory_lock(110094, hashtext(source))`.
      - `capturing` rows older than 10 minutes are purged.
+     - **Decision (P1-6 implementation, review-accepted):** the purge runs right after admission in its own best-effort transaction, not under the global admission lock. Admission counts only live sessions, so stale rows never occupy a slot. Deleting a stale 94k-row session under the lock would break the 50 ms global-lock budget. The purge uses `SKIP LOCKED`, is capped per call, and a failed purge never fails the create.
+     - The floor hold (P1-2) ignores sessions whose catalogue epoch or core server no longer matches: they would 410 anyway (P1-2 review F3). The session row for the hold is committed at admission, before capture, so the hold covers the capture window (F2).
   2. **Release** deletes any row matching token hash and source, even if identity-stale, and always returns 200 `released`.
   3. **K5:** optional `client_request_id` (UUID). An unexpired session with the same (source, id) and `pages_served=0` is deleted before a new one is created. New columns `client_request_id` and `pages_served`.
   4. **K4:** `Retry-After` on 429 (seconds until the earliest slot expires, capped at 300) and on 503 (5).
@@ -364,11 +389,50 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - Measure the time `catalog_state` is held.
   - Evaluate `FOR SHARE` instead of `FOR UPDATE` for attempt admission and completion, which need only fence against publication. Adopt it only with a concurrency test proving LUM-008 invariants.
 - Budget: a full reconcile of 20k changed tracks holds `catalog_state` for ≤1 s (currently about 8 s).
+- **Outcome (merged, review PASS after 3 rounds).**
+  - The build runs before the lock. The publication then takes an advisory publisher lock, re-reads `catalog_state` as its base and re-checks it under `FOR UPDATE`.
+  - Withdrawals are set-based (`record_profile_deletions`) under the lock.
+  - Edge rows of withdrawn tracks are purged after the commit by a whole-source sweep (`purge_withdrawn_edges`). The sweep runs after each publication and in `compact_enrichment_storage`, and in `migrate` it must run **after** the 1.2.5 published-profile seed; a test pins that order.
+  - Hold at 20k changed of 132k: 147 s → 0.68 s median (0.73 s max); statements run under the lock: 672k → 12.
+- **Decision.** `FOR SHARE` was evaluated and not adopted. An admission batch and a completion both lock `source_profiles`/`published_source_profiles` rows and then `profile_stream_state`, so under `FOR SHARE` they deadlock (reproduced by `test_admission_batch_and_completion_serialize_without_deadlock`). They serialize on `profile_stream_state` anyway, and F4 is fixed by shortening the hold instead.
+- **Follow-ups (not blocking).**
+  - (L4) `inspect_catalog_identity` still takes `FOR UPDATE OF c` on `catalog_state` during a provider-identity transition. That path builds under the lock; drop `c` from that lock now that the publisher lock excludes a second publisher.
+  - The hold of a fingerprint-schema rebase is unmeasured.
+  - Overlapping refreshes publish in fetch-completion order, so a removed track can briefly reappear until the next refresh. A possible mitigation: skip as superseded when the generation published in the meantime came from a later scan.
 
 **P2-4 — v2 capture off the request thread (conditional).**
 - After P1-5 and P1-6, measure create p95 at 94k with edges on gunicorn gthread×4 (P2-6).
-- If it is ≤5 s and no 503s occur under 2 concurrent creators, **close as not needed**.
+- Also measure a first **catch-up capture at the cap** (4 × retention, about 752k events at 94k). The P1-5 review extrapolated about 3.5–4 minutes on one web thread, about 690 MB of WAL and a table of about 750 MB. The client's 10 s fast-fail gives up long before that, and retries get 503 while the capture holds the session row. If this misses, choose one:
+  - (a) page the catch-up straight from `profile_changes` while the floor hold lasts the whole session, with no copy;
+  - (b) capture with a single `INSERT…SELECT` in SQL, or move capture to an RQ task (below).
+
+  The 1 KiB-per-event catch-up byte cap never binds in practice.
+- If create is ≤5 s, no 503s occur under 2 concurrent creators, and the capped catch-up is acceptable, **close as not needed**.
 - Otherwise implement create → 202 `{status_url}` with the capture as an RQ task, add a new capability flag and a contract entry, and add client support through §H C-3.
+- **Decision (after P2-6, `docs/perf/E2E-2026-09-25.md`): implement, but server-internal and not 202 + RQ.**
+  - Measured at 94k with edges on gthread 1×4:
+    - a single create takes 4.0–4.3 s;
+    - two concurrent creators take p95 6.7–8.0 s on different sources (GIL contention) and 8.7–9.7 s on the same source (serialized on the per-source capture lock), with 1 of 40 returning 503 on the stock host;
+    - the capped catch-up (1,056,000 events) takes 48 s with flat memory and recovers through `Retry-After`, which is acceptable, so option (a) is not needed.
+  - P2-4 builds the snapshot and first catch-up rows in PostgreSQL with bounded `INSERT … SELECT` batches: byte-identical output, proven by an equivalence test against the old path. It also fixes the page query, which applies `ORDER BY ordinal LIMIT` before the lateral edge join; without statistics, the current plan does one edge lookup per remaining row.
+  - Acceptance is the P2-6 `creators` scenario: two-creator create p95 ≤5 s and no 503. On the same source, that requires one 94k capture in about 2.5 s or less.
+  - If SQL capture cannot reach that, the orchestrator decides between accepting a same-source wait (two devices of one library starting a first sync at once) and the 202 path.
+- **Outcome (P2-4 and P2-4b merged, reviews PASS).**
+  - Single create at 94k: 3.6–4.0 s → 2.0–2.2 s.
+  - Different-source two-creator p95: 6.3–6.6 s → 2.4–3.3 s.
+  - Status routes are back within budget during creates.
+  - A page query on a table without statistics does 50 edge lookups instead of one per remaining row.
+  - **Same-source two-creator p95 does not reliably meet 5 s.** Across 10 full-scale runs it was 4.58–6.12 s, with 0 × 503 in every run. The two creates serialize on the per-source capture lock, so the second waits for the whole first capture. The runs also churn about 3.8M snapshot rows, which triggers autovacuum.
+- **Decision (orchestrator): accept the same-source wait, and do not build the 202 + RQ path.**
+  - The case needs two devices of one library to start a first sync within about 2 s of each other.
+  - The second create still succeeds, well inside the client's 10 s create timeout and the 5 s lock timeout (the lock is held for about 2 s).
+  - No 503 occurred in any post-P2-4 run.
+  - The 202 path would add a capability flag, a contract entry and client work (C-3) for this case alone.
+  - The budget now reads: single create ≤5 s; two creators on **different** sources p95 ≤5 s; two creators on the **same** source no 503 and p95 ≤10 s.
+  - Re-check at P4-2 qualification on the stock host.
+- **Follow-ups (low, not blocking).**
+  - If every row's `ref_lufs` is non-plain (NaN, infinite, or within 1e-4 of 0), a 94k create takes 5.6–6.2 s because the Python fallback is slow. Fix it with COPY or `page_size=len(values)`, and a track-range predicate on the fallback SELECT.
+  - Compute the float4 text once in `_PLAIN_LUFS`: +6% create time was measured.
 
 **P2-5 — Migration and lock hygiene (P3 migration items).**
 - Files: `migrate_attempts` and the other `ADD COLUMN IF NOT EXISTS` sequences; `collection_manager.py:147-151`.
@@ -398,6 +462,8 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 - Change: connect timeout 3 s, read timeout 5 s, a response size cap, and a short negative cache for failing friends. This keeps one slow friend server from pinning the 4 host threads.
 - Test: a mocked slow upstream returns within 6 s.
 
+**P2-8 — FederatedAlbums migration lock hygiene (follow-up found in P2-5).** FederatedAlbums still runs raw `ALTER`/`CREATE INDEX` on every migrate, which takes ACCESS EXCLUSIVE or SHARE locks each time: `catalog_store.py` ~43-55, `sync_jobs.py` ~20, `__init__.py` ~177. It is packaged separately, so it needs its own copy of the P2-5 helpers (`ensure_columns`/`ensure_index` with a bounded `lock_timeout` and retry). The plugin is private, not published, so this is low priority; it can run in any phase. Done: `plugins/FederatedAlbums/migrations.py` copies `run_ddl`, `ensure_columns` and `ensure_index`, and every per-migrate `ADD COLUMN` and `CREATE INDEX` now goes through them, so a no-op re-migrate takes no lock above ROW EXCLUSIVE and needed DDL waits boundedly (`tests/plugins/test_federated_albums_migration_locks_postgres.py`).
+
 ### Phase 3 — Semantics, product and structure
 
 **P3-1 — LUM-005 loudness analyzer v2 (AUD-10, K11).** Depends on P3-2 (K6) being released to clients before regeneration starts.
@@ -423,6 +489,17 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - Without the opt-in, it expands to the full current edge, joined by digest. If the digest is gone, it falls back to the current edge for that `media_revision`, and otherwise omits the edge; the replacing event follows.
   - Edge publications themselves always carry the full edge.
 - Tests: both modes; an old-client byte-compatibility test against golden responses; a 94k waveform-only republish producing ≤1 KB per event on the wire with the opt-in.
+- **Outcome (merged, review PASS).**
+  - **Journal:** stores the waveform part plus `edge_ref` (`kept: true` marks a waveform-only republish whose edge was kept). Rows written before K6 (`edge_ref` NULL) are served as stored in both modes and never rewritten.
+  - **Opt-in:** `/changes?edge_refs=1` and v2 create `edge_refs: true`. Snapshot pages, the legacy bootstrap and `/api/profiles` always carry full edges.
+  - **Old clients:** byte-identical against goldens regenerated from f36e087. The one exception is a `/changes` replay of an event whose edge was later replaced; it now carries the current edge of the same `media_revision`, or none, and the replacing event follows.
+  - **Size:** a full republish costs 150–192 B per track on the wire with the opt-in, against 8.3 KB without.
+  - **Publication:** `complete_attempt` p95 is 3.6–4.6 ms, which **meets the ≤5 ms budget** and closes the P1-2 accepted miss.
+  - **v2 catch-up:** keeps the K2 rule for a replaced edge (omitted, no fallback).
+  - **Miss fetches:** budgeted by request-line bytes; gunicorn's limit is 4,094 bytes.
+  - **Follow-ups:**
+    - Without the opt-in, `/changes` on K6 rows is 108 ms p50 against 83 ms for a 250-event page, because of the JSONB concatenation and the wide sort. Attach the edge payload in Python.
+    - Optionally serve a kept row whose digest is gone with the current same-revision edge in full.
 
 **P3-3 — Compact edge transport (K7, optional, about 13% after gzip).**
 - With `edge_compact=1`, strip `boundaries` (and the other derivable fields only if the client supports it) at serialization. The stored payload and digest are unchanged.
@@ -435,7 +512,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   1. **Feed (K8):**
      - add `epoch`, `head_seq`, `has_more` and `next_cursor` (already present) to the response;
      - a 410 `collections_resync_required` when the request's `epoch` mismatches or the cursor is beyond head;
-     - `GET /collections/snapshot` returns collections, items and `{epoch, head_seq}` in one REPEATABLE READ transaction on an owned connection (reuse the `profile_bootstrap._connection` pattern);
+     - `GET /plugins/lumae_analysis/api/collections/snapshot` returns collections, items and `{epoch, head_seq}` in one REPEATABLE READ transaction on an owned connection (reuse the `profile_bootstrap._connection` pattern);
      - publish `floor_seq`, the head at cutover.
   2. **Restore and batch:**
      - allocate a block with `UPDATE feed_state SET head_seq=head_seq+n RETURNING` after staging, then insert the events in one multi-row insert;
@@ -453,6 +530,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
      - the revision is bumped and events are emitted through `_record_change`;
      - scope to the matching catalogue once K10 lands;
      - **stop rewriting delivered `collection_changes` and receipt payloads**;
+     - `_copy_analysis_generation` runs `ANALYZE` on the new generation's key columns before commit, as P2-2 does for projection. Without it, `_load_relationship_inputs` can plan a quadratic nested loop after a rekey (found in P2-2).
      - a collision in one principal is isolated: that principal's rekey is deferred with a diagnostic, and the installation rekey proceeds.
   5. **Shelves:** `rekey_shelves` (179-194) takes the `shelf_scopes` lock before `nextval`, and shelf receipts bind the request fingerprint (235-238).
   6. **Growth:** compact `collection_changes` below `floor_seq` once K8 has shipped and clients have been observed on it. Receipts get a 30-day TTL.
@@ -468,6 +546,20 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
   - the shelves late-commit test;
   - K8 and K9 in both header modes;
   - the old-client compatibility tests.
+- **Split and outcome.** P3-4 runs as three WPs: **P3-4a** (items 1–2), **P3-4b** (items 3, 5 and 7) and **P3-4c** (item 4). Item 6 (growth) waits until after the release, as written.
+- **P3-4a (merged, review PASS after 2 rounds).**
+  - **410 gating:** `collections_resync_required` (reasons `epoch_mismatch` and `cursor_ahead`) is returned **only when the request echoes a non-empty `epoch`**. A client that doesn't echo it keeps today's empty 200 for a cursor past head. This follows §2's rule that unchanged clients keep working. `floor_seq` is published but not yet enforced; the growth WP decides the 410 for a cursor below the floor.
+  - **Snapshot:** unpaged, one at a time per process (`BoundedSemaphore(1)`; a request that waits more than 2 s gets 503 with `Retry-After: 5`). Measured at 20k items: 0.3–0.4 s and +61 MB RSS; at 100k: 1.7–1.9 s and +255 MB.
+  - **Restores:**
+    - Chunks of at most 2,000 rows. Keyed restores resume through `collection_restores`, and a key held by an unfinished restore can't be reused by another request (409).
+    - Another principal's write waits at most 20–136 ms during a 20k restore (1×20k and 2,000×10; it was 9.85–17.6 s before).
+    - Only the event and receipt inserts run while the feed head is held; a test pins this.
+  - **Follow-ups:**
+    - build the snapshot JSON in SQL (`json_agg`);
+    - keep the restore key per backup checksum for the page's lifetime, so a retry after a reload resumes instead of duplicating;
+    - a test for a collection finished in an earlier chunk and deleted before the last chunk (mutant M21 survives);
+    - clean up stale `collection_restores` rows (growth WP);
+    - operator epoch rotation after a DB restore is runbook repair C.
 
 **P3-5 — Workbench LUM-013 → 014 → 015 → 016 (K10).** Serial, one PR each.
 - **LUM-013:**
@@ -543,6 +635,10 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 - **Guards:**
   - Tests patch 264 package-level attributes (70 of them `get_db`). Keep the names resolvable from `__init__`, or move the patches in the same PR.
   - Add a test asserting every registered cron and RQ dotted path is still importable.
+- **Outcome (2026-09-26):** slice 1 done: steps 1 and 2 (`status_model.py` already existed from P2-1), plus the dotted-path guard.
+  - `settings_render.py` holds the 22 panel renderers and helpers, with bodies byte-identical apart from `_pkg.` qualification. It binds its package through `sys.modules[__package__]`, because the host installs the plugin under its own package name.
+  - `tests/plugins/test_task_paths.py` pins every registered task, cron and hook path, forbids importing the package by its repository name, and loads the plugin under a host-style name.
+  - **Deferred to after 1.3.0:** steps 3–6 and the transaction convention. They carry regression risk without user-visible benefit before the release; each stays a behaviour-preserving slice under the same guards.
 
 **P3-12 — LUM-019 documentation.**
 - The README describes current capabilities: catalogue, profiles, edges, the offline bulk copy, collections and the 1.3.0 upgrade runbook. DJ history moves to the changelog.
@@ -691,7 +787,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
 | `Retry-After` on 429/503 | Honour it. |
 | `profile_stream.edge_refs` | Send `edge_refs=1` (query) or `edge_refs:true` (v2 body). Upserts may carry `edge_profile_ref:{media_revision, profile_digest}` instead of `edge_profile`. |
 | `edge_profiles.compact_transport` | Optionally send `edge_compact=1`. `boundaries` is omitted; rebuild it before verifying. |
-| `collections.feed_epoch` | Echo `epoch`; handle 410 `collections_resync_required` through `GET /collections/snapshot`; use `has_more`/`next_cursor`. |
+| `collections.feed_epoch` | Echo `epoch`; handle 410 `collections_resync_required` through `GET /plugins/lumae_analysis/api/collections/snapshot`; use `has_more`/`next_cursor`. |
 | `collections.contract: 2` | Send `X-Lumae-Collections-Contract: 2`; handle 409 `membership_conflict {existing_item_id}` and `idempotency_key_conflict` with `current`. |
 | `collections.source_scoped_items` | Items carry `catalog_instance_id`. |
 | `lumae_analysis_profiles.analyzer_versions` includes 2 | Profiles may have `analyzer_ver:2` (BS.1770-4 `ref_lufs`). |
@@ -842,7 +938,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
      - scope the feed cursor per (AudioMuse source, account), a v39 DDL or `sync_metadata` keys;
      - echo `epoch`;
      - page by `has_more`/`next_cursor`, not "fewer than 200 rows";
-     - on 410, fetch `GET /collections/snapshot` and merge with the outbox, preserving unsent mutations, memberships, order and undo;
+     - on 410, fetch `GET /plugins/lumae_analysis/api/collections/snapshot` and merge with the outbox, preserving unsent mutations, memberships, order and undo;
      - a failed feed shows a recoverable state, not a sticky string.
   5. **Before the plugin's LUM-014 ships:** align the album unique index with the server. Make it partial where `provider_album_id IS NULL` for `album_key`, so same-name editions with distinct provider ids can coexist. In v39, include `catalog_instance_id` when K10 is advertised.
   6. Send `X-Lumae-Collections-Contract: 2` when `collections.contract==2`.

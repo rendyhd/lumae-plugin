@@ -25,17 +25,20 @@ import numpy as np
 
 from plugin.api import get_db, table
 
+from . import migrations
 from .reconcile import arm_reconcile
 from .edge_profiles import opaque_revision
 from .edge_profile_store import edge_join
 
 from .catalog import (
+    JOURNAL_WRITER_GENERATION,
     CatalogScanError,
     canonical_json,
     change_journal_retention_limit,
     compact_change_journal,
     opaque_cursor,
     parse_opaque_cursor,
+    read_change_page,
     resolve_catalog_source,
 )
 
@@ -47,7 +50,17 @@ RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR = 96
 RELATIONSHIP_MAX_CANDIDATE_ENTITIES = 384
 RELATIONSHIP_ENTITY_SAMPLE_LIMIT = 160
 ENRICHMENT_STALE_HOURS = 2
+# Minimum profile journal retention per source. The effective limit is
+# profile_change_retention_limit(library size), persisted per source in
+# profile_stream_state.retention_limit by compact_enrichment_storage.
 PROFILE_CHANGE_RETENTION_EVENTS = 50_000
+# Most journal rows one profile publication may compact past the current floor
+# (bounds the delete under the publication locks; maintenance is unbounded).
+PROFILE_COMPACTION_MAX_ADVANCE = 5_000
+# A v2 bootstrap session admitted in state 'capturing' whose capture has not
+# finished after this long was abandoned (its request died): it holds neither
+# a slot nor the journal floor, and the next create purges it.
+PROFILE_BOOTSTRAP_CAPTURE_MINUTES = 10
 MOOD_FEATURE_NAMES = ("danceable", "aggressive", "happy", "party", "relaxed", "sad")
 
 _ALBUM_WEIGHTS = {
@@ -94,6 +107,11 @@ def _json(value, fallback=None):
 
 
 def _iso(value):
+    """ISO-8601 text. A zoned value (TIMESTAMPTZ) is converted to UTC with a
+    ``Z`` suffix whatever the database session's TimeZone is. A naive value
+    (TIMESTAMP, e.g. a profile's ``analyzed_at``) keeps its zone-less form."""
+    if getattr(value, "tzinfo", None) is not None:
+        value = value.astimezone(timezone.utc)
     if hasattr(value, "isoformat"):
         return value.isoformat().replace("+00:00", "Z")
     return str(value)
@@ -155,8 +173,110 @@ def _profile_stream_state(cur, catalog_instance_id, *, for_update=False):
     return str(row[0]), int(row[1]), int(row[2])
 
 
-def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
-    """Bound profile and relationship journals during upgrades and maintenance."""
+def profile_change_retention_limit(library_count):
+    """Profile events kept per source: two full libraries, at least 50k."""
+    return max(
+        PROFILE_CHANGE_RETENTION_EVENTS,
+        change_journal_retention_limit(library_count),
+    )
+
+
+def refresh_profile_retention(cur, catalog_instance_id, library_count):
+    """Persist the source's profile retention limit for a new library size.
+
+    Called when the catalogue publishes a generation (which already holds the
+    catalog_state row lock, the same order publishers use) and, with the
+    published-profile count as well, by compact_enrichment_storage.
+    """
+    retention_limit = profile_change_retention_limit(library_count)
+    cur.execute(
+        f"""
+        INSERT INTO {t('profile_stream_state')} AS p
+            (catalog_instance_id, epoch, head_seq, floor_seq, retention_limit, updated_at)
+        VALUES (%s, %s, 0, 0, %s, now())
+        ON CONFLICT (catalog_instance_id) DO UPDATE
+           SET retention_limit=EXCLUDED.retention_limit
+         WHERE p.retention_limit IS DISTINCT FROM EXCLUDED.retention_limit
+        """,
+        (catalog_instance_id, str(uuid.uuid4()), retention_limit),
+    )
+    return retention_limit
+
+
+def live_bootstrap_session_sql(alias="s"):
+    """SQL condition: v2 bootstrap session ``alias`` is still servable.
+
+    A live session is unexpired, is not an abandoned capture (still
+    'capturing' after PROFILE_BOOTSTRAP_CAPTURE_MINUTES), and its source is
+    active with the same core server, catalogue epoch and profile epoch. Only
+    live sessions hold a slot or the journal floor; every other session would
+    answer 410 on its next request, and the next create purges it.
+    """
+    return f"""(
+        {alias}.expires_at > now()
+        AND ({alias}.state <> 'capturing'
+             OR {alias}.created_at > now()
+                 - interval '{int(PROFILE_BOOTSTRAP_CAPTURE_MINUTES)} minutes')
+        AND EXISTS (
+            SELECT 1
+              FROM {t('catalog_sources')} src
+              JOIN {t('catalog_state')} cs
+                ON cs.catalog_instance_id=src.catalog_instance_id
+              JOIN {t('profile_stream_state')} ps
+                ON ps.catalog_instance_id=src.catalog_instance_id
+             WHERE src.catalog_instance_id={alias}.catalog_instance_id
+               AND src.rebind_status='active'
+               AND src.current_core_server_id={alias}.core_server_id
+               AND cs.catalog_epoch={alias}.catalog_epoch
+               AND ps.epoch={alias}.profile_epoch))"""
+
+
+def _profile_floor_hold(cur, catalog_instance_id, epoch):
+    """Oldest snapshot seq an open v2 bootstrap session still has to replay.
+
+    A session reads ``seq > snapshot_seq`` once, when its catch-up captures the
+    head; until then compaction must not advance the floor past it. The row is
+    committed at admission, before the capture, with the admission head as
+    ``snapshot_seq`` (a lower bound of the capture's head), so the hold covers
+    the capture too. Sessions that are no longer live (identity-stale,
+    expired, abandoned captures) would 410 anyway and hold nothing.
+    """
+    cur.execute(
+        f"""
+        SELECT MIN(s.snapshot_seq)
+          FROM {t('profile_bootstrap_sessions')} s
+         WHERE s.source_scope=%s AND s.catalog_instance_id=%s
+           AND s.profile_epoch=%s AND s.head_seq IS NULL
+           AND {live_bootstrap_session_sql('s')}
+        """,
+        (catalog_instance_id, catalog_instance_id, str(epoch)),
+    )
+    row = cur.fetchone()
+    return None if row is None or row[0] is None else int(row[0])
+
+
+def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None,
+                               profile_versions=None):
+    """Bound profile and relationship journals during upgrades and maintenance.
+
+    Also sweeps edge payloads that no published profile reaches: a catalogue
+    publication deletes the edges of the profiles it withdraws only after it
+    commits (P2-3), so a failed purge leaves them behind until the next
+    publication or this sweep.
+
+    Then it repairs the publication (P3-7), bounded, in the caller's
+    transaction: it withdraws published profiles whose track the current
+    catalogue generation lacks (at install, the 1.2.5 seed's orphans), with
+    their edges, and, given ``profile_versions`` (analyzer, schema),
+    republishes 'ready' profiles that have no published row. Both lock
+    catalog_state before the profile stream state, as every publisher does.
+    """
+    from .profile_publication import (
+        purge_withdrawn_edges,
+        republish_ready_profiles,
+        withdraw_orphaned_profiles,
+    )
+
     cur = cursor or db.cursor()
     cur.execute(
         f"""
@@ -170,17 +290,37 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
         (catalog_instance_id, catalog_instance_id),
     )
     rows = cur.fetchall()
+    # Before any stream-state row is locked below, so no publisher waits on it.
+    for row in rows:
+        purge_withdrawn_edges(cur, str(row[0]))
+    for row in rows:
+        withdraw_orphaned_profiles(db, str(row[0]), commit=False)
+        if profile_versions is not None:
+            republish_ready_profiles(db, str(row[0]), *profile_versions, commit=False)
     for row in rows:
         source_id = str(row[0])
         epoch, head_seq, _floor_seq = _profile_stream_state(
             cur, source_id, for_update=True
         )
+        # The library is the larger of the published profiles and the
+        # catalogue's tracks, so a first backfill is already covered.
         cur.execute(
-            f"SELECT COUNT(*) FROM {t('source_profiles')} "
-            "WHERE catalog_instance_id=%s",
-            (source_id,),
+            f"""
+            SELECT GREATEST(
+                (SELECT COUNT(*) FROM {t('published_source_profiles')}
+                  WHERE catalog_instance_id=%s),
+                COALESCE((SELECT (entity_counts->>'track')::bigint
+                            FROM {t('catalog_state')}
+                           WHERE catalog_instance_id=%s), 0))
+            """,
+            (source_id, source_id),
         )
-        profile_count = int(cur.fetchone()[0])
+        retention_limit = profile_change_retention_limit(cur.fetchone()[0])
+        cur.execute(
+            f"UPDATE {t('profile_stream_state')} SET retention_limit=%s "
+            "WHERE catalog_instance_id=%s",
+            (retention_limit, source_id),
+        )
         compact_change_journal(
             cur,
             catalog_instance_id=source_id,
@@ -190,7 +330,9 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
             floor_column="floor_seq",
             epoch=epoch,
             head_seq=head_seq,
-            retention_limit=change_journal_retention_limit(profile_count),
+            retention_limit=retention_limit,
+            purge_other_epochs=True,
+            hold_floor_seq=_profile_floor_hold(cur, source_id, epoch),
         )
         if row[1] is not None:
             compact_change_journal(
@@ -205,6 +347,7 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None):
                 retention_limit=change_journal_retention_limit(
                     int(row[3] or 0) + int(row[4] or 0)
                 ),
+                purge_other_epochs=True,
             )
     if cursor is None:
         cur.close()
@@ -224,6 +367,10 @@ def migrate_enrichment(db):
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
+        lambda cur: migrations.ensure_columns(
+            cur, t("profile_stream_state"),
+            f"retention_limit BIGINT NOT NULL DEFAULT {PROFILE_CHANGE_RETENTION_EVENTS}",
+        ),
         f"""
         CREATE TABLE IF NOT EXISTS {t("profile_changes")} (
             catalog_instance_id TEXT NOT NULL,
@@ -236,6 +383,19 @@ def migrate_enrichment(db):
             PRIMARY KEY (catalog_instance_id, epoch, seq)
         )
         """,
+        # AUD-05 fence: a 1.2.5 worker writes source_profiles 'ready' without a
+        # published row, then journals it in the same transaction. Its journal
+        # insert omits this column, fails, and rolls the source row back too.
+        lambda cur: migrations.ensure_columns(
+            cur, t("profile_changes"),
+            f"writer_generation SMALLINT NOT NULL DEFAULT {JOURNAL_WRITER_GENERATION}",
+        ),
+        lambda cur: migrations.ensure_no_default(cur, t("profile_changes"), "writer_generation"),
+        # K6 (P3-2): an upsert journals its waveform payload plus a reference
+        # to its edge (journal_edge_ref) instead of a copy of the edge. Rows
+        # journalled before (1.2.5, 1.3.0 before K6) keep their embedded edge
+        # and a NULL reference; they are never rewritten. Additive, no default.
+        lambda cur: migrations.ensure_columns(cur, t("profile_changes"), "edge_ref JSONB"),
         f"""
         CREATE TABLE IF NOT EXISTS {t("profile_bootstrap_sessions")} (
             session_id UUID PRIMARY KEY,
@@ -256,40 +416,25 @@ def migrate_enrichment(db):
             created_at TIMESTAMPTZ NOT NULL DEFAULT now()
         )
         """,
-        f"""
-        ALTER TABLE {t('profile_bootstrap_sessions')}
-        ADD COLUMN IF NOT EXISTS source_scope TEXT
-        """,
-        f"""
-        ALTER TABLE {t('profile_bootstrap_sessions')}
-        ADD COLUMN IF NOT EXISTS transfer_contract_version INTEGER NOT NULL DEFAULT 0
-        """,
+        lambda cur: migrations.ensure_columns(
+            cur, t('profile_bootstrap_sessions'),
+            "source_scope TEXT",
+            "transfer_contract_version INTEGER NOT NULL DEFAULT 0",
+        ),
         f"""
         DELETE FROM {t('profile_bootstrap_sessions')}
         WHERE transfer_contract_version <> 3 OR source_scope IS NULL
         """,
-        f"""
-        DO $$ BEGIN
-            IF EXISTS (
-                SELECT 1 FROM information_schema.columns
-                 WHERE table_schema=current_schema()
-                   AND table_name='{t('profile_bootstrap_sessions')}'
-                   AND column_name='principal'
-            ) THEN
-                ALTER TABLE {t('profile_bootstrap_sessions')}
-                    ALTER COLUMN principal DROP NOT NULL;
-            END IF;
-        END $$
-        """,
-        f"""
-        ALTER TABLE {t('profile_bootstrap_sessions')}
-        ALTER COLUMN source_scope SET NOT NULL,
-        ALTER COLUMN transfer_contract_version SET DEFAULT 3
-        """,
-        f"""
+        # Account-era sessions had a NOT NULL principal; relax it if present.
+        lambda cur: migrations.ensure_nullable(cur, t('profile_bootstrap_sessions'), "principal"),
+        lambda cur: migrations.ensure_not_null(cur, t('profile_bootstrap_sessions'), "source_scope"),
+        lambda cur: migrations.ensure_default(
+            cur, t('profile_bootstrap_sessions'), "transfer_contract_version", "3",
+        ),
+        lambda cur: migrations.ensure_index(cur, f"""
         CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_source_idx')}
         ON {t('profile_bootstrap_sessions')} (source_scope, expires_at)
-        """,
+        """),
         f"""
         CREATE TABLE IF NOT EXISTS {t('profile_bootstrap_snapshot')} (
             session_id UUID NOT NULL REFERENCES {t('profile_bootstrap_sessions')}(session_id)
@@ -310,10 +455,50 @@ def migrate_enrichment(db):
             UNIQUE (session_id, seq)
         )
         """,
+        # K2 (P1-5): captures store the waveform payload plus an edge
+        # reference {media_revision, profile_digest}, resolved at page read.
+        # Rows captured before 1.3.0 keep their embedded edge and a NULL ref.
+        lambda cur: migrations.ensure_columns(cur, t('profile_bootstrap_snapshot'), "edge_ref JSONB"),
+        lambda cur: migrations.ensure_columns(cur, t('profile_bootstrap_catchup'), "edge_ref JSONB"),
+        # P1-6 (K3/K5, AUD-11): a session is admitted as 'capturing' and
+        # becomes 'ready' when its capture commits; rows from before 1.3.0 are
+        # ready. expiry_mode 'sliding' extends expires_at on every page;
+        # client_request_id and pages_served let a retried create replace its
+        # unclaimed session. Additive, metadata-only defaults.
+        lambda cur: migrations.ensure_columns(
+            cur, t('profile_bootstrap_sessions'),
+            "state TEXT NOT NULL DEFAULT 'ready'",
+            "expiry_mode TEXT NOT NULL DEFAULT 'absolute'",
+            "client_request_id UUID",
+            "pages_served INTEGER NOT NULL DEFAULT 0",
+        ),
+        # K6 (P3-2): a session created with edge_refs: true serves ref-eligible
+        # catch-up upserts as edge_profile_ref. Metadata-only default.
+        lambda cur: migrations.ensure_columns(
+            cur, t('profile_bootstrap_sessions'), "edge_refs BOOLEAN NOT NULL DEFAULT FALSE",
+        ),
+        lambda cur: migrations.ensure_index(cur, f"""
+        CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_request_idx')}
+        ON {t('profile_bootstrap_sessions')} (source_scope, client_request_id)
+        WHERE client_request_id IS NOT NULL
+        """),
+        # Admitted creates per (source, caller) for the create rate limit;
+        # rows older than the window are purged by the next create.
         f"""
+        CREATE TABLE IF NOT EXISTS {t('profile_bootstrap_creates')} (
+            catalog_instance_id TEXT NOT NULL,
+            caller_key TEXT NOT NULL,
+            created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        )
+        """,
+        lambda cur: migrations.ensure_index(cur, f"""
+        CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_creates_caller_idx')}
+        ON {t('profile_bootstrap_creates')} (catalog_instance_id, caller_key, created_at)
+        """),
+        lambda cur: migrations.ensure_index(cur, f"""
         CREATE INDEX IF NOT EXISTS {t("profile_changes_track_idx")}
         ON {t("profile_changes")} (catalog_instance_id, track_id)
-        """,
+        """),
         f"""
         CREATE TABLE IF NOT EXISTS {t("relationship_state")} (
             catalog_instance_id TEXT PRIMARY KEY
@@ -363,8 +548,7 @@ def migrate_enrichment(db):
         )
         """,
     ]
-    for statement in statements:
-        cur.execute(statement)
+    migrations.apply(cur, statements)
 
     from .relationship_build import migrate_relationship_builds
     migrate_relationship_builds(cur)
@@ -425,6 +609,17 @@ def _bytes(value):
     return bytes(value)
 
 
+def float4(value):
+    """Return ``value`` at the ``REAL`` (float4) precision the profile tables store.
+
+    The result is a decimal that round-trips the float4 value; equal to
+    PostgreSQL's text form for the LUFS range. Publication compares
+    and inserts this value, and every payload path emits it, so change events,
+    bootstraps, snapshots and direct reads agree (AUD-03).
+    """
+    return float(str(np.float32(float(value))))
+
+
 def serialize_profile(
     track_id,
     sample_rate,
@@ -438,12 +633,13 @@ def serialize_profile(
     edge_profile=None,
 ):
     revision = opaque_revision(media_signature)
+    ref_lufs = float4(ref_lufs)
     payload = {
         "track_id": str(track_id),
         "source": "waveform",
         "sample_rate": int(sample_rate),
         "duration_ms": int(duration_ms),
-        "ref_lufs": float(ref_lufs),
+        "ref_lufs": ref_lufs if math.isfinite(ref_lufs) else None,
         "start_ramp": base64.b64encode(_bytes(start_ramp)).decode("ascii"),
         "end_ramp": base64.b64encode(_bytes(end_ramp)).decode("ascii"),
         "analyzer_ver": int(analyzer_ver),
@@ -457,18 +653,59 @@ def serialize_profile(
     return payload
 
 
-def record_profile_change(cur, catalog_instance_id, track_id, status, payload=None):
-    """Append a profile upsert/delete in the same transaction as its profile."""
-    epoch, head_seq, _floor_seq = _profile_stream_state(
+def _profile_json(payload):
+    # ``serialize_profile`` output is already the wire form every read path
+    # returns, so events store it as is. The catalogue sanitizer
+    # (``catalog.canonical_json``) would rewrite empty ramps to null and could
+    # alter an embedded edge, making events differ from reads.
+    return json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def journal_edge_ref(profile_digest, *, kept):
+    """An upsert's reference to its edge in the journal (K6, P3-2).
+
+    ``profile_digest`` names the ``edge_profiles`` row; its media_revision is
+    the upsert payload's own (an edge belongs to its row's revision only).
+    ``kept`` marks a waveform-only republish that kept the current edge. Only
+    such an event is served as ``edge_profile_ref`` to a client that opted
+    in; an edge publication (not kept) always reaches every client in full.
+    """
+    reference = {"profile_digest": str(profile_digest)}
+    if kept:
+        reference["kept"] = True
+    return reference
+
+
+def record_profile_change(cur, catalog_instance_id, track_id, status, payload=None, *,
+                          edge_ref=None):
+    """Append a profile upsert/delete in the same transaction as its profile.
+
+    An upsert with an edge journals its waveform payload (``serialize_profile``
+    without the edge) and ``edge_ref`` (``journal_edge_ref``); readers join
+    the edge back from ``edge_profiles`` (K6). A payload that embeds
+    ``edge_profile`` and has no ``edge_ref`` is journalled as given: the
+    format of 1.2.5 and of 1.3.0 before K6, which every reader still serves.
+    """
+    epoch, head_seq, floor_seq = _profile_stream_state(
         cur, catalog_instance_id, for_update=True
     )
     seq = head_seq + 1
     operation = "upsert" if status == "ready" and payload is not None else "delete"
+    if edge_ref is not None and (
+            operation != "upsert" or "edge_profile" in payload
+            or not payload.get("media_revision")
+            or not isinstance(edge_ref, dict) or not edge_ref.get("profile_digest")):
+        raise ValueError("An edge reference needs an upsert with a media revision "
+                         "and without an embedded edge")
     cur.execute(
         f"""
         INSERT INTO {t("profile_changes")}
-            (catalog_instance_id, epoch, seq, track_id, operation, payload)
-        VALUES (%s, %s, %s, %s, %s, %s::jsonb)
+            (catalog_instance_id, epoch, seq, track_id, operation, payload,
+             edge_ref, writer_generation)
+        VALUES (%s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
         """,
         (
             catalog_instance_id,
@@ -476,17 +713,20 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
             seq,
             str(track_id),
             operation,
-            canonical_json(payload) if payload is not None and operation == "upsert" else None,
+            _profile_json(payload) if payload is not None and operation == "upsert" else None,
+            _profile_json(edge_ref) if edge_ref is not None else None,
+            JOURNAL_WRITER_GENERATION,
         ),
     )
     cur.execute(
         f"UPDATE {t('profile_stream_state')} "
         "SET head_seq=%s, updated_at=now() "
         "WHERE catalog_instance_id=%s AND epoch=%s AND head_seq=%s "
-        "RETURNING head_seq",
+        "RETURNING head_seq, retention_limit",
         (seq, catalog_instance_id, epoch, head_seq),
     )
-    if cur.fetchone() is None:
+    advanced = cur.fetchone()
+    if advanced is None:
         raise RuntimeError("Profile stream head changed during publication")
     compact_change_journal(
         cur,
@@ -497,7 +737,68 @@ def record_profile_change(cur, catalog_instance_id, track_id, status, payload=No
         floor_column="floor_seq",
         epoch=epoch,
         head_seq=seq,
-        retention_limit=PROFILE_CHANGE_RETENTION_EVENTS,
+        # Persisted by compact_enrichment_storage: no count(*) per publication.
+        retention_limit=max(PROFILE_CHANGE_RETENTION_EVENTS, int(advanced[1] or 0)),
+        hold_floor_seq=_profile_floor_hold(cur, catalog_instance_id, epoch),
+        current_floor=floor_seq,
+        max_advance=PROFILE_COMPACTION_MAX_ADVANCE,
+    )
+    return seq
+
+
+def record_profile_deletions(cur, catalog_instance_id, track_ids):
+    """Append one delete event per track, in order, with one compaction (P2-3).
+
+    Leaves the journal and stream state exactly as ``record_profile_change(...,
+    "deleted")`` called once per track would: the same seqs, rows and head, and
+    the same floor. Per event, compaction may advance the floor by at most
+    ``PROFILE_COMPACTION_MAX_ADVANCE`` towards a target that grows by at most
+    one seq per event, under a hold that cannot change inside the transaction.
+    So n appends reach ``min(target at the last head, floor +
+    n * PROFILE_COMPACTION_MAX_ADVANCE)``, which one compaction with that
+    bound computes, and delete the same rows. Returns the new head, or None
+    when ``track_ids`` is empty (then nothing is read or written).
+    """
+    track_ids = [str(track_id) for track_id in track_ids]
+    if not track_ids:
+        return None
+    epoch, head_seq, floor_seq = _profile_stream_state(
+        cur, catalog_instance_id, for_update=True
+    )
+    seq = head_seq + len(track_ids)
+    cur.execute(
+        f"""
+        INSERT INTO {t("profile_changes")}
+            (catalog_instance_id, epoch, seq, track_id, operation, payload,
+             writer_generation)
+        SELECT %s, %s, %s + event.ordinality, event.track_id, 'delete', NULL, %s
+          FROM unnest(%s::text[]) WITH ORDINALITY AS event(track_id, ordinality)
+        """,
+        (catalog_instance_id, epoch, head_seq, JOURNAL_WRITER_GENERATION, track_ids),
+    )
+    cur.execute(
+        f"UPDATE {t('profile_stream_state')} "
+        "SET head_seq=%s, updated_at=now() "
+        "WHERE catalog_instance_id=%s AND epoch=%s AND head_seq=%s "
+        "RETURNING head_seq, retention_limit",
+        (seq, catalog_instance_id, epoch, head_seq),
+    )
+    advanced = cur.fetchone()
+    if advanced is None:
+        raise RuntimeError("Profile stream head changed during publication")
+    compact_change_journal(
+        cur,
+        catalog_instance_id=catalog_instance_id,
+        state_table="profile_stream_state",
+        changes_table="profile_changes",
+        epoch_column="epoch",
+        floor_column="floor_seq",
+        epoch=epoch,
+        head_seq=seq,
+        retention_limit=max(PROFILE_CHANGE_RETENTION_EVENTS, int(advanced[1] or 0)),
+        hold_floor_seq=_profile_floor_hold(cur, catalog_instance_id, epoch),
+        current_floor=floor_seq,
+        max_advance=PROFILE_COMPACTION_MAX_ADVANCE * len(track_ids),
     )
     return seq
 
@@ -580,47 +881,107 @@ def profile_bootstrap_page(db, catalog_instance_id, page_token=None, limit=250):
     }
 
 
-def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250):
+# K6 (P3-2): a journalled edge reference is ref-eligible when it is kept
+# (journal_edge_ref); ``{alias}`` is the journal (or catch-up) row.
+EDGE_REF_KEPT = """{alias}.edge_ref @> '{{"kept": true}}'::jsonb"""
+
+
+def edge_profile_ref_sql(alias, payload):
+    """SQL: the wire ``edge_profile_ref`` of a kept journal row whose waveform
+    payload is at the SQL path ``payload``."""
+    return (f"jsonb_build_object('media_revision', {payload}->'media_revision', "
+            f"'profile_digest', {alias}.edge_ref->'profile_digest')")
+
+
+def _changes_page_sql(edge_refs):
+    """(select, join) that serve a /changes page's journal rows (alias ``c``).
+
+    A row journalled with an edge reference is joined back to its edge: the
+    edge of that digest (for the row's track and media_revision), else the
+    edge current for that media_revision (the referenced one was replaced
+    later), else none (it was removed). Either way the event that replaced or
+    removed it follows in the journal. The join runs only for the page's own
+    rows, and without the opt-in a row reads exactly as the pre-K6 journal
+    row with the edge embedded. With ``edge_refs`` a kept row carries
+    ``edge_profile_ref`` instead, as journalled, and looks nothing up. Rows
+    journalled before K6 (NULL edge_ref) are served as stored.
+
+    The found edge's own payload is returned as its own column, unmerged:
+    ``read_profile_changes`` attaches it to the row's ``payload`` in Python.
+    Concatenating it in SQL (``payload || jsonb_build_object('edge_profile',
+    ...)``) forced Postgres to rebuild a fresh ~19 KB JSONB value per row
+    (P3-2 follow-up: 108 ms p50 for a 250-event page against 83 ms), which a
+    plain Python dict merge does not.
+    """
+    kept = EDGE_REF_KEPT.format(alias="c")
+    payload = "c.payload"
+    lookup = "c.edge_ref IS NOT NULL"
+    if edge_refs:
+        payload = (f"CASE WHEN {kept} THEN c.payload || jsonb_build_object("
+                   f"'edge_profile_ref', {edge_profile_ref_sql('c', 'c.payload')}) "
+                   f"ELSE c.payload END")
+        lookup += f" AND NOT {kept}"
+    select = f"c.seq, c.track_id, c.operation, {payload}, c.created_at, edge.payload"
+    join = f"""LEFT JOIN LATERAL (
+        SELECT e.payload FROM {t('edge_profiles')} e
+         WHERE {lookup}
+           AND e.catalog_instance_id=%s AND e.track_id=c.track_id
+           AND e.media_revision=c.payload->>'media_revision'
+         ORDER BY e.profile_digest=c.edge_ref->>'profile_digest' DESC,
+                  e.updated_at DESC, e.profile_digest
+         LIMIT 1
+    ) edge ON TRUE"""
+    return select, join
+
+
+def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250, *,
+                         edge_refs=False):
+    """One /profiles/changes page. ``edge_refs`` is the K6 opt-in (P3-2)."""
     cursor = parse_opaque_cursor(cursor_value)
     expected_id = catalog_instance_id or cursor["catalog_instance_id"]
     sources = resolve_catalog_source(db, catalog_instance_id=expected_id)
     if len(sources) != 1 or sources[0]["catalog_instance_id"] != cursor["catalog_instance_id"]:
         raise ValueError("Cursor belongs to another profile source")
+    page_select, page_join = _changes_page_sql(bool(edge_refs))
     cur = db.cursor()
-    epoch, head_seq, floor_seq = _profile_stream_state(cur, expected_id)
-    if cursor["epoch"] != epoch or cursor["seq"] < floor_seq:
+    try:
+        # State and events from one snapshot, checked for density (P1-7);
+        # each event's edge is resolved in that snapshot too (K6).
+        epoch, head_seq, rows, _state = read_change_page(
+            cur,
+            catalog_instance_id=expected_id,
+            cursor=cursor,
+            limit=limit,
+            state_table="profile_stream_state",
+            epoch_column="epoch",
+            head_column="head_seq",
+            floor_column="floor_seq",
+            changes_table="profile_changes",
+            columns=("seq", "track_id", "operation", "payload", "created_at", "edge_ref"),
+            ahead_message="Cursor is ahead of the profile head",
+            page_select=page_select,
+            page_join=page_join,
+            page_params=(expected_id,),
+        )
+    finally:
         cur.close()
-        raise KeyError("bootstrap_required")
-    if cursor["seq"] > head_seq:
-        cur.close()
-        raise ValueError("Cursor is ahead of the profile head")
-    cur.execute(
-        f"""
-        SELECT seq, track_id, operation, payload, created_at
-          FROM {t("profile_changes")}
-         WHERE catalog_instance_id=%s AND epoch=%s AND seq>%s AND seq<=%s
-         ORDER BY seq LIMIT %s
-        """,
-        (
-            expected_id,
-            epoch,
-            cursor["seq"],
-            head_seq,
-            max(1, min(int(limit), 1000)),
-        ),
-    )
-    rows = cur.fetchall()
-    cur.close()
-    changes = [
-        {
+    changes = []
+    for row in rows:
+        payload = _json(row[3])
+        edge_profile = _json(row[5])
+        # ``edge.payload`` (row[5]) is only ever non-NULL when the join found
+        # an edge for a non-"kept" edge_ref row (P3-2's invariant: such a
+        # payload never already embeds one), so this is the same merge the
+        # SQL ``||`` used to do, just in Python instead of in Postgres.
+        if edge_profile is not None and isinstance(payload, dict):
+            payload = dict(payload, edge_profile=edge_profile)
+        changes.append({
             "seq": int(row[0]),
             "track_id": str(row[1]),
             "operation": row[2],
-            "payload": _json(row[3]),
+            "payload": payload,
             "created_at": _iso(row[4]),
-        }
-        for row in rows
-    ]
+        })
     next_seq = changes[-1]["seq"] if changes else cursor["seq"]
     return {
         "schema_version": 1,
@@ -1686,31 +2047,31 @@ def read_relationship_changes(db, cursor_value, catalog_instance_id=None, limit=
     cursor = parse_opaque_cursor(cursor_value)
     expected_id = catalog_instance_id or cursor["catalog_instance_id"]
     status = relationship_status(db, expected_id)
-    head = parse_opaque_cursor(status["cursor"])
     if cursor["catalog_instance_id"] != expected_id:
         raise ValueError("Cursor belongs to another relationship source")
-    if cursor["epoch"] != head["epoch"] or cursor["seq"] < status["floor_seq"]:
+    if "cursor" not in status:
         raise KeyError("bootstrap_required")
-    if cursor["seq"] > head["seq"]:
-        raise ValueError("Cursor is ahead of the relationship head")
     cur = db.cursor()
-    cur.execute(
-        f"""
-        SELECT seq, generation, entity_type, entity_id, operation, payload, created_at
-          FROM {t("relationship_changes")}
-         WHERE catalog_instance_id=%s AND epoch=%s AND seq>%s AND seq<=%s
-         ORDER BY seq LIMIT %s
-        """,
-        (
-            expected_id,
-            head["epoch"],
-            cursor["seq"],
-            head["seq"],
-            max(1, min(int(limit), 1000)),
-        ),
-    )
-    rows = cur.fetchall()
-    cur.close()
+    try:
+        # State and events from one snapshot, checked for density (P1-7).
+        epoch, head_seq, rows, _state = read_change_page(
+            cur,
+            catalog_instance_id=expected_id,
+            cursor=cursor,
+            limit=limit,
+            state_table="relationship_state",
+            epoch_column="epoch",
+            head_column="head_seq",
+            floor_column="floor_seq",
+            changes_table="relationship_changes",
+            columns=(
+                "seq", "generation", "entity_type", "entity_id", "operation",
+                "payload", "created_at",
+            ),
+            ahead_message="Cursor is ahead of the relationship head",
+        )
+    finally:
+        cur.close()
     changes = [
         {
             "seq": int(row[0]),
@@ -1729,7 +2090,7 @@ def read_relationship_changes(db, cursor_value, catalog_instance_id=None, limit=
         "algorithm_version": status["algorithm_version"],
         "catalog_instance_id": expected_id,
         "changes": changes,
-        "cursor": opaque_cursor(expected_id, head["epoch"], next_seq),
-        "head_cursor": status["cursor"],
-        "has_more": next_seq < head["seq"],
+        "cursor": opaque_cursor(expected_id, epoch, next_seq),
+        "head_cursor": opaque_cursor(expected_id, epoch, head_seq),
+        "has_more": next_seq < head_seq,
     }

@@ -1,0 +1,15 @@
+CREATE TABLE IF NOT EXISTS music_servers (server_id TEXT PRIMARY KEY, name TEXT);
+INSERT INTO music_servers VALUES ('server-a','Main') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS score (item_id TEXT PRIMARY KEY, title TEXT, author TEXT, album TEXT, album_artist TEXT, tempo REAL, key TEXT, scale TEXT, mood_vector TEXT, created_at TIMESTAMP NOT NULL DEFAULT now(), energy REAL, other_features TEXT, year INTEGER, rating INTEGER, file_path TEXT, duration DOUBLE PRECISION);
+CREATE TABLE IF NOT EXISTS embedding (item_id TEXT PRIMARY KEY REFERENCES score(item_id) ON DELETE CASCADE, embedding BYTEA);
+CREATE TABLE IF NOT EXISTS clap_embedding (item_id TEXT PRIMARY KEY REFERENCES score(item_id) ON DELETE CASCADE, embedding BYTEA);
+CREATE TABLE IF NOT EXISTS track_server_map (item_id TEXT NOT NULL REFERENCES score(item_id) ON UPDATE CASCADE ON DELETE CASCADE, server_id TEXT NOT NULL REFERENCES music_servers(server_id) ON DELETE CASCADE, provider_track_id TEXT NOT NULL, match_tier TEXT, file_path TEXT, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_track_server_map_provider_unique ON track_server_map (server_id, provider_track_id);
+CREATE INDEX IF NOT EXISTS idx_track_server_map_server_item ON track_server_map (server_id, item_id);
+CREATE TABLE IF NOT EXISTS chromaprint (server_id TEXT NOT NULL REFERENCES music_servers(server_id) ON DELETE CASCADE, provider_track_id TEXT NOT NULL, fingerprint BYTEA, updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY (server_id, provider_track_id));
+CREATE TABLE IF NOT EXISTS task_status (id SERIAL PRIMARY KEY, task_id TEXT UNIQUE NOT NULL, parent_task_id TEXT, task_type TEXT NOT NULL, sub_type_identifier TEXT, status TEXT, progress INTEGER DEFAULT 0, details TEXT, timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP, start_time DOUBLE PRECISION, end_time DOUBLE PRECISION);
+CREATE INDEX IF NOT EXISTS idx_task_status_parent ON task_status (parent_task_id) WHERE parent_task_id IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_task_status_type_timestamp ON task_status (task_type, timestamp DESC);
+CREATE TABLE IF NOT EXISTS map_projection_data (index_name VARCHAR(255) PRIMARY KEY, projection_data BYTEA NOT NULL, id_map_json TEXT NOT NULL, embedding_dimension INTEGER NOT NULL, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP);
+CREATE TABLE IF NOT EXISTS cron (id SERIAL PRIMARY KEY, name TEXT, task_type TEXT NOT NULL, cron_expr TEXT NOT NULL, enabled BOOLEAN DEFAULT FALSE, last_run DOUBLE PRECISION, created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP, options JSONB NOT NULL DEFAULT '{}'::jsonb);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_cron_task_type ON cron (task_type);

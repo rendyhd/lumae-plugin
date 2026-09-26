@@ -275,13 +275,40 @@ def analyze_buffer(audio, sample_rate):
     )
 
 
-def _frame_blocks(resampler, frame):
+# F1: PyAV 16's ``AudioFrame.planes`` (behind ``to_ndarray()``) counts planes
+# by walking ``extended_data`` up to a NULL pointer. A planar frame with 8
+# channels fills all 8 slots of ``AVFrame.data`` with no NULL after them, so
+# PyAV reads the next field (``linesize``) as a 9th plane pointer and
+# ``np.vstack`` dereferences it: SIGSEGV on 7.1 input. A packed frame always
+# has one plane. Mono and stereo keep the planar path; wider layouts decode to
+# packed float and are de-interleaved here. The samples are the same.
+PLANAR_MAX_CHANNELS = 2
+
+
+def _decode_sample_format(channels):
+    return "fltp" if channels <= PLANAR_MAX_CHANNELS else "flt"
+
+
+def _frame_blocks(resampler, frame, channels):
+    """Yield the resampled audio as channel-first float32 blocks."""
     for converted in resampler.resample(frame):
-        yield converted.to_ndarray()
+        if channels <= PLANAR_MAX_CHANNELS:
+            yield converted.to_ndarray()
+            continue
+        if converted.format.is_planar or converted.layout.nb_channels != channels:
+            raise ValueError("decoded audio changed sample format or channel count")
+        yield converted.to_ndarray().reshape(-1, channels).T
 
 
-def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS):
-    """Decode one media file incrementally with PyAV and bounded memory."""
+def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS, observer=None):
+    """Decode one media file incrementally with PyAV and bounded memory.
+
+    ``observer`` (``analysis_isolation.DecodeProbe``) records the stream and the
+    decode position for failure diagnostics. The deadline is checked between
+    decoded frames only. The plugin's tasks pass the configured limit as
+    ``deadline_seconds``, and ``analysis_isolation`` adds the hard limit
+    (LUM-018).
+    """
     try:
         import av
     except ImportError as exc:  # pragma: no cover - AudioMuse images include PyAV.
@@ -293,6 +320,8 @@ def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS):
         if not container.streams.audio:
             raise ValueError("media file does not contain an audio stream")
         stream = container.streams.audio[0]
+        if observer is not None:
+            observer.opened(container, stream)
         sample_rate = int(
             getattr(stream.codec_context, "sample_rate", 0)
             or getattr(stream, "rate", 0)
@@ -315,7 +344,7 @@ def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS):
             )
 
         resampler = av.audio.resampler.AudioResampler(
-            format="fltp",
+            format=_decode_sample_format(channels),
             layout=layout_name,
             rate=sample_rate,
         )
@@ -323,8 +352,10 @@ def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS):
         def decoded_blocks():
             for frame in container.decode(stream):
                 _check_deadline(deadline)
-                yield from _frame_blocks(resampler, frame)
-            yield from _frame_blocks(resampler, None)
+                if observer is not None:
+                    observer.decoded(frame)
+                yield from _frame_blocks(resampler, frame, channels)
+            yield from _frame_blocks(resampler, None, channels)
 
         return analyze_blocks(
             decoded_blocks(),

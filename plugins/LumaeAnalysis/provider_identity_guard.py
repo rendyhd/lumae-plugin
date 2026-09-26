@@ -10,6 +10,7 @@ from typing import Iterable
 
 from plugin.api import table
 
+from . import migrations
 from .provider_identity import (
     ProviderIdentityTransitionState,
     canonicalize_navidrome_id,
@@ -127,6 +128,7 @@ def migrate_provider_identity(db):
             audiomuse_health TEXT,
             projection_reconcile_required BOOLEAN NOT NULL DEFAULT FALSE,
             manifest_sha256 TEXT,
+            collection_deferrals JSONB NOT NULL DEFAULT '[]'::jsonb,
             detected_at TIMESTAMPTZ,
             applied_at TIMESTAMPTZ,
             checked_at TIMESTAMPTZ,
@@ -136,28 +138,20 @@ def migrate_provider_identity(db):
         )
         """
     )
-    for statement in (
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS target_scan_count INTEGER NOT NULL DEFAULT 0",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS first_seq BIGINT",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS last_seq BIGINT",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS analysis_baseline JSONB NOT NULL DEFAULT '{}'::jsonb",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS baseline_integrity BOOLEAN",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS audiomuse_health TEXT",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS projection_reconcile_required "
-        "BOOLEAN NOT NULL DEFAULT FALSE",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS manifest_sha256 TEXT",
-        f"ALTER TABLE {t('provider_identity_transitions')} "
-        "ADD COLUMN IF NOT EXISTS applied_at TIMESTAMPTZ",
-    ):
-        cur.execute(statement)
+    migrations.ensure_columns(
+        cur, t('provider_identity_transitions'),
+        "target_scan_count INTEGER NOT NULL DEFAULT 0",
+        "first_seq BIGINT",
+        "last_seq BIGINT",
+        "analysis_baseline JSONB NOT NULL DEFAULT '{}'::jsonb",
+        "baseline_integrity BOOLEAN",
+        "audiomuse_health TEXT",
+        "projection_reconcile_required BOOLEAN NOT NULL DEFAULT FALSE",
+        "manifest_sha256 TEXT",
+        "applied_at TIMESTAMPTZ",
+        # P3-4c: principals whose collection rekey was deferred, with why.
+        "collection_deferrals JSONB NOT NULL DEFAULT '[]'::jsonb",
+    )
     cur.execute(
         f"""
         CREATE TABLE IF NOT EXISTS {t('provider_identity_manifests')} (
@@ -271,7 +265,9 @@ def _source_state(db, server_id, for_update=False):
                p.detection_reason, p.required_action, p.counts,
                p.target_fingerprint, p.last_error, p.target_scan_count,
                p.first_seq, p.last_seq, p.analysis_baseline,
-               p.baseline_integrity, p.audiomuse_health, p.manifest_sha256
+               p.baseline_integrity, p.audiomuse_health, p.manifest_sha256,
+               p.catalog_instance_id IS NOT NULL, p.baseline_catalog_generation,
+               p.baseline_analysis_generation, p.detected_at IS NOT NULL
           FROM {t('catalog_sources')} s
           LEFT JOIN {t('catalog_state')} c USING (catalog_instance_id)
           LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
@@ -285,7 +281,7 @@ def _source_state(db, server_id, for_update=False):
     cur.close()
     if row is None:
         return None
-    return {
+    source = {
         "catalog_instance_id": str(row[0]),
         "catalog_generation": int(row[1] or 0),
         "analysis_generation": int(row[2] or 0),
@@ -307,6 +303,17 @@ def _source_state(db, server_id, for_update=False):
         "audiomuse_health": str(row[18]) if row[18] else None,
         "manifest_sha256": str(row[19]) if row[19] else None,
     }
+    if len(row) > 23:
+        # What an observation compares before it writes (P2-1).
+        source.update(
+            {
+                "transition_exists": bool(row[20]),
+                "baseline_catalog_generation": int(row[21]) if row[21] is not None else None,
+                "baseline_analysis_generation": int(row[22]) if row[22] is not None else None,
+                "detected": bool(row[23]),
+            }
+        )
+    return source
 
 
 def _ensure_transition_row(db, source):
@@ -327,6 +334,61 @@ def _ensure_transition_row(db, source):
     cur.close()
 
 
+def _starts_new_transition(source, state):
+    return state == ProviderIdentityTransitionState.TRANSITION_PENDING.value and (
+        not source.get("transition_id")
+        or source.get("state") == ProviderIdentityTransitionState.APPLIED.value
+    )
+
+
+_OBSERVED_KEYS = (
+    "transition_exists",
+    "state",
+    "current_provider_version",
+    "detection_reason",
+    "required_action",
+    "last_error",
+    "baseline_catalog_generation",
+    "baseline_analysis_generation",
+    "detected",
+)
+
+
+def _observation_changes(
+    source,
+    *,
+    state,
+    current_version,
+    detection_reason,
+    required_action,
+    last_error=None,
+):
+    """Whether ``_update_observation`` would change the stored transition row.
+
+    Only ``updated_at`` is ignored. A source read without the compared columns
+    (an older caller or a test double) counts as changed.
+    """
+    if any(key not in source for key in _OBSERVED_KEYS) or not source["transition_exists"]:
+        return True
+    if _starts_new_transition(source, state):
+        return True
+    stored_state = source["state"] or ProviderIdentityTransitionState.NORMAL.value
+    if stored_state == ProviderIdentityTransitionState.NORMAL.value and (
+        source["baseline_catalog_generation"] != source["catalog_generation"]
+        or source["baseline_analysis_generation"] != source["analysis_generation"]
+    ):
+        return True
+    if state == ProviderIdentityTransitionState.TRANSITION_PENDING.value and not source["detected"]:
+        return True
+    return (
+        stored_state != state
+        or (source["current_provider_version"] or None) != (current_version or None)
+        or (source["detection_reason"] or None) != (detection_reason or None)
+        or (source["required_action"] or None) != (required_action or None)
+        or (source["last_error"] or None) != (str(last_error)[:1000] if last_error else None)
+    )
+
+
 def _update_observation(
     db,
     source,
@@ -338,13 +400,7 @@ def _update_observation(
     last_error=None,
 ):
     transition_id = source.get("transition_id")
-    starts_new_transition = (
-        state == ProviderIdentityTransitionState.TRANSITION_PENDING.value
-        and (
-            not transition_id
-            or source.get("state") == ProviderIdentityTransitionState.APPLIED.value
-        )
-    )
+    starts_new_transition = _starts_new_transition(source, state)
     if starts_new_transition:
         transition_id = str(uuid.uuid4())
     cur = db.cursor()
@@ -406,20 +462,31 @@ def _update_observation(
     cur.close()
 
 
-def observe_provider_version(db, bridge, server_id, commit=True):
-    """Probe the credential-contained provider and close admission if it changed."""
+def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=True):
+    """Probe the credential-contained provider and close admission if it changed.
+
+    The provider is pinged on every call. The transition row is written only
+    when the observed state or evidence changed; ``written`` in the result says
+    whether anything was. ``commit=False`` leaves the transaction to the
+    caller, so a GET route owns it (P2-1). ``refresh_health=False`` skips the
+    AudioMuse health inspection of an applied transition, which the
+    ``provider_identity_recheck`` cron keeps current.
+    """
 
     source = _source_state(db, server_id)
     if source is None:
         return None
-    _ensure_transition_row(db, source)
-    source = _source_state(db, server_id) or source
+    written = False
+    if source.get("transition_exists") is not True:
+        _ensure_transition_row(db, source)
+        source = _source_state(db, server_id) or source
+        written = True
 
     probe = getattr(bridge, "probe_server_identity", None)
     if not callable(probe):
         # Unit-test and legacy bridge doubles do not expose the new API. The
         # production ProviderCatalogBridge always does.
-        return {**source, "observation": "bridge_unavailable"}
+        return {**source, "observation": "bridge_unavailable", "written": written}
 
     try:
         identity = probe(server_id)
@@ -433,15 +500,18 @@ def observe_provider_version(db, bridge, server_id, commit=True):
             and state != ProviderIdentityTransitionState.APPLIED.value
         ):
             state = ProviderIdentityTransitionState.TRANSITION_PENDING.value
-        _update_observation(
-            db,
-            source,
-            state=state,
-            current_version=source.get("current_provider_version"),
-            detection_reason="provider_version_unverified",
-            required_action="retry_provider_identity_check" if state != "normal" else None,
-            last_error=exc,
-        )
+        observation = {
+            "state": state,
+            "current_version": source.get("current_provider_version"),
+            "detection_reason": "provider_version_unverified",
+            "required_action": (
+                "retry_provider_identity_check" if state != "normal" else None
+            ),
+            "last_error": exc,
+        }
+        if _observation_changes(source, **observation):
+            _update_observation(db, source, **observation)
+            written = True
         if commit:
             db.commit()
         return {
@@ -449,6 +519,7 @@ def observe_provider_version(db, bridge, server_id, commit=True):
             "state": state,
             "observation": "unverified",
             "last_error": str(exc),
+            "written": written,
         }
 
     if source["catalog_generation"] == 0:
@@ -475,16 +546,17 @@ def observe_provider_version(db, bridge, server_id, commit=True):
             reason = "provider_version_boundary" if after_boundary else "provider_version_uncertain"
             action = "inspect_provider_identity"
 
-    _update_observation(
-        db,
-        source,
-        state=next_state,
-        current_version=current_version,
-        detection_reason=reason,
-        required_action=action,
-    )
+    observation = {
+        "state": next_state,
+        "current_version": current_version,
+        "detection_reason": reason,
+        "required_action": action,
+    }
+    if _observation_changes(source, **observation):
+        _update_observation(db, source, **observation)
+        written = True
     audiomuse_health = source.get("audiomuse_health")
-    if next_state == ProviderIdentityTransitionState.APPLIED.value:
+    if refresh_health and next_state == ProviderIdentityTransitionState.APPLIED.value:
         adapter = getattr(bridge, "core", None)
         if adapter is not None and callable(getattr(adapter, "analysis_mapping_sql", None)):
             from .provider_identity_rekey import refresh_audiomuse_health
@@ -496,6 +568,7 @@ def observe_provider_version(db, bridge, server_id, commit=True):
                 adapter,
                 commit=False,
             )
+            written = True
     if commit:
         db.commit()
     return {
@@ -507,6 +580,7 @@ def observe_provider_version(db, bridge, server_id, commit=True):
         "detection_reason": reason,
         "required_action": action,
         "audiomuse_health": audiomuse_health,
+        "written": written,
     }
 
 

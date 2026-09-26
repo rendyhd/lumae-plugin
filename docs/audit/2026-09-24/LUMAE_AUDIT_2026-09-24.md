@@ -189,7 +189,7 @@ The probes are checked in under [`probes/`](probes/).
    - keep the atomic publication for the waveform and cursor state only.
 
    This removes the about 1.8 GB JavaScript load and the doubled staging-plus-published storage.
-5. **Do not re-send unchanged edges.** Journal events currently embed the full edge on every waveform republish (`edge_profile_store.py:155`, `profile_publication.py:381`). Send the edge only when its digest changed, and otherwise send `edge_profile_digest` so the client keeps its copy. A future analyzer change such as LUM-005 v2 then costs about 0.5 KB per track instead of about 19 KB.
+5. **Do not re-send unchanged edges.** *(Corrected 2026-09-24, P0-5.)* A waveform republish does **not** embed the edge: `complete_attempt` deletes the edge rows server-side (`profile_publication.py:342-359`) and emits an upsert without `edge_profile` (`:380-381`), and clients then delete their copy because an upsert without an edge removes it. The edge is then re-sent in full (about 19 KB) when the edge job completes (`edge_profile_store.py:155`). The fix is P1-1 (keep the edge when the media is unchanged and embed it in the upsert), followed by K6/P3-2 (send an `edge_profile_ref` instead of the full edge to opted-in clients). A future analyzer change such as LUM-005 v2 then costs about 0.5 KB per track instead of about 19 KB.
 6. **Make "only once" true:**
    - AUD-01: the 5-minute timeout deletes progress.
    - AUD-03: no-op re-analysis re-sends everything and forces a re-bootstrap past 50k events.

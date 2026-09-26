@@ -7,6 +7,7 @@ import uuid
 
 from plugin.api import table
 
+from . import migrations
 from .edge_profiles import METHOD, SCHEMA_VERSION, canonical_json, opaque_revision, profile_digest
 
 
@@ -33,13 +34,23 @@ def migrate_edge_profiles(db):
         updated_at TIMESTAMP NOT NULL DEFAULT now(),
         PRIMARY KEY (catalog_instance_id, track_id)
     )""")
+    # The settings poll counts a source's edges and reads the newest one
+    # (edge_profile_status): an index-only scan of this narrow index instead
+    # of two scans of the wide table.
+    migrations.ensure_index(
+        cur,
+        f"CREATE INDEX IF NOT EXISTS {table('edge_profiles')}_updated_idx "
+        f"ON {table('edge_profiles')} (catalog_instance_id, updated_at)",
+    )
     cur.close()
 
 
-def edge_join(profile_alias='p'):
+def edge_join(profile_alias='p', columns='e.payload'):
     # Internal signatures stay on the server. Only their opaque revision is public.
+    # ``columns`` lets a caller read only key columns of the chosen edge row
+    # (the v2 capture stores a reference and never detoasts the payload).
     return f"""LEFT JOIN LATERAL (
-        SELECT e.payload FROM {table('edge_profiles')} e
+        SELECT {columns} FROM {table('edge_profiles')} e
          WHERE e.catalog_instance_id={profile_alias}.catalog_instance_id
            AND e.track_id={profile_alias}.track_id
            AND e.media_signature={profile_alias}.media_signature
@@ -98,7 +109,7 @@ def update_edge_job(db, catalog_id, job, status, reason=None):
 
 
 def publish_edge_profile(db, catalog_id, job, payload, signature):
-    from .catalog_enrichment import record_profile_change, serialize_profile
+    from .catalog_enrichment import journal_edge_ref, record_profile_change, serialize_profile
 
     if (payload.get('schema_version') != SCHEMA_VERSION or payload.get('catalog_instance_id') != catalog_id or
             payload.get('track_id') != job['track_id'] or payload.get('media_revision') != job['media_revision'] or
@@ -152,7 +163,10 @@ def publish_edge_profile(db, catalog_id, job, payload, signature):
         VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)""",
                 (catalog_id, job['track_id'], job['media_revision'], payload['representation_id'],
                  signature, payload['profile_digest'], canonical_json(payload)))
-    record_profile_change(cur, catalog_id, job['track_id'], 'ready', serialize_profile(*legacy, edge_profile=payload))
+    # The event journals the waveform part and a reference to the edge just
+    # stored (K6); an edge publication is served in full to every client.
+    record_profile_change(cur, catalog_id, job['track_id'], 'ready', serialize_profile(*legacy),
+                          edge_ref=journal_edge_ref(payload['profile_digest'], kept=False))
     cur.execute(f"""UPDATE {table('edge_profile_jobs')} SET status='ready', last_error=NULL, updated_at=now()
         WHERE catalog_instance_id=%s AND track_id=%s AND job_token=%s""",
                 (catalog_id, job['track_id'], job['job_token']))
@@ -161,9 +175,46 @@ def publish_edge_profile(db, catalog_id, job, payload, signature):
     return True
 
 
-def edge_backfill_candidates(db, catalog_id, after='', limit=100):
+def edge_profile_status(db, catalog_id):
+    """Read-only counts and freshness for one source's edge upgrade (P3-9).
+
+    Source-scoped aggregates: published edge profiles, jobs in progress,
+    failed jobs, the most recent failed job's ``last_error`` (free text;
+    callers redact it) and the latest published edge's ``updated_at``. The
+    edge count and the latest edge come from one index-only scan of
+    ``(catalog_instance_id, updated_at)``; the jobs table is small. Never
+    mutates anything.
+    """
     cur = db.cursor()
-    cur.execute(f"""SELECT p.track_id FROM {table('source_profiles')} p {edge_join()}
+    cur.execute(f"""
+        SELECT edges.ready, jobs.active, jobs.failed, jobs.last_error, edges.last_success_at
+          FROM (SELECT count(*) AS ready, max(updated_at) AS last_success_at
+                  FROM {table('edge_profiles')} WHERE catalog_instance_id=%s) edges,
+               (SELECT count(*) FILTER (WHERE status IN ('pending', 'running')) AS active,
+                       count(*) FILTER (WHERE status='failed') AS failed,
+                       (SELECT last_error FROM {table('edge_profile_jobs')}
+                         WHERE catalog_instance_id=%s AND status='failed'
+                         ORDER BY updated_at DESC LIMIT 1) AS last_error
+                  FROM {table('edge_profile_jobs')} WHERE catalog_instance_id=%s) jobs
+    """, (catalog_id, catalog_id, catalog_id))
+    row = cur.fetchone()
+    cur.close()
+    ready, active, failed, last_error, last_success_at = row or (0, 0, 0, None, None)
+    return {
+        "ready": int(ready or 0),
+        "active": int(active or 0),
+        "failed": int(failed or 0),
+        "last_error": str(last_error) if last_error else None,
+        "last_success_at": last_success_at.isoformat() if last_success_at else None,
+    }
+
+
+def edge_backfill_candidates(db, catalog_id, after='', limit=100):
+    # Published waveform rows without an edge for their media (P3-7): an edge
+    # is published only for, and read only through, such a row. An attempt
+    # row may be unpublished or describe other media than what is published.
+    cur = db.cursor()
+    cur.execute(f"""SELECT p.track_id FROM {table('published_source_profiles')} p {edge_join()}
         LEFT JOIN {table('edge_profile_jobs')} j ON j.catalog_instance_id=p.catalog_instance_id AND j.track_id=p.track_id
         WHERE p.catalog_instance_id=%s AND p.media_signature IS NOT NULL
           AND p.track_id>%s AND edge.payload IS NULL

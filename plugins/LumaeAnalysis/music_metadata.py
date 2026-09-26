@@ -5,6 +5,7 @@ import unicodedata
 import uuid
 from flask import jsonify, request
 from plugin.api import get_db, table
+from . import migrations
 from .personal_discovery import principal, identifier
 from .credits_musicbrainz import Client, MusicBrainzDeferred, _quoted
 from .credits_service import paused, playback_pending
@@ -23,7 +24,7 @@ def migrate(db):
             status TEXT NOT NULL DEFAULT 'pending', result JSONB, error TEXT, attempts INTEGER NOT NULL DEFAULT 0,
             not_before TIMESTAMPTZ NOT NULL DEFAULT now(), lease TEXT, lease_until TIMESTAMPTZ,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(principal,id))""")
-        cur.execute(f"CREATE INDEX IF NOT EXISTS lumae_metadata_due ON {table('metadata_jobs')}(status,not_before)")
+        migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS lumae_metadata_due ON {table('metadata_jobs')}(status,not_before)")
 
 
 def ensure_schedule(db):

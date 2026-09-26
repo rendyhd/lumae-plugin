@@ -124,7 +124,12 @@ def test_multi_event_restore_pagination_tombstone_and_receipt_replay(collection_
         pages.extend(page["changes"])
         cursor = page["next_cursor"]
     assert [r["entity_kind"] for r in pages] == ["collection", "item", "item", "collection", "item"]
-    assert _page(call, cursor, 1) == {"changes": [], "next_cursor": cursor}
+    # 1.2.5 keys are unchanged; K8 (1.3.0) only adds epoch, head_seq,
+    # floor_seq and has_more.
+    end = _page(call, cursor, 1)
+    assert {key: end[key] for key in ("changes", "next_cursor")} == {
+        "changes": [], "next_cursor": cursor}
+    assert end["has_more"] is False and end["head_seq"] == cursor
     cid = first.get_json()["collections"][0]["id"]
     deleted = call("DELETE", f"/api/collections/{cid}", {})
     assert deleted.status_code == 200
@@ -145,6 +150,10 @@ def test_populated_cache_sequence_migration_twice_preserves_epoch_and_head(colle
     with db.cursor() as cur:
         cur.execute(f"DROP TABLE {manager.collection_feed_state_table()}")
         cur.execute(f"ALTER SEQUENCE {manager.collection_changes_table()}_seq_seq CACHE 32")
+        # Rebuild the 1.2.5 schema: seq was a BIGSERIAL with a nextval default
+        # (1.3.0 migration drops it, AUD-05).
+        cur.execute(f"ALTER TABLE {manager.collection_changes_table()} ALTER COLUMN seq "
+                    f"SET DEFAULT nextval('{manager.collection_changes_table()}_seq_seq')")
         cur.execute(f"INSERT INTO {manager.collection_changes_table()} "
                     "(principal, collection_id, entity_kind, entity_id, operation, payload) "
                     "VALUES ('user:alice', 'legacy', 'collection', 'legacy', 'upsert', '{}'::jsonb) "
@@ -165,6 +174,11 @@ def test_populated_cache_sequence_migration_twice_preserves_epoch_and_head(colle
     assert state[1] == legacy_seq
     manager.migrate_collections(db)
     db.commit()
+    with db.cursor() as cur:
+        cur.execute("SELECT column_default FROM information_schema.columns "
+                    "WHERE table_schema=current_schema() AND table_name=%s "
+                    "AND column_name='seq'", (manager.collection_changes_table(),))
+        assert cur.fetchone() == (None,)
     with db.cursor() as cur:
         cur.execute(f"SELECT epoch::text, head_seq FROM {manager.collection_feed_state_table()}")
         assert cur.fetchone() == state
