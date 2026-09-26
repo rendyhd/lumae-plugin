@@ -25,6 +25,7 @@ from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
     publish_edge_profile, edge_backfill_candidates,
 )
+from . import analysis_isolation
 from . import migrations
 from . import optional_storage
 from . import credits_service, credits_store, personal_discovery, music_metadata
@@ -97,9 +98,11 @@ from .provider_identity_guard import (
 )
 from .provider_identity_rekey import read_transition_manifest, refresh_audiomuse_health
 from .profile_publication import (
+    TRANSIENT_FAILURES,
     admit_attempts,
     complete_attempt,
     migrate_attempts,
+    public_failure_reason,
     published_profile_current,
     release_attempts,
 )
@@ -288,6 +291,12 @@ def enqueue_bounded(func, *args, queue="default", timeout=None, **kwargs):
     ``timeout`` remains accepted for call-site and older-core compatibility,
     but queue internals are deliberately not imported by the plugin. AudioMuse
     owns execution limits and queue implementation details.
+
+    AudioMuse enforces no execution limit on plugin tasks: RQ-era hosts
+    enqueued them with an RQ ``job_timeout`` of -1 (no timeout), and the
+    database task queue that replaced RQ has no per-task timeout. ``timeout`` is therefore
+    not enforced by anyone. File analysis has its own hard limit per file
+    instead (``run_file_analysis``, LUM-018).
     """
     del timeout
     return enqueue(func, *args, queue=queue, **kwargs)
@@ -405,6 +414,52 @@ def remove_downloaded_file(path):
 def configured_backfill_limit():
     raw = get_setting("backfill_batch_size", DEFAULT_BACKFILL_BATCH_SIZE)
     return normalize_backfill_limit(raw)
+
+
+def analysis_time_limit_seconds():
+    """Per-file time limit (setting ``analysis_time_limit_seconds``).
+
+    It is the analyzers' soft deadline; the analysis child is killed 30 s
+    after it (``analysis_isolation.HARD_LIMIT_HEADROOM_SECONDS``).
+    """
+    return analysis_isolation.normalize_limit(
+        get_setting("analysis_time_limit_seconds", analysis_isolation.DEFAULT_LIMIT_SECONDS)
+    )
+
+
+def run_file_analysis(analyzer, path, **kwargs):
+    """Run one file analysis in a child process under the hard limit (LUM-018).
+
+    The host puts no timeout on the task (see ``enqueue_bounded``), and the
+    analyzer's soft deadline cannot interrupt a decoder hung in native code.
+    The setting is the analyzer's soft deadline, passed with each file, and
+    the child is killed 30 s after it, so a progressing analysis stops at the
+    soft deadline first. Failures raise with a LUM-007 category.
+    """
+    return analysis_isolation.run_isolated(
+        analyzer, path, limit_seconds=analysis_time_limit_seconds(), **kwargs
+    )
+
+
+def analysis_failure_code(track_id, exc, context="failed"):
+    """The LUM-007 category of an analysis failure; logs it.
+
+    A child's failure is logged with its safe diagnostics only. An in-process
+    exception is logged as before (its text can name a temporary file).
+    """
+    code = analysis_isolation.failure_category(exc)
+    if code == "silent_audio":
+        return code
+    if isinstance(exc, analysis_isolation.IsolatedAnalysisError):
+        logger.warning(
+            "lumae_analysis analysis %s for %s: %s %s",
+            context, track_id, exc, exc.diagnostics or {},
+        )
+    elif code in ("analysis_timeout", "resource_limit"):
+        logger.warning("lumae_analysis bounded profile rejection for %s: %s", track_id, exc)
+    else:
+        logger.exception("lumae_analysis %s for %s", context, track_id)
+    return code
 
 
 def maintenance_paused():
@@ -1816,12 +1871,13 @@ def upsert_profile(
     catalog_instance_id=None,
     attempt_token=None,
     failure_code=None,
+    diagnostics=None,
 ):
     if catalog_instance_id:
         return complete_attempt(
             get_db(), catalog_instance_id, track_id, attempt_token,
             result, status, last_error, media_sig, ANALYZER_VERSION, SCHEMA_VERSION,
-            failure_code=failure_code,
+            failure_code=failure_code, diagnostics=diagnostics,
         )
     # The pre-source compatibility table has no public profile stream.
     db = get_db()
@@ -2855,7 +2911,7 @@ def profiles():
         elif attempts.get(track_id, {}).get("status") in ("failed", "skipped_no_file"):
             failed.append({
                 "track_id": track_id,
-                "reason": attempts[track_id].get("last_error") or "failed",
+                "reason": public_failure_reason(attempts[track_id].get("last_error")) or "failed",
             })
         else:
             missing.append(track_id)
@@ -3234,17 +3290,19 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id):
             info = load_track_file(job["track_id"], catalog_instance_id=catalog_instance_id, server_id=server_id)
             if not info or opaque_revision(info.get("media_signature")) != job["media_revision"]:
                 raise ValueError("edge-source-replaced")
-            payload = analyze_edge_file(info["file_path"], catalog_instance_id=catalog_instance_id,
+            payload = run_file_analysis(analyze_edge_file, info["file_path"],
+                                        catalog_instance_id=catalog_instance_id,
                                         track_id=job["track_id"], media_revision=job["media_revision"])
             applied = publish_edge_profile(get_db(), catalog_instance_id, job, payload, info["media_signature"])
             if not applied:
                 update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-source-replaced")
             outcomes.append({"track_id": job["track_id"], "status": "ready" if applied else "superseded"})
-        except Exception:
+        except Exception as exc:
             rollback = getattr(get_db(), "rollback", None)
             if callable(rollback):
                 rollback()
-            update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-analysis-unavailable")
+            update_edge_job(get_db(), catalog_instance_id, job, "failed",
+                            analysis_isolation.edge_failure_reason(exc))
             outcomes.append({"track_id": job["track_id"], "status": "failed"})
         finally:
             if info:
@@ -3264,12 +3322,14 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
     if catalog_instance_id and not attempt_token:
         return {"track_id": track_id, "status": "superseded"}
 
-    def complete(result, status, error=None, media_sig=None, failure_code=None):
+    def complete(result, status, error=None, media_sig=None, failure_code=None,
+                 diagnostics=None):
         applied = upsert_profile(
             track_id, result, status, error, media_sig,
             catalog_instance_id=catalog_instance_id,
             attempt_token=attempt_token,
             **({"failure_code": failure_code} if failure_code else {}),
+            **({"diagnostics": diagnostics} if diagnostics else {}),
         )
         return {"track_id": track_id, "status": status if applied else "superseded"}
 
@@ -3282,21 +3342,15 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
     if info is None:
         return complete(object(), "skipped_no_file", "missing file path", failure_code="media_unavailable")
     try:
-        result = analyze_file(info["file_path"])
+        result = run_file_analysis(analyze_file, info["file_path"])
         outcome = complete(result, "ready", media_sig=info["media_signature"])
         if outcome["status"] == "ready":
             _schedule_edge_upgrade(track_id, catalog_instance_id, server_id)
         return outcome
-    except SilentAudioError as exc:
-        return complete(object(), "failed", str(exc), info["media_signature"], "silent_audio")
-    except (ProfileAnalysisTimeout, ProfileResourceLimitError) as exc:
-        logger.warning("lumae_analysis bounded profile rejection for %s: %s", track_id, exc)
-        code = "analysis_timeout" if isinstance(exc, ProfileAnalysisTimeout) else "resource_limit"
-        return complete(object(), "failed", str(exc), info["media_signature"], code)
     except Exception as exc:
-        logger.exception("lumae_analysis failed for %s", track_id)
-        code = "unsupported_media" if isinstance(exc, (ValueError, EOFError)) or type(exc).__name__ == "InvalidDataError" else "analysis_error"
-        return complete(object(), "failed", str(exc), info["media_signature"], code)
+        code = analysis_failure_code(track_id, exc)
+        return complete(object(), "failed", str(exc), info["media_signature"], code,
+                        analysis_isolation.failure_diagnostics(exc))
     finally:
         remove_downloaded_file(info.get("cleanup_path"))
 
@@ -3606,11 +3660,12 @@ def analyze_song_hook(song):
         track_id, source_server_id, catalog_instance_id=catalog_instance_id
     )
 
-    def complete(result, status, error=None, failure_code=None):
+    def complete(result, status, error=None, failure_code=None, diagnostics=None):
         applied = upsert_profile(
             track_id, result, status, error, media_sig,
             catalog_instance_id=catalog_instance_id, attempt_token=token,
             **({"failure_code": failure_code} if failure_code else {}),
+            **({"diagnostics": diagnostics} if diagnostics else {}),
         )
         # An AudioMuse run completes profiles song by song. Keep the settings
         # counts moving without counting the library for every song (P2-1).
@@ -3623,21 +3678,15 @@ def analyze_song_hook(song):
     if not audio_path or not os.path.exists(audio_path):
         return complete(object(), "skipped_no_file", "missing analysis audio path", "media_unavailable")
     try:
-        result = analyze_file(audio_path)
+        result = run_file_analysis(analyze_file, audio_path)
         outcome = complete(result, "ready")
         if outcome["status"] == "ready":
             _schedule_edge_upgrade(track_id, catalog_instance_id, source_server_id)
         return outcome
-    except SilentAudioError as exc:
-        return complete(object(), "failed", str(exc), "silent_audio")
-    except (ProfileAnalysisTimeout, ProfileResourceLimitError) as exc:
-        logger.warning("lumae_analysis bounded profile rejection for %s: %s", track_id, exc)
-        code = "analysis_timeout" if isinstance(exc, ProfileAnalysisTimeout) else "resource_limit"
-        return complete(object(), "failed", str(exc), code)
     except Exception as exc:
-        logger.exception("lumae_analysis hook failed for %s", track_id)
-        code = "unsupported_media" if isinstance(exc, (ValueError, EOFError)) or type(exc).__name__ == "InvalidDataError" else "analysis_error"
-        return complete(object(), "failed", str(exc), code)
+        code = analysis_failure_code(track_id, exc, "hook failed")
+        return complete(object(), "failed", str(exc), code,
+                        analysis_isolation.failure_diagnostics(exc))
 
 
 def profile_task_disposition(track_id, catalog_instance_id=None, server_id=None, priority="background"):
@@ -3898,10 +3947,7 @@ def fetch_backfill_rows(
                     OR (p.retry_profile_schema_ver IS NOT NULL
                         AND p.retry_profile_schema_ver < %s)
                     OR (p.retry_category IS NULL AND p.retry_count=0)
-                    OR (p.retry_category IN
-                            ('download_unavailable', 'media_unavailable',
-                             'analysis_timeout', 'analysis_error',
-                             'queue_unavailable')
+                    OR (p.retry_category = ANY(%s)
                         AND p.retry_count < %s AND p.retry_after <= now())
                 ))"""
         if catalog_instance_id else
@@ -3909,7 +3955,9 @@ def fetch_backfill_rows(
     )
     params.append(ANALYZER_VERSION)
     if catalog_instance_id:
-        params.extend((ANALYZER_VERSION, SCHEMA_VERSION, 3))
+        # The transient categories come from the set complete_attempt uses to
+        # arm retry_after, so SQL and Python cannot disagree (LUM-007).
+        params.extend((ANALYZER_VERSION, SCHEMA_VERSION, sorted(TRANSIENT_FAILURES), 3))
     else:
         params.extend((bool(include_failed), retry_skipped))
     params.append(max(1, int(limit)))
@@ -4449,12 +4497,10 @@ def next_profile_retry_at(catalog_instance_id, db=None):
                    AND (
                        p.status IN ('pending', 'pending_interactive')
                        OR (p.status IN ('failed', 'skipped_no_file', 'stale')
-                           AND p.retry_category IN ('download_unavailable',
-                               'media_unavailable', 'analysis_timeout',
-                               'analysis_error', 'queue_unavailable')
+                           AND p.retry_category = ANY(%s)
                            AND p.retry_count < 3 AND p.retry_after IS NOT NULL)
                    )""",
-            (catalog_instance_id,),
+            (catalog_instance_id, sorted(TRANSIENT_FAILURES)),
         )
         row = cur.fetchone()
     return row[0] if row else None

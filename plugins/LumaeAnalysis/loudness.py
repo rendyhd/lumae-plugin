@@ -280,8 +280,15 @@ def _frame_blocks(resampler, frame):
         yield converted.to_ndarray()
 
 
-def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS):
-    """Decode one media file incrementally with PyAV and bounded memory."""
+def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS, observer=None):
+    """Decode one media file incrementally with PyAV and bounded memory.
+
+    ``observer`` (``analysis_isolation.DecodeProbe``) records the stream and the
+    decode position for failure diagnostics. The deadline is checked between
+    decoded frames only. The plugin's tasks pass the configured limit as
+    ``deadline_seconds``, and ``analysis_isolation`` adds the hard limit
+    (LUM-018).
+    """
     try:
         import av
     except ImportError as exc:  # pragma: no cover - AudioMuse images include PyAV.
@@ -293,6 +300,8 @@ def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS):
         if not container.streams.audio:
             raise ValueError("media file does not contain an audio stream")
         stream = container.streams.audio[0]
+        if observer is not None:
+            observer.opened(container, stream)
         sample_rate = int(
             getattr(stream.codec_context, "sample_rate", 0)
             or getattr(stream, "rate", 0)
@@ -323,6 +332,8 @@ def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS):
         def decoded_blocks():
             for frame in container.decode(stream):
                 _check_deadline(deadline)
+                if observer is not None:
+                    observer.decoded(frame)
                 yield from _frame_blocks(resampler, frame)
             yield from _frame_blocks(resampler, None)
 

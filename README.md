@@ -58,7 +58,8 @@ remains excluded from the public catalogue.
 Waveform analysis now decodes and filters audio incrementally. Its working
 memory is bounded by decoder blocks instead of growing with the duration and
 native sample rate of the media file. Background batches default to three
-tracks and are capped at ten, every heavy queue job has a finite timeout, and
+tracks and are capped at ten, every heavy queue job requests a finite timeout
+(AudioMuse does not enforce it; see the execution limits for 1.3.0 below), and
 backfill candidates are selected with a SQL `LIMIT`.
 
 Album and artist matching now asks AudioMuse's MusicNN IVF index for a bounded
@@ -71,6 +72,71 @@ Administrators can pause Lumae background maintenance from the plugin settings
 page. Pausing stops new catalogue, projection, waveform, and relationship work;
 it does not delete or hide already published catalogue, profile, collection, or
 relationship data.
+
+### Execution limits for file analysis in 1.3.0
+
+AudioMuse runs plugin tasks without a time limit. RQ-era hosts enqueued them
+with an RQ `job_timeout` of -1 (no timeout), and the database task queue that
+replaced RQ in August 2026 has no per-task timeout. The `timeout` the plugin
+passes when it queues work is not enforced by anyone.
+
+Each waveform and edge analysis therefore runs in a separate process with a
+wall-clock limit. The limit is also the analyzers' own deadline, checked
+between decoded blocks: an analysis that is still making progress stops there.
+A decoder stuck inside native code never reaches that check, so the process is
+killed 30 seconds after the limit (SIGTERM, then SIGKILL 5 seconds later).
+Cancelling the AudioMuse job also stops it. Only the file path goes to the
+analysis process, so audio is never held in two processes. The process is
+started in one of two ways:
+
+* **A fork of the job (AudioMuse jobs).** AudioMuse runs every job in a freshly
+  forked process with one thread, so each file is analyzed in a fork of that
+  process, which already has the analyzers loaded. With 4-minute FLAC tracks on
+  4 CPUs, running each job in a fresh fork as AudioMuse does, a 1-track edge job
+  and a 3-track waveform job took as long as without isolation, within noise
+  (−29 to +50 ms per job, at most 2%). A quiet micro-benchmark puts the cost at
+  about 12 ms per file. The fork shares the job's open descriptors, including
+  its database connection. It never uses or closes them and exits without
+  running exit handlers, so the job's connection is unaffected.
+* **A separate interpreter (processes with more threads).** Forking a process
+  with more than one Python thread is unsafe, so there a worker is started with
+  `python -c`. Starting it takes 1.1–1.4 seconds, mostly `import scipy.signal`.
+  It is then reused for later files from the same thread. In the same job model
+  it adds 1.1–1.5 seconds per job (+41–46%). A killed or crashed worker is
+  replaced, and a worker killed while idle is replaced without counting a
+  failure. Its environment omits credential-like variables.
+
+Neither path is a security boundary. The analysis process runs as the same
+user as AudioMuse: a compromised decoder could read AudioMuse's memory or its
+`/proc/<pid>/environ`. The environment filtering is hygiene only.
+
+Frozen native builds and non-POSIX platforms analyze in-process: the limit still
+applies as the analyzers' deadline, but nothing is killed and no failure
+diagnostics are recorded.
+
+The limit is the plugin setting `analysis_time_limit_seconds`: 900 by default
+(the fixed deadline of earlier releases), clamped to 60–86400. A new value
+applies to the next analyzed file; no worker is restarted. Set it through
+AudioMuse's plugin settings API: `GET /api/plugins/settings/lumae_analysis`, add
+the key to `settings`, and `POST` the whole object back. The POST replaces every
+stored setting.
+
+Failures get their own retry categories:
+
+* `analysis_timeout`: the hard limit or the analyzers' deadline. Retried after
+  a cooldown, at most three attempts in all (the LUM-007 retry budget).
+* `analysis_crash`: the analysis process died without an answer (a signal
+  such as SIGSEGV, a non-zero exit, or a `MemoryError`). Retried like a timeout.
+* `media_error`: the decoder rejected the data (PyAV `InvalidDataError`, for
+  example a corrupt FLAC frame; PyAV stops at the first invalid packet).
+  Retried only when the media, the analyzer or the schema changes.
+
+`/api/profiles` still reports the 1.2.5 reasons for these (`unsupported_media`
+for `media_error`, `analysis_error` for `analysis_crash`). The server keeps
+diagnostics for the latest failed analysis: `source_profiles.failure_diagnostics`
+(JSON) and, for edge jobs, the `last_error` text. They hold the container,
+codec, sample rate, channel layout, byte size, decode position, error class and
+exit signal, never a path, URL, tag or exception message.
 
 ### Provider-identity reconciliation fix in 1.1.9
 

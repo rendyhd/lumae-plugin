@@ -1,16 +1,33 @@
 """Fenced source-profile attempts and atomic public profile publication."""
 
+import json
 from uuid import uuid4
 
 
 RETRY_LIMIT = 3
 RETRY_DELAYS_SECONDS = (60, 300, 1800)
+# Transient: retried after a RETRY_DELAYS_SECONDS cooldown while retry_count < RETRY_LIMIT.
+# Revision: retried only for new media, a new analyzer or a new schema.
+# fetch_backfill_rows and next_profile_retry_at select TRANSIENT_FAILURES
+# themselves, so a category added here is retried there too.
 TRANSIENT_FAILURES = frozenset((
     "download_unavailable", "media_unavailable", "analysis_timeout",
     "analysis_error", "queue_unavailable",
+    "analysis_crash",  # LUM-018: the analysis child died (signal, exit, MemoryError)
 ))
-REVISION_FAILURES = frozenset(("silent_audio", "unsupported_media", "resource_limit"))
+REVISION_FAILURES = frozenset((
+    "silent_audio", "unsupported_media", "resource_limit",
+    "media_error",  # LUM-018: the decoder rejected the data (InvalidDataError)
+))
 SAFE_FAILURES = TRANSIENT_FAILURES | REVISION_FAILURES
+# /api/profiles reports ``last_error`` as ``failed[].reason``. Categories added
+# after 1.2.5 are reported as the reason 1.2.5 gave for the same failure, so
+# clients never see a new value without a capability gate (contract §8.5).
+_PUBLIC_REASONS = {"media_error": "unsupported_media", "analysis_crash": "analysis_error"}
+
+
+def public_failure_reason(code):
+    return _PUBLIC_REASONS.get(code, code)
 
 
 from plugin.api import table
@@ -41,6 +58,8 @@ def migrate_attempts(cur):
         "retry_media_signature TEXT",
         "retry_analyzer_ver INTEGER",
         "retry_profile_schema_ver INTEGER",
+        # Safe facts about the latest failed analysis (LUM-018); NULL once ready.
+        "failure_diagnostics JSONB",
     )
 
 
@@ -279,8 +298,13 @@ def published_profile_current(db, source, track_id, analyzer_version, schema_ver
 
 
 def complete_attempt(db, source, track_id, token, result, status, error, media_sig,
-                     analyzer_version, schema_version, failure_code=None):
-    """Publish only the currently admitted revision, row and journal together."""
+                     analyzer_version, schema_version, failure_code=None,
+                     diagnostics=None):
+    """Publish only the currently admitted revision, row and journal together.
+
+    ``diagnostics`` (already allowlisted by ``analysis_isolation``) is stored
+    with a failure and cleared by a ready completion.
+    """
     if not token:
         return False
     cur = db.cursor()
@@ -356,7 +380,7 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
                 f"""UPDATE {table('source_profiles')}
                        SET retry_category=NULL, retry_count=0, retry_after=NULL,
                            retry_media_signature=NULL, retry_analyzer_ver=NULL,
-                           retry_profile_schema_ver=NULL
+                           retry_profile_schema_ver=NULL, failure_diagnostics=NULL
                      WHERE catalog_instance_id=%s AND track_id=%s""",
                 (source, track_id),
             )
@@ -370,11 +394,13 @@ def complete_attempt(db, source, track_id, token, result, status, error, media_s
                                    WHEN 0 THEN %s WHEN 1 THEN %s ELSE %s END)
                                ELSE NULL END,
                            retry_media_signature=%s, retry_analyzer_ver=%s,
-                           retry_profile_schema_ver=%s
+                           retry_profile_schema_ver=%s, failure_diagnostics=%s::jsonb
                      WHERE catalog_instance_id=%s AND track_id=%s""",
                 (code, code in TRANSIENT_FAILURES, RETRY_LIMIT,
                  *RETRY_DELAYS_SECONDS, attempt[1], analyzer_version,
-                 schema_version, source, track_id),
+                 schema_version,
+                 json.dumps(diagnostics, sort_keys=True) if diagnostics else None,
+                 source, track_id),
             )
         if status == "ready":
             cur.execute(

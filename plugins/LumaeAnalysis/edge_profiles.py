@@ -42,6 +42,10 @@ class EdgeProfileError(ValueError):
     pass
 
 
+class EdgeAnalysisTimeout(EdgeProfileError):
+    """The soft deadline (LUM-007 category ``analysis_timeout``)."""
+
+
 def canonical_json(value):
     return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
 
@@ -80,7 +84,7 @@ def _q15(value):
 
 def _check_deadline(deadline):
     if deadline is not None and time.monotonic() >= deadline:
-        raise EdgeProfileError("edge analysis deadline exceeded")
+        raise EdgeAnalysisTimeout("edge analysis deadline exceeded")
 
 
 def _av():
@@ -416,7 +420,9 @@ def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
     return payload
 
 
-def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, deadline_seconds=900):
+def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, deadline_seconds=900,
+                      observer=None):
+    # ``observer``: see ``loudness.analyze_file``; the hard limit is LUM-018's.
     av = _av()
     deadline = time.monotonic() + max(1, deadline_seconds)
     with open(path, "rb") as source:
@@ -436,6 +442,8 @@ def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, de
             if not container.streams.audio:
                 raise EdgeProfileError("no audio stream")
             stream = container.streams.audio[0]
+            if observer is not None:
+                observer.opened(container, stream)
             rate = stream.codec_context.sample_rate
             layout = stream.codec_context.layout.name
             codec = stream.codec_context.name
@@ -444,6 +452,8 @@ def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, de
             def blocks():
                 for frame in container.decode(stream):
                     _check_deadline(deadline)
+                    if observer is not None:
+                        observer.decoded(frame)
                     for converted in converter.resample(frame):
                         yield converted.to_ndarray()
                 for converted in converter.resample(None):
