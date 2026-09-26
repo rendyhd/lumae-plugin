@@ -8,6 +8,11 @@ nullable ``catalog_instance_id``.
 ``workbench_scope_v1_golden.json`` was recorded from phase/3-semantics
 6155e27, before K10, by this module's ``_library_transcript`` on a
 single-source install.
+
+P3-5b: LUM-014 albums are catalogue albums, ``(catalogue, album_id)``, with
+``provider_album_id`` always set; same-name editions stay apart (the
+inverted ``probes/collections/explain_editions.py``). Art and stream of a
+mixed-catalogue collection follow each item's catalogue.
 """
 
 import importlib
@@ -132,6 +137,7 @@ def record_golden(api):
 
 
 K10_ECHO = re.compile(rb'"catalog_instance_id":"catalog-a",')
+PROVIDER_ALBUM_ID = re.compile(rb'"provider_album_id":"[^"]+"')
 READS = (
     f"{LIBRARY}?scope=albums",
     f"{LIBRARY}/stats",
@@ -171,6 +177,14 @@ def test_single_source_reads_match_the_pre_k10_golden(workbench):
                     else b'"catalog_instance_id":"catalog-a"'
                 assert echo in body, label
                 body = body.replace(b'"catalog_instance_id":null,', b"")
+            if b'"sections"' in body:
+                # LUM-014: a browsed album carries its catalogue album_id as
+                # provider_album_id (1.2.5 sent null). Only that value is undone.
+                albums = [row for section in json.loads(body)["sections"].values()
+                          for row in section["items"] if row["kind"] == "album"]
+                assert all(row["provider_album_id"] == row["cover_item_id"].rsplit("-t", 1)[0]
+                           for row in albums), label
+                body = PROVIDER_ALBUM_ID.sub(b'"provider_album_id":null', body)
             stripped.append((label, status, K10_ECHO.sub(b"", body), headers))
         assert _normalized(stripped) == golden, suffix
 
@@ -428,3 +442,138 @@ def test_workbench_no_longer_offers_the_newest_year_sort():
     assert 'value="year"' not in body and "newest year" not in body
     assert "Sort: title" in body and "Sort: artist" in body
     assert "withCatalog(new URLSearchParams({title:item.title" in body
+
+
+EDITIONS = {
+    "al-ed-2": ("Blue", "Joni Mitchell", ["All I Want (Demo)", "River (Demo)", "A Case of You"]),
+    "al-ed-1": ("Blue", "Joni Mitchell", ["All I Want", "River"]),
+    "al-court": ("Court and Spark", "Joni Mitchell", ["Help Me"]),
+}
+
+
+def _album_rows(items):
+    return [(row["title"], row["provider_album_id"], row["track_count"]) for row in items]
+
+
+def test_same_name_editions_are_separate_catalogue_albums(workbench):
+    """LUM-014: the editions probe inverted. Albums are (catalogue, album_id)."""
+    _seed(workbench, "catalog-a", "navidrome", EDITIONS, default=True)
+    # catalog-b reuses an album_id of catalog-a for another album.
+    _seed(workbench, "catalog-b", "jellyfin", {"al-ed-1": ("Hejira", "Joni Mitchell", ["Coyote"])})
+    call = workbench.call
+    blue = [("Blue", "al-ed-1", 2), ("Blue", "al-ed-2", 3)]
+    body = call("GET", _with(f"{LIBRARY}?scope=albums", "catalog-a")).get_json()
+    albums = body["sections"]["albums"]["items"]
+    assert _album_rows(albums) == blue + [("Court and Spark", "al-court", 1)]
+    assert [row["album_key"] for row in albums[:2]] == ["joni mitchell::blue"] * 2
+    found = call("GET", _with(f"{LIBRARY}?scope=all&q=blue", "catalog-a")).get_json()
+    assert _album_rows(found["sections"]["albums"]["items"]) == blue
+    search = call("GET", _with("/api/collections/search?q=blue&kind=album", "catalog-a"))
+    assert [(r["title"], r["provider_album_id"], r["track_count"])
+            for r in search.get_json()["results"]] == blue
+    stats = call("GET", _with(f"{LIBRARY}/stats", "catalog-a")).get_json()
+    assert stats == {"album_count": 3, "artist_count": 1, "track_count": 6}
+    artists = call("GET", _with(f"{LIBRARY}?scope=artists", "catalog-a")).get_json()
+    assert artists["sections"]["artists"]["items"][0]["album_count"] == 3
+
+    # Details by (catalogue, album_id): no title or artist needed.
+    detail = call("GET", _with(f"{LIBRARY}/album?provider_album_id=al-ed-2", "catalog-a"))
+    assert detail.status_code == 200, detail.get_json()
+    detail = detail.get_json()
+    assert {key: detail["album"][key] for key in ("title", "artist", "provider_album_id",
+                                                 "album_key", "track_count")} == {
+        "title": "Blue", "artist": "Joni Mitchell", "provider_album_id": "al-ed-2",
+        "album_key": "joni mitchell::blue", "track_count": 3}
+    assert {track["album_id"] for track in detail["tracks"]} == {"al-ed-2"}
+    other = call("GET", _with(f"{LIBRARY}/album?provider_album_id=al-ed-1", "catalog-b"))
+    other = other.get_json()
+    assert (other["album"]["title"], other["provider_type"], other["catalog_instance_id"]) == (
+        "Hejira", "jellyfin", "catalog-b")
+    assert [track["track_id"] for track in other["tracks"]] == ["al-ed-1-t1"]
+
+    # LEGACY: title and artist alone (an album_key) still resolve, to one
+    # edition (the lowest album_id), whose id the response carries.
+    for title in ("Blue", "blue"):
+        legacy = call("GET", _with(
+            f"{LIBRARY}/album?title={title}&artist=Joni%20Mitchell", "catalog-a")).get_json()
+        assert legacy["album"]["provider_album_id"] == "al-ed-1"
+        assert legacy["album"]["title"] == "Blue"
+        assert [track["track_id"] for track in legacy["tracks"]] == ["al-ed-1-t1", "al-ed-1-t2"]
+    assert call("GET", _with(f"{LIBRARY}/album?title=Blue", "catalog-a")).status_code == 400
+
+
+def test_a_mixed_catalogue_collection_streams_and_shows_art_per_item(workbench, monkeypatch):
+    """Art, stream and album details of collection items use each item's
+    catalogue; an item without one falls back to the default rule."""
+    _two_sources(workbench)
+    library, call = workbench.library, workbench.call
+    seen = []
+    monkeypatch.setattr(library, "_resolve_stream_target", lambda item_id, provider: (
+        seen.append(("stream", item_id, provider)) or (None, ("stopped", 502))))
+    monkeypatch.setattr(library, "_resolve_art_target", lambda item_id, size, provider: (
+        seen.append(("art", item_id, provider))))
+    monkeypatch.setattr(library, "_proxy_art", lambda target: None)
+    assert call("POST", "/api/collections", {"id": "mix", "name": "Mix"}).status_code == 201
+    batch = call("POST", "/api/collections/mix/items/batch", {"items": [
+        {"id": "from-a", "kind": "track", "track_id": "al-rain-t1",
+         "catalog_instance_id": "catalog-a"},
+        {"id": "from-b", "kind": "track", "track_id": "al-kid-t1",
+         "catalog_instance_id": "catalog-b"},
+        {"id": "album-b", "kind": "album", "provider_album_id": "al-kid",
+         "cover_item_id": "al-kid-t2", "catalog_instance_id": "catalog-b"},
+        {"id": "unscoped", "kind": "track", "track_id": "al-moon-t1"},
+    ]})
+    assert batch.status_code == 200, batch.get_json()
+    items = {item["id"]: item for item in call("GET", "/api/collections/mix").get_json()["items"]}
+    assert {key: item["catalog_instance_id"] for key, item in items.items()} == {
+        "from-a": "catalog-a", "from-b": "catalog-b", "album-b": "catalog-b", "unscoped": None}
+    providers = {}
+    for key, item in items.items():
+        media = item["track_id"] or item["cover_item_id"]
+        # What the workbench sends: the item's catalogue, else its default.
+        scope = item["catalog_instance_id"] or "catalog-a"
+        seen.clear()
+        assert call("GET", _with(f"{LIBRARY}/stream/{media}", scope)).status_code == 502
+        assert call("GET", _with(f"{LIBRARY}/art/{media}?size=120", scope)).status_code == 404
+        providers[key] = seen[:]
+    assert providers == {
+        "from-a": [("stream", "al-rain-t1", "navidrome"), ("art", "al-rain-t1", "navidrome")],
+        "from-b": [("stream", "al-kid-t1", "jellyfin"), ("art", "al-kid-t1", "jellyfin")],
+        "album-b": [("stream", "al-kid-t2", "jellyfin"), ("art", "al-kid-t2", "jellyfin")],
+        "unscoped": [("stream", "al-moon-t1", "navidrome"), ("art", "al-moon-t1", "navidrome")],
+    }
+    # Without a catalogue the default rule applies: two sources, 400.
+    assert call("GET", f"{LIBRARY}/art/al-moon-t1").status_code == 400
+    album = call("GET", _with(f"{LIBRARY}/album?provider_album_id=al-kid", "catalog-b"))
+    assert [track["track_id"] for track in album.get_json()["tracks"]] == [
+        "al-kid-t1", "al-kid-t2"]
+
+    ui = importlib.import_module("plugins.LumaeAnalysis.collection_ui")
+    body = ui.render_collection_workbench("Label", "Detail")
+
+    def function(name):
+        start = body.index(f"function {name}(")
+        return body[start:body.index("\nfunction ", start)]
+
+    assert "const catalogOf=item=>item?.catalog_instance_id||catalog;" in body
+    assert "artUrl(cover,120,catalogOf(item))" in function("renderItemRows")
+    assert "artUrl(item.cover_item_id||item.track_id,240,catalogOf(item))" in function(
+        "collectionMosaic")
+    preview = function("playPreview")
+    assert "artUrl(cover,120,catalogOf(item))" in preview
+    assert "streamUrl(item.track_id,catalogOf(item))" in preview
+    assert ("withCatalog(new URLSearchParams({title:item.title,artist:item.artist}),"
+            "catalogOf(item))") in function("openAlbum")
+    assert "artUrl(cover,480,catalogOf(album))" in function("renderAlbumDetail")
+
+
+def test_workbench_script_declares_every_binding():
+    """A declaration keyword glued to its name (review P3-5b: ``constcatalogued=``)
+    is legal syntax but a ReferenceError under 'use strict' when it runs."""
+    import re
+
+    from plugins.LumaeAnalysis import collection_ui
+
+    source = open(collection_ui.__file__, encoding="utf-8").read()
+    glued = re.findall(r"(?<![A-Za-z0-9_$.])(?:const|let|var)(?=[a-z_$][A-Za-z0-9_$]*\s*=)", source)
+    assert glued == []

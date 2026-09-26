@@ -73,6 +73,7 @@ def catalog_track_view_sql(unaccent=True):
         SELECT t.track_id AS item_id, t.title,
                t.artist_display AS author, al.name AS album,
                t.album_artist_display AS album_artist,
+               al.album_artist_display AS album_row_artist,
                NULL::INTEGER AS year, NULL::INTEGER AS rating,
                t.track_id AS cover_item_id, t.album_id,
                t.track_number, t.disc_number, t.duration_ms,
@@ -211,27 +212,40 @@ def _library_filters(query, artist=None, unaccent=True):
     return (" AND " + " AND ".join(clauses)) if clauses else "", params
 
 
+def album_artist_sql(over=""):
+    """An album's artist: the catalogue album's, else its tracks' (LUM-014).
+    An aggregate, or a window function with ``over="OVER ()"``."""
+    return (f"COALESCE(NULLIF(MIN(album_row_artist) {over}, ''), "
+            f"MIN(COALESCE(NULLIF(album_artist, ''), author)) {over})")
+
+
 def _browse_albums(cur, query, artist, sort, limit, offset, unaccent=True, catalog=None):
+    """One row per catalogue album of the current generation (LUM-014).
+
+    Rows are grouped by ``album_id``, so same-name editions are separate
+    albums, and each carries its id as ``provider_album_id``. ``album_key``
+    is for display and legacy callers only.
+    """
     filters, params = _library_filters(query, artist, unaccent)
     order = {
-        "title": "lower(title), lower(artist)",
-        "artist": "lower(artist), lower(title)",
-        "year": "year DESC NULLS LAST, lower(title)",
+        "title": "lower(title), lower(artist), album_id",
+        "artist": "lower(artist), lower(title), album_id",
+        "year": "year DESC NULLS LAST, lower(title), album_id",
     }[sort]
     cur.execute(
         f"""
-        SELECT title, artist, cover_item_id, track_count, year, rating,
+        SELECT album_id, title, artist, cover_item_id, track_count, year, rating,
                COUNT(*) OVER()::INTEGER AS total_count
           FROM (
-            SELECT album AS title,
-                   COALESCE(NULLIF(album_artist, ''), author) AS artist,
+            SELECT album_id, MIN(album) AS title,
+                   {album_artist_sql()} AS artist,
                    MIN(item_id) AS cover_item_id,
                    COUNT(*)::INTEGER AS track_count,
                    MIN(year)::INTEGER AS year,
                    MAX(rating)::INTEGER AS rating
               FROM ({catalog_track_view_sql(unaccent)}) score
              WHERE NULLIF(album, '') IS NOT NULL {filters}
-             GROUP BY album, COALESCE(NULLIF(album_artist, ''), author)
+             GROUP BY album_id
           ) albums
          ORDER BY {order}
          LIMIT %s OFFSET %s
@@ -246,7 +260,7 @@ def _browse_albums(cur, query, artist, sort, limit, offset, unaccent=True, catal
             {
                 "kind": "album",
                 "album_key": _album_key(row.get("title"), row.get("artist")),
-                "provider_album_id": None,
+                "provider_album_id": str(row.pop("album_id")),
             }
         )
     return {"items": rows, "total": total}
@@ -298,7 +312,8 @@ def _browse_artists(cur, query, sort, limit, offset, unaccent=True, catalog=None
           FROM (
             SELECT COALESCE(NULLIF(album_artist, ''), author) AS artist,
                    MIN(item_id) AS cover_item_id,
-                   COUNT(DISTINCT NULLIF(album, ''))::INTEGER AS album_count,
+                   COUNT(DISTINCT album_id)
+                     FILTER (WHERE NULLIF(album, '') IS NOT NULL)::INTEGER AS album_count,
                    COUNT(*)::INTEGER AS track_count,
                    MIN(year)::INTEGER AS first_year,
                    MAX(year)::INTEGER AS latest_year
@@ -390,10 +405,8 @@ def library_stats(catalog_instance_id=None):
         cur.execute(
             f"""
             SELECT COUNT(*)::INTEGER AS track_count,
-                   COUNT(DISTINCT (
-                     lower(COALESCE(NULLIF(album_artist, ''), author)) || E'\\x1f' ||
-                     lower(COALESCE(album, ''))
-                   )) FILTER (WHERE NULLIF(album, '') IS NOT NULL)::INTEGER AS album_count,
+                   COUNT(DISTINCT album_id)
+                     FILTER (WHERE NULLIF(album, '') IS NOT NULL)::INTEGER AS album_count,
                    COUNT(DISTINCT lower(COALESCE(NULLIF(album_artist, ''), author)))::INTEGER
                      AS artist_count
               FROM ({catalog_track_view_sql(unaccent=False)}) score
@@ -479,11 +492,38 @@ def _normalize_provider_track(item, index=0):
     }
 
 
+def _legacy_album_id(cur, catalog, title, artist):
+    """LEGACY (pre-LUM-014 callers): the album an ``album_key`` names.
+
+    Old clients ask for album details by title and artist only. That pair
+    can name several catalogue albums (same-name editions); the one with the
+    lowest ``album_id`` answers, and the response carries its
+    ``provider_album_id``. None when nothing matches.
+    """
+    cur.execute(
+        f"""
+        SELECT MIN(album_id)
+          FROM ({catalog_track_view_sql(unaccent=False)}) score
+         WHERE lower(album) = lower(%s)
+           AND lower(COALESCE(NULLIF(album_artist, ''), author)) = lower(%s)
+        """,
+        (catalog, title, artist),
+    )
+    return (cur.fetchone() or (None,))[0]
+
+
 def _score_album_tracks(title, artist, provider_album_id=None, catalog_instance_id=None):
+    """``(tracks, (title, artist))`` of one catalogue album; the pair is
+    ``(None, None)`` when it has no tracks.
+
+    The album is ``(catalog, provider_album_id)`` (LUM-014); without an id,
+    the legacy title-and-artist fallback picks it.
+    """
     db = get_db()
     cur = db.cursor()
     try:
         catalog, _provider = resolve_catalog(cur, catalog_instance_id)
+        album_id = provider_album_id or _legacy_album_id(cur, catalog, title, artist)
         cur.execute(
             f"""
             SELECT item_id AS track_id, title, author AS artist, album,
@@ -492,19 +532,21 @@ def _score_album_tracks(title, artist, provider_album_id=None, catalog_instance_
                    track_number, disc_number,
                    CASE WHEN duration_ms IS NULL THEN NULL ELSE round(duration_ms / 1000.0) END
                      AS duration_seconds,
-                   analysis_status, provider_type, catalog_instance_id
+                   analysis_status, provider_type, catalog_instance_id,
+                   MIN(album) OVER () AS album_title,
+                   {album_artist_sql("OVER ()")} AS album_display_artist
               FROM ({catalog_track_view_sql(unaccent=False)}) score
-             WHERE ((%s IS NOT NULL AND album_id=%s) OR
-                    (%s IS NULL AND lower(album) = lower(%s)
-                     AND lower(COALESCE(NULLIF(album_artist, ''), author)) = lower(%s)))
+             WHERE album_id = %s
              ORDER BY lower(title), item_id
             """,
-            (catalog, provider_album_id, provider_album_id, provider_album_id, title, artist),
+            (catalog, album_id),
         )
         rows = _all_dicts(cur)
     finally:
         cur.close()
+    header = None
     for index, row in enumerate(rows):
+        header = (row.pop("album_title"), row.pop("album_display_artist"))
         row.update(
             {
                 "kind": "track",
@@ -512,15 +554,22 @@ def _score_album_tracks(title, artist, provider_album_id=None, catalog_instance_
                 "provider_index": index,
             }
         )
-    return rows
+    return rows, header or (None, None)
 
 
-def album_detail(title, artist, provider_album_id=None, catalog_instance_id=None):
-    """Load provider-authoritative order and metadata from the published mirror."""
-    tracks = _score_album_tracks(
+def album_detail(title=None, artist=None, provider_album_id=None, catalog_instance_id=None):
+    """Load provider-authoritative order and metadata from the published mirror.
+
+    The album is ``(catalogue, provider_album_id)``, the catalogue's
+    ``album_id`` (LUM-014); its title and artist come from the catalogue.
+    ``title`` and ``artist`` alone are the legacy ``album_key`` fallback
+    (``_legacy_album_id``), and are echoed when nothing matches.
+    """
+    tracks, (album_title, album_artist) = _score_album_tracks(
         title, artist, provider_album_id=provider_album_id,
         catalog_instance_id=catalog_instance_id,
     )
+    title, artist = album_title or title, album_artist or artist
     tracks.sort(
         key=lambda item: (
             item.get("disc_number") or 1,
@@ -801,14 +850,17 @@ def register_collection_library_routes(bp, require_enabled):
     def collection_library_album():
         title = str(request.args.get("title") or "").strip()
         artist = str(request.args.get("artist") or "").strip()
-        if not title or not artist:
+        album_id = str(request.args.get("provider_album_id") or "").strip() or None
+        # LUM-014: an album is (catalogue, provider_album_id). Title and
+        # artist without an id are the legacy album_key lookup.
+        if not album_id and (not title or not artist):
             return jsonify({"error": "Album title and artist are required"}), 400
         try:
             return jsonify(
                 album_detail(
-                    title,
-                    artist,
-                    provider_album_id=request.args.get("provider_album_id") or None,
+                    title or None,
+                    artist or None,
+                    provider_album_id=album_id,
                     catalog_instance_id=requested_catalog(),
                 )
             )
