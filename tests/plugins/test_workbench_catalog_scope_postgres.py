@@ -565,3 +565,15 @@ def test_a_mixed_catalogue_collection_streams_and_shows_art_per_item(workbench, 
     assert ("withCatalog(new URLSearchParams({title:item.title,artist:item.artist}),"
             "catalogOf(item))") in function("openAlbum")
     assert "artUrl(cover,480,catalogOf(album))" in function("renderAlbumDetail")
+
+
+def test_workbench_script_declares_every_binding():
+    """A declaration keyword glued to its name (review P3-5b: ``constcatalogued=``)
+    is legal syntax but a ReferenceError under 'use strict' when it runs."""
+    import re
+
+    from plugins.LumaeAnalysis import collection_ui
+
+    source = open(collection_ui.__file__, encoding="utf-8").read()
+    glued = re.findall(r"(?<![A-Za-z0-9_$.])(?:const|let|var)(?=[a-z_$][A-Za-z0-9_$]*\s*=)", source)
+    assert glued == []
