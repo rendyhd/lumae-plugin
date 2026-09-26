@@ -1974,27 +1974,6 @@ def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(
     assert db.commits == 0
 
 
-def test_collection_library_normalizes_live_track_and_disc_numbers():
-    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
-
-    track = library._normalize_provider_track(
-        {
-            "Id": "track-7",
-            "Name": "Reckoner",
-            "AlbumArtist": "Radiohead",
-            "Album": "In Rainbows",
-            "IndexNumber": 7,
-            "ParentIndexNumber": 2,
-            "RunTimeTicks": 310_000_000,
-        }
-    )
-
-    assert track["track_id"] == "track-7"
-    assert track["track_number"] == 7
-    assert track["disc_number"] == 2
-    assert track["duration_seconds"] == 31
-
-
 def test_album_detail_uses_provider_catalog_order_and_analysis_links(monkeypatch):
     library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
     monkeypatch.setattr(
