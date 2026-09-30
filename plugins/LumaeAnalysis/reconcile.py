@@ -220,6 +220,12 @@ def _work_summary(cur):
              WHERE status IN ('queued', 'failed')
                 OR (status='running' AND updated_at < now() - interval '30 minutes')
             UNION ALL
+            SELECT CASE WHEN next_retry_at > now() THEN 'retry' ELSE 'ready' END,
+                   retry_count, next_retry_at
+              FROM {_work_table('edge_backfill_state')}
+             WHERE status IN ('queued', 'failed')
+                OR (status='running' AND updated_at < now() - interval '30 minutes')
+            UNION ALL
             SELECT CASE WHEN not_before>now() THEN 'retry' ELSE 'ready' END,
                    attempts,not_before
               FROM {_work_table('credits_jobs')}
@@ -319,6 +325,8 @@ def _retry_target(action):
         return "relationship_state"
     if action == "profile_backfill":
         return "profile_backfill_state"
+    if action == "edge_backfill":
+        return "edge_backfill_state"
     raise ValueError(f"Unknown reconciliation action: {action}")
 
 

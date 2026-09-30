@@ -36,7 +36,14 @@ def paused():
 def playback_pending(db):
     cur = db.cursor()
     # Public plugin-owned job tables: no host queue internals or personal data.
-    cur.execute(f"SELECT EXISTS(SELECT 1 FROM {table('profiles')} WHERE status='pending_interactive')")
+    # On-demand waveform attempts live in source_profiles (legacy installs:
+    # profiles); on-demand edges in edge_profile_jobs.
+    cur.execute(
+        f"""SELECT EXISTS(SELECT 1 FROM {table('source_profiles')} WHERE status='pending_interactive')
+               OR EXISTS(SELECT 1 FROM {table('profiles')} WHERE status='pending_interactive')
+               OR EXISTS(SELECT 1 FROM {table('edge_profile_jobs')}
+                          WHERE status='pending' AND priority='interactive')"""
+    )
     result = bool(cur.fetchone()[0])
     cur.close()
     db.commit()

@@ -168,7 +168,7 @@ the whole object back — the POST replaces every stored setting.
 |---|---|---|---|
 | `analysis_time_limit_seconds` | 900 | 60–86400 | Per-file wall-clock kill for waveform/edge analysis (Analysis time limits, above). A new value applies to the next analyzed file; no worker restarts. |
 | `diagnostic_statement_timeout_ms` | 5000 | 1000–30000 | `SET LOCAL statement_timeout` for each read behind the settings-page diagnostics and `/database-state`; a section whose read timed out is reported as "unavailable", never as zero. |
-| `edge_profiles_enabled` | `true` | — | Turns edge (SmoothFade) analysis off without touching already-published waveform profiles. Also gated by the PyAV/libswresample runtime; see `capabilities.edge_profiles.available` in health. |
+| `edge_profiles_enabled` | `true` | — | Turns edge (SmoothFade) analysis off without touching already-published waveform profiles. Also gated by the PyAV runtime (any PyAV >= 16.0 that passes the built-in qualification check); see `capabilities.edge_profiles.available` in health. |
 | `collection_manager_enabled` | `false` | — | Enables Living Collections and Personal Shelves sync (Collections, above). |
 
 ## Compatibility

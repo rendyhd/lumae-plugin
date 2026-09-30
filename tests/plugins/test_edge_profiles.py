@@ -17,6 +17,14 @@ sys.modules[_spec.name] = edge
 _spec.loader.exec_module(edge)
 
 
+def _runtime_resampler():
+    import av
+    return "pyav-" + av.__version__ + "-swr-" + ".".join(map(str, av.library_versions["libswresample"]))
+
+
+RUNTIME_RESAMPLER = _runtime_resampler()
+
+
 def measure(pcm, rate, block=7919):
     return edge.analyze_edge_blocks(
         (pcm[:, i:i + block] for i in range(0, pcm.shape[1], block)), rate,
@@ -37,7 +45,12 @@ def test_published_cross_language_golden_contract():
     result = edge.analyze_edge_blocks([pcm], 48000, catalog_instance_id='catalog-a', track_id='track-a',
         media_revision='sha256:' + 'a' * 64, content_sha256='b' * 64, timeline_verified=True)
     golden = json.loads((Path(__file__).parent / 'edge_profile_v2_golden.json').read_text(encoding='utf-8'))
-    assert result == golden
+    if result['measurement']['resampler'] == golden['measurement']['resampler']:
+        assert result == golden
+    else:
+        # Another qualified PyAV runtime: provenance and digest change, the
+        # measurement stays within the qualification tolerances.
+        assert edge.compare_to_reference(result, golden) == []
 
 
 def test_v2_contract_series_are_bounded_exact_and_true_peak_is_conservative():
@@ -55,7 +68,7 @@ def test_v2_contract_series_are_bounded_exact_and_true_peak_is_conservative():
         'sample_rate': 48000,
         'channel_rule': 'mean-power',
         'quantization': 's16le-centidb-u16le-q15-v2',
-        'resampler': 'pyav-16.1.0-swr-6.1.100',
+        'resampler': RUNTIME_RESAMPLER,
         'true_peak_oversample': 4,
         'crossover_hz': [150, 2500],
     }
@@ -142,7 +155,7 @@ def test_real_flac_decoder_timeline_silence_and_source_replacement(tmp_path, mon
     result = edge.analyze_edge_file(path, **args)
     assert result['source']['decoded_frames'] == 10003
     assert result['source']['timeline_verified'] is True
-    assert result['source']['decoder'] == 'pyav-16.1.0:flac'
+    assert result['source']['decoder'] == 'pyav-' + av.__version__ + ':flac'
     assert result['leading_silence']['frames'] == 403
     original = edge.analyze_edge_blocks
     def replace_during_measurement(*args, **kwargs):
@@ -265,3 +278,120 @@ def test_bounded_storage_does_not_grow_with_source_duration():
         samples.push(np.arange(77, dtype=np.float32))
     assert samples.head.nbytes + samples.tail.nbytes == size
     assert len(samples.window(samples.total - 100, samples.total)) == 100
+
+
+# --- Runtime self-qualification -------------------------------------------
+
+def _reference():
+    return json.loads((_path.parent / edge.QUALIFICATION_FILE).read_text(encoding='utf-8'))
+
+
+@pytest.fixture
+def fresh_status():
+    edge._reset_runtime_status()
+    yield
+    edge._reset_runtime_status()
+
+
+def test_qualification_reference_embeds_the_published_golden():
+    golden = json.loads((Path(__file__).parent / 'edge_profile_v2_golden.json').read_text(encoding='utf-8'))
+    cases = {case['name']: case for case in _reference()['cases']}
+    assert cases['golden-pcm-48k-stereo']['expected'] == golden
+    # The WAV cases must exercise the real resampler (not 48 kHz passthrough).
+    assert {case['sample_rate'] for case in cases.values() if case['input'] == 'wav'} == {44100, 96000}
+
+
+def test_installed_runtime_qualifies_once_and_is_cached(fresh_status, monkeypatch):
+    import av
+    status = edge.edge_runtime_status()
+    assert status['available'] is True and status['reason'] is None
+    assert status['pyav'] == av.__version__
+    assert status['libswresample'] == '.'.join(map(str, av.library_versions['libswresample']))
+    assert status['qualified_at'].endswith('Z')
+    assert status['qualification_ms'] < 2000
+    assert json.loads(json.dumps(status)) == status
+    calls = []
+    monkeypatch.setattr(edge, '_qualify', lambda: calls.append(1) or {'available': False})
+    assert edge.edge_runtime_available() is True
+    assert edge.edge_runtime_status() == status
+    assert calls == []
+
+
+def test_every_qualification_case_matches_the_reference_on_this_runtime():
+    edge._QUALIFYING.active = True
+    try:
+        for case in _reference()['cases']:
+            result = edge.run_qualification_case(case)
+            assert edge.compare_to_reference(result, case['expected']) == [], case['name']
+            assert result['measurement']['resampler'] == RUNTIME_RESAMPLER
+    finally:
+        edge._QUALIFYING.active = False
+
+
+def test_too_old_pyav_is_rejected_without_running_the_analyzer(fresh_status, monkeypatch):
+    import av
+    monkeypatch.setattr(av, '__version__', '15.1.0')
+    monkeypatch.setattr(edge, 'run_qualification_case', lambda case: pytest.fail('must not run'))
+    status = edge.edge_runtime_status()
+    assert status['available'] is False and status['reason'] == 'pyav_too_old'
+    assert status['pyav'] == '15.1.0'
+    assert edge.edge_runtime_available() is False
+    with pytest.raises(edge.EdgeProfileError, match='pyav_too_old'):
+        edge._av()
+
+
+def test_missing_pyav_is_reported(fresh_status, monkeypatch):
+    monkeypatch.setitem(sys.modules, 'av', None)
+    status = edge.edge_runtime_status()
+    assert status == {**status, 'available': False, 'pyav': None, 'reason': 'pyav_missing'}
+
+
+@pytest.mark.parametrize('series, delta, qualifies', [
+    ('level_cdb', 2, True), ('level_cdb', 3, False),
+    ('spectral_flux_q15', 4, True), ('spectral_flux_q15', 5, False),
+])
+def test_measurement_drift_beyond_tolerance_is_unqualified(fresh_status, monkeypatch, series, delta, qualifies):
+    original = edge.run_qualification_case
+
+    def drifted(case):
+        result = original(case)
+        dtype = '<i2' if series.endswith('_cdb') else '<u2'
+        data = np.frombuffer(base64.b64decode(result['head'][series]), dtype=dtype).astype(int)
+        index = int(np.flatnonzero(data != edge.ZERO_CDB)[-1])
+        data[index] += delta if data[index] + delta < (32767 if dtype == '<i2' else 32768) else -delta
+        result['head'][series] = base64.b64encode(data.astype(dtype).tobytes()).decode('ascii')
+        return result
+
+    monkeypatch.setattr(edge, 'run_qualification_case', drifted)
+    status = edge.edge_runtime_status()
+    assert status['available'] is qualifies
+    if not qualifies:
+        assert status['reason'] == 'runtime_unqualified'
+        assert 'head/' + series in status['detail']
+        with pytest.raises(edge.EdgeProfileError, match='runtime_unqualified'):
+            measure(edge.golden_pcm(), 48000)
+
+
+def test_exact_fields_and_digital_zero_positions_have_no_tolerance():
+    expected = _reference()['cases'][0]['expected']
+    moved = json.loads(json.dumps(expected))
+    moved['leading_silence']['frames'] += 1
+    assert edge.compare_to_reference(moved, expected) == ['leading_silence/frames: differs']
+    zeroed = json.loads(json.dumps(expected))
+    data = values(zeroed).copy()
+    data[-1] = edge.ZERO_CDB
+    zeroed['head']['level_cdb'] = base64.b64encode(data.astype('<i2').tobytes()).decode('ascii')
+    assert edge.compare_to_reference(zeroed, expected) == ['head/level_cdb: digital-zero positions differ']
+    provenance = json.loads(json.dumps(expected))
+    provenance['measurement']['resampler'] = 'pyav-99.0.0-swr-9.9.9'
+    provenance['profile_digest'] = '0' * 64
+    assert edge.compare_to_reference(provenance, expected) == []
+
+
+def test_crashing_runtime_is_a_qualification_error(fresh_status, monkeypatch):
+    def boom(case):
+        raise RuntimeError('decoder exploded')
+    monkeypatch.setattr(edge, 'run_qualification_case', boom)
+    status = edge.edge_runtime_status()
+    assert status['available'] is False and status['reason'] == 'qualification_error'
+    assert 'decoder exploded' in status['detail']

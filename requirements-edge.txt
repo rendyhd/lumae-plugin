@@ -1,3 +1,6 @@
-# Optional EdgeProfileV1 measurement branch. Install explicitly on each worker;
-# legacy analysis remains available when this contract is not installed.
-av==16.1.0
+# Optional EdgeProfileV2 measurement branch. Any PyAV >= 16.0 is accepted: the
+# worker self-qualifies its runtime at first use (edge_profiles.
+# edge_runtime_status) against bundled reference measurements, so an already
+# installed newer PyAV (AudioMuse ships 17.1.0) is used as-is and never
+# downgraded. Legacy analysis remains available when this is not installed.
+av>=16.0

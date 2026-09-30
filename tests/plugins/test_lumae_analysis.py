@@ -238,12 +238,20 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "method": mod.EDGE_METHOD,
                 "available": mod.edge_runtime_available(),
                 "enabled": mod.edge_profiles_enabled(),
+                # No worker report: this process's own runtime decides.
+                "analyzable": mod.edge_profiles_analyzable(),
+                "worker_runtime": None,
                 "served": True,
                 # No database: whether edges are stored is unknown.
                 "stored": None,
+                "server_backfill": True,
+                "edge_status": True,
+                "deferred_requests": True,
+                "queue": None,
             },
             "transport": {"gzip": True},
             "profile_stream": {"edge_refs": True},
+            "analysis_vectors": {"generation_fallback": True, "missing": True, "strict_generation": True},
         },
         # The host stub has no database, so the invariants are unknown.
         "integrity": {
@@ -525,11 +533,14 @@ def test_edge_publish_rolls_back_payload_and_cursor_when_journal_fails(edge_publ
 
 def test_edge_api_old_runtime_disabled_and_bounded_requests(edge_publication_db, monkeypatch):
     mod = load_plugin()
-    monkeypatch.setattr(mod, 'edge_profiles_enabled', lambda: False)
+    # No qualified runtime here and no worker report: nothing is queued.
+    monkeypatch.setattr(mod, 'edge_runtime_available', lambda: False)
+    monkeypatch.setattr(mod, 'edge_worker_state', lambda db=None: (None, None))
     client = plugin_client(mod)
     response = client.post('/api/profiles/edges/analyze', json={'catalog_instance_id': 'catalog-a', 'ids': ['track-a']})
     assert response.status_code == 202
-    assert response.get_json() == {'available': False, 'accepted': [], 'already_ready': []}
+    assert response.get_json() == {'available': False, 'accepted': [], 'already_ready': [],
+                                   'already_pending': [], 'unsupported': [], 'deferred': []}
     assert client.post('/api/profiles/edges/analyze', json={'ids': ['x'] * 101}).status_code == 400
     for limit in [0, 101, None, True, 'invalid']:
         assert client.post('/api/profiles/edges/backfill', json={'limit': limit}).status_code == 400
@@ -546,7 +557,8 @@ def test_edge_enqueue_submits_one_root_task_for_the_bounded_batch(monkeypatch):
     monkeypatch.setattr(mod, 'edge_profiles_enabled', lambda: True)
     monkeypatch.setattr(mod, 'maintenance_paused', lambda: False)
     monkeypatch.setattr(mod, 'get_db', lambda: object())
-    monkeypatch.setattr(mod, 'claim_edge_jobs', lambda *_args: (jobs, []))
+    monkeypatch.setattr(mod, 'edge_scheduling_allowed', lambda: True)
+    monkeypatch.setattr(mod, 'claim_edge_requests', lambda *_args: (jobs, [], [], []))
     monkeypatch.setattr(
         mod,
         'enqueue_bounded',
@@ -561,10 +573,13 @@ def test_edge_enqueue_submits_one_root_task_for_the_bounded_batch(monkeypatch):
         'available': True,
         'accepted': ['track-a', 'track-b'],
         'already_ready': [],
+        'already_pending': [],
+        'unsupported': [],
+        'deferred': [],
     }
     assert submitted == [
         (
-            (mod.analyze_edges_task, jobs, 'catalog-a', 'server-a'),
+            (mod.analyze_edges_task, jobs, 'catalog-a', 'server-a', 'interactive'),
             {'queue': 'high', 'timeout': mod.PROFILE_JOB_TIMEOUT_SECONDS},
         )
     ]
@@ -2505,6 +2520,7 @@ def test_analyze_endpoint_promotes_pending_and_enqueues_small_high_priority_chun
         "accepted": ["stale-1", "missing-1"],
         "already_ready": ["ready-1"],
         "already_pending": ["pending-1"],
+        "deferred": [],
     }
     assert calls == [
         (
@@ -4433,11 +4449,19 @@ def test_track_batch_counts_attempts_separately_from_reused_and_promoted_tracks(
     }
 
 
+def _stub_edge_reconcile(monkeypatch, mod):
+    """Reconcile ticks without the edge runtime report, deferred work or pass."""
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "serve_deferred_interactive", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(mod, "next_edge_backfill", lambda db=None, server_id=None: None)
+
+
 def test_track_batch_does_not_count_tracks_paused_before_dispatch_as_attempted(monkeypatch):
     mod = load_plugin()
     pause_checks = iter([False, False, True])
     released = []
     monkeypatch.setattr(mod, "maintenance_paused", lambda: next(pause_checks))
+    monkeypatch.setattr(mod, "serve_deferred_interactive", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(mod, "_safe_progress", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(mod, "heartbeat_profile_backfill", lambda _catalog_id: None)
     monkeypatch.setattr(mod, "finalize_preparation_if_settled", lambda _catalog_id: None)
@@ -4948,6 +4972,7 @@ def test_reconcile_watchdog_is_a_noop_for_current_attested_catalogues(monkeypatc
     monkeypatch.setattr(
         mod, "next_profile_backfill_run", lambda db=None, server_id=None: None
     )
+    _stub_edge_reconcile(monkeypatch, mod)
 
     assert mod.catalog_reconcile_task() == {
         "status": "current",
@@ -5209,6 +5234,11 @@ def test_reconcile_scopes_idle_checks_to_active_audio_muse_server(monkeypatch):
             or None,
         )
     monkeypatch.setattr(mod, "_safe_reconcile_schedule", lambda *_args, **_kwargs: None)
+    _stub_edge_reconcile(monkeypatch, mod)
+    monkeypatch.setattr(
+        mod, "next_edge_backfill",
+        lambda db=None, server_id=None: seen.append(("edge", server_id)) or None,
+    )
 
     assert mod.catalog_reconcile_task()["status"] == "current"
     assert {server_id for _name, server_id in seen} == {"server-b"}
@@ -7874,7 +7904,7 @@ def test_vector_batch_endpoint_returns_versioned_little_endian_payload(monkeypat
     assert response.mimetype == "application/vnd.lumae.f32le-v1"
     assert response.data == binary
     assert response.headers["Cache-Control"] == "private, no-store"
-    assert captured == {"family": "musicnn", "generation": 4}
+    assert captured == {"family": "musicnn", "generation": 4, "strict_generation": False}
 
 
 def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
@@ -7887,11 +7917,12 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.settings_endpoint == "lumae_analysis.settings"
     assert ctx.install_hooks == [mod.migrate]
     assert ctx.flask_hooks == [mod.observe_provider_identities_on_start]
-    assert ctx.worker_hooks == []
+    assert ctx.worker_hooks == [mod.report_edge_runtime_on_start]
     assert ctx.song_hooks == [mod.analyze_song_hook]
     assert ctx.tasks == [
         ("prepare", mod.prepare_lumae_task, "default"),
         ("profile_backfill", mod.profile_backfill_task, "default"),
+        ("edge_backfill", mod.edge_backfill_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
         ("credits", mod.credits_service.run_one, "default"),
         ("relationship_preparation", mod.relationship_preparation_task, "default"),

@@ -3,6 +3,8 @@ import gzip
 import json
 import os
 import re
+import socket
+import time
 from datetime import datetime, timezone
 from html import escape
 
@@ -18,12 +20,16 @@ from .loudness import (
     analyze_file,
 )
 from .edge_profiles import (
-    analyze_edge_file, edge_runtime_available, opaque_revision,
+    analyze_edge_file, edge_runtime_available, edge_runtime_status, opaque_revision,
     METHOD as EDGE_METHOD, SCHEMA_VERSION as EDGE_SCHEMA_VERSION,
 )
 from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
     publish_edge_profile, edge_backfill_candidates, edge_profile_status,
+    claim_edge_requests, record_edge_runtime, edge_worker_runtime, is_unsupported_failure,
+    UNSUPPORTED as EDGE_UNSUPPORTED, mark_edge_jobs_deferred, claim_deferred_edge_jobs,
+    edge_queue_counts, next_edge_backfill, update_edge_backfill, arm_edge_backfill,
+    park_edge_backfill, edge_backfill_row, edge_statuses, EDGE_BACKFILL_RESWEEP_HOURS,
 )
 from . import analysis_isolation
 from . import migrations
@@ -59,6 +65,7 @@ from .catalog import (
     verify_library_scope,
 )
 from .catalog_analysis import (
+    GenerationExpired,
     dedup_policy,
     project_analysis,
     read_analysis_changes,
@@ -635,6 +642,8 @@ def catalog_refresh_task(server_id=None):
                                   server_id=result["server_id"]) or
                 next_profile_retry_at(source)):
             wake_profile_backfill_after_catalog_refresh(result)
+        if changed:
+            arm_edge_backfill(get_db(), source)
     except Exception:
         _rollback_if_possible(get_db())
         logger.exception("Could not arm source profile repair after catalogue publication")
@@ -885,6 +894,12 @@ def _run_reconcile_action(
             return result
         if result_status in ("failed", "failure", "error"):
             raise RuntimeError(str((result or {}).get("error") or result_status))
+        if action == "edge_backfill":
+            # The pass keeps its own next_retry_at (the re-sweep after a
+            # finished pass); resetting it here would make it due at once.
+            finish_event(db, event_id, "success", phase=result_status,
+                         summary=_reconcile_result_summary(result))
+            return result
         # Track failures do not mean the batch itself crashed. Keep its normal
         # retry lifecycle, but persist a warning verdict for the journal.
         has_track_failures = (
@@ -970,6 +985,11 @@ def catalog_reconcile_task():
 
     requested = 0
     try:
+        report_edge_runtime()
+        # On-demand work the host refused to queue goes before everything.
+        served = serve_deferred_interactive()
+        if served:
+            return {"status": "processed", "action": "interactive", "served": served}
         run = next_settled_analysis_run(db=db, server_id=server_id)
         if run:
             result = _run_reconcile_action(
@@ -1037,6 +1057,21 @@ def catalog_reconcile_task():
                 *profile[:2],
             )
             return {"status": "processed", "action": "profile_backfill", "result": result}
+
+        edge = next_edge_backfill(db, server_id=server_id) if edge_profiles_enabled() else None
+        if edge:
+            result = _run_reconcile_action(
+                db,
+                "edge_backfill",
+                edge[0],
+                edge[1],
+                edge[1],
+                0,
+                edge_backfill_task,
+                edge[0],
+                edge[1],
+            )
+            return {"status": "processed", "action": "edge_backfill", "result": result}
 
         credits_result = _safe_credits_reconcile(db, server_id, before_background=False)
         if credits_result:
@@ -1363,6 +1398,12 @@ def migrate(db):
         f"ON {source_profiles_table()} (catalog_instance_id, status)",
     )
     migrate_attempts(cur)
+    migrations.ensure_index(
+        cur,
+        f"CREATE INDEX IF NOT EXISTS {source_profiles_table()}_deferred_idx "
+        f"ON {source_profiles_table()} (analyzed_at) "
+        f"WHERE status='pending_interactive' AND last_error='{DEFERRED_MARKER}'",
+    )
     migrate_edge_profiles(db)
     _drop_dj_tables(db)
     optional_storage.migrate(db)
@@ -1860,6 +1901,10 @@ def enqueue_profile_analysis(
             timeout=PROFILE_JOB_TIMEOUT_SECONDS,
         )
     except Exception as exc:
+        if priority == "interactive" and catalog_instance_id and host_queue_busy(exc):
+            # Saved, not lost: the next worker task serves it.
+            mark_profiles_deferred(get_db(), catalog_instance_id, tokens)
+            return DEFERRED
         release_pending(
             admitted_ids,
             catalog_instance_id=catalog_instance_id,
@@ -2241,6 +2286,37 @@ def edge_profiles_stored(db=None):
         return None
 
 
+def edge_profiles_capability():
+    """Health ``capabilities.edge_profiles``.
+
+    ``available``/``enabled`` describe the answering process; ``analyzable``
+    whether queued edge jobs will be computed (a worker reported a qualified
+    runtime); ``worker_runtime`` that report; ``server_backfill`` that the
+    server walks the library itself; ``queue`` the job counts (null unknown).
+    """
+    worker_analyzable, worker = edge_worker_state()
+    if not edge_setting_enabled():
+        analyzable = False
+    elif worker_analyzable or edge_runtime_available():
+        analyzable = True
+    else:
+        analyzable = worker_analyzable
+    try:
+        queue = edge_queue_counts(get_db())
+    except Exception:
+        queue = None
+        try:
+            _rollback_if_possible(get_db())
+        except Exception:
+            pass
+    return {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
+            "available": edge_runtime_available(), "enabled": edge_profiles_enabled(),
+            "analyzable": analyzable, "worker_runtime": worker,
+            "served": True, "stored": edge_profiles_stored(),
+            "server_backfill": True, "edge_status": True, "deferred_requests": True,
+            "queue": queue}
+
+
 def integrity_status(db=None):
     """Health ``integrity``: fail-closed invariants of the 1.3.0 upgrade (AUD-05).
 
@@ -2394,9 +2470,7 @@ def health():
                     "sliding_expiry": True,
                     "idempotent_create": True,
                 },
-                "edge_profiles": {"schema_version": EDGE_SCHEMA_VERSION, "method": EDGE_METHOD,
-                                  "available": edge_runtime_available(), "enabled": edge_profiles_enabled(),
-                                  "served": True, "stored": edge_profiles_stored()},
+                "edge_profiles": edge_profiles_capability(),
                 "personal_discovery": {"schema_version": 1, "enabled": collections_enabled(), "scope": health_scope_mode(), "features": ["album_memory_context", "enjoyment_feedback"]},
                 "music_metadata": {"schema_version": 1, "enabled": not maintenance_paused(), "provider": "musicbrainz", "daily_request_limit": 80, "recording_membership": True},
                 "shelves": {
@@ -2417,6 +2491,7 @@ def health():
                 "credits": credits_service.capability(),
                 "transport": {"gzip": True},
                 "profile_stream": {"edge_refs": True},
+                "analysis_vectors": {"generation_fallback": True, "missing": True, "strict_generation": True},
             },
             "integrity": integrity_status(),
             "status": "ok" if compatibility.supported else compatibility.status,
@@ -3061,16 +3136,28 @@ def analysis_vectors_api():
         ids = body.get("analysis_ids") or []
         family = str(body.get("family") or "musicnn")
         generation = body.get("generation")
+        strict_generation = body.get("strict_generation") is True
         if not catalog_instance_id or not isinstance(ids, list):
             raise ValueError("catalog_instance_id and analysis_ids are required")
         payload = vector_batch(
-            get_db(), catalog_instance_id, ids, family=family, generation=generation
+            get_db(), catalog_instance_id, ids, family=family, generation=generation,
+            strict_generation=strict_generation,
         )
         response = Response(payload, mimetype="application/vnd.lumae.f32le-v1")
         response.headers["Cache-Control"] = "private, no-store"
         response.headers["Vary"] = "Authorization, Cookie"
         response.headers["X-Content-Type-Options"] = "nosniff"
         return response
+    except GenerationExpired as exc:
+        return _private_json(
+            {
+                "error": "generation_expired",
+                "message": str(exc),
+                "requested_generation": exc.requested_generation,
+                "current_generation": exc.current_generation,
+            },
+            410,
+        )
     except (KeyError, ValueError, CatalogScanError) as exc:
         return _catalog_error("invalid_batch", str(exc), 400)
 
@@ -3110,16 +3197,19 @@ def profiles():
             })
         else:
             missing.append(track_id)
-    return _private_json(
-        {
-            "schema_version": SCHEMA_VERSION,
-            "analyzer_version": ANALYZER_VERSION,
-            "catalog_instance_id": source["catalog_instance_id"],
-            "profiles": ready,
-            "missing": missing,
-            "failed": failed,
-        }
-    )
+    body = {
+        "schema_version": SCHEMA_VERSION,
+        "analyzer_version": ANALYZER_VERSION,
+        "catalog_instance_id": source["catalog_instance_id"],
+        "profiles": ready,
+        "missing": missing,
+        "failed": failed,
+    }
+    if str(request.args.get("edge_status") or "").strip().lower() in ("1", "true"):
+        # Opt-in (capabilities.edge_profiles.edge_status): without it the
+        # response is unchanged.
+        body["edge_status"] = edge_statuses(get_db(), source_id, ids)
+    return _private_json(body)
 
 
 @bp.get("/api/profiles/bootstrap")
@@ -3389,51 +3479,169 @@ def analyze():
     # playback is never trapped behind an hours-long library backfill. The
     # default task re-checks readiness before each track and becomes a no-op.
     interactive_ids = accepted + already_pending
+    deferred = []
     for start in range(0, len(interactive_ids), INTERACTIVE_PROFILE_CHUNK_SIZE):
         chunk = interactive_ids[start : start + INTERACTIVE_PROFILE_CHUNK_SIZE]
-        enqueue_profile_analysis(
+        if enqueue_profile_analysis(
             chunk,
             catalog_instance_id,
             server_id,
             priority="interactive",
-        )
+        ) == DEFERRED:
+            deferred.extend(chunk)
     return jsonify(
         {
-            "accepted": accepted,
+            "accepted": [track_id for track_id in accepted if track_id not in deferred],
             "already_ready": already_ready,
             "already_pending": already_pending,
+            "deferred": deferred,
         }
     ), 202
 
 
+def edge_setting_enabled():
+    return str(get_setting("edge_profiles_enabled", "true")).lower() in ("true", "1", "yes")
+
+
 def edge_profiles_enabled():
-    return str(get_setting("edge_profiles_enabled", "true")).lower() in ("true", "1", "yes") and edge_runtime_available()
+    """This process can compute edges: the setting is on and its runtime qualifies."""
+    return edge_setting_enabled() and edge_runtime_available()
+
+
+def edge_worker_state(db=None):
+    """``(analyzable, status)`` from the workers' runtime reports; never raises."""
+    try:
+        db = db or get_db()
+    except Exception:
+        db = None
+    if db is None:
+        return None, None
+    try:
+        return edge_worker_runtime(db)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not read the edge worker runtime")
+        return None, None
+
+
+def edge_profiles_analyzable(db=None):
+    """Health ``edge_profiles.analyzable``: edge jobs queued now will be computed.
+
+    False when the setting is off. Otherwise True when this process or a
+    worker that reported within the freshness window has a qualified runtime,
+    False when fresh reports all lack one, None when no worker reported.
+    """
+    if not edge_setting_enabled():
+        return False
+    analyzable, _status = edge_worker_state(db)
+    if analyzable or edge_runtime_available():
+        return True
+    return analyzable
+
+
+def edge_scheduling_allowed():
+    return not maintenance_paused() and edge_profiles_analyzable() is True
+
+
+# A worker re-reports its edge runtime at most this often; health treats a
+# report as fresh for edge_profile_store.EDGE_RUNTIME_FRESH_HOURS.
+EDGE_RUNTIME_REPORT_SECONDS = 600
+_edge_runtime_reported_at = None
+
+
+def report_edge_runtime(force=False):
+    """Record this worker's edge runtime verdict; worker processes only.
+
+    Called at worker start, by every edge task and by the reconcile tick. A
+    newly qualified worker arms a parked library pass; a worker without one
+    parks due passes so the watchdog can go idle.
+    """
+    global _edge_runtime_reported_at
+    now = time.monotonic()
+    if (not force and _edge_runtime_reported_at is not None
+            and now - _edge_runtime_reported_at < EDGE_RUNTIME_REPORT_SECONDS):
+        return
+    db = None
+    try:
+        db = get_db()
+        status = edge_runtime_status()
+        record_edge_runtime(db, socket.gethostname(), status)
+        if status.get("available") and edge_setting_enabled():
+            arm_edge_backfill(db)
+        else:
+            park_edge_backfill(db)
+        _edge_runtime_reported_at = now
+    except Exception:
+        if db is not None:
+            _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not report the edge runtime")
+
+
+def report_edge_runtime_on_start():
+    report_edge_runtime(force=True)
+
+
+# AudioMuse refuses a new root task from the web process while any plugin
+# task or AudioMuse main job runs (``ERR_TASK_IN_PROGRESS``). On-demand work
+# refused that way stays pending with this marker, and the next worker task
+# serves it (serve_deferred_interactive).
+HOST_BUSY_ERROR_CODE = 1201
+DEFERRED_MARKER = "deferred_host_busy"
+DEFERRED = "deferred"
+# A queued background edge batch yields its slot after this long; its
+# unstarted jobs are released and due again at once.
+EDGE_BACKGROUND_BUDGET_SECONDS = 60
+# One library-pass tick analyses edges for about this long, one track at a
+# time, serving on-demand work between tracks.
+EDGE_BACKFILL_TICK_SECONDS = 30
+EDGE_BACKFILL_TICK_MAX_TRACKS = 25
+
+
+def host_queue_busy(exc):
+    """The host refused a root task because another one is running."""
+    return getattr(exc, "code", None) == HOST_BUSY_ERROR_CODE
 
 
 def enqueue_edge_profiles(ids, catalog_instance_id, server_id, *, priority="background"):
-    if not edge_profiles_enabled() or maintenance_paused():
-        return {"available": False, "accepted": [], "already_ready": []}
-    jobs, ready = claim_edge_jobs(get_db(), catalog_instance_id, ids)
+    empty = {"available": False, "accepted": [], "already_ready": [], "already_pending": [],
+             "unsupported": [], "deferred": []}
+    if not edge_scheduling_allowed():
+        return empty
+    db = get_db()
+    jobs, ready, pending, unsupported = claim_edge_requests(db, catalog_instance_id, ids, priority)
+    deferred = []
     if jobs:
         try:
             # AudioMuse admits one root task per plugin. Submit the bounded
             # source-bound batch as one task; per-track tasks would make the
             # second item contend with the first and strand its durable job.
-            enqueue_bounded(analyze_edges_task, jobs, catalog_instance_id, server_id,
+            enqueue_bounded(analyze_edges_task, jobs, catalog_instance_id, server_id, priority,
                             queue="high" if priority == "interactive" else "default",
                             timeout=PROFILE_JOB_TIMEOUT_SECONDS)
-        except Exception:
-            for job in jobs:
-                update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-enqueue-failed")
-            raise
-    return {"available": True, "accepted": [job["track_id"] for job in jobs], "already_ready": ready}
+        except Exception as exc:
+            if not host_queue_busy(exc):
+                for job in jobs:
+                    update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-enqueue-failed")
+                raise
+            if priority == "interactive":
+                mark_edge_jobs_deferred(get_db(), catalog_instance_id, jobs, DEFERRED_MARKER)
+            else:
+                # Due again at once; the library pass also covers them.
+                for job in jobs:
+                    update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-enqueue-failed")
+            deferred = [job["track_id"] for job in jobs]
+    waiting = set(pending) | set(deferred)
+    return {"available": True,
+            "accepted": [job["track_id"] for job in jobs if job["track_id"] not in waiting],
+            "already_ready": ready, "already_pending": pending, "unsupported": unsupported,
+            "deferred": deferred}
 
 
-def _schedule_edge_upgrade(track_id, catalog_instance_id, server_id):
+def _schedule_edge_upgrade(track_id, catalog_instance_id, server_id, priority="background"):
     if not catalog_instance_id or not edge_profiles_enabled():
         return
     try:
-        enqueue_edge_profiles([track_id], catalog_instance_id, server_id)
+        enqueue_edge_profiles([track_id], catalog_instance_id, server_id, priority=priority)
     except Exception:
         rollback = getattr(get_db(), "rollback", None)
         if callable(rollback):
@@ -3456,6 +3664,7 @@ def edge_analyze_api():
 
 @bp.post("/api/profiles/edges/backfill")
 def edge_backfill_api():
+    """Compatibility: the server walks the library itself (``server_backfill``)."""
     try:
         body = _json_body(max_bytes=64000)
         source = resolve_profile_source(catalog_instance_id=body.get("catalog_instance_id"))
@@ -3473,9 +3682,27 @@ def edge_backfill_api():
         return _catalog_error("invalid_edge_request", str(exc), 400)
 
 
-def analyze_edges_task(jobs, catalog_instance_id, server_id):
+def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="background",
+                       budget_seconds=EDGE_BACKGROUND_BUDGET_SECONDS):
+    """Compute edges for claimed jobs, one file at a time.
+
+    A background batch serves refused on-demand work before each track and
+    releases its unstarted jobs once ``budget_seconds`` have passed (None: no
+    budget), so it never holds the plugin's task slot for long.
+    """
+    report_edge_runtime()
     outcomes = []
-    for job in jobs[:100]:
+    background = priority != "interactive"
+    deadline = time.monotonic() + budget_seconds if background and budget_seconds else None
+    jobs = list(jobs)[:100]
+    for index, job in enumerate(jobs):
+        if background:
+            serve_deferred_interactive()
+            if deadline is not None and time.monotonic() > deadline:
+                for rest in jobs[index:]:
+                    update_edge_job(get_db(), catalog_instance_id, rest, "failed", "edge-enqueue-failed")
+                    outcomes.append({"track_id": rest["track_id"], "status": "released"})
+                break
         if not update_edge_job(get_db(), catalog_instance_id, job, "running"):
             continue
         info = None
@@ -3496,17 +3723,155 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id):
             rollback = getattr(get_db(), "rollback", None)
             if callable(rollback):
                 rollback()
-            update_edge_job(get_db(), catalog_instance_id, job, "failed",
-                            analysis_isolation.edge_failure_reason(exc))
-            outcomes.append({"track_id": job["track_id"], "status": "failed"})
+            if is_unsupported_failure(exc):
+                # Terminal for this media revision: never retried until it changes.
+                update_edge_job(get_db(), catalog_instance_id, job, EDGE_UNSUPPORTED,
+                                analysis_isolation.edge_failure_reason(exc))
+                outcomes.append({"track_id": job["track_id"], "status": EDGE_UNSUPPORTED})
+            else:
+                update_edge_job(get_db(), catalog_instance_id, job, "failed",
+                                analysis_isolation.edge_failure_reason(exc))
+                outcomes.append({"track_id": job["track_id"], "status": "failed"})
         finally:
             if info:
                 remove_downloaded_file(info.get("cleanup_path"))
     return outcomes
 
 
+def edge_backfill_task(server_id, catalog_instance_id):
+    """One library-pass tick: edges for a few published tracks, then yield.
+
+    Runs inside the reconcile tick after the waveform backfill. Analyses one
+    track at a time for about EDGE_BACKFILL_TICK_SECONDS, serving on-demand
+    work between tracks, and keeps its cursor at the last track it reached.
+    """
+    if maintenance_paused():
+        return {"status": "paused", "processed": 0}
+    db = get_db()
+    if not edge_profiles_enabled():
+        park_edge_backfill(db)
+        return {"status": "paused", "reason": "edge_runtime_unavailable", "processed": 0}
+    row = edge_backfill_row(db, catalog_instance_id) or {}
+    cursor = row.get("cursor") or ""
+    started = not cursor
+    try:
+        ids = edge_backfill_candidates(db, catalog_instance_id, cursor, EDGE_BACKFILL_TICK_MAX_TRACKS)
+        if not ids:
+            update_edge_backfill(db, catalog_instance_id, "complete", cursor="",
+                                 next_retry_hours=EDGE_BACKFILL_RESWEEP_HOURS, completed=True)
+            return {"status": "complete", "processed": 0}
+        update_edge_backfill(db, catalog_instance_id, "running", started=started)
+        deadline = time.monotonic() + EDGE_BACKFILL_TICK_SECONDS
+        reached, counts = cursor, {}
+        for track_id in ids:
+            if reached != cursor and time.monotonic() > deadline:
+                break
+            jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
+            for outcome in analyze_edges_task(jobs, catalog_instance_id, server_id,
+                                              budget_seconds=None):
+                counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+            reached = track_id
+        processed = sum(counts.values())
+        update_edge_backfill(db, catalog_instance_id, "queued", cursor=reached, processed=processed)
+        return {"status": "queued", "processed": processed, **counts}
+    except Exception as exc:
+        _rollback_if_possible(db)
+        update_edge_backfill(db, catalog_instance_id, "failed", error=exc)
+        raise
+
+
+def serve_deferred_interactive(limit=None):
+    """Serve on-demand work the host refused to queue; returns tracks served.
+
+    Called by background batches before each track, first thing by every
+    reconcile tick, and after each AudioMuse song hook, so a refused request
+    waits about one track. Waveform first, then edges. Never raises.
+    """
+    global _serving_deferred
+    if _serving_deferred or maintenance_paused():
+        return 0
+    limit = limit or INTERACTIVE_PROFILE_CHUNK_SIZE
+    _serving_deferred = True
+    served = 0
+    db = None
+    try:
+        db = get_db()
+        by_source = {}
+        for source, track_id, token in claim_deferred_profiles(db, limit):
+            by_source.setdefault(source, {})[track_id] = token
+        for source, tokens in by_source.items():
+            server = resolve_profile_source(catalog_instance_id=source)["server_id"]
+            analyze_tracks_task(list(tokens), catalog_instance_id=source, server_id=server,
+                                priority="interactive", attempt_tokens=tokens)
+            served += len(tokens)
+        if edge_profiles_enabled():
+            by_source = {}
+            for job in claim_deferred_edge_jobs(db, DEFERRED_MARKER, limit):
+                by_source.setdefault(job.pop("catalog_instance_id"), []).append(job)
+            for source, jobs in by_source.items():
+                server = resolve_profile_source(catalog_instance_id=source)["server_id"]
+                analyze_edges_task(jobs, source, server, "interactive")
+                served += len(jobs)
+    except Exception:
+        if db is not None:
+            _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not serve deferred on-demand work")
+    finally:
+        _serving_deferred = False
+    return served
+
+
+_serving_deferred = False
+
+
+def claim_deferred_profiles(db, limit):
+    """Take refused on-demand waveform attempts, oldest first: (source, track, token)."""
+    cur = db.cursor()
+    cur.execute(
+        f"""UPDATE {source_profiles_table()} p SET last_error=NULL
+              FROM (SELECT catalog_instance_id, track_id FROM {source_profiles_table()}
+                     WHERE status='pending_interactive' AND last_error=%s
+                       AND attempt_token IS NOT NULL
+                     ORDER BY analyzed_at, track_id LIMIT %s FOR UPDATE SKIP LOCKED) d
+             WHERE p.catalog_instance_id=d.catalog_instance_id AND p.track_id=d.track_id
+         RETURNING p.catalog_instance_id, p.track_id, p.attempt_token""",
+        (DEFERRED_MARKER, int(limit)),
+    )
+    rows = cur.fetchall()
+    db.commit()
+    cur.close()
+    return [(row[0], row[1], row[2]) for row in rows]
+
+
+def mark_profiles_deferred(db, catalog_instance_id, tokens):
+    """Keep refused on-demand attempts pending, marked for the next worker task."""
+    cur = db.cursor()
+    for track_id, token in tokens.items():
+        cur.execute(
+            f"""UPDATE {source_profiles_table()} SET last_error=%s
+                 WHERE catalog_instance_id=%s AND track_id=%s AND attempt_token=%s
+                   AND status='pending_interactive'""",
+            (DEFERRED_MARKER, catalog_instance_id, track_id, token),
+        )
+    db.commit()
+    cur.close()
+
+
+def interactive_demand_pending(db):
+    """Whether on-demand waveform or edge work is waiting (credits and metadata yield)."""
+    cur = db.cursor()
+    cur.execute(
+        f"""SELECT EXISTS(SELECT 1 FROM {source_profiles_table()} WHERE status='pending_interactive')
+                OR EXISTS(SELECT 1 FROM {table('edge_profile_jobs')}
+                           WHERE status='pending' AND priority='interactive')"""
+    )
+    row = cur.fetchone()
+    cur.close()
+    return bool(row and row[0])
+
+
 def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
-                      attempt_token=None):
+                      attempt_token=None, priority="background"):
     if maintenance_paused():
         release_pending(
             [track_id], catalog_instance_id=catalog_instance_id,
@@ -3541,7 +3906,8 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
         result = run_file_analysis(analyze_file, info["file_path"])
         outcome = complete(result, "ready", media_sig=info["media_signature"])
         if outcome["status"] == "ready":
-            _schedule_edge_upgrade(track_id, catalog_instance_id, server_id)
+            # An on-demand track's edge follows at on-demand priority.
+            _schedule_edge_upgrade(track_id, catalog_instance_id, server_id, priority)
         return outcome
     except Exception as exc:
         code = analysis_failure_code(track_id, exc)
@@ -3806,6 +4172,15 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
 
 
 def analyze_song_hook(song):
+    """AudioMuse per-song hook; while AudioMuse's own analysis runs no plugin
+    task can start, so each song also serves one deferred on-demand track."""
+    try:
+        return _analyze_song_hook(song)
+    finally:
+        serve_deferred_interactive(limit=1)
+
+
+def _analyze_song_hook(song):
     event = {}
     source_server_id = None
     catalog_instance_id = None
@@ -3970,6 +4345,8 @@ def analyze_tracks_task(
     attempted = 0
     for index, track_id in enumerate(ids):
         _safe_progress("analyzing volume and ramps", current=index, total=len(ids))
+        if priority == "background":
+            serve_deferred_interactive()
         if priority == "background" and catalog_instance_id:
             heartbeat_profile_backfill(catalog_instance_id)
         if maintenance_paused():
@@ -4005,6 +4382,7 @@ def analyze_tracks_task(
                 catalog_instance_id=catalog_instance_id,
                 server_id=server_id,
                 attempt_token=attempt_tokens.get(track_id) if catalog_instance_id else None,
+                priority=priority,
             )
         )
         _safe_progress("analyzing volume and ramps", current=index + 1, total=len(ids))
@@ -5523,9 +5901,12 @@ def register(ctx):
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
     ctx.on_install(migrate)
     ctx.on_flask_start(observe_provider_identities_on_start)
+    if hasattr(ctx, "on_worker_start"):
+        ctx.on_worker_start(report_edge_runtime_on_start)
     ctx.on_song_analyzed(analyze_song_hook)
     ctx.add_task("prepare", prepare_lumae_task, queue="default")
     ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
+    ctx.add_task("edge_backfill", edge_backfill_task, queue="default")
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_task("credits", credits_service.run_one, queue="default")
     ctx.add_cron_task("music_metadata", music_metadata.run_one, queue="default")

@@ -48,6 +48,9 @@ class RecordingCtx:
     def on_song_analyzed(self, func):
         self.recorded["on_song_analyzed"] = func
 
+    def on_worker_start(self, func):
+        self.recorded["on_worker_start"] = func
+
     def add_task(self, name, func, queue="default"):
         self.recorded[f"task:{name}"] = func
 
@@ -72,8 +75,10 @@ EXPECTED_DOTTED_PATHS = {
     "on_flask_start": "plugins.LumaeAnalysis.observe_provider_identities_on_start",
     "on_install": "plugins.LumaeAnalysis.migrate",
     "on_song_analyzed": "plugins.LumaeAnalysis.analyze_song_hook",
+    "on_worker_start": "plugins.LumaeAnalysis.report_edge_runtime_on_start",
     "task:analysis_projection": "plugins.LumaeAnalysis.analysis_projection_task",
     "task:credits": "plugins.LumaeAnalysis.credits_service.run_one",
+    "task:edge_backfill": "plugins.LumaeAnalysis.edge_backfill_task",
     "task:prepare": "plugins.LumaeAnalysis.prepare_lumae_task",
     "task:profile_backfill": "plugins.LumaeAnalysis.profile_backfill_task",
     "task:provider_identity_recheck": "plugins.LumaeAnalysis.provider_identity_recheck_task",

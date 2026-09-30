@@ -1,0 +1,324 @@
+{
+ "cases": [
+  {
+   "expected": {
+    "analyzer_version": "lumae-edge-v2.0.0",
+    "catalog_instance_id": "catalog-a",
+    "content_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "head": {
+     "bin_count": 3,
+     "boundaries": [
+      0,
+      4800,
+      9600,
+      10003
+     ],
+     "covered_frames": 10003,
+     "high_power_cdb": "5fUM9g32",
+     "level_cdb": "sfbY9uH2",
+     "low_power_cdb": "S+nE58zn",
+     "mid_power_cdb": "gvap9qT2",
+     "onset_density_q15": "AAAAAAAA",
+     "origin_frame": 0,
+     "peak_cdb": "Mfgx+DH4",
+     "spectral_flux_q15": "KQQAAN4D",
+     "true_peak_cdb": "Mfgx+DH4",
+     "valid": "Bw=="
+    },
+    "landmarks": {
+     "audible_end_frame": 10003,
+     "audible_start_frame": 403,
+     "body_end_frame": 10003,
+     "body_start_frame": 403,
+     "confidence_q15": 27682,
+     "hidden_content_guard": false,
+     "leading_padding_frames": 403,
+     "terminal_silence_confidence_q15": 0,
+     "trailing_padding_frames": 0
+    },
+    "leading_silence": {
+     "frames": 403,
+     "method": "digital-zero",
+     "verified": true
+    },
+    "measurement": {
+     "channel_rule": "mean-power",
+     "crossover_hz": [
+      150,
+      2500
+     ],
+     "method": "lumae-edge-kweighted-bands-48k-k4-v2",
+     "quantization": "s16le-centidb-u16le-q15-v2",
+     "resampler": "pyav-16.1.0-swr-6.1.100",
+     "sample_rate": 48000,
+     "true_peak_oversample": 4
+    },
+    "media_revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "noise_floor_cdb": -2383,
+    "profile_digest": "29aa50286114359e0d4603802b06d0c9049e4b1316763d36144b6ca827f17f10",
+    "representation_id": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "schema_version": 2,
+    "source": {
+     "channel_layout": "stereo",
+     "decoded_frames": 10003,
+     "decoder": "pcm-input-v1",
+     "padding": "decoder-output-v1",
+     "sample_rate": 48000,
+     "timeline_verified": true
+    },
+    "tail": {
+     "bin_count": 3,
+     "boundaries": [
+      0,
+      4800,
+      9600,
+      10003
+     ],
+     "covered_frames": 10003,
+     "high_power_cdb": "5fUM9g32",
+     "level_cdb": "sfbY9uH2",
+     "low_power_cdb": "S+nE58zn",
+     "mid_power_cdb": "gvap9qT2",
+     "onset_density_q15": "AAAAAAAA",
+     "origin_frame": 0,
+     "peak_cdb": "Mfgx+DH4",
+     "spectral_flux_q15": "KQQAAN4D",
+     "true_peak_cdb": "Mfgx+DH4",
+     "valid": "Bw=="
+    },
+    "track_id": "track-a"
+   },
+   "input": "golden-pcm",
+   "name": "golden-pcm-48k-stereo"
+  },
+  {
+   "channels": 2,
+   "expected": {
+    "analyzer_version": "lumae-edge-v2.0.0",
+    "catalog_instance_id": "catalog-a",
+    "content_sha256": "27a52f2bfd3dabdc99750edd05202b1fda436f84026c5280e3b8d2bcf8339fc7",
+    "head": {
+     "bin_count": 12,
+     "boundaries": [
+      0,
+      4410,
+      8820,
+      13230,
+      17640,
+      22050,
+      26460,
+      30870,
+      35280,
+      39690,
+      44100,
+      48510,
+      52920
+     ],
+     "covered_frames": 52920,
+     "high_power_cdb": "PvWL+A36N/o3+jf6N/o3+jf6N/o3+jf6",
+     "level_cdb": "UPZc+dX6APsA+wD7APsA+wD7APsA+wD7",
+     "low_power_cdb": "efSp9Kn0qfSp9Kn0qfSp9Kn0qfSp9Kn0",
+     "mid_power_cdb": "uPUh+ID5qPmo+aj5qPmo+aj5qPmo+aj5",
+     "onset_density_q15": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "origin_frame": 0,
+     "peak_cdb": "4vm9+3D8cPxw/HD8cPxw/HD8cPxw/HD8",
+     "spectral_flux_q15": "HmREODoVAAAAAAAAAAAAAAAAAAAAAAAA",
+     "true_peak_cdb": "4/m++3H8cfxx/HH8cfxx/HH8cfxx/HH8",
+     "valid": "/w8="
+    },
+    "landmarks": {
+     "audible_end_frame": 52920,
+     "audible_start_frame": 403,
+     "body_end_frame": 52920,
+     "body_start_frame": 4410,
+     "confidence_q15": 28872,
+     "hidden_content_guard": false,
+     "leading_padding_frames": 403,
+     "terminal_silence_confidence_q15": 0,
+     "trailing_padding_frames": 0
+    },
+    "leading_silence": {
+     "frames": 403,
+     "method": "digital-zero",
+     "verified": true
+    },
+    "measurement": {
+     "channel_rule": "mean-power",
+     "crossover_hz": [
+      150,
+      2500
+     ],
+     "method": "lumae-edge-kweighted-bands-48k-k4-v2",
+     "quantization": "s16le-centidb-u16le-q15-v2",
+     "resampler": "pyav-16.1.0-swr-6.1.100",
+     "sample_rate": 48000,
+     "true_peak_oversample": 4
+    },
+    "media_revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "noise_floor_cdb": -1691,
+    "profile_digest": "8669c91505b6fc3f1be0121cf522e090580eb97ce10814fef2ac179b6986d0e9",
+    "representation_id": "sha256:27a52f2bfd3dabdc99750edd05202b1fda436f84026c5280e3b8d2bcf8339fc7",
+    "schema_version": 2,
+    "source": {
+     "channel_layout": "stereo",
+     "decoded_frames": 52920,
+     "decoder": "pyav-16.1.0:pcm_s16le",
+     "padding": "decoder-output-v1",
+     "sample_rate": 44100,
+     "timeline_verified": true
+    },
+    "tail": {
+     "bin_count": 12,
+     "boundaries": [
+      0,
+      4410,
+      8820,
+      13230,
+      17640,
+      22050,
+      26460,
+      30870,
+      35280,
+      39690,
+      44100,
+      48510,
+      52920
+     ],
+     "covered_frames": 52920,
+     "high_power_cdb": "PvWL+A36N/o3+jf6N/o3+jf6N/o3+jf6",
+     "level_cdb": "UPZc+dX6APsA+wD7APsA+wD7APsA+wD7",
+     "low_power_cdb": "efSp9Kn0qfSp9Kn0qfSp9Kn0qfSp9Kn0",
+     "mid_power_cdb": "uPUh+ID5qPmo+aj5qPmo+aj5qPmo+aj5",
+     "onset_density_q15": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+     "origin_frame": 0,
+     "peak_cdb": "4vm9+3D8cPxw/HD8cPxw/HD8cPxw/HD8",
+     "spectral_flux_q15": "HmREODoVAAAAAAAAAAAAAAAAAAAAAAAA",
+     "true_peak_cdb": "4/m++3H8cfxx/HH8cfxx/HH8cfxx/HH8",
+     "valid": "/w8="
+    },
+    "track_id": "track-a"
+   },
+   "frames": 52920,
+   "input": "wav",
+   "leading_zero_frames": 403,
+   "name": "wav-44k1-stereo",
+   "sample_rate": 44100
+  },
+  {
+   "channels": 1,
+   "expected": {
+    "analyzer_version": "lumae-edge-v2.0.0",
+    "catalog_instance_id": "catalog-a",
+    "content_sha256": "58d3a7a0a91d80cf47792d89496d895185b27dc937d8429d0d819cafb77b96b0",
+    "head": {
+     "bin_count": 11,
+     "boundaries": [
+      0,
+      9600,
+      19200,
+      28800,
+      38400,
+      48000,
+      57600,
+      67200,
+      76800,
+      86400,
+      96000,
+      105600
+     ],
+     "covered_frames": 105600,
+     "high_power_cdb": "dPK+9T/3avdq92r3avdq92r3avdq9w==",
+     "level_cdb": "nfWK+P75KPoo+ij6KPoo+ij6KPoo+g==",
+     "low_power_cdb": "evSp9Kr0q/Sr9Kv0q/Sr9Kv0q/Sr9A==",
+     "mid_power_cdb": "//WZ+AH6Kvoq+ir6Kvoq+ir6Kvoq+g==",
+     "onset_density_q15": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+     "origin_frame": 0,
+     "peak_cdb": "YPkv++r76vvq++r76vvq++r76vvq+w==",
+     "spectral_flux_q15": "HWREODsVAAAAAAAAAAAAAAAAAAAAAA==",
+     "true_peak_cdb": "YPkw++v76/vr++v76/vr++v76/vr+w==",
+     "valid": "/wc="
+    },
+    "landmarks": {
+     "audible_end_frame": 105600,
+     "audible_start_frame": 777,
+     "body_end_frame": 105600,
+     "body_start_frame": 9600,
+     "confidence_q15": 28629,
+     "hidden_content_guard": false,
+     "leading_padding_frames": 777,
+     "terminal_silence_confidence_q15": 0,
+     "trailing_padding_frames": 0
+    },
+    "leading_silence": {
+     "frames": 777,
+     "method": "digital-zero",
+     "verified": true
+    },
+    "measurement": {
+     "channel_rule": "mean-power",
+     "crossover_hz": [
+      150,
+      2500
+     ],
+     "method": "lumae-edge-kweighted-bands-48k-k4-v2",
+     "quantization": "s16le-centidb-u16le-q15-v2",
+     "resampler": "pyav-16.1.0-swr-6.1.100",
+     "sample_rate": 48000,
+     "true_peak_oversample": 4
+    },
+    "media_revision": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "noise_floor_cdb": -1833,
+    "profile_digest": "038e3002ad21926e7a1568be940ce5fb524c2e3b5fe795df561f2be9b098e27c",
+    "representation_id": "sha256:58d3a7a0a91d80cf47792d89496d895185b27dc937d8429d0d819cafb77b96b0",
+    "schema_version": 2,
+    "source": {
+     "channel_layout": "mono",
+     "decoded_frames": 105600,
+     "decoder": "pyav-16.1.0:pcm_s16le",
+     "padding": "decoder-output-v1",
+     "sample_rate": 96000,
+     "timeline_verified": true
+    },
+    "tail": {
+     "bin_count": 11,
+     "boundaries": [
+      0,
+      9600,
+      19200,
+      28800,
+      38400,
+      48000,
+      57600,
+      67200,
+      76800,
+      86400,
+      96000,
+      105600
+     ],
+     "covered_frames": 105600,
+     "high_power_cdb": "dPK+9T/3avdq92r3avdq92r3avdq9w==",
+     "level_cdb": "nfWK+P75KPoo+ij6KPoo+ij6KPoo+g==",
+     "low_power_cdb": "evSp9Kr0q/Sr9Kv0q/Sr9Kv0q/Sr9A==",
+     "mid_power_cdb": "//WZ+AH6Kvoq+ir6Kvoq+ir6Kvoq+g==",
+     "onset_density_q15": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAA==",
+     "origin_frame": 0,
+     "peak_cdb": "YPkv++r76vvq++r76vvq++r76vvq+w==",
+     "spectral_flux_q15": "HWREODsVAAAAAAAAAAAAAAAAAAAAAA==",
+     "true_peak_cdb": "YPkw++v76/vr++v76/vr++v76/vr+w==",
+     "valid": "/wc="
+    },
+    "track_id": "track-a"
+   },
+   "frames": 105600,
+   "input": "wav",
+   "leading_zero_frames": 777,
+   "name": "wav-96k-mono",
+   "sample_rate": 96000
+  }
+ ],
+ "comment": "EdgeProfileV2 runtime qualification reference, recorded with PyAV 16.1.0 / libswresample 6.1.100. See edge_profiles.py.",
+ "recorded_with": {
+  "libswresample": "6.1.100",
+  "pyav": "16.1.0"
+ }
+}

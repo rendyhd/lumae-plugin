@@ -11,7 +11,12 @@ import hashlib
 import json
 import math
 import os
+import struct
+import tempfile
+import threading
 import time
+from datetime import datetime, timezone
+from pathlib import Path
 
 import numpy as np
 from scipy.signal import butter, lfilter, resample_poly
@@ -28,8 +33,16 @@ MAX_SECONDS = 6553.6
 BLOCK_FRAMES = 65_536
 TRUE_PEAK_OVERSAMPLE = 4
 CROSSOVER_HZ = (150, 2500)
-PYAV_VERSION = "16.1.0"
-SWR_VERSION = (6, 1, 100)
+# PyAV is not pinned: any release at or above this floor is accepted once its
+# decode+resample runtime reproduces the qualification reference (below).
+PYAV_MINIMUM = (16, 0)
+QUALIFICATION_FILE = "edge_qualification_v2.json"
+# Largest per-value difference a qualified runtime may show against the
+# reference (see EDGE_PROFILES.md for the measured PyAV 16.1.0 / 17.1.0
+# differences). Frame counts, boundaries, digital-zero positions, flags and
+# every other field must match exactly.
+QUALIFICATION_CDB_TOLERANCE = 2
+QUALIFICATION_Q15_TOLERANCE = 4
 _B1 = (1.53512485958697, -2.69169618940638, 1.19839281085285)
 _A1 = (1.0, -1.69065929318241, 0.73248077421585)
 _B2 = (1.0, -2.0, 1.0)
@@ -87,19 +100,204 @@ def _check_deadline(deadline):
         raise EdgeAnalysisTimeout("edge analysis deadline exceeded")
 
 
-def _av():
+_QUALIFYING = threading.local()
+_STATUS_LOCK = threading.Lock()
+_STATUS = None
+
+
+def _version_tuple(text):
+    parts = []
+    for piece in str(text).split("."):
+        digits = ""
+        for char in piece:
+            if not char.isdigit():
+                break
+            digits += char
+        if not digits:
+            break
+        parts.append(int(digits))
+    return tuple(parts)
+
+
+def _import_av():
+    """PyAV at or above the floor, without runtime qualification."""
     import av
-    if av.__version__ != PYAV_VERSION or av.library_versions.get("libswresample") != SWR_VERSION:
-        raise EdgeProfileError("edge analysis requires PyAV 16.1.0 with libswresample 6.1.100")
+    if _version_tuple(av.__version__)[:2] < PYAV_MINIMUM:
+        raise EdgeProfileError("edge analysis requires PyAV >= %d.%d" % PYAV_MINIMUM)
+    if not av.library_versions.get("libswresample"):
+        raise EdgeProfileError("edge analysis requires libswresample")
     return av
 
 
-def edge_runtime_available():
+def _swr_text(av):
+    return ".".join(str(value) for value in av.library_versions["libswresample"])
+
+
+def _av():
+    if getattr(_QUALIFYING, "active", False):
+        return _import_av()
+    status = edge_runtime_status()
+    if not status["available"]:
+        raise EdgeProfileError("edge runtime unavailable: " + str(status["reason"]))
+    return _import_av()
+
+
+# Qualification: the runtime must reproduce, through the production code
+# paths, reference payloads recorded with PyAV 16.1.0 / libswresample 6.1.100
+# (edge_qualification_v2.json). Case "golden-pcm" is the published
+# cross-language golden input; the WAV cases go through analyze_edge_file, so
+# the real demuxer, decoder, layout detection and a 44.1 kHz up / 96 kHz down
+# resample are exercised.
+def qualification_wav(case):
+    """Deterministic WAVE_FORMAT_EXTENSIBLE s16 bytes for a qualification case."""
+    rate, channels, frames, lead = case["sample_rate"], case["channels"], case["frames"], case["leading_zero_frames"]
+    t = np.arange(frames, dtype=np.float64) / rate
+    envelope = np.minimum(1.0, t / 0.25)
+    tones = [(0.3, 1000.0), (0.2, 12000.0)] if channels == 2 else [(0.25, 440.0)]
+    pcm = np.stack([amp * envelope * np.sin(2 * np.pi * hz * t) + 0.05 * np.sin(2 * np.pi * 60.0 * t) for amp, hz in tones])
+    pcm[:, :lead] = 0
+    samples = np.round(pcm.T * 32767).astype("<i2")
+    mask = 3 if channels == 2 else 4
+    fmt = struct.pack("<HHIIHHHHI16s", 0xfffe, channels, rate, rate * channels * 2, channels * 2, 16, 22, 16, mask,
+                      bytes.fromhex("0100000000001000800000aa00389b71"))
+    data = b"fmt " + struct.pack("<I", len(fmt)) + fmt + b"data" + struct.pack("<I", samples.nbytes) + samples.tobytes()
+    return b"RIFF" + struct.pack("<I", len(data) + 4) + b"WAVE" + data
+
+
+def golden_pcm():
+    """The published cross-language golden input (48 kHz stereo float PCM)."""
+    t = np.arange(10003, dtype=np.float64) / 48000
+    pcm = np.asarray([.1 * np.sin(2 * np.pi * 1000 * t), .08 * np.sin(2 * np.pi * 400 * t)], dtype=np.float32)
+    pcm[:, :403] = 0
+    return pcm
+
+
+_IDENTITY = dict(catalog_instance_id="catalog-a", track_id="track-a", media_revision="sha256:" + "a" * 64)
+
+
+def run_qualification_case(case):
+    """Measure one qualification case with the production analyzer."""
+    if case["input"] == "golden-pcm":
+        return analyze_edge_blocks([golden_pcm()], 48000, content_sha256="b" * 64, timeline_verified=True, **_IDENTITY)
+    handle, path = tempfile.mkstemp(suffix=".wav", prefix="lumae-edge-qual-")
     try:
-        _av()
-        return True
-    except (ImportError, EdgeProfileError):
-        return False
+        with os.fdopen(handle, "wb") as out:
+            out.write(qualification_wav(case))
+        return analyze_edge_file(path, **_IDENTITY)
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+_RUNTIME_FIELDS = {("measurement", "resampler"), ("source", "decoder"), ("profile_digest",)}
+
+
+def compare_to_reference(actual, expected, path=()):
+    """Differences beyond the qualification tolerances, as short strings.
+
+    ``*_cdb`` values (scalars or base64 s16 series) may differ by
+    QUALIFICATION_CDB_TOLERANCE and ``*_q15`` values by
+    QUALIFICATION_Q15_TOLERANCE; digital-zero (ZERO_CDB) positions and every
+    other field must be exact. Runtime provenance strings and the digest are
+    not compared."""
+    if path in _RUNTIME_FIELDS:
+        return []
+    where = "/".join(path)
+    name = path[-1] if path else ""
+    if isinstance(expected, dict):
+        if not isinstance(actual, dict) or set(actual) != set(expected):
+            return [where + ": keys differ"]
+        out = []
+        for key in sorted(expected):
+            out += compare_to_reference(actual[key], expected[key], path + (key,))
+        return out
+    cdb = name.endswith("_cdb")
+    if not cdb and not name.endswith("_q15"):
+        return [] if type(actual) is type(expected) and actual == expected else [where + ": differs"]
+    tolerance = QUALIFICATION_CDB_TOLERANCE if cdb else QUALIFICATION_Q15_TOLERANCE
+    if isinstance(expected, str) and isinstance(actual, str):
+        dtype = "<i2" if cdb else "<u2"
+        got = np.frombuffer(base64.b64decode(actual), dtype=dtype).astype(int)
+        want = np.frombuffer(base64.b64decode(expected), dtype=dtype).astype(int)
+    elif type(expected) is int and type(actual) is int:
+        got, want = np.asarray([actual]), np.asarray([expected])
+    else:
+        return [where + ": differs"]
+    if got.shape != want.shape:
+        return [where + ": length differs"]
+    if cdb and not np.array_equal(got == ZERO_CDB, want == ZERO_CDB):
+        return [where + ": digital-zero positions differ"]
+    worst = int(np.max(np.abs(got - want))) if got.size else 0
+    return [where + ": off by %d" % worst] if worst > tolerance else []
+
+
+def _qualify():
+    started = time.monotonic()
+    status = {"available": False, "pyav": None, "libswresample": None, "reason": None, "detail": None,
+              "qualified_at": None, "qualification_ms": None}
+    try:
+        import av
+    except Exception:
+        status["reason"] = "pyav_missing"
+        return status
+    status["pyav"] = str(getattr(av, "__version__", "")) or None
+    swr = getattr(av, "library_versions", {}).get("libswresample")
+    status["libswresample"] = ".".join(str(v) for v in swr) if swr else None
+    try:
+        _import_av()
+    except EdgeProfileError as error:
+        status["reason"] = "libswresample_missing" if "libswresample" in str(error) else "pyav_too_old"
+        status["detail"] = str(error)
+        return status
+    _QUALIFYING.active = True
+    try:
+        reference = json.loads((Path(__file__).resolve().parent / QUALIFICATION_FILE).read_text(encoding="utf-8"))
+        failures = []
+        for case in reference["cases"]:
+            failures += [case["name"] + ": " + item for item in compare_to_reference(run_qualification_case(case), case["expected"])]
+    except Exception as error:  # a runtime that cannot run the reference is unqualified
+        status["reason"] = "qualification_error"
+        status["detail"] = (type(error).__name__ + ": " + str(error))[:200]
+        return status
+    finally:
+        _QUALIFYING.active = False
+        status["qualification_ms"] = int((time.monotonic() - started) * 1000)
+    if failures:
+        status["reason"] = "runtime_unqualified"
+        status["detail"] = "; ".join(failures[:5])[:300]
+        return status
+    status["available"] = True
+    status["qualified_at"] = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return status
+
+
+def edge_runtime_status():
+    """JSON-serializable verdict on this process's edge runtime:
+    ``available``, ``pyav``, ``libswresample``, ``reason`` (None,
+    ``pyav_missing``, ``pyav_too_old``, ``libswresample_missing``,
+    ``runtime_unqualified`` or ``qualification_error``), ``detail``,
+    ``qualified_at`` (UTC ISO-8601 when available) and ``qualification_ms``.
+    Qualification runs once per process on first use and is cached; importing
+    this module does not run it."""
+    global _STATUS
+    if _STATUS is None:
+        with _STATUS_LOCK:
+            if _STATUS is None:
+                _STATUS = _qualify()
+    return dict(_STATUS)
+
+
+def edge_runtime_available():
+    return edge_runtime_status()["available"]
+
+
+def _reset_runtime_status():
+    """Tests only: forget the cached qualification verdict."""
+    global _STATUS
+    with _STATUS_LOCK:
+        _STATUS = None
 
 
 class _EdgeSamples:
@@ -399,7 +597,7 @@ def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
     head, head_levels = _edge(peaks, powers, true_pcm, band_powers, sample_rate, 0, min(peaks.total, EDGE_SECONDS * sample_rate))
     tail, tail_levels = _edge(peaks, powers, true_pcm, band_powers, sample_rate, max(0, peaks.total - EDGE_SECONDS * sample_rate), peaks.total)
     noise_floor, landmarks = _landmarks(head, head_levels, tail, tail_levels, peaks.total, leading_zero_frames, trailing_zero_frames, timeline_verified)
-    swr = ".".join(str(value) for value in av.library_versions["libswresample"])
+    swr = _swr_text(av)
     payload = {
         "schema_version": SCHEMA_VERSION,
         "analyzer_version": ANALYZER_VERSION,
@@ -409,7 +607,7 @@ def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
         "representation_id": "sha256:" + content_sha256,
         "content_sha256": content_sha256,
         "source": {"sample_rate": sample_rate, "channel_layout": channel_layout, "decoded_frames": peaks.total, "decoder": decoder, "padding": "decoder-output-v1", "timeline_verified": timeline_verified},
-        "measurement": {"method": METHOD, "sample_rate": CANONICAL_RATE, "channel_rule": "mean-power", "quantization": QUANTIZATION, "resampler": "pyav-" + PYAV_VERSION + "-swr-" + swr, "true_peak_oversample": TRUE_PEAK_OVERSAMPLE, "crossover_hz": list(CROSSOVER_HZ)},
+        "measurement": {"method": METHOD, "sample_rate": CANONICAL_RATE, "channel_rule": "mean-power", "quantization": QUANTIZATION, "resampler": "pyav-" + av.__version__ + "-swr-" + swr, "true_peak_oversample": TRUE_PEAK_OVERSAMPLE, "crossover_hz": list(CROSSOVER_HZ)},
         "leading_silence": {"frames": leading_zero_frames, "method": "digital-zero", "verified": True},
         "noise_floor_cdb": noise_floor,
         "landmarks": landmarks,
@@ -462,7 +660,7 @@ def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, de
                 for converted in converter.resample(None):
                     yield converted.to_ndarray()
 
-            result = analyze_edge_blocks(blocks(), rate, catalog_instance_id=catalog_instance_id, track_id=track_id, media_revision=media_revision or "sha256:" + content_hash, content_sha256=content_hash, channel_layout=layout, decoder="pyav-" + PYAV_VERSION + ":" + codec, timeline_verified=codec in ("flac", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le"), deadline=deadline)
+            result = analyze_edge_blocks(blocks(), rate, catalog_instance_id=catalog_instance_id, track_id=track_id, media_revision=media_revision or "sha256:" + content_hash, content_sha256=content_hash, channel_layout=layout, decoder="pyav-" + av.__version__ + ":" + codec, timeline_verified=codec in ("flac", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le"), deadline=deadline)
         after = os.fstat(source.fileno())
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or hash_source() != content_hash:
             raise EdgeProfileError("source changed during analysis")

@@ -1148,37 +1148,83 @@ def scalar_batch(db, catalog_instance_id, provider_track_ids):
     ]
 
 
-def vector_batch(db, catalog_instance_id, analysis_ids, family="musicnn", generation=None):
+class GenerationExpired(ValueError):
+    """A pruned analysis generation was requested with ``strict_generation``."""
+
+    def __init__(self, requested_generation, current_generation):
+        super().__init__(
+            f"Analysis generation {requested_generation} has been pruned; "
+            f"the current generation is {current_generation}"
+        )
+        self.requested_generation = requested_generation
+        self.current_generation = current_generation
+
+
+def _generation_has_rows(cur, catalog_instance_id, generation):
+    cur.execute(
+        f"SELECT EXISTS (SELECT 1 FROM {t('analysis_items')} "
+        "WHERE catalog_instance_id=%s AND projection_generation=%s)",
+        (catalog_instance_id, generation),
+    )
+    return bool(cur.fetchone()[0])
+
+
+def vector_batch(
+    db, catalog_instance_id, analysis_ids, family="musicnn", generation=None,
+    strict_generation=False,
+):
+    """Return one f32le vector page for ``analysis_ids``.
+
+    A generation older than current that has been pruned (no rows left for this
+    source, no bootstrap lease pinning it) is served from the current
+    generation; the header then carries ``requested_generation``. With
+    ``strict_generation`` a pruned generation raises ``GenerationExpired``
+    instead. Requested ids without a served vector are listed in ``missing``.
+    """
     ids = list(dict.fromkeys(str(value) for value in analysis_ids))
     if len(ids) > 250:
         raise ValueError("At most 250 analysis IDs are allowed")
     if family not in ("musicnn", "clap"):
         raise ValueError("Unknown vector family")
     source = resolve_catalog_source(db, catalog_instance_id=catalog_instance_id)[0]
-    current_generation = source["analysis"]["generation"]
-    generation = int(generation) if generation is not None else current_generation
-    if generation < 0 or generation > current_generation:
+    current_generation = int(source["analysis"]["generation"])
+    requested_generation = (
+        int(generation) if generation is not None else current_generation
+    )
+    if requested_generation < 0 or requested_generation > current_generation:
         raise ValueError("Unknown analysis generation")
     column = "musicnn_vector" if family == "musicnn" else "clap_vector"
     dimensions_column = "musicnn_dimensions" if family == "musicnn" else "clap_dimensions"
     checksum_column = "musicnn_fp" if family == "musicnn" else "clap_fp"
     cur = db.cursor()
-    cur.execute(
-        f"SELECT analysis_id, {column}, {dimensions_column}, {checksum_column} "
-        f"FROM {t('analysis_items')} WHERE catalog_instance_id=%s "
-        "AND projection_generation=%s AND analysis_id = ANY(%s) ORDER BY analysis_id",
-        (catalog_instance_id, generation, ids),
-    )
-    rows = cur.fetchall()
-    cur.close()
+    try:
+        served_generation = requested_generation
+        if requested_generation < current_generation and not _generation_has_rows(
+            cur, catalog_instance_id, requested_generation
+        ):
+            if strict_generation:
+                raise GenerationExpired(requested_generation, current_generation)
+            served_generation = current_generation
+        cur.execute(
+            f"SELECT analysis_id, {column}, {dimensions_column}, {checksum_column} "
+            f"FROM {t('analysis_items')} WHERE catalog_instance_id=%s "
+            "AND projection_generation=%s AND analysis_id = ANY(%s) ORDER BY analysis_id",
+            (catalog_instance_id, served_generation, ids),
+        )
+        rows = cur.fetchall()
+    finally:
+        cur.close()
     data = bytearray()
     index = []
+    reasons = {}
     for analysis_id, blob, dimensions, checksum in rows:
         vector = _bytes(blob)
         if not vector:
+            reasons[str(analysis_id)] = "no_vector"
             continue
         if len(vector) != int(dimensions) * 4:
             raise CatalogScanError(f"Stored {family} vector has an invalid byte length")
+        reasons[str(analysis_id)] = None
         index.append(
             {
                 "analysis_id": str(analysis_id),
@@ -1189,14 +1235,21 @@ def vector_batch(db, catalog_instance_id, analysis_ids, family="musicnn", genera
             }
         )
         data.extend(vector)
-    header = canonical_json(
-        {
-            "format": "lumae-f32le-v1",
-            "family": family,
-            "generation": generation,
-            "vectors": index,
-        }
-    ).encode("utf-8")
+    missing = [
+        {"analysis_id": analysis_id, "reason": reasons.get(analysis_id, "not_in_generation")}
+        for analysis_id in ids
+        if reasons.get(analysis_id, "not_in_generation") is not None
+    ]
+    header = {
+        "format": "lumae-f32le-v1",
+        "family": family,
+        "generation": served_generation,
+        "missing": missing,
+        "vectors": index,
+    }
+    if served_generation != requested_generation:
+        header["requested_generation"] = requested_generation
+    header = canonical_json(header).encode("utf-8")
     return struct.pack("<I", len(header)) + header + bytes(data)
 
 

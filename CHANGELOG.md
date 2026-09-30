@@ -19,6 +19,9 @@ precise wire changes (K1–K11) are in
 §7. Summary:
 
 - Health `capabilities.edge_profiles` adds `served: true` and a live `stored: bool|null`, so clients can tell whether profile transfers carry edges; `available`/`enabled` only describe the answering process's PyAV runtime (contract §2).
+- **Edge profiles work on a stock AudioMuse worker.** The exact PyAV 16.1.0 pin is replaced by runtime self-qualification against bundled reference measurements (PyAV >= 16; AudioMuse's 17.1.0 is bit-identical). Workers report their runtime, and health's new `analyzable` says whether queued edge jobs will be computed; the web process no longer needs PyAV to queue them.
+- **On-demand first, library in the background, for waveforms and edges.** The server walks the library for edges at low priority from the reconcile watchdog (`server_backfill`). On-demand edge requests promote tracks a background batch holds; an on-demand waveform's edge follows at on-demand priority. A request AudioMuse refuses because another task runs is saved and served by the next worker task (`deferred`) instead of failing. Background batches serve that work between tracks and yield after a budget. Unmeasurable media is `unsupported` and not retried. Credits and metadata yield to on-demand work again. `GET /api/profiles?edge_status=1` reports per-track edge state (contract §2, §3.2, §3.6).
+- **Vectors after a projection rebuild:** a request for a pruned analysis generation is served from the current one with checksums and an explicit `missing` list, never a silently empty page; `strict_generation` returns 410 `generation_expired` (contract §3.8).
 
 - **Transport:** gzip for JSON responses of 1 KiB or more (K1).
 - **v2 profile bootstrap:** snapshot pages store an edge *reference* instead
