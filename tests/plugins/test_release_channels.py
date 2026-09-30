@@ -132,8 +132,8 @@ def test_current_release_contains_supported_source_only():
 
     metadata = json.loads((ROOT / "plugins/LumaeAnalysis/plugin.json").read_text())
     latest = metadata["versions"][0]
-    assert latest["version"] == "1.2.5"
-    archive = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+    assert latest["version"] == "1.3.0"
+    archive = ROOT / "dist/lumae_analysis/lumae_analysis_1.3.0.zip"
     assert hashlib.md5(archive.read_bytes()).hexdigest() == latest["checksum"]
     with zipfile.ZipFile(archive) as package:
         names = package.namelist()
@@ -141,13 +141,17 @@ def test_current_release_contains_supported_source_only():
         assert "edge_profiles.py" in names
         assert "personal_discovery.py" in names
         assert "music_metadata.py" in names
-        assert b"PLUGIN_VERSION = \"1.2.5\"" in package.read("__init__.py")
+        assert b"PLUGIN_VERSION = \"1.3.0\"" in package.read("__init__.py")
+        assert "edge_qualification_v2.json" in names
         if _lumae_release_policy()["mode"] == "source":
             # Only a source-mode release must match the working source.
             assert package.read("__init__.py") == (ROOT / "plugins/LumaeAnalysis/__init__.py").read_bytes()
         assert b"def _drop_dj_tables" in package.read("__init__.py")
-    previous = next(item for item in metadata["versions"] if item["version"] == "1.2.4")
-    assert hashlib.md5((ROOT / "dist/lumae_analysis/lumae_analysis_1.2.4.zip").read_bytes()).hexdigest() == previous["checksum"]
+    # Earlier archives are immutable.
+    for version in ("1.2.5", "1.2.4"):
+        previous = next(item for item in metadata["versions"] if item["version"] == version)
+        archive = ROOT / f"dist/lumae_analysis/lumae_analysis_{version}.zip"
+        assert hashlib.md5(archive.read_bytes()).hexdigest() == previous["checksum"]
 
 
 @pytest.mark.parametrize("platform", ["win32", "linux"])
@@ -160,7 +164,7 @@ def test_release_archive_is_identical_across_platforms(tmp_path, monkeypatch, pl
     monkeypatch.setattr(zipfile, "sys", SimpleNamespace(platform=platform))
     candidate = tmp_path / "release.zip"
     builder.code_zip(ROOT / "plugins/LumaeAnalysis", candidate)
-    published = ROOT / "dist/lumae_analysis/lumae_analysis_1.2.5.zip"
+    published = ROOT / "dist/lumae_analysis/lumae_analysis_1.3.0.zip"
     if _lumae_release_policy()["mode"] == "source":
         assert builder.same_zip_contents(candidate, published)
     else:

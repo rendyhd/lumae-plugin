@@ -7,11 +7,10 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased (1.3.0)
+## 1.3.0 (2026-09-30)
 
-**Not yet released.** It merges to `main` only after user approval
-(`docs/plan/LUMAE_FINAL_PLAN_2026-09-24.md`, P4-1) and, once released, no
-1.2.5 process may keep running against an upgraded database — follow
+Released with user approval (`docs/plan/LUMAE_FINAL_PLAN_2026-09-24.md`,
+P4-1). No 1.2.5 process may keep running against an upgraded database — follow
 [`docs/runbooks/UPGRADE_1.3.md`](docs/runbooks/UPGRADE_1.3.md). Work-package-level
 progress and test evidence are in [`docs/STATUS.md`](docs/STATUS.md); the
 precise wire changes (K1–K11) are in

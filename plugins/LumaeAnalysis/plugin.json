@@ -111,6 +111,14 @@
   },
   "versions": [
     {
+      "version": "1.3.0",
+      "min_core_version": "3.2.0",
+      "changelog": "Journal fences and integrity health (upgrade: docs/runbooks/UPGRADE_1.3.md); gzip transport (K1); v2 bootstrap edge references, sliding expiry, truthful availability, idempotent create (K2-K5); edge_refs in the profile stream (K6); collections feed epoch and conflicts (K8-K10); edge profiles on stock AudioMuse via PyAV self-qualification, worker-reported analyzable, server edge library pass, on-demand priority with deferred requests, edge_status; vectors served for pruned analysis generations.",
+      "imageUrl": "",
+      "checksum": "6da6fbde29f72ed78426dc2106b16ad9",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.3.0.zip"
+    },
+    {
       "version": "1.2.5",
       "min_core_version": "3.2.0",
       "changelog": "Set fully_verified to False when transition blocks catalog sync to preserve progressive readiness contract.",

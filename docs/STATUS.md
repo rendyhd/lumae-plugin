@@ -6,7 +6,7 @@ The single source of truth for the plan in [docs/plan/LUMAE_FINAL_PLAN_2026-09-2
 
 | Item | State |
 |---|---|
-| `main` release policy | LumaeAnalysis pinned to the 1.2.5 archive (P0-1). Merges do not publish. |
+| `main` release policy | LumaeAnalysis 1.3.0 released from source (P4-1, 2026-09-30, user-approved); `dist/lumae_analysis/lumae_analysis_1.3.0.zip`. The 1.2.x archives are unchanged. P4-2 qualification (host-SHA matrix, PG15, upgrade rehearsal, client fallback matrix, device checks) was not run before this release. Server rollout (P4-3) follows `docs/runbooks/UPGRADE_1.3.md` and is user-executed. |
 | CI on `main` | The `test` job (PG17) runs on every PR push. Making it a required check is pending the user (U1). |
 | Next release | 1.3.0 (P4-1). Phases 1–3 are merged (Phase 3: rendyhd/lumae-plugin#8, e88dabd). Follow-ups run on `phase/3f-followups`. User decision (2026-09-26): release only when everything is fine **and** the matching Lumae app (Auralscape) changes are done; then U5. |
 | Phase 2 exit gate (2026-09-25, `phase/2-performance` 66ec4c3) | `run_baseline.py --check` at scale 1 (94k profiles with real edges; [docs/perf/PHASE2-EXIT-2026-09-25.json](perf/PHASE2-EXIT-2026-09-25.json)): health p95 3.6 ms (≤50), settings 6.5 ms (≤100), projection no-change 3.0 s / 357 MB (≤5 s / 400 MB), delta 6.2 s (≤10), v2 create 2.1 s with 5.2 ms global lock (≤5 s / 50 ms), page p95 32 ms (≤50). The publication critical section is 6.0 ms against ≤5 ms, an accepted miss (P1-2 decision, 8.2 ms then; re-check after P3-2). AUD-07 (projection) and AUD-08 (health/settings) are inverted. End-to-end gate: [docs/perf/E2E-2026-09-25.md](perf/E2E-2026-09-25.md); the same-source creator decision is in the plan's P2-4 entry. Full suite 859 passed, 1 xfailed. |
