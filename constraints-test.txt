@@ -1,0 +1,6 @@
+# Test-only pins. requirements-edge.txt accepts any PyAV the worker can
+# qualify; the regression suite runs on the reference runtime its golden
+# fixtures were recorded with (edge_qualification_v2.json, the K6 old-client
+# goldens, the decoder-error isolation cases). CI also runs the edge
+# qualification tests on AudioMuse's PyAV separately.
+av==16.1.0
