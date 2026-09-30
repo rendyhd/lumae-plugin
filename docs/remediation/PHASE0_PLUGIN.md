@@ -13,7 +13,9 @@ connection test proves a required concurrency invariant.
 
 * Python dependencies are declared in `requirements-dev.txt`: Flask, NumPy,
   pytest, psycopg2-binary, requests, SciPy and psutil. `requirements-edge.txt`
-  additionally requires PyAV 16.1.0 for the optional edge contract.
+  adds PyAV for the optional edge contract (then pinned to 16.1.0; from
+  1.3.0 any PyAV >= 16.0 that passes runtime qualification, see
+  `plugins/LumaeAnalysis/EDGE_PROFILES.md`).
 * `pytest tests/plugins --collect-only -q` collected **397 tests** before the
   disposable-PG suite expanded its conditional integration parametrization.
 * PostgreSQL tests gate on `LUMAE_POSTGRES_TEST_DSN` in

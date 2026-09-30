@@ -39,7 +39,8 @@ self-qualification (E1).
 ## Phase 0: operations (no code)
 
 - Read `capabilities.edge_profiles` from health on the server the phone uses.
-- Confirm PyAV 16.1.0 / libswresample 6.1.100 in the **worker** environment.
+- Check the worker's PyAV and whether edge analysis is available there.
+  (Done: PyAV 17.1.0 failed the old exact pin; resolved by E1.)
 - Confirm the `edge_profiles_enabled` setting is not `false`.
 - Record the AudioMuse host version; check the web logs for
   `ERR_TASK_IN_PROGRESS` on `/api/analyze` and `/edges/analyze`, and
