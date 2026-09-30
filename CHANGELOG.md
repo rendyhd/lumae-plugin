@@ -7,6 +7,14 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.3.1 (2026-09-30)
+
+- The edge library pass starts within a minute when a worker first reports a
+  qualified runtime or a catalogue refresh has changes. In 1.3.0 a fresh
+  install or upgrade waited for the watchdog's next idle (hourly) tick.
+- A worker's periodic runtime report (every 10 minutes) no longer re-arms a
+  finished pass, so the six-hour re-sweep delay holds.
+
 ## 1.3.0 (2026-09-30)
 
 Released with user approval (`docs/plan/LUMAE_FINAL_PLAN_2026-09-24.md`,

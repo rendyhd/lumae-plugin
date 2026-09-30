@@ -104,11 +104,11 @@ def plugin_125(tmp_path, monkeypatch):
 # -- 1. version and the existing preparation attestation ----------------------
 
 
-def test_plugin_version_is_1_3_0_and_differs_from_the_pinned_release():
+def test_plugin_version_is_1_3_x_and_differs_from_the_1_2_5_release():
     mod = load_plugin()
-    assert mod.PLUGIN_VERSION == "1.3.0"
-    # release-sources.json stays pinned at 1.2.5 until P4-1, so a 1.2.5 worker
-    # and this source are now distinguishable by the attestation.
+    # Any 1.3.x carries the fences; a 1.2.5 worker and this source are
+    # distinguishable by the attestation.
+    assert mod.PLUGIN_VERSION.startswith("1.3.")
     with zipfile.ZipFile(ARCHIVE_125) as archive:
         assert b'PLUGIN_VERSION = "1.2.5"' in archive.read("__init__.py")
 
@@ -131,9 +131,9 @@ def test_migration_retargets_preparation_and_fences_a_1_2_5_worker(
     run_plugin_migration(migrated_db)
     monkeypatch.setattr(mod, "get_db", lambda: migrated_db)
     state = mod.preparation_state(SOURCE)
-    assert state["target_plugin_version"] == "1.3.0"
+    assert state["target_plugin_version"] == mod.PLUGIN_VERSION
 
-    mod.assert_preparation_worker_current(SOURCE)  # the 1.3.0 worker runs it
+    mod.assert_preparation_worker_current(SOURCE)  # the current worker runs it
     monkeypatch.setattr(mod, "PLUGIN_VERSION", "1.2.5")
     with pytest.raises(RuntimeError, match="worker is still running 1.2.5"):
         mod.assert_preparation_worker_current(SOURCE)
@@ -560,7 +560,8 @@ def test_health_reports_integrity(migrated_db, monkeypatch):
     _seed_source(migrated_db, "t1")
     monkeypatch.setattr(mod, "get_db", lambda: migrated_db)
     body = plugin_client(mod).get("/api/health").get_json()
-    assert body["plugin_version"] == mod.PLUGIN_VERSION == "1.3.0"
+    assert body["plugin_version"] == mod.PLUGIN_VERSION
+    assert mod.PLUGIN_VERSION.startswith("1.3.")
     integrity = body["integrity"]
     assert set(integrity) == {
         "collections_feed_ok", "profiles_unpublished_ready", "profiles_orphaned",

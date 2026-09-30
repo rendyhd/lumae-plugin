@@ -420,12 +420,15 @@ EDGE_BACKFILL_RESWEEP_HOURS = 6
 
 
 def ensure_edge_backfill_sources(db):
+    """Give every active source a pass row (a new row is due now); returns rows added."""
     cur = db.cursor()
     cur.execute(f"""INSERT INTO {table('edge_backfill_state')} (catalog_instance_id)
         SELECT catalog_instance_id FROM {table('catalog_sources')} WHERE rebind_status='active'
         ON CONFLICT (catalog_instance_id) DO NOTHING""")
+    added = max(0, cur.rowcount or 0)
     db.commit()
     cur.close()
+    return added
 
 
 def next_edge_backfill(db, server_id=None):
@@ -466,15 +469,24 @@ def update_edge_backfill(db, catalog_id, status, *, cursor=None, processed=0,
     cur.close()
 
 
-def arm_edge_backfill(db, catalog_id=None):
-    """Make a finished or parked pass due now (catalogue refresh, worker ready)."""
+def arm_edge_backfill(db, catalog_id=None, include_complete=True):
+    """Make a parked pass, and unless ``include_complete`` is False a finished
+    one, due now; returns the passes armed.
+
+    A catalogue refresh re-arms finished passes (new tracks). A worker's
+    periodic runtime report only resumes parked ones, so it never cancels a
+    finished pass's re-sweep delay.
+    """
+    statuses = ['complete', 'waiting_runtime'] if include_complete else ['waiting_runtime']
     cur = db.cursor()
     cur.execute(f"""UPDATE {table('edge_backfill_state')} SET status='queued', next_retry_at=NULL,
             cursor=CASE WHEN status='complete' THEN '' ELSE cursor END, updated_at=now()
-        WHERE status IN ('complete', 'waiting_runtime') AND (%s IS NULL OR catalog_instance_id=%s)""",
-                (catalog_id, catalog_id))
+        WHERE status=ANY(%s) AND (%s IS NULL OR catalog_instance_id=%s)""",
+                (statuses, catalog_id, catalog_id))
+    armed = max(0, cur.rowcount or 0)
     db.commit()
     cur.close()
+    return armed
 
 
 def park_edge_backfill(db):

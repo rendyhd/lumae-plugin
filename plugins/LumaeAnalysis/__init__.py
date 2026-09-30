@@ -30,6 +30,7 @@ from .edge_profile_store import (
     UNSUPPORTED as EDGE_UNSUPPORTED, mark_edge_jobs_deferred, claim_deferred_edge_jobs,
     edge_queue_counts, next_edge_backfill, update_edge_backfill, arm_edge_backfill,
     park_edge_backfill, edge_backfill_row, edge_statuses, EDGE_BACKFILL_RESWEEP_HOURS,
+    ensure_edge_backfill_sources,
 )
 from . import analysis_isolation
 from . import migrations
@@ -152,7 +153,7 @@ from .reconcile import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.3.0"
+PLUGIN_VERSION = "1.3.1"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -642,8 +643,8 @@ def catalog_refresh_task(server_id=None):
                                   server_id=result["server_id"]) or
                 next_profile_retry_at(source)):
             wake_profile_backfill_after_catalog_refresh(result)
-        if changed:
-            arm_edge_backfill(get_db(), source)
+        if changed and arm_edge_backfill(get_db(), source):
+            arm_reconcile(get_db(), "edge_backfill_ready", commit=True)
     except Exception:
         _rollback_if_possible(get_db())
         logger.exception("Could not arm source profile repair after catalogue publication")
@@ -3553,8 +3554,11 @@ def report_edge_runtime(force=False):
     """Record this worker's edge runtime verdict; worker processes only.
 
     Called at worker start, by every edge task and by the reconcile tick. A
-    newly qualified worker arms a parked library pass; a worker without one
-    parks due passes so the watchdog can go idle.
+    qualified worker creates missing pass rows and resumes parked passes, and
+    when either happened wakes the reconcile watchdog, so a fresh install or
+    upgrade starts the library pass within a minute instead of at the next
+    idle (hourly) tick. A worker without a qualified runtime parks due passes
+    so the watchdog can go idle.
     """
     global _edge_runtime_reported_at
     now = time.monotonic()
@@ -3567,7 +3571,8 @@ def report_edge_runtime(force=False):
         status = edge_runtime_status()
         record_edge_runtime(db, socket.gethostname(), status)
         if status.get("available") and edge_setting_enabled():
-            arm_edge_backfill(db)
+            if ensure_edge_backfill_sources(db) + arm_edge_backfill(db, include_complete=False):
+                arm_reconcile(db, "edge_backfill_ready", commit=True)
         else:
             park_edge_backfill(db)
         _edge_runtime_reported_at = now

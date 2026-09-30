@@ -250,8 +250,41 @@ def test_worker_reports_decide_analyzable_for_a_web_process_without_pyav(edge_pu
     assert mod.edge_profiles_analyzable() is False
 
 
+def test_first_qualified_report_starts_the_pass_and_wakes_the_watchdog(edge_publication_db, monkeypatch):
+    mod, db = load_plugin(), edge_publication_db
+    woken = []
+    monkeypatch.setattr(mod, "arm_reconcile", lambda _db, reason, commit=False: woken.append(reason))
+    monkeypatch.setattr(mod, "edge_runtime_status", lambda: {"available": True, "reason": None})
+
+    mod.report_edge_runtime(force=True)
+
+    assert _q(db, f"SELECT status FROM {STATE}") == [("queued",)]
+    assert woken == ["edge_backfill_ready"]
+    # Nothing new to start: later reports do not wake the watchdog.
+    mod.report_edge_runtime(force=True)
+    assert woken == ["edge_backfill_ready"]
+
+
+def test_periodic_report_keeps_a_finished_pass_resweep_delay(edge_publication_db, monkeypatch):
+    mod, db, store = load_plugin(), edge_publication_db, _store()
+    monkeypatch.setattr(mod, "arm_reconcile", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "edge_runtime_status", lambda: {"available": True, "reason": None})
+    store.ensure_edge_backfill_sources(db)
+    store.update_edge_backfill(db, "catalog-a", "complete", cursor="", next_retry_hours=6, completed=True)
+
+    mod.report_edge_runtime(force=True)
+
+    assert _q(db, f"SELECT status, next_retry_at > now() + interval '5 hours' FROM {STATE}") == [
+        ("complete", True)
+    ]
+    # A catalogue refresh with changes does re-arm it.
+    assert store.arm_edge_backfill(db, "catalog-a") == 1
+    assert _q(db, f"SELECT status FROM {STATE}") == [("queued",)]
+
+
 def test_runtime_report_parks_and_arms_the_library_pass(edge_publication_db, monkeypatch):
     mod, db, store = load_plugin(), edge_publication_db, _store()
+    monkeypatch.setattr(mod, "arm_reconcile", lambda *_a, **_k: None)
     assert store.next_edge_backfill(db) == ("server-a", "catalog-a", "")
 
     monkeypatch.setattr(mod, "edge_runtime_status", lambda: {"available": False, "reason": "pyav_missing"})
