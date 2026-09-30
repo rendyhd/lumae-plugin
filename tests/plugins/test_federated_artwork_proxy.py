@@ -21,7 +21,12 @@ def friend(federation, monkeypatch):
     remote_album(mod, cid)
     # Loopback test servers are rejected by the SSRF guard; bypass it here.
     monkeypatch.setattr(mod, "_validate_base_url", lambda url: url)
-    return mod
+    # The failing-friend back-off is process-wide and keyed by URL. A slow
+    # friend test marks 127.0.0.1:<port> failing for 60 s, and the OS may hand
+    # that port to the next test's server, which would then get 503.
+    mod._FRIEND_FAILURES.clear()
+    yield mod
+    mod._FRIEND_FAILURES.clear()
 
 
 def _set_friend_url(mod, url):
