@@ -4,7 +4,7 @@ Never changes the legacy profile's readiness. The legacy row is locked before
 publishing a measurement, so a completed old job cannot attach to a new source.
 """
 import uuid
-from datetime import timedelta
+from datetime import timedelta, timezone
 
 from plugin.api import table
 
@@ -87,6 +87,21 @@ def migrate_edge_profiles(db):
 
 
 EDGE_RUNTIME_FRESH_HOURS = 6
+
+
+def _utc_iso(value):
+    """UTC ``...Z`` text for a ``timestamptz`` value, else None.
+
+    The edge tables use ``TIMESTAMP`` columns written with ``now()``, so they
+    hold the session's local time. Callers select them cast to
+    ``timestamptz`` (interpreted in the session time zone, as written) and
+    this converts to real UTC instead of appending ``Z`` to local time.
+    """
+    if not hasattr(value, 'astimezone'):
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace('+00:00', 'Z')
 # Refusals that a retry of the same media can never change: never re-queued
 # for the same revision.
 UNSUPPORTED_REASONS = (
@@ -122,7 +137,7 @@ def edge_worker_runtime(db):
     qualified report (else the newest report) with ``reported_at``.
     """
     cur = db.cursor()
-    cur.execute(f"""SELECT available, status, reported_at FROM {table('edge_runtime_state')}
+    cur.execute(f"""SELECT available, status, reported_at::timestamptz FROM {table('edge_runtime_state')}
         WHERE reported_at > now() - make_interval(hours => %s)
         ORDER BY available DESC, reported_at DESC LIMIT 1""", (EDGE_RUNTIME_FRESH_HOURS,))
     row = cur.fetchone()
@@ -131,7 +146,7 @@ def edge_worker_runtime(db):
         return None, None
     status = dict(row[1] or {})
     reported = row[2]
-    status['reported_at'] = reported.isoformat() + 'Z' if hasattr(reported, 'isoformat') else str(reported)
+    status['reported_at'] = _utc_iso(reported)
     return bool(row[0]), status
 
 
@@ -473,16 +488,16 @@ def park_edge_backfill(db):
 
 def edge_backfill_row(db, catalog_id):
     cur = db.cursor()
-    cur.execute(f"""SELECT status, cursor, processed, pass_started_at, completed_at, next_retry_at, last_error
+    cur.execute(f"""SELECT status, cursor, processed, pass_started_at::timestamptz,
+                           completed_at::timestamptz, next_retry_at::timestamptz, last_error
         FROM {table('edge_backfill_state')} WHERE catalog_instance_id=%s""", (catalog_id,))
     row = cur.fetchone()
     cur.close()
     if not row:
         return None
-    iso = lambda v: v.isoformat() + 'Z' if hasattr(v, 'isoformat') else None
     return {'status': row[0], 'cursor': row[1], 'processed': int(row[2] or 0),
-            'pass_started_at': iso(row[3]), 'completed_at': iso(row[4]),
-            'next_retry_at': iso(row[5]), 'last_error': row[6]}
+            'pass_started_at': _utc_iso(row[3]), 'completed_at': _utc_iso(row[4]),
+            'next_retry_at': _utc_iso(row[5]), 'last_error': row[6]}
 
 
 def edge_statuses(db, catalog_id, ids):
@@ -496,7 +511,7 @@ def edge_statuses(db, catalog_id, ids):
     if not ids:
         return {}
     cur = db.cursor()
-    cur.execute(f"""SELECT p.track_id, edge.payload IS NOT NULL, j.status, j.updated_at, j.media_revision,
+    cur.execute(f"""SELECT p.track_id, edge.payload IS NOT NULL, j.status, j.updated_at::timestamptz, j.media_revision,
                            p.media_signature, j.last_error
         FROM {table('published_source_profiles')} p {edge_join(columns='1 AS payload')}
         LEFT JOIN {table('edge_profile_jobs')} j
@@ -518,7 +533,7 @@ def edge_statuses(db, catalog_id, ids):
             # once, any other failure after its six-hour back-off.
             delay = timedelta(seconds=2) if last_error == 'edge-enqueue-failed' else timedelta(hours=6)
             retry_at = updated_at + delay
-            result[track_id] = {'status': 'failed', 'retry_at': retry_at.isoformat() + 'Z'}
+            result[track_id] = {'status': 'failed', 'retry_at': _utc_iso(retry_at)}
         else:
             result[track_id] = {'status': 'absent'}
     return result

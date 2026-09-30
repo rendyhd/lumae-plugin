@@ -333,3 +333,29 @@ def test_reconcile_runner_keeps_the_edge_pass_resweep_time(monkeypatch):
 
     assert result["status"] == "complete"
     assert calls == [("event-1", "success")]
+
+
+@pytest.mark.parametrize("zone", ["UTC", "Asia/Kolkata", "America/Los_Angeles"])
+def test_edge_timestamps_are_real_utc_whatever_the_session_time_zone(edge_publication_db, zone):
+    from datetime import datetime, timedelta, timezone
+
+    store, db = _store(), edge_publication_db
+    _q(db, f"SET TIME ZONE '{zone}'")
+    jobs, _ready = store.claim_edge_jobs(db, "catalog-a", ["track-a"])
+    store.update_edge_job(db, "catalog-a", jobs[0], "failed", "edge-analysis-timeout")
+    store.record_edge_runtime(db, "worker-1", {"available": True})
+    store.ensure_edge_backfill_sources(db)
+    store.update_edge_backfill(db, "catalog-a", "complete", next_retry_hours=6, completed=True)
+    now = datetime.now(timezone.utc)
+
+    def parse(text):
+        assert text.endswith("Z")
+        return datetime.fromisoformat(text.replace("Z", "+00:00"))
+
+    retry_at = parse(store.edge_statuses(db, "catalog-a", ["track-a"])["track-a"]["retry_at"])
+    assert abs(retry_at - (now + timedelta(hours=6))) < timedelta(minutes=1)
+    reported_at = parse(store.edge_worker_runtime(db)[1]["reported_at"])
+    assert abs(reported_at - now) < timedelta(minutes=1)
+    row = store.edge_backfill_row(db, "catalog-a")
+    assert abs(parse(row["completed_at"]) - now) < timedelta(minutes=1)
+    assert abs(parse(row["next_retry_at"]) - (now + timedelta(hours=6))) < timedelta(minutes=1)
