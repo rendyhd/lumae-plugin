@@ -41,6 +41,12 @@ def slow_server():
     stop = threading.Event()
 
     class Handler(http.server.BaseHTTPRequestHandler):
+        # Keep-alive, so the client closes the connection first. With
+        # HTTP/1.0 the server closes it, and on Windows that can reset the
+        # socket before the client has read the whole body (WinError 10054),
+        # which made the healthy-friend test fail intermittently.
+        protocol_version = "HTTP/1.1"
+
         def log_message(self, *args):
             pass
 
@@ -82,8 +88,13 @@ def slow_server():
                 except OSError:
                     return
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    server.daemon_threads = True
+    class Server(http.server.ThreadingHTTPServer):
+        daemon_threads = True
+
+        def handle_error(self, request, client_address):
+            pass  # a client hanging up a kept-alive connection is expected
+
+    server = Server(("127.0.0.1", 0), Handler)
     server.mode = "stall"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
