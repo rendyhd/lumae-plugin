@@ -137,6 +137,7 @@ from .collection_manager import (
     render_collections_settings_panel,
 )
 from .reconcile import (
+    DEFERRED_MARKER,
     arm_reconcile,
     begin_event,
     defer_work,
@@ -153,7 +154,7 @@ from .reconcile import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.3.1"
+PLUGIN_VERSION = "1.3.2"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -1905,6 +1906,7 @@ def enqueue_profile_analysis(
         if priority == "interactive" and catalog_instance_id and host_queue_busy(exc):
             # Saved, not lost: the next worker task serves it.
             mark_profiles_deferred(get_db(), catalog_instance_id, tokens)
+            _wake_for_deferred()
             return DEFERRED
         release_pending(
             admitted_ids,
@@ -3591,7 +3593,6 @@ def report_edge_runtime_on_start():
 # refused that way stays pending with this marker, and the next worker task
 # serves it (serve_deferred_interactive).
 HOST_BUSY_ERROR_CODE = 1201
-DEFERRED_MARKER = "deferred_host_busy"
 DEFERRED = "deferred"
 # A queued background edge batch yields its slot after this long; its
 # unstarted jobs are released and due again at once.
@@ -3630,6 +3631,7 @@ def enqueue_edge_profiles(ids, catalog_instance_id, server_id, *, priority="back
                 raise
             if priority == "interactive":
                 mark_edge_jobs_deferred(get_db(), catalog_instance_id, jobs, DEFERRED_MARKER)
+                _wake_for_deferred()
             else:
                 # Due again at once; the library pass also covers them.
                 for job in jobs:
@@ -3827,6 +3829,22 @@ def serve_deferred_interactive(limit=None):
 
 
 _serving_deferred = False
+
+
+def _wake_for_deferred():
+    """Put the reconcile watchdog on minute cadence for saved on-demand work.
+
+    The schedule also counts deferred work as ready, so it stays active until
+    that work is served. Never fails the request that deferred.
+    """
+    db = None
+    try:
+        db = get_db()
+        arm_reconcile(db, "deferred_on_demand", commit=True)
+    except Exception:
+        if db is not None:
+            _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not wake the watchdog for deferred work")
 
 
 def claim_deferred_profiles(db, limit):

@@ -392,3 +392,50 @@ def test_edge_timestamps_are_real_utc_whatever_the_session_time_zone(edge_public
     row = store.edge_backfill_row(db, "catalog-a")
     assert abs(parse(row["completed_at"]) - now) < timedelta(minutes=1)
     assert abs(parse(row["next_retry_at"]) - (now + timedelta(hours=6))) < timedelta(minutes=1)
+
+
+def test_refused_requests_wake_the_watchdog(edge_publication_db, monkeypatch):
+    mod, db = load_plugin(), edge_publication_db
+    woken = []
+    monkeypatch.setattr(mod, "arm_reconcile", lambda _db, reason, commit=False: woken.append(reason))
+    monkeypatch.setattr(mod, "edge_scheduling_allowed", lambda: True)
+    monkeypatch.setattr(mod, "enqueue_bounded", _refuse)
+    mod.enqueue_edge_profiles(["track-a"], "catalog-a", "server-a", priority="interactive")
+    assert woken == ["deferred_on_demand"]
+
+    _q(db, f"UPDATE {PROFILES} SET status='pending_interactive', attempt_token='tok-a'")
+    monkeypatch.setattr(mod, "mark_pending", lambda *_args, **_kwargs: {"track-a": "tok-a"})
+    assert mod.enqueue_profile_analysis(["track-a"], "catalog-a", "server-a", priority="interactive") == mod.DEFERRED
+    assert woken == ["deferred_on_demand", "deferred_on_demand"]
+
+    # A background refusal is retried by the library pass; it does not wake.
+    mod.enqueue_edge_profiles(["track-a"], "catalog-a", "server-a")
+    assert len(woken) == 2
+
+
+def test_deferred_on_demand_work_keeps_the_watchdog_active(migrated_db):
+    from plugins.LumaeAnalysis import reconcile
+
+    db = migrated_db
+    with db.cursor() as cur:
+        cur.execute("""CREATE TABLE IF NOT EXISTS task_status (task_id TEXT, parent_task_id TEXT,
+            task_type TEXT, status TEXT)""")
+    db.commit()
+
+    def summary():
+        with db.cursor() as cur:
+            result = reconcile._work_summary(cur)
+        db.rollback()
+        return result["ready"]
+
+    baseline = summary()
+    with db.cursor() as cur:
+        cur.execute("""INSERT INTO plugin_lumae_analysis__catalog_sources
+            (catalog_instance_id, current_core_server_id, provider_type, server_name, is_default, rebind_status)
+            VALUES ('any', 'server-a', 'navidrome', 'Test', TRUE, 'active')""")
+        cur.execute(f"""INSERT INTO {PROFILES} (catalog_instance_id, track_id, sample_rate, duration_ms,
+            ref_lufs, start_ramp, end_ramp, analyzer_ver, profile_schema_ver, analyzed_at, status,
+            last_error) VALUES ('any', 't', 0, 0, 0, '', '', 1, 1, now(), 'pending_interactive', %s)""",
+                    (reconcile.DEFERRED_MARKER,))
+    db.commit()
+    assert summary() == baseline + 1

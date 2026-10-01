@@ -11,6 +11,9 @@ from . import migrations
 
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
 ACTIVE_CRON = "* * * * *"
+# On-demand work AudioMuse refused to queue (``last_error`` of a pending
+# interactive attempt or edge job). It is runnable work for the watchdog.
+DEFERRED_MARKER = "deferred_host_busy"
 WAITING_CRON = "*/5 * * * *"
 BACKOFF_15_CRON = "*/15 * * * *"
 IDLE_CRON = "11 * * * *"
@@ -225,6 +228,13 @@ def _work_summary(cur):
               FROM {_work_table('edge_backfill_state')}
              WHERE status IN ('queued', 'failed')
                 OR (status='running' AND updated_at < now() - interval '30 minutes')
+            UNION ALL
+            SELECT 'ready', 0, NULL::timestamp
+             WHERE EXISTS (SELECT 1 FROM {_work_table('source_profiles')}
+                            WHERE status='pending_interactive' AND last_error='{DEFERRED_MARKER}')
+                OR EXISTS (SELECT 1 FROM {_work_table('edge_profile_jobs')}
+                            WHERE status='pending' AND priority='interactive'
+                              AND last_error='{DEFERRED_MARKER}')
             UNION ALL
             SELECT CASE WHEN not_before>now() THEN 'retry' ELSE 'ready' END,
                    attempts,not_before

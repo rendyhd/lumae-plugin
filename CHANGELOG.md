@@ -7,6 +7,14 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.3.2 (2026-10-01)
+
+- Saved (`deferred`) on-demand requests are served within about a minute on an
+  otherwise idle server. A deferral wakes the reconcile watchdog, and its
+  schedule counts deferred work as ready until it is served. In 1.3.0 and 1.3.1
+  they waited for the next idle (hourly) tick when no batch or AudioMuse
+  analysis was running (seen on the media host: 261 deferred edge requests).
+
 ## 1.3.1 (2026-09-30)
 
 - The edge library pass starts within a minute when a worker first reports a
