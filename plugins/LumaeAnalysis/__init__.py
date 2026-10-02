@@ -154,7 +154,7 @@ from .reconcile import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.3.3"
+PLUGIN_VERSION = "1.3.4"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -2472,6 +2472,7 @@ def health():
                     "available": profile_bootstrap.availability(),
                     "sliding_expiry": True,
                     "idempotent_create": True,
+                    "create_adoption": True,
                 },
                 "edge_profiles": edge_profiles_capability(),
                 "personal_discovery": {"schema_version": 1, "enabled": collections_enabled(), "scope": health_scope_mode(), "features": ["album_memory_context", "enjoyment_feedback"]},

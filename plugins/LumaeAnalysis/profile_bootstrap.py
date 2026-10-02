@@ -1094,31 +1094,83 @@ def _abandon(db, session_id):
         _rollback_quietly(db)
 
 
-def create_session(body, caller=ANONYMOUS_CALLER):
-    """Create a v2 session. ``caller`` identifies the requester for the
-    per-(source, caller) create rate limit; only its hash is stored."""
-    size, mode, request_id, edge_refs = _create_options(body)
-    source = body["catalog_instance_id"]
-    token = secrets.token_hex(32)
-    token_hash = hashlib.sha256(token.encode()).hexdigest()
-    session_id = str(uuid.uuid4())
-    secret = secrets.token_hex(32)
-    caller_key = hashlib.sha256(str(caller or ANONYMOUS_CALLER).encode()).hexdigest()
-    with _connection() as db:
-        admitted, expires_at = _admit(db, source, session_id, token_hash, secret, size, mode,
-                                      request_id, caller_key, edge_refs)
-        try:
-            _purge(db)
-            ordinal, snapshot_seq = _capture(db, source, session_id, admitted)
-        except BaseException:
-            _abandon(db, session_id)
-            raise
-    catalog_epoch, profile_epoch = admitted[2], admitted[3]
+def _find_retried(db, source, request_id):
+    """(session_id, state) of the live, never-paged session a K5 retry names."""
+    with db.cursor() as cur:
+        cur.execute(
+            f"""SELECT session_id, state FROM {_table('profile_bootstrap_sessions')}
+                 WHERE source_scope=%s AND client_request_id=%s
+                   AND pages_served=0 AND expires_at > now()
+                 ORDER BY created_at DESC LIMIT 1""", (source, request_id))
+        row = cur.fetchone()
+    db.commit()
+    return row
+
+
+def _await_capture(db, source):
+    """Wait, as a same-source create does, for the source's running capture.
+
+    Past CAPTURE_LOCK_TIMEOUT_MS the lock wait fails and the create is 503
+    with ``Retry-After``, so the client comes back for the finished capture.
+    """
+    with db.cursor() as cur:
+        cur.execute("SELECT set_config('lock_timeout', %s, true)",
+                    (str(CAPTURE_LOCK_TIMEOUT_MS),))
+        cur.execute("SELECT pg_advisory_lock(%s, hashtext(%s))",
+                    (ADVISORY_LOCK_CLASS, source))
+        cur.execute("SELECT pg_advisory_unlock(%s, hashtext(%s))",
+                    (ADVISORY_LOCK_CLASS, source))
+    db.commit()
+
+
+def _adopt(db, source, request_id, token_hash, size, mode, edge_refs):
+    """1.3.4 create adoption: a K5 retry takes over the snapshot its own
+    earlier create captured, instead of capturing the library again.
+
+    The capture runs inside the create request and grows with the library, so
+    a create can outlive its client. It still finishes and leaves a ready,
+    never-paged session under the request's ``client_request_id``; the retry
+    rotates that session's token to its own and answers at once. A capture
+    still running is waited for like a same-source create (then 503). Adopted
+    only while the session is live and unclaimed, with the same page size,
+    expiry mode and edge opt-in, and while the source still has the identity
+    and epochs it captured; otherwise the retry replaces it as before (K5).
+    Returns the adopted session row, or None.
+    """
+    found = _find_retried(db, source, request_id)
+    if found is None:
+        return None
+    if found[1] == "capturing":
+        _await_capture(db, source)
+        found = _find_retried(db, source, request_id)
+        if found is None:
+            return None
+    if found[1] != "ready":
+        return None
+    with db.cursor() as cur:
+        state = _state(cur, source)
+        cur.execute(
+            f"""UPDATE {_table('profile_bootstrap_sessions')} SET token_hash=%s
+                 WHERE session_id=%s AND source_scope=%s AND state='ready'
+                   AND pages_served=0 AND expires_at > now()
+                   AND page_size=%s AND expiry_mode=%s AND edge_refs=%s
+                   AND core_server_id=%s AND catalog_epoch=%s AND profile_epoch=%s
+             RETURNING session_id, signing_secret, page_size, catalog_epoch,
+                       profile_epoch, snapshot_seq, snapshot_count, expires_at""",
+            (token_hash, found[0], source, size, mode, edge_refs,
+             state[0], state[2], state[3]))
+        adopted = cur.fetchone()
+    db.commit()
+    return adopted
+
+
+def _created(source, token, session_id, secret, size, catalog_epoch, profile_epoch,
+             snapshot_seq, count, expires_at, edge_refs):
     created = {"protocol_version": 2, "schema_version": 1,
                "transfer_contract": TRANSFER_CONTRACT,
                "catalog_instance_id": source,
                "session_token": token, "page_size": size,
-               "snapshot_count": ordinal, "total_profiles": ordinal,
+               "snapshot_count": count, "total_profiles": count,
                "catalog_epoch": catalog_epoch, "profile_epoch": profile_epoch,
                "snapshot_seq": snapshot_seq, "expires_at": _iso(expires_at),
                "snapshot_cursor": opaque_cursor(source, profile_epoch, snapshot_seq),
@@ -1129,6 +1181,40 @@ def create_session(body, caller=ANONYMOUS_CALLER):
         # K6: echoed only when requested, so other creates answer as before.
         created["edge_refs"] = True
     return created
+
+
+def create_session(body, caller=ANONYMOUS_CALLER):
+    """Create a v2 session. ``caller`` identifies the requester for the
+    per-(source, caller) create rate limit; only its hash is stored.
+
+    A create carrying ``client_request_id`` first tries to adopt the capture
+    of its own earlier create (1.3.4, ``create_adoption``). Adoption captures
+    nothing, so it counts against neither the rate limit nor the slots.
+    """
+    size, mode, request_id, edge_refs = _create_options(body)
+    source = body["catalog_instance_id"]
+    token = secrets.token_hex(32)
+    token_hash = hashlib.sha256(token.encode()).hexdigest()
+    session_id = str(uuid.uuid4())
+    secret = secrets.token_hex(32)
+    caller_key = hashlib.sha256(str(caller or ANONYMOUS_CALLER).encode()).hexdigest()
+    with _connection() as db:
+        if request_id is not None:
+            adopted = _adopt(db, source, request_id, token_hash, size, mode, edge_refs)
+            if adopted is not None:
+                return _created(source, token, adopted[0], adopted[1], adopted[2],
+                                adopted[3], adopted[4], int(adopted[5]), int(adopted[6]),
+                                adopted[7], edge_refs)
+        admitted, expires_at = _admit(db, source, session_id, token_hash, secret, size, mode,
+                                      request_id, caller_key, edge_refs)
+        try:
+            _purge(db)
+            ordinal, snapshot_seq = _capture(db, source, session_id, admitted)
+        except BaseException:
+            _abandon(db, session_id)
+            raise
+    return _created(source, token, session_id, secret, size, admitted[2], admitted[3],
+                    snapshot_seq, ordinal, expires_at, edge_refs)
 
 
 def snapshot_page(body):

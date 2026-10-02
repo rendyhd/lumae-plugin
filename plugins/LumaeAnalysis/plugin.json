@@ -111,6 +111,14 @@
   },
   "versions": [
     {
+      "version": "1.3.4",
+      "min_core_version": "3.2.0",
+      "changelog": "Profile bootstrap create adoption: a retried create (same client_request_id) takes over the snapshot its own earlier create already captured, instead of capturing the whole library again. Fixes large libraries (about 132k profiles) whose first profile load never finished because the in-request capture outlasted the app's request timeout. Health advertises profile_bootstrap.create_adoption.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.3.4.zip",
+      "checksum": "63840587ec07d0c86b5a5fb1d112c8d1"
+    },
+    {
       "version": "1.3.3",
       "min_core_version": "3.2.0",
       "changelog": "Artist portraits in the catalogue: a Navidrome scan reads getArtists once per selected music folder and publishes each album artist's coverArt as artists.cover_art_id, so the Lumae app no longer looks up every artist from the phone. A changed portrait republishes the artist; guests and a failed lookup keep the published portrait.",

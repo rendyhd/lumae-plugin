@@ -7,6 +7,20 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.3.4 (2026-10-02)
+
+- A retried profile-bootstrap create adopts the snapshot its own earlier
+  create captured (K12, health `profile_bootstrap.create_adoption`). The v2
+  capture runs inside the create request and grows with the library; at
+  about 132k profiles on a home server it outlasted the Lumae app's 10 s
+  request, and every K5 retry replaced the finished capture and captured
+  again, so the first profile load never completed. Now a retry under the
+  same `client_request_id` takes over the ready, never-paged session (or
+  waits up to 5 s for its capture, then 503 with `Retry-After`) and answers
+  at once. Different create options, a changed source epoch, or a session
+  that has served a page keep the 1.3.0 replace behaviour. Adoption counts
+  against neither the create rate limit nor the session slots.
+
 ## 1.3.3 (2026-10-02)
 
 - Artist portraits in the catalogue. A Navidrome scan calls `getArtists` once

@@ -3,7 +3,8 @@
 Admission is a short transaction under the global advisory lock; the capture
 runs under a per-source lock. Identity-stale, expired and abandoned rows never
 hold a slot or the journal floor, release always deletes, a duplicate
-``client_request_id`` replaces its unclaimed session, sliding sessions extend
+``client_request_id`` adopts its unclaimed capture (1.3.4) or else replaces
+its unclaimed session, sliding sessions extend
 on every page, errors are logged, 429/503 carry ``Retry-After``, timestamps are
 UTC and health reports what it can actually serve. Runs on the real migrated
 schema. The lum010 audit probe's lock, lockout and logging cases are inverted
@@ -468,7 +469,7 @@ def test_release_always_deletes_the_matching_session(db):
     assert exc.value.status == 400
 
 
-def test_duplicate_client_request_id_replaces_the_unclaimed_session(db):
+def test_duplicate_client_request_id_takes_over_the_unclaimed_session(db):
     request_id = str(uuid.uuid4())
     first = profile_bootstrap.create_session(body(client_request_id=request_id))
     second = profile_bootstrap.create_session(body(client_request_id=request_id.upper()))
@@ -490,7 +491,7 @@ def test_duplicate_client_request_id_replaces_the_unclaimed_session(db):
                   (_hash(second["session_token"]),)) == [(2,)]
 
 
-def test_duplicate_client_request_id_is_replaced_even_when_slots_are_full(db):
+def test_duplicate_client_request_id_is_taken_over_even_when_slots_are_full(db):
     request_id = str(uuid.uuid4())
     for _ in range(3):
         profile_bootstrap.create_session(body())
@@ -504,11 +505,12 @@ def test_duplicate_client_request_id_is_replaced_even_when_slots_are_full(db):
     assert _hash(stale["session_token"]) not in hashes and len(hashes) == 4
 
 
-def test_retried_create_replaces_a_session_that_is_still_capturing(
+def test_retried_create_adopts_a_capture_that_is_still_running(
         db, second_connection, monkeypatch):
     """A client that timed out retries with the same id while the first
-    capture still runs: the retry replaces it, the first capture gives up
-    (410) and removes its rows, and only the retry's session remains."""
+    capture still runs: the retry waits for that capture and adopts it (1.3.4)
+    instead of capturing again. The first create still answers, but only the
+    retry's token pages the one snapshot."""
     request_id = str(uuid.uuid4())
     blocker = _Blocker(monkeypatch, SOURCE)
     thread, first = _in_thread(profile_bootstrap.create_session,
@@ -518,21 +520,115 @@ def test_retried_create_replaces_a_session_that_is_still_capturing(
         assert blocker.capturing.wait(20)
         retry, retried = _in_thread(profile_bootstrap.create_session,
                                     body(client_request_id=request_id))
-        # The retry is admitted (replacing the first) and waits for the capture.
         _await_capture_lock_waiter(second_connection, SOURCE)
     finally:
         blocker.release.set()
         thread.join(30)
         if retry is not None:
             retry.join(30)
+    original = _outcome(first)
     second = _outcome(retried)
-    error = first.get("error")
-    assert isinstance(error, profile_bootstrap.BootstrapError), first
-    assert (error.code, error.status) == ("bootstrap_required", 410)
+    assert second["snapshot_count"] == original["snapshot_count"] == 1
+    assert second["next_page_token"] == original["next_page_token"]
     assert _query(db, f"SELECT token_hash, state FROM {SESSIONS}") == [
         (_hash(second["session_token"]), "ready")]
     assert _query(db, f"SELECT count(*) FROM {P}profile_bootstrap_snapshot") == [(1,)]
+    with pytest.raises(profile_bootstrap.BootstrapError) as exc:
+        profile_bootstrap.snapshot_page(body(session_token=original["session_token"]))
+    assert exc.value.status == 410
     assert profile_bootstrap.snapshot_page(body(session_token=second["session_token"]))["profiles"]
+
+
+# --- 1.3.4: create adoption --------------------------------------------------
+
+
+def _capture_spy(monkeypatch):
+    calls = []
+    original = profile_bootstrap._capture
+
+    def spy(*args):
+        calls.append(args[1])
+        return original(*args)
+
+    monkeypatch.setattr(profile_bootstrap, "_capture", spy)
+    return calls
+
+
+def test_retry_adopts_a_finished_capture_without_capturing_again(db, monkeypatch):
+    """The create outlived its client: the capture finished, nobody holds its
+    token. The retry answers at once from that snapshot, pages it from the
+    start and counts as no new create."""
+    request_id = str(uuid.uuid4())
+    captures = _capture_spy(monkeypatch)
+    lost = profile_bootstrap.create_session(body(client_request_id=request_id, page_size=1))
+    monkeypatch.setattr(profile_bootstrap, "CREATE_RATE_LIMIT", 1)
+    retried = profile_bootstrap.create_session(body(client_request_id=request_id, page_size=1))
+    assert captures == [SOURCE]
+    assert retried["session_token"] != lost["session_token"]
+    for key in ("snapshot_count", "snapshot_seq", "snapshot_cursor", "profile_epoch",
+                "catalog_epoch", "expires_at", "next_page_token", "page_size"):
+        assert retried[key] == lost[key], key
+    assert _query(db, f"SELECT count(*) FROM {P}profile_bootstrap_creates") == [(1,)]
+    page = profile_bootstrap.snapshot_page(body(session_token=retried["session_token"],
+                                                page_token=retried["next_page_token"]))
+    assert [row["track_id"] for row in page["profiles"]] == [f"{SOURCE}-track"]
+
+
+@pytest.mark.parametrize("changed", [
+    {"page_size": 7}, {"expiry_mode": "sliding"}, {"edge_refs": True}])
+def test_retry_with_other_options_replaces_instead_of_adopting(db, monkeypatch, changed):
+    request_id = str(uuid.uuid4())
+    captures = _capture_spy(monkeypatch)
+    lost = profile_bootstrap.create_session(body(client_request_id=request_id))
+    retried = profile_bootstrap.create_session(body(client_request_id=request_id, **changed))
+    assert captures == [SOURCE, SOURCE]
+    assert _query(db, f"SELECT token_hash FROM {SESSIONS} WHERE expires_at > now()") == [
+        (_hash(retried["session_token"]),)]
+    with pytest.raises(profile_bootstrap.BootstrapError) as exc:
+        profile_bootstrap.snapshot_page(body(session_token=lost["session_token"]))
+    assert exc.value.status == 410
+
+
+def test_retry_after_a_profile_epoch_change_captures_the_new_epoch(db, monkeypatch):
+    request_id = str(uuid.uuid4())
+    captures = _capture_spy(monkeypatch)
+    lost = profile_bootstrap.create_session(body(client_request_id=request_id))
+    _execute(db, f"UPDATE {STATE} SET epoch='epoch-rebased' WHERE catalog_instance_id=%s",
+             (SOURCE,))
+    retried = profile_bootstrap.create_session(body(client_request_id=request_id))
+    assert captures == [SOURCE, SOURCE]
+    assert retried["profile_epoch"] == "epoch-rebased" != lost["profile_epoch"]
+
+
+def test_retry_gets_503_while_its_capture_outlasts_the_wait_then_adopts(
+        db, second_connection, monkeypatch):
+    request_id = str(uuid.uuid4())
+    monkeypatch.setattr(profile_bootstrap, "CAPTURE_LOCK_TIMEOUT_MS", 200)
+    blocker = _Blocker(monkeypatch, SOURCE)
+    thread, first = _in_thread(profile_bootstrap.create_session,
+                               body(client_request_id=request_id))
+    try:
+        assert blocker.capturing.wait(20)
+        with pytest.raises(profile_bootstrap.BootstrapError) as exc:
+            profile_bootstrap.create_session(body(client_request_id=request_id))
+        assert (exc.value.code, exc.value.status) == ("bootstrap_unavailable", 503)
+    finally:
+        blocker.release.set()
+        thread.join(30)
+    _outcome(first)
+    captures = _capture_spy(monkeypatch)
+    retried = profile_bootstrap.create_session(body(client_request_id=request_id))
+    assert captures == []
+    assert profile_bootstrap.snapshot_page(body(session_token=retried["session_token"]))
+
+
+def test_create_without_request_id_never_adopts(db, monkeypatch):
+    captures = _capture_spy(monkeypatch)
+    first = profile_bootstrap.create_session(body())
+    second = profile_bootstrap.create_session(body())
+    assert captures == [SOURCE, SOURCE]
+    assert first["session_token"] != second["session_token"]
+    assert len(_query(db, f"SELECT session_id FROM {SESSIONS}")) == 2
 
 
 @pytest.mark.parametrize("field,value", [
@@ -652,7 +748,8 @@ def test_health_profile_bootstrap_is_truthful(db, monkeypatch):
     assert capability == {"protocol_version": 2, "schema_version": 1,
                           "auth": "host_authenticated", "auth_enabled": False,
                           "transfer_contract": "source_scoped_v1", "available": True,
-                          "sliding_expiry": True, "idempotent_create": True}
+                          "sliding_expiry": True, "idempotent_create": True,
+                          "create_adoption": True}
     for configured, expected in ((True, True), ("true", True), ("False", False), (False, False)):
         monkeypatch.setattr(plugin_api_module.config, "AUTH_ENABLED", configured, raising=False)
         assert _health()["auth_enabled"] is expected

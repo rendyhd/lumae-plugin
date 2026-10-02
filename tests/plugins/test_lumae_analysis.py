@@ -218,6 +218,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "available": False,
                 "sliding_expiry": True,
                 "idempotent_create": True,
+                "create_adoption": True,
             },
             "personal_discovery": {"schema_version": 1, "enabled": False, "scope": "shared", "features": ["album_memory_context", "enjoyment_feedback"]},
             "music_metadata": {"schema_version": 1, "enabled": True, "provider": "musicbrainz", "daily_request_limit": 80, "recording_membership": True},
@@ -327,7 +328,8 @@ def test_profile_bootstrap_capability_requires_public_database_url(monkeypatch):
     assert capability == {"protocol_version": 2, "schema_version": 1,
                           "auth": "host_authenticated", "auth_enabled": False,
                           "transfer_contract": "source_scoped_v1", "available": True,
-                          "sliding_expiry": True, "idempotent_create": True}
+                          "sliding_expiry": True, "idempotent_create": True,
+                          "create_adoption": True}
     assert probes == [1]
     monkeypatch.setattr(mod.host_api.config, "DATABASE_URL", None)
     capability = client.get("/api/health").get_json()["capabilities"]["profile_bootstrap"]
