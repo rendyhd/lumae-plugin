@@ -5423,6 +5423,9 @@ def test_navidrome_catalog_uses_folder_album_queries_when_song_rows_lack_folder_
                         ],
                     }
                 }
+            if endpoint == "getArtists":
+                assert params == {"musicFolderId": "folder-a"}
+                return {"artists": {"index": []}}
             raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
 
     result = _fetch_navidrome(Module(), object(), "server-a")
@@ -5539,6 +5542,288 @@ def test_navidrome_catalog_joins_large_folder_scope_onto_search_rows_without_n_p
     assert [endpoint for endpoint, _params in calls].count("getAlbumList2") == 1
     assert [endpoint for endpoint, _params in calls].count("search3") == 1
     assert all(endpoint != "getAlbum" for endpoint, _params in calls)
+
+
+def _artist_art_module(get_artists, folders=("folder-a", "folder-b"), target=None):
+    calls = []
+
+    class Module:
+        @staticmethod
+        def list_libraries():
+            return [{"id": folder, "name": folder} for folder in folders]
+
+        @staticmethod
+        def _get_target_music_folder_ids():
+            return target
+
+        @staticmethod
+        def _navidrome_request(endpoint, params=None):
+            calls.append((endpoint, params))
+            if endpoint == "getAlbumList2":
+                folder = params["musicFolderId"]
+                return {"albumList2": {"album": [{"id": f"album-{folder}", "name": "Album"}]}}
+            if endpoint == "getAlbum":
+                album_id = params["id"]
+                return {
+                    "album": {
+                        "id": album_id,
+                        "name": "Album",
+                        "song": [{"id": f"track-{album_id}", "title": "Song", "albumId": album_id}],
+                    }
+                }
+            if endpoint == "getArtists":
+                return get_artists(params)
+            raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
+
+    return Module(), calls
+
+
+def test_navidrome_catalog_reads_artist_art_once_per_selected_folder():
+    from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
+
+    responses = {
+        "folder-a": {
+            "artists": {
+                "index": [
+                    {
+                        "name": "A",
+                        "artist": [
+                            {"id": "artist-1", "name": "One", "coverArt": "ar-artist-1_aa"},
+                            {"id": "artist-2", "name": "Two", "coverArt": ""},
+                            {"id": "artist-3", "name": "Three"},
+                        ],
+                    },
+                    # Some clients' JSON collapses one-element arrays.
+                    {
+                        "name": "F",
+                        "artist": {"id": "artist-4", "name": "Four", "coverArt": "ar-artist-4_bb"},
+                    },
+                ]
+            }
+        },
+        "folder-c": {
+            "artists": {
+                "index": {
+                    "name": "A",
+                    "artist": [
+                        {"id": "artist-1", "name": "One", "coverArt": ""},
+                        {"id": "artist-3", "name": "Three", "coverArt": "ar-artist-3_cc"},
+                    ],
+                }
+            }
+        },
+    }
+    module, calls = _artist_art_module(
+        lambda params: responses[params["musicFolderId"]],
+        folders=("folder-a", "folder-b", "folder-c"),
+        target={"folder-a", "folder-c"},
+    )
+
+    result = _fetch_navidrome(module, object(), "server-a")
+
+    assert [params for endpoint, params in calls if endpoint == "getArtists"] == [
+        {"musicFolderId": "folder-a"},
+        {"musicFolderId": "folder-c"},
+    ]
+    # A non-empty value from any folder wins; an empty one means no image.
+    assert result["artist_cover_art"] == {
+        "artist-1": "ar-artist-1_aa",
+        "artist-2": None,
+        "artist-3": "ar-artist-3_cc",
+        "artist-4": "ar-artist-4_bb",
+    }
+
+
+def test_navidrome_artist_art_failure_does_not_fail_the_scan():
+    from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
+
+    def get_artists(params):
+        if params["musicFolderId"] == "folder-a":
+            raise RuntimeError("getArtists unavailable")
+        return {"artists": {"index": [{"artist": [{"id": "artist-9", "coverArt": "ar-artist-9_x"}]}]}}
+
+    module, _calls = _artist_art_module(get_artists)
+
+    result = _fetch_navidrome(module, object(), "server-a")
+
+    assert len(result["tracks"]) == 2
+    assert result["artist_cover_art"] == {"artist-9": "ar-artist-9_x"}
+
+
+def test_rich_catalog_result_passes_artist_art_through():
+    from plugins.LumaeAnalysis.catalog_providers import _coerce_catalog_result
+
+    coerced = _coerce_catalog_result({"tracks": [], "artist_cover_art": {"a": "ar-a_1"}}, [])
+    assert coerced["artist_cover_art"] == {"a": "ar-a_1"}
+    assert "artist_cover_art" not in _coerce_catalog_result({"tracks": []}, [])
+
+
+def _portrait_catalog(artist_cover_art=None):
+    raw = {
+        "libraries": [{"id": "library-1", "name": "Music"}],
+        "tracks": [
+            {
+                "id": "track-1",
+                "title": "Song",
+                "artists": [
+                    {"id": "artist-1", "name": "Lead"},
+                    {"id": "guest-1", "name": "Guest"},
+                ],
+                "_lumae_library_ids": ["library-1"],
+            },
+            {
+                "id": "track-2",
+                "title": "Other",
+                "artists": [{"id": "artist-2", "name": "Bare"}],
+                "_lumae_library_ids": ["library-1"],
+            },
+        ],
+    }
+    if artist_cover_art is not None:
+        raw["artist_cover_art"] = artist_cover_art
+    return raw
+
+
+def test_normalized_artists_carry_navidrome_portraits():
+    from plugins.LumaeAnalysis.catalog import fingerprint, normalize_provider_catalog
+
+    normalized = normalize_provider_catalog(
+        _portrait_catalog({"artist-1": "ar-artist-1_aa", "artist-2": None}),
+        "navidrome",
+    )
+    artists = {row["artist_id"]: row for row in normalized["artists"]}
+
+    assert artists["artist-1"]["cover_art_id"] == "ar-artist-1_aa"
+    # An empty coverArt from getArtists is authoritative: no portrait.
+    assert artists["artist-2"]["cover_art_id"] is None
+    # A guest is not listed by getArtists; the publisher resolves it.
+    assert artists["guest-1"]["cover_art_id"] is None
+    assert normalized["unresolved_artist_art"] == ["guest-1"]
+    # Artists without a portrait keep their pre-portrait fingerprint.
+    assert artists["artist-2"]["metadata_fp"] == fingerprint(artists["artist-2"]["payload"])
+
+
+def test_artist_fingerprint_changes_when_only_the_portrait_hash_changes():
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    def artist_fps(cover):
+        normalized = normalize_provider_catalog(_portrait_catalog({"artist-1": cover}), "navidrome")
+        return {row["artist_id"]: row["metadata_fp"] for row in normalized["artists"]}
+
+    old, new = artist_fps("ar-artist-1_aa"), artist_fps("ar-artist-1_bb")
+
+    assert old["artist-1"] != new["artist-1"]
+    assert old["guest-1"] == new["guest-1"]
+
+
+def _portrait_refresh(monkeypatch, previous_art, published_art, current_art):
+    import json
+
+    from plugins.LumaeAnalysis import catalog
+
+    previous = catalog.normalize_provider_catalog(_portrait_catalog(previous_art), "navidrome")
+    db = RefreshDb(
+        previous_counts={"library": 1, "artist": 3, "track": 2},
+        previous_generation=1,
+        published_fingerprints={
+            "catalog_libraries": [
+                (row["library_id"], row["metadata_fp"]) for row in previous["libraries"]
+            ],
+            "catalog_artists": [
+                (row["artist_id"], row["metadata_fp"]) for row in previous["artists"]
+            ],
+            "catalog_tracks": [
+                (row["track_id"], row["metadata_fp"], row["media_fp"], row["artwork_fp"])
+                for row in previous["tracks"]
+            ],
+        },
+        published_artist_art=published_art,
+    )
+    monkeypatch.setattr(
+        catalog,
+        "observe_provider_version",
+        lambda *_args, **_kwargs: {
+            "observation": "verified",
+            "state": "normal",
+            "current_provider_version": "0.64.2",
+        },
+    )
+
+    result = catalog.refresh_catalog(
+        "server-a", db=db, bridge=RefreshBridge(_portrait_catalog(current_art))
+    )
+
+    artist_changes = {
+        params[5]: json.loads(params[8])
+        for sql, params in db.executed
+        if "INSERT INTO plugin_lumae_analysis__catalog_changes" in sql and params[4] == "artist"
+    }
+    inserted = next(
+        (
+            params
+            for sql, params in db.executed
+            if "INSERT INTO plugin_lumae_analysis__catalog_artists" in sql
+        ),
+        None,
+    )
+    # (catalog, generation, artist_id, name, sort_name, provenance, cover_art_id, ...)
+    stored = None if inserted is None else {row[2]: row[6] for row in inserted}
+    return result, artist_changes, stored
+
+
+def test_incremental_publish_emits_an_artist_whose_portrait_changed(monkeypatch):
+    result, changes, stored = _portrait_refresh(
+        monkeypatch,
+        previous_art={"artist-1": "ar-artist-1_aa", "artist-2": None, "guest-1": "ar-guest-1_gg"},
+        published_art=[("artist-1", "ar-artist-1_aa"), ("guest-1", "ar-guest-1_gg")],
+        current_art={"artist-1": "ar-artist-1_bb", "artist-2": None},
+    )
+
+    assert result["change_reason"] == "provider_diff"
+    assert set(changes) == {"artist-1"}
+    assert changes["artist-1"]["cover_art_id"] == "ar-artist-1_bb"
+    # The guest is no longer listed by getArtists and keeps its portrait.
+    assert stored == {
+        "artist-1": "ar-artist-1_bb",
+        "artist-2": None,
+        "guest-1": "ar-guest-1_gg",
+    }
+
+
+def test_failed_artist_art_lookup_keeps_published_portraits(monkeypatch):
+    previous_art = {"artist-1": "ar-artist-1_aa", "artist-2": None, "guest-1": "ar-guest-1_gg"}
+    result, changes, stored = _portrait_refresh(
+        monkeypatch,
+        previous_art=previous_art,
+        published_art=[("artist-1", "ar-artist-1_aa"), ("guest-1", "ar-guest-1_gg")],
+        current_art={},
+    )
+
+    # Every artist resolves to its published portrait, so nothing changed.
+    assert result["change_reason"] == "no_change"
+    assert changes == {}
+    assert stored is None
+
+
+def test_first_scan_leaves_an_unlisted_guest_without_a_portrait():
+    from plugins.LumaeAnalysis.catalog import refresh_catalog
+
+    db = RefreshDb()
+    refresh_catalog(
+        "server-a", db=db, bridge=RefreshBridge(_portrait_catalog({"artist-1": "ar-artist-1_aa"}))
+    )
+
+    inserted = next(
+        params
+        for sql, params in db.executed
+        if "INSERT INTO plugin_lumae_analysis__catalog_artists" in sql
+    )
+    assert {row[2]: row[6] for row in inserted} == {
+        "artist-1": "ar-artist-1_aa",
+        "artist-2": None,
+        "guest-1": None,
+    }
+    assert not any("cover_art_id IS NOT NULL" in sql for sql, _params in db.executed)
 
 
 def test_navidrome_catalog_rejects_an_unmatched_music_folder_filter():
@@ -6536,6 +6821,8 @@ class RefreshCursor(FakeCursor):
                 ),
                 [],
             )
+        elif "cover_art_id IS NOT NULL" in sql:
+            self.rows = list(self.db.published_artist_art)
         elif sql.lstrip().startswith("SELECT") and "available=TRUE" in sql:
             self.rows = next(
                 (
@@ -6563,7 +6850,9 @@ class RefreshDb:
         fingerprint_schema_version=2,
         published_fingerprints=None,
         historical_entity_ids=None,
+        published_artist_art=None,
     ):
+        self.published_artist_art = published_artist_art or []
         self.previous_counts = previous_counts or {}
         self.previous_generation = previous_generation
         self.epoch = epoch

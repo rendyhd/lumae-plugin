@@ -7,6 +7,18 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.3.3 (2026-10-02)
+
+- Artist portraits in the catalogue. A Navidrome scan calls `getArtists` once
+  per selected music folder and publishes each album artist's `coverArt` as
+  `artists.cover_art_id`, so the Lumae app shows catalogue portraits instead
+  of looking up every artist from each phone. The art ID is part of the
+  artist fingerprint, so a changed portrait republishes the artist (the first
+  scan republishes every artist that has one). An empty `coverArt` (Navidrome
+  0.64+: no image) clears it; guests, which `getArtists` does not list, and a
+  failed lookup keep the published value. A failed `getArtists` never fails
+  the scan.
+
 ## 1.3.2 (2026-10-01)
 
 - Saved (`deferred`) on-demand requests are served within about a minute on an

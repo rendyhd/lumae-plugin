@@ -840,7 +840,14 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         album["payload"]["_lumae"] = enrichment
         album["metadata_fp"] = fingerprint({"base": album["metadata_fp"], "enrichment": enrichment})
 
+    # Navidrome getArtists portraits. Artists absent from the map (guests, or
+    # a failed call) are resolved from the published generation at publish
+    # time, so a known portrait is never erased by a missing lookup.
+    artist_cover_art = raw_catalog.get("artist_cover_art")
+    if not isinstance(artist_cover_art, dict):
+        artist_cover_art = {}
     artists = []
+    unresolved_artist_art = []
     for artist in artists_by_id.values():
         metadata = {
             "name": artist["name"],
@@ -849,7 +856,14 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         }
         library_ids = sorted(artist_libraries.get(artist["artist_id"], set()))
         payload = {**metadata, "_lumae": {"library_ids": library_ids}}
-        artists.append({**artist, "payload": payload, "metadata_fp": fingerprint(payload)})
+        if artist["artist_id"] not in artist_cover_art:
+            unresolved_artist_art.append(artist["artist_id"])
+        artists.append(
+            _with_artist_cover_art(
+                {**artist, "payload": payload},
+                artist_cover_art.get(artist["artist_id"]),
+            )
+        )
         for library_id in library_ids:
             entity_libraries.append(
                 {
@@ -869,7 +883,52 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             {(row["entity_type"], row["entity_id"], row["library_id"]): row for row in entity_libraries}.values(),
             key=lambda row: (row["entity_type"], row["entity_id"], row["library_id"]),
         ),
+        "unresolved_artist_art": sorted(unresolved_artist_art),
     }
+
+
+def _with_artist_cover_art(artist, cover_art_id):
+    """Set an artist row's portrait and the fingerprint that covers it.
+
+    The art ID is fingerprinted only when present, so artists without a
+    portrait keep the fingerprint they had before portraits were synced.
+    """
+    cover_art_id = _text(cover_art_id)
+    fingerprinted = artist["payload"]
+    if cover_art_id:
+        fingerprinted = {**fingerprinted, "cover_art_id": cover_art_id}
+    return {**artist, "cover_art_id": cover_art_id, "metadata_fp": fingerprint(fingerprinted)}
+
+
+def _carry_over_artist_art(cur, catalog_instance_id, generation, normalized):
+    """Keep the published portrait of artists the provider did not describe.
+
+    getArtists lists album artists only and may fail; neither is evidence
+    that a portrait went away, so those artists keep the value of the
+    published generation (none before the first publication).
+    """
+    unresolved = set(normalized.get("unresolved_artist_art") or ())
+    if not unresolved or generation <= 0:
+        return
+    table_name, id_column = ENTITY_TABLES["artist"]
+    cur.execute(
+        f"SELECT {id_column}, cover_art_id FROM {t(table_name)} "
+        "WHERE catalog_instance_id=%s AND published_generation=%s AND available=TRUE "
+        "AND cover_art_id IS NOT NULL",
+        (catalog_instance_id, generation),
+    )
+    published = {
+        str(artist_id): cover_art_id
+        for artist_id, cover_art_id in cur.fetchall()
+        if str(artist_id) in unresolved
+    }
+    if published:
+        normalized["artists"] = [
+            _with_artist_cover_art(row, published[row["artist_id"]])
+            if row["artist_id"] in published
+            else row
+            for row in normalized["artists"]
+        ]
 
 
 def catalog_scope_evidence(normalized, provider_type):
@@ -2023,6 +2082,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             previous_generation > 0
             and previous_fingerprint_schema != CATALOG_FINGERPRINT_SCHEMA_VERSION
         )
+        _carry_over_artist_art(cur, catalog_instance_id, previous_generation, normalized)
         for entity_type in ENTITY_ORDER:
             rows = normalized[ENTITY_COLLECTIONS[entity_type]]
             current = {row[ENTITY_TABLES[entity_type][1]]: row for row in rows}

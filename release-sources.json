@@ -2,7 +2,7 @@
   "plugins": {
     "LumaeAnalysis": {
       "mode": "source",
-      "version": "1.3.2"
+      "version": "1.3.3"
     },
     "FederatedAlbums": {
       "mode": "private",

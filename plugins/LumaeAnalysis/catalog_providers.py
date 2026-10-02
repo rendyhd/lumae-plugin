@@ -7,6 +7,8 @@ to the normalizer; callers must never persist or serialize the bridge itself.
 
 from contextlib import nullcontext
 
+from plugin.api import logger
+
 from .core_compat import get_core_adapter
 
 
@@ -148,11 +150,14 @@ class ProviderCatalogBridge:
 
 def _coerce_catalog_result(result, libraries):
     if isinstance(result, dict):
-        return {
+        coerced = {
             "libraries": list(result.get("libraries") or libraries or []),
             "albums": list(result.get("albums") or []),
             "tracks": list(result.get("tracks") or []),
         }
+        if isinstance(result.get("artist_cover_art"), dict):
+            coerced["artist_cover_art"] = dict(result["artist_cover_art"])
+        return coerced
     return {"libraries": list(libraries or []), "albums": [], "tracks": list(result or [])}
 
 
@@ -302,7 +307,46 @@ def _fetch_navidrome(module, core, server_id):
         "libraries": libraries,
         "albums": list(albums_by_id.values()),
         "tracks": tracks,
+        "artist_cover_art": _navidrome_artist_cover_art(request, selected_folder_ids),
     }
+
+
+def _navidrome_artist_cover_art(request, folder_ids):
+    """Map Navidrome artist IDs to their portrait art IDs, one getArtists per folder.
+
+    getArtists lists album artists only, so guests are absent; the publisher
+    keeps their previous value. An empty coverArt (Navidrome 0.64+: no image)
+    is authoritative. Portraits are enrichment: a folder that fails is skipped
+    and never fails the scan, and its artists keep their previous value too.
+    """
+    cover_art = {}
+    for folder_id in sorted(folder_ids):
+        try:
+            response = request("getArtists", {"musicFolderId": folder_id}) or {}
+            indexes = (response.get("artists") or {}).get("index") or []
+        except Exception as exc:  # noqa: BLE001 - enrichment must not fail a scan
+            # Only the type: provider errors can echo the credentialed URL.
+            logger.warning(
+                "Navidrome getArtists failed for music folder %s (%s); "
+                "keeping published artist art",
+                folder_id,
+                type(exc).__name__,
+            )
+            continue
+        if isinstance(indexes, dict):
+            indexes = [indexes]
+        for index in indexes:
+            artists = (index.get("artist") or []) if isinstance(index, dict) else []
+            if isinstance(artists, dict):
+                artists = [artists]
+            for artist in artists:
+                if not isinstance(artist, dict) or artist.get("id") is None:
+                    continue
+                artist_id = str(artist["id"])
+                value = str(artist.get("coverArt") or "") or None
+                if value or artist_id not in cover_art:
+                    cover_art[artist_id] = value
+    return cover_art
 
 
 def _fetch_jellyfin_or_emby(module, core, server_id):
