@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased (1.4.0)
+## 1.4.0 (2026-10-03)
 
 - Saved Vibe sync (health `capabilities.vibes`, contract §5.5). The Lumae app
   keeps its saved Palette, Mood Compass and DNA Vibes in step across devices

@@ -104,11 +104,15 @@ def plugin_125(tmp_path, monkeypatch):
 # -- 1. version and the existing preparation attestation ----------------------
 
 
-def test_plugin_version_is_1_3_x_and_differs_from_the_1_2_5_release():
+def _version(text):
+    return tuple(int(part) for part in text.split("."))
+
+
+def test_plugin_version_is_1_3_or_later_and_differs_from_the_1_2_5_release():
     mod = load_plugin()
-    # Any 1.3.x carries the fences; a 1.2.5 worker and this source are
-    # distinguishable by the attestation.
-    assert mod.PLUGIN_VERSION.startswith("1.3.")
+    # Every release from 1.3.0 carries the fences; a 1.2.5 worker and this
+    # source are distinguishable by the attestation.
+    assert _version(mod.PLUGIN_VERSION) >= (1, 3, 0)
     with zipfile.ZipFile(ARCHIVE_125) as archive:
         assert b'PLUGIN_VERSION = "1.2.5"' in archive.read("__init__.py")
 
@@ -561,7 +565,7 @@ def test_health_reports_integrity(migrated_db, monkeypatch):
     monkeypatch.setattr(mod, "get_db", lambda: migrated_db)
     body = plugin_client(mod).get("/api/health").get_json()
     assert body["plugin_version"] == mod.PLUGIN_VERSION
-    assert mod.PLUGIN_VERSION.startswith("1.3.")
+    assert _version(mod.PLUGIN_VERSION) >= (1, 3, 0)
     integrity = body["integrity"]
     assert set(integrity) == {
         "collections_feed_ok", "profiles_unpublished_ready", "profiles_orphaned",
