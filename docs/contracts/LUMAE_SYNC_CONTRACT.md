@@ -58,6 +58,7 @@ There are three shapes. Clients must accept all three.
 | Profiles, v2 bootstrap, edges, catalogue | `{"error": "<code>", "message": "<text>"}`. The v2 bootstrap sets `message` to the same value as `error`, except when the body is too large or is JSON but not an object (`"Invalid bootstrap request."`, `__init__.py:2605-2606`). | `_catalog_error`, `__init__.py:2050-2051` |
 | Collections | `{"error": "<code or human sentence>"}`, sometimes with extra keys (`current`) | `_error`, `collection_manager.py:515-516`, plus inline `jsonify` |
 | Shelves | `{"error": "<human sentence or code>"}`, sometimes with extra keys (`order`) | `shelves.py:209, 228, 143` |
+| Vibes (1.4.0, unreleased) | `{"error": "<human sentence or code>"}`; `vibe_conflict` carries `record` | `vibes.py` (§5.5) |
 
 - Collection and shelf validation errors put a **human sentence** in `error`, for example `"Item kind must be album or track."`. Branch only on the codes listed in §5.
 - An unhandled exception is the host's HTML 500, and an unknown route is Flask's HTML 404/405. Treat an HTML body on a non-2xx status as a server error. Treat a 404 on a route this contract documents as "the plugin is older than this route".
@@ -124,6 +125,7 @@ This route always answers 200 (unless an exception occurs, or the request carrie
 | `personal_discovery` | `schema_version: 1`, `enabled`, `scope: "shared"\|"personal"`, `features: ["album_memory_context","enjoyment_feedback"]` | out of scope here; see `docs/discovery-api-v1.md` |
 | `music_metadata` | `schema_version: 1`, `enabled`, `provider: "musicbrainz"`, `daily_request_limit: 80`, `recording_membership: true` | out of scope |
 | `shelves` | `schema_version: 1`, `enabled`, `scope` | `enabled` is the collection-manager setting. `scope` is `"shared"` or `"personal"`, the caller's collections principal (§1.2); **from 1.3.0 (P3-4b)** it is `null` when the host auth method names no principal, and then every shelf, collection and personal-discovery route answers that caller 401. The same holds for `personal_discovery.scope` and `collections.scope`. |
+| `vibes` | absent in 1.3.4 and earlier. **1.4.0 (unreleased):** `schema_version: 1`, `enabled`, `scope`, `max_vibe_bytes: 65536` | Saved Vibe sync (§5.5). `enabled` and `scope` follow the `shelves` rules above. |
 | `collections` | `schema_version: 1`, `backup_version: 1`, `enabled`, `scope`. **1.3.0 adds** `feed_epoch: true` (K8, P3-4a), `contract: 2` (K9, P3-4b) and `source_scoped_items: true` (K10, P3-5a). | `collection_manager.py:18-20, 53-57`. `feed_epoch` gates the feed `epoch` echo and 410 (§5.2) and the snapshot route (§5.2a). `contract` is the collections contract a request can opt in to with the header `X-Lumae-Collections-Contract` (K9, §5.3); it also covers shelf mutations (§5.4). |
 | `catalog_mirror` | `contract_revision`, `catalog_schema_version: 3`, `analysis_schema_version: 2`, `catalog_builder_version`, `supported_core_range`, `supported_provider_types: ["navidrome"]`, `features: [...]` | `catalog_capability()`, 1753-1762. `features` is the static `CATALOG_FEATURES` list (120-162), which includes `profile_cursor_stream` and `source_scoped_profiles`. |
 | `credits` | `credits_service.capability()` | out of scope |
@@ -131,7 +133,7 @@ This route always answers 200 (unless an exception occurs, or the request carrie
 | `profile_stream` | `edge_refs: true` | **New in 1.3.0 (unreleased, K6, P3-2).** The server accepts the edge-reference opt-in on `/profiles/changes` and on v2 create (§3.7). Absent in 1.2.5. |
 | `analysis_vectors` | `generation_fallback: true`, `missing: true`, `strict_generation: true` | **New in 1.3.0 (unreleased, F9, Phase C).** `POST /api/catalog/analysis/vectors` serves a pruned generation from the current one, lists absent ids in `missing`, and accepts `strict_generation` (§3.8). Absent in 1.2.5. |
 
-**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream` (added in 1.3.0, K6), `analysis_vectors` (added in 1.3.0, F9), `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `edge_profiles.served`, `edge_profiles.stored` (both added in 1.3.0), `edge_profiles.analyzable`, `edge_profiles.worker_runtime`, `edge_profiles.server_backfill`, `edge_profiles.edge_status`, `edge_profiles.deferred_requests`, `edge_profiles.queue` (all added in 1.3.0), `collections.feed_epoch` (added in 1.3.0, P3-4a), `collections.contract` (added in 1.3.0, P3-4b), `collections.source_scoped_items`, and `lumae_analysis_profiles`.
+**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream` (added in 1.3.0, K6), `analysis_vectors` (added in 1.3.0, F9), `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `edge_profiles.served`, `edge_profiles.stored` (both added in 1.3.0), `edge_profiles.analyzable`, `edge_profiles.worker_runtime`, `edge_profiles.server_backfill`, `edge_profiles.edge_status`, `edge_profiles.deferred_requests`, `edge_profiles.queue` (all added in 1.3.0), `collections.feed_epoch` (added in 1.3.0, P3-4a), `collections.contract` (added in 1.3.0, P3-4b), `collections.source_scoped_items`, `vibes` (added in 1.4.0, unreleased, §5.5), and `lumae_analysis_profiles`.
 
 > Note: `lumae_analysis_profiles` is a **manifest** capability in `plugin.json` (with `schema_version`, `analyzer_version`, `profile_source`, `features`). It is not part of the health payload. See §9 item 1.
 
@@ -683,6 +685,37 @@ Read routes:
   - 400 for validation errors.
   - **Idempotency:** the receipt is keyed by the body `id`, scoped to (principal, catalogue). In 1.2.5 a replay returns the stored response even if the rest of the body is different; there is no fingerprint check.
   - **Receipt fingerprints (1.3.0, P3-4b).** Each new receipt also stores `request_fingerprint`, the SHA-256 of the canonical body (keys sorted, no whitespace, UTF-8). A replay with the same body returns the stored response in both modes. Another body under the same `id` returns the stored response (200, as in 1.2.5) unless the request sends **`X-Lumae-Collections-Contract: 2`** (K9, §5.3): then it is **409 `{"error":"idempotency_key_conflict"}`**, without `current`, and nothing changes. Re-read the changes feed and send the new body under a new `id`. A receipt stored before 1.3.0 has no fingerprint and replays in both modes.
+
+### 5.5 Saved Vibes (`vibes.py`, 1.4.0, unreleased)
+
+Gate: `capabilities.vibes` = `{schema_version: 1, enabled, scope, max_vibe_bytes: 65536}`. `enabled` is the collection-manager setting, as for shelves; `scope` follows the shelf rules (§2), so with `scope: null` both routes answer that caller 401. Routes answer 404 `collection_manager_disabled` when the setting is off. Data is scoped by (principal, `catalog_id`), exactly as shelves.
+
+The app owns what a Vibe means. The plugin stores the `vibe` object as sent (unknown keys kept) and never interprets the recipe, so a new recipe field needs no plugin release.
+
+- **Record:** `{id, revision, deletedAt, vibe}`.
+  - `id` is the app's Vibe id: `palette:…`, `compass_preset:…` or `dna_vibe:…`, 1–512 chars.
+  - `revision` is an integer ≥ 1.
+  - `vibe` is `{kind: "palette"|"compass"|"dna", name, createdAt?, recipe: {…}}`, or `null` exactly when `deletedAt` (the client-supplied delete time, a number) is set. Tombstones are kept forever.
+- **`GET /api/vibes/changes`.**
+  - Parameters: `catalog_id` (required, 1–512 chars), `cursor` (int ≥ 0), `limit` (1–500, default 250).
+  - Response: `{records:[…], cursor, hasMore}`, with `Cache-Control: private, no-store`.
+  - Compact like the shelf feed: each Vibe keeps only its latest record and seq. Seqs are allocated under the scope row lock (as §5.4 Ordering), so paging by `cursor` never skips a late commit.
+  - 400 for bad parameters.
+- **`POST /api/vibes/mutations?catalog_id=…`.** Body `{id, operation: "put"|"delete", vibeId, baseRevision, vibe | at}`.
+  - `id` (1–200 chars) is the receipt key.
+  - `baseRevision` (int ≥ 0) is the revision the client last saw; 0 means "no record".
+  - `put` needs `vibe`: `kind` must match the id prefix, `name` is 1–500 chars, `recipe` is an object, and the canonical `vibe` JSON is at most 65,536 bytes.
+  - `delete` needs `at` (a finite number ≥ 0).
+  - A request body over 131,072 bytes (`Content-Length`) is 400.
+  - **Revision check.** If the record's current revision (0 when absent) differs from `baseRevision`: **409 `{"error":"vibe_conflict","record":<current record or null>}`**, and nothing changes. Otherwise `put` writes the Vibe (this also restores a tombstone) and `delete` writes a tombstone. Either way the revision becomes current + 1, with a new seq.
+  - 200 `{record}`.
+  - **Receipts.** Keyed by `id` and scoped to (principal, catalogue), each with the SHA-256 fingerprint of the canonical body. A replay with the same body returns the stored 200 response. Another body under the same `id` is **409 `{"error":"idempotency_key_conflict"}`** in every mode (no contract header needed). Only 200 responses are stored. Receipts older than 30 days are deleted by the daily `collection_retention` task, after which a retried id is checked by revision instead.
+- **Provider-identity rekey.** It rewrites exact old provider ids inside stored Vibes and receipts for the rekeyed catalogue (`rekey_vibes`, called next to `rekey_shelves` in `_rekey_plugin_owned_state`), under the scope lock.
+  - A rewritten record gets a new seq, so clients receive it, but **keeps its revision**. Only the ids naming its songs changed, so a client's next write based on that revision still applies.
+- **Client rules.**
+  - Send deletes only for Vibes the user deleted, never for Vibes that are merely absent locally.
+  - Treat a 409 whose `record` equals what was sent (or is a tombstone for a delete) as success.
+  - Retry a lost response with the same `id` and the same body.
 
 ---
 

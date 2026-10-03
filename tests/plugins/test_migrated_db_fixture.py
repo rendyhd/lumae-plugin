@@ -26,6 +26,9 @@ PRODUCTION_TABLES = (
     "credits_results",
     "shelf_scopes",
     "shelf_records",
+    "vibe_scopes",
+    "vibe_records",
+    "vibe_mutations",
     "discovery_scopes",
     "discovery_records",
     "metadata_jobs",
@@ -97,6 +100,7 @@ def test_migrated_db_has_production_tables(migrated_db):
         )
         sequences = {row[0] for row in cur.fetchall()}
     assert PREFIX + "shelf_sequence" in sequences
+    assert PREFIX + "vibe_sequence" in sequences
 
 
 def test_plugin_migration_is_idempotent(migrated_db, run_plugin_migration):

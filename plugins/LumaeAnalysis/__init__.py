@@ -42,6 +42,7 @@ from .shelves import (
     purge_expired_shelf_mutations,
     register_shelf_routes,
 )
+from . import vibes
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -247,6 +248,7 @@ COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
 bp = Blueprint("lumae_analysis", __name__)
 register_collection_routes(bp)
 register_shelf_routes(bp)
+vibes.register_vibe_routes(bp)
 personal_discovery.register_routes(bp)
 music_metadata.register_routes(bp)
 credits_service.register_routes(bp)
@@ -559,7 +561,7 @@ def ensure_analysis_projection_schedule(db):
 
 
 def ensure_collection_retention_schedule(db):
-    """Daily bounded cleanup of expired collection and shelf receipts and
+    """Daily bounded cleanup of expired collection, shelf and Vibe receipts and
     abandoned restore progress (F2). Enabled on install; an administrator's
     later change to the row is kept."""
     cur = db.cursor()
@@ -1251,6 +1253,7 @@ def collection_retention_task():
         mutations_deleted = purge_expired_collection_mutations(db)
         restores_deleted = purge_stale_collection_restores(db)
         shelf_deleted = purge_expired_shelf_mutations(db)
+        vibe_deleted = vibes.purge_expired_vibe_mutations(db)
     except Exception:
         _rollback_if_possible(db)
         logger.exception("lumae_analysis collection retention cleanup failed")
@@ -1260,6 +1263,7 @@ def collection_retention_task():
         "collection_mutations_deleted": mutations_deleted,
         "collection_restores_deleted": restores_deleted,
         "shelf_mutations_deleted": shelf_deleted,
+        "vibe_mutations_deleted": vibe_deleted,
     }
 
 
@@ -1637,6 +1641,7 @@ def migrate(db):
     refresh_integrity_snapshot(db)
     refresh_status_summaries(db)
     migrate_shelves(db)
+    vibes.migrate_vibes(db)
     personal_discovery.migrate(db)
     music_metadata.migrate(db)
     music_metadata.ensure_schedule(db)
@@ -2482,6 +2487,7 @@ def health():
                     "enabled": collections_enabled(),
                     "scope": health_scope_mode(),
                 },
+                "vibes": vibes.capability(collections_enabled(), health_scope_mode()),
                 "collections": {
                     "schema_version": COLLECTIONS_SCHEMA_VERSION,
                     "backup_version": COLLECTIONS_BACKUP_VERSION,

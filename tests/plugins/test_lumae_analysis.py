@@ -223,6 +223,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
             "personal_discovery": {"schema_version": 1, "enabled": False, "scope": "shared", "features": ["album_memory_context", "enjoyment_feedback"]},
             "music_metadata": {"schema_version": 1, "enabled": True, "provider": "musicbrainz", "daily_request_limit": 80, "recording_membership": True},
             "shelves": {"schema_version": 1, "enabled": False, "scope": "shared"},
+            "vibes": {"schema_version": 1, "enabled": False, "scope": "shared", "max_vibe_bytes": 65536},
             "collections": {
                 "schema_version": 1,
                 "backup_version": 1,

@@ -7,6 +7,21 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased (1.4.0)
+
+- Saved Vibe sync (health `capabilities.vibes`, contract §5.5). The Lumae app
+  keeps its saved Palette, Mood Compass and DNA Vibes in step across devices
+  through `GET /api/vibes/changes` and `POST /api/vibes/mutations`, scoped by
+  account and catalogue like Album Shelf and switched on by the same Living
+  Collections setting. Each Vibe is one compact record with a revision: a
+  write based on an older revision is refused with the current record
+  (`vibe_conflict`), so two devices never overwrite each other silently, and
+  deletes are tombstones every device learns about. The plugin stores the
+  Vibe as the app sends it (at most 64 KB) and never interprets the recipe.
+  Receipts replay a lost response and expire after 30 days with the shelf
+  receipts; a provider-identity rekey rewrites song ids inside stored Vibes
+  without changing their revision.
+
 ## 1.3.4 (2026-10-02)
 
 - A retried profile-bootstrap create adopts the snapshot its own earlier
