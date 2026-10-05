@@ -127,7 +127,7 @@ This route always answers 200 (unless an exception occurs, or the request carrie
 | `music_metadata` | `schema_version: 1`, `enabled`, `provider: "musicbrainz"`, `daily_request_limit: 80`, `recording_membership: true` | out of scope |
 | `shelves` | `schema_version: 1`, `enabled`, `scope` | `enabled` is the collection-manager setting. `scope` is `"shared"` or `"personal"`, the caller's collections principal (§1.2); **from 1.3.0 (P3-4b)** it is `null` when the host auth method names no principal, and then every shelf, collection and personal-discovery route answers that caller 401. The same holds for `personal_discovery.scope` and `collections.scope`. |
 | `vibes` | absent in 1.3.4 and earlier. **1.4.0:** `schema_version: 1`, `enabled`, `scope`, `max_vibe_bytes: 65536` | Saved Vibe sync (§5.5). `enabled` and `scope` follow the `shelves` rules above. |
-| `covers` | absent in 1.4.0 and earlier. **1.5.0 (unreleased):** `schema_version: 1`, `enabled`, `scope`, `max_cover_bytes: 4096`, `max_image_bytes: 524288`, `image_types: ["image/jpeg","image/png","image/webp"]` | Custom covers (§5.6). `enabled` and `scope` follow the `shelves` rules above. |
+| `covers` | absent in 1.4.0 and earlier. **1.5.0:** `schema_version: 1`, `enabled`, `scope`, `max_cover_bytes: 4096`, `max_image_bytes: 524288`, `image_types: ["image/jpeg","image/png","image/webp"]` | Custom covers (§5.6). `enabled` and `scope` follow the `shelves` rules above. |
 | `collections` | `schema_version: 1`, `backup_version: 1`, `enabled`, `scope`. **1.3.0 adds** `feed_epoch: true` (K8, P3-4a), `contract: 2` (K9, P3-4b) and `source_scoped_items: true` (K10, P3-5a). | `collection_manager.py:18-20, 53-57`. `feed_epoch` gates the feed `epoch` echo and 410 (§5.2) and the snapshot route (§5.2a). `contract` is the collections contract a request can opt in to with the header `X-Lumae-Collections-Contract` (K9, §5.3); it also covers shelf mutations (§5.4). |
 | `catalog_mirror` | `contract_revision`, `catalog_schema_version: 3`, `analysis_schema_version: 2`, `catalog_builder_version`, `supported_core_range`, `supported_provider_types: ["navidrome"]`, `features: [...]` | `catalog_capability()`, 1753-1762. `features` is the static `CATALOG_FEATURES` list (120-162), which includes `profile_cursor_stream` and `source_scoped_profiles`. |
 | `credits` | `credits_service.capability()` | out of scope |
@@ -719,7 +719,7 @@ The app owns what a Vibe means. The plugin stores the `vibe` object as sent (unk
   - Treat a 409 whose `record` equals what was sent (or is a tombstone for a delete) as success.
   - Retry a lost response with the same `id` and the same body.
 
-### 5.6 Custom covers (`covers.py`, 1.5.0, unreleased)
+### 5.6 Custom covers (`covers.py`, 1.5.0)
 
 Gate: `capabilities.covers` (§2). Data is scoped by (principal, `catalog_id`) and switched by the collection-manager setting, exactly as saved Vibes (§5.5); with `scope: null` every route answers that caller 401, and every route answers 404 `collection_manager_disabled` when the setting is off.
 

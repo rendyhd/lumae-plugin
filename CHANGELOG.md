@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased (1.5.0)
+## 1.5.0 (2026-10-05)
 
 - Custom covers (health `capabilities.covers`, contract §5.6). The Lumae app
   and Lumae Radio keep the cover a person chose for a saved Vibe, a Living

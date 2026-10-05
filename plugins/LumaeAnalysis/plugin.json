@@ -111,6 +111,14 @@
   },
   "versions": [
     {
+      "version": "1.5.0",
+      "min_core_version": "3.2.0",
+      "changelog": "Custom covers: the Lumae app and Lumae Radio keep the cover a person chose for a saved Vibe, a Living Collection or a playlist in step through GET /api/covers/changes and POST /api/covers/mutations: an album from inside it, an orb colour or a photo. Covers are revisioned records scoped by account and catalogue like saved Vibes, and a delete means back to the automatic cover. Photos go to a small image store (POST /api/covers/images, GET /api/covers/image): JPEG, PNG or WebP up to 512 KB, named by their SHA-256; an image no cover uses is deleted after two days. Health advertises capabilities.covers.",
+      "imageUrl": "",
+      "checksum": "4157951f3f138c842e21db6db6c58df0",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.5.0.zip"
+    },
+    {
       "version": "1.4.0",
       "min_core_version": "3.2.0",
       "changelog": "Saved Vibe sync: the Lumae app keeps its saved Palette, Mood Compass and DNA Vibes in step across devices through GET /api/vibes/changes and POST /api/vibes/mutations, scoped by account and catalogue like Album Shelf and switched on by the Living Collections setting. Writes are revision-checked (409 vibe_conflict with the current record), deletes are tombstones, and receipts replay a lost response for 30 days. Health advertises capabilities.vibes.",
