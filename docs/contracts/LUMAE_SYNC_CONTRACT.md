@@ -59,6 +59,7 @@ There are three shapes. Clients must accept all three.
 | Collections | `{"error": "<code or human sentence>"}`, sometimes with extra keys (`current`) | `_error`, `collection_manager.py:515-516`, plus inline `jsonify` |
 | Shelves | `{"error": "<human sentence or code>"}`, sometimes with extra keys (`order`) | `shelves.py:209, 228, 143` |
 | Vibes (1.4.0) | `{"error": "<human sentence or code>"}`; `vibe_conflict` carries `record` | `vibes.py` (§5.5) |
+| Covers (1.5.0) | `{"error": "<human sentence or code>"}`; `cover_conflict` carries `record`, `cover_image_missing` carries `imageId` | `covers.py` (§5.6) |
 
 - Collection and shelf validation errors put a **human sentence** in `error`, for example `"Item kind must be album or track."`. Branch only on the codes listed in §5.
 - An unhandled exception is the host's HTML 500, and an unknown route is Flask's HTML 404/405. Treat an HTML body on a non-2xx status as a server error. Treat a 404 on a route this contract documents as "the plugin is older than this route".
@@ -126,6 +127,7 @@ This route always answers 200 (unless an exception occurs, or the request carrie
 | `music_metadata` | `schema_version: 1`, `enabled`, `provider: "musicbrainz"`, `daily_request_limit: 80`, `recording_membership: true` | out of scope |
 | `shelves` | `schema_version: 1`, `enabled`, `scope` | `enabled` is the collection-manager setting. `scope` is `"shared"` or `"personal"`, the caller's collections principal (§1.2); **from 1.3.0 (P3-4b)** it is `null` when the host auth method names no principal, and then every shelf, collection and personal-discovery route answers that caller 401. The same holds for `personal_discovery.scope` and `collections.scope`. |
 | `vibes` | absent in 1.3.4 and earlier. **1.4.0:** `schema_version: 1`, `enabled`, `scope`, `max_vibe_bytes: 65536` | Saved Vibe sync (§5.5). `enabled` and `scope` follow the `shelves` rules above. |
+| `covers` | absent in 1.4.0 and earlier. **1.5.0 (unreleased):** `schema_version: 1`, `enabled`, `scope`, `max_cover_bytes: 4096`, `max_image_bytes: 524288`, `image_types: ["image/jpeg","image/png","image/webp"]` | Custom covers (§5.6). `enabled` and `scope` follow the `shelves` rules above. |
 | `collections` | `schema_version: 1`, `backup_version: 1`, `enabled`, `scope`. **1.3.0 adds** `feed_epoch: true` (K8, P3-4a), `contract: 2` (K9, P3-4b) and `source_scoped_items: true` (K10, P3-5a). | `collection_manager.py:18-20, 53-57`. `feed_epoch` gates the feed `epoch` echo and 410 (§5.2) and the snapshot route (§5.2a). `contract` is the collections contract a request can opt in to with the header `X-Lumae-Collections-Contract` (K9, §5.3); it also covers shelf mutations (§5.4). |
 | `catalog_mirror` | `contract_revision`, `catalog_schema_version: 3`, `analysis_schema_version: 2`, `catalog_builder_version`, `supported_core_range`, `supported_provider_types: ["navidrome"]`, `features: [...]` | `catalog_capability()`, 1753-1762. `features` is the static `CATALOG_FEATURES` list (120-162), which includes `profile_cursor_stream` and `source_scoped_profiles`. |
 | `credits` | `credits_service.capability()` | out of scope |
@@ -133,7 +135,7 @@ This route always answers 200 (unless an exception occurs, or the request carrie
 | `profile_stream` | `edge_refs: true` | **New in 1.3.0 (unreleased, K6, P3-2).** The server accepts the edge-reference opt-in on `/profiles/changes` and on v2 create (§3.7). Absent in 1.2.5. |
 | `analysis_vectors` | `generation_fallback: true`, `missing: true`, `strict_generation: true` | **New in 1.3.0 (unreleased, F9, Phase C).** `POST /api/catalog/analysis/vectors` serves a pruned generation from the current one, lists absent ids in `missing`, and accepts `strict_generation` (§3.8). Absent in 1.2.5. |
 
-**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream` (added in 1.3.0, K6), `analysis_vectors` (added in 1.3.0, F9), `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `edge_profiles.served`, `edge_profiles.stored` (both added in 1.3.0), `edge_profiles.analyzable`, `edge_profiles.worker_runtime`, `edge_profiles.server_backfill`, `edge_profiles.edge_status`, `edge_profiles.deferred_requests`, `edge_profiles.queue` (all added in 1.3.0), `collections.feed_epoch` (added in 1.3.0, P3-4a), `collections.contract` (added in 1.3.0, P3-4b), `collections.source_scoped_items`, `vibes` (added in 1.4.0, §5.5), and `lumae_analysis_profiles`.
+**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream` (added in 1.3.0, K6), `analysis_vectors` (added in 1.3.0, F9), `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `edge_profiles.served`, `edge_profiles.stored` (both added in 1.3.0), `edge_profiles.analyzable`, `edge_profiles.worker_runtime`, `edge_profiles.server_backfill`, `edge_profiles.edge_status`, `edge_profiles.deferred_requests`, `edge_profiles.queue` (all added in 1.3.0), `collections.feed_epoch` (added in 1.3.0, P3-4a), `collections.contract` (added in 1.3.0, P3-4b), `collections.source_scoped_items`, `vibes` (added in 1.4.0, §5.5), `covers` (added in 1.5.0, §5.6), and `lumae_analysis_profiles`.
 
 > Note: `lumae_analysis_profiles` is a **manifest** capability in `plugin.json` (with `schema_version`, `analyzer_version`, `profile_source`, `features`). It is not part of the health payload. See §9 item 1.
 
@@ -716,6 +718,28 @@ The app owns what a Vibe means. The plugin stores the `vibe` object as sent (unk
   - Send deletes only for Vibes the user deleted, never for Vibes that are merely absent locally.
   - Treat a 409 whose `record` equals what was sent (or is a tombstone for a delete) as success.
   - Retry a lost response with the same `id` and the same body.
+
+### 5.6 Custom covers (`covers.py`, 1.5.0, unreleased)
+
+Gate: `capabilities.covers` (§2). Data is scoped by (principal, `catalog_id`) and switched by the collection-manager setting, exactly as saved Vibes (§5.5); with `scope: null` every route answers that caller 401, and every route answers 404 `collection_manager_disabled` when the setting is off.
+
+A cover is the person's choice of picture for a saved Vibe, a Living Collection or a provider playlist. It lives apart from the Vibe record on purpose: other clients rewrite Vibes with only their recipe, collections drop unknown fields, and the plugin keeps no playlist store.
+
+- **Record:** `{id, revision, deletedAt, cover}`.
+  - `id` names the target, 1–600 chars: `vibe:<Vibe id>` (the Vibe id has a `palette:`, `compass_preset:` or `dna_vibe:` prefix), `collection:<collection id>` or `playlist:<provider playlist id>`.
+  - `cover` is an object with a `type` (1–32 chars), or `null` exactly when `deletedAt` is set. A tombstone means "back to the automatic cover"; tombstones are kept forever.
+  - Known types are checked; any other type is stored as sent, so a new type needs no plugin release:
+    - `{type:"album", itemId}`: the cover art of a catalogue album or track id (1–256 chars).
+    - `{type:"color", color:"#RRGGBB"}`.
+    - `{type:"photo", imageId, width?, height?}`: `imageId` is 64 lowercase hex characters naming an image in the same scope; `width` and `height`, when present, are integers 1–20,000.
+  - The canonical cover JSON is at most 4,096 bytes.
+- **`GET /api/covers/changes`** and **`POST /api/covers/mutations?catalog_id=…`** follow §5.5 exactly, with `coverId` for `vibeId`, `cover` for `vibe` and `cover_conflict` for `vibe_conflict`: a compact feed by seq (`{records, cursor, hasMore}`, `limit` 1–500), revision-checked `put` and `delete` (`baseRevision`, 409 with the current record), and receipts that replay a lost response, bind their body (409 `idempotency_key_conflict`) and expire after 30 days. A mutation body over 16,384 bytes (`Content-Length`) is 400.
+  - **A photo needs its image first.** A `put` whose cover is a `photo` with an `imageId` the scope does not hold is **409 `{"error":"cover_image_missing","imageId":…}`**, checked under the scope lock, and nothing changes. No receipt is stored, so the same mutation applies once the image is uploaded.
+- **`POST /api/covers/images?catalog_id=…`.** The body is the raw image; `Content-Type` is `image/jpeg`, `image/png` or `image/webp` and must match the bytes (else 415). At most 524,288 bytes, bounded on `Content-Length` and on the read itself (else 413); an empty body is 400. The id is the lowercase SHA-256 of the bytes, so uploading the same image again is idempotent (and restarts its retention grace). 200 `{imageId, contentType, bytes}`. A scope holds at most 2,000 images: a new one beyond that is 409 `cover_image_quota`.
+- **`GET /api/covers/image?catalog_id=…&id=…`.** The image bytes with their stored type, `Cache-Control: private, max-age=31536000, immutable`, `ETag: "<id>"` (`If-None-Match` answers 304) and `X-Content-Type-Options: nosniff`. 400 for a malformed id, 404 `cover_image_not_found` when the scope holds no such image. The id is a query parameter so clients with fixed-path transports can fetch it.
+- **Retention** (daily `collection_retention_task`): cover receipts expire after 30 days, and an image that no live cover in its scope names is deleted once it is 2 days old. A client whose queued write meets `cover_image_missing` uploads the image again and retries.
+- **Provider-identity rekey** rewrites exact old provider ids inside stored covers and receipts (an `album` cover's `itemId`), with a new seq and the same revision, as §5.5.
+- **Client rules.** Send a delete only when the person chose the automatic cover again. Treat a 409 whose `record` equals what was sent (or is a tombstone for a delete) as success. Retry a lost response with the same `id` and body.
 
 ---
 

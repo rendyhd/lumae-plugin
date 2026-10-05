@@ -224,6 +224,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
             "music_metadata": {"schema_version": 1, "enabled": True, "provider": "musicbrainz", "daily_request_limit": 80, "recording_membership": True},
             "shelves": {"schema_version": 1, "enabled": False, "scope": "shared"},
             "vibes": {"schema_version": 1, "enabled": False, "scope": "shared", "max_vibe_bytes": 65536},
+            "covers": {"schema_version": 1, "enabled": False, "scope": "shared", "max_cover_bytes": 4096, "max_image_bytes": 524288, "image_types": ["image/jpeg", "image/png", "image/webp"]},
             "collections": {
                 "schema_version": 1,
                 "backup_version": 1,

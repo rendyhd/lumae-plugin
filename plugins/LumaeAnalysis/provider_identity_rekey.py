@@ -342,8 +342,10 @@ def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings):
     # collection receipts are history and are never rewritten (P3-4c).
     from .shelves import rekey_shelves
     from .vibes import rekey_vibes
+    from .covers import rekey_covers
     rekey_shelves(cur, catalog_instance_id, exact)
     rekey_vibes(cur, catalog_instance_id, exact)
+    rekey_covers(cur, catalog_instance_id, exact)
 
 
 def _rekey_collections(cur, catalog_instance_id, mappings):

@@ -716,7 +716,7 @@ def test_health_answers_200_with_a_null_scope_for_an_unknown_auth_method(monkeyp
 
     app.register_blueprint(mod.bp)
     client = app.test_client()
-    scoped = ("collections", "shelves", "vibes", "personal_discovery")
+    scoped = ("collections", "shelves", "vibes", "covers", "personal_discovery")
 
     def health(headers):
         response = client.get("/api/health", headers=headers)
@@ -742,6 +742,8 @@ def test_health_answers_200_with_a_null_scope_for_an_unknown_auth_method(monkeyp
         assert client.get("/api/shelves/changes?catalog_id=catalog-a",
                           headers=headers).status_code == 401
         assert client.get("/api/vibes/changes?catalog_id=catalog-a",
+                          headers=headers).status_code == 401
+        assert client.get("/api/covers/changes?catalog_id=catalog-a",
                           headers=headers).status_code == 401
     # A malformed session keeps its 1.2.5 answer on health.
     assert client.get("/api/health", headers={"X-Auth-Method": "session"}).status_code == 401

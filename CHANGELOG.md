@@ -7,6 +7,22 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased (1.5.0)
+
+- Custom covers (health `capabilities.covers`, contract §5.6). The Lumae app
+  and Lumae Radio keep the cover a person chose for a saved Vibe, a Living
+  Collection or a playlist in step through `GET /api/covers/changes` and
+  `POST /api/covers/mutations`: an album from inside it, an orb colour or a
+  photo. Covers are revisioned records scoped by account and catalogue like
+  saved Vibes, kept apart from the Vibe record so a client that rewrites a
+  recipe cannot erase them; a delete means "back to the automatic cover".
+  Photos go to a small image store (`POST /api/covers/images`, `GET
+  /api/covers/image`): JPEG, PNG or WebP up to 512 KB, named by their SHA-256
+  so an upload is idempotent, at most 2,000 per scope, served with an
+  immutable cache. A cover can name a photo only once it is stored; an image
+  no cover uses is deleted after two days. Receipts expire with the Vibe
+  receipts, and a provider-identity rekey rewrites album ids inside covers.
+
 ## 1.4.0 (2026-10-03)
 
 - Saved Vibe sync (health `capabilities.vibes`, contract §5.5). The Lumae app
