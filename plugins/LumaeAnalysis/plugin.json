@@ -112,6 +112,14 @@
   },
   "versions": [
     {
+      "version": "1.6.0",
+      "min_core_version": "3.2.0",
+      "changelog": "Jellyfin: Lumae Analysis mirrors a Jellyfin 12.0 or later library next to Navidrome (supported_provider_types jellyfin and navidrome), reading each music library inside the bound AudioMuse server with that server's own credentials, and binds each Jellyfin catalogue to its server Id from /System/Info/Public: another server, product, release or server type blocks the catalogue and is never adopted. Health adds provider_server_id and provider_version per source. A moved, renamed or re-cased Jellyfin file keeps its identity: a missing track is held for 14 days and, when AudioMuse maps a new ID to the same content fingerprint, the move is published as an atomic provider_identity_rekey_v2 (journal rekeys and a manifest; collections, shelves, Vibes, covers and profiles follow). Tags Jellyfin does not expose (release type, compilation, explicit, credits with roles, ISRC, disc subtitle, original date, ReplayGain gains and peaks, BPM, sort names) are read from the original files and published under the OpenSubsonic keys Navidrome uses. Health keeps every applied rekey (last_applied_transition_id and retained_transitions) and each v2 manifest names its previous_transition_id. Emby and Lyrion are removed. Navidrome behaviour is unchanged.",
+      "imageUrl": "",
+      "checksum": "d460866db6f9217490ba400d51ce12b0",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.6.0.zip"
+    },
+    {
       "version": "1.5.0",
       "min_core_version": "3.2.0",
       "changelog": "Custom covers: the Lumae app and Lumae Radio keep the cover a person chose for a saved Vibe, a Living Collection or a playlist in step through GET /api/covers/changes and POST /api/covers/mutations: an album from inside it, an orb colour or a photo. Covers are revisioned records scoped by account and catalogue like saved Vibes, and a delete means back to the automatic cover. Photos go to a small image store (POST /api/covers/images, GET /api/covers/image): JPEG, PNG or WebP up to 512 KB, named by their SHA-256; an image no cover uses is deleted after two days. Health advertises capabilities.covers.",

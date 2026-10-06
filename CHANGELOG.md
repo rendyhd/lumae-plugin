@@ -7,7 +7,13 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased (1.6.0)
+## 1.6.0 (2026-10-06)
+
+Jellyfin. The plugin mirrors a Jellyfin 12.0+ library next to Navidrome,
+keeps a moved Jellyfin file's identity through fingerprint rekeys, and fills
+in the tags Jellyfin does not expose from the original files. Emby and
+Lyrion are gone. Navidrome behaviour is unchanged. Minimum AudioMuse core
+stays 3.2.0 (per-server Jellyfin access with `Authorization: MediaBrowser`).
 
 - Emby and Lyrion are gone. Neither was ever admitted as a Lumae catalogue
   source; their dormant catalogue readers and the Emby and Lyrion stream and

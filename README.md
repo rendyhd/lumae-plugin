@@ -180,6 +180,14 @@ the whole object back — the POST replaces every stored setting.
   such a type stays hidden. A Jellyfin catalogue is bound to its server `Id`
   (`/System/Info/Public`); another server is never adopted as the same
   catalogue, and a catalogue never changes server type.
+* **Jellyfin operator notes (1.6.0):** AudioMuse lists Jellyfin libraries
+  through `/Library/VirtualFolders`, which needs an administrator account or
+  API key, and AudioMuse's own analysis downloads `/Items/{id}/Download`,
+  which needs the account's "allow media downloading" permission. A moved or
+  renamed file keeps its identity through a fingerprint rekey
+  (`provider_identity_rekey_v2`, contract §2.2); tags Jellyfin does not
+  expose are read from the original files, with `mutagen` when it is
+  installed and PyAV otherwise (contract §2.3).
 * **Old clients against a 1.3.0 server:** every 1.3.0 change is additive or
   opt-in; a client that ignores unknown health and response keys sees 1.2.5
   behaviour byte-for-byte. See "Keys that do not exist in 1.2.5" in
