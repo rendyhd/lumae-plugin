@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased (1.5.1)
+## 1.5.1 (2026-10-06)
 
 - MusicBrainz lookups (`/api/music_metadata/prepare`) run on the catalogue
   watchdog instead of their own every-minute cron task. That task fired
