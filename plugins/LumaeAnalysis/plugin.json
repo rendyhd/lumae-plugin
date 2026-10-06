@@ -2,7 +2,7 @@
   "id": "lumae_analysis",
   "name": "Lumae Analysis",
   "author": "Lumae",
-  "description": "Mirrors supported Navidrome catalogues and prepares Lumae volume, SmoothFade, album-similarity, and artist-similarity data away from the phone.",
+  "description": "Mirrors supported Navidrome and Jellyfin catalogues and prepares Lumae volume, SmoothFade, album-similarity, and artist-similarity data away from the phone.",
   "requirements": [],
   "capabilities": {
     "lumae_analysis_profiles": {
@@ -41,6 +41,7 @@
       "catalog_builder_version": 5,
       "supported_core_range": ">=2.6.0,<4.0.0",
       "supported_provider_types": [
+        "jellyfin",
         "navidrome"
       ],
       "features": [

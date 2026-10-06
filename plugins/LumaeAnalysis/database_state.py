@@ -31,6 +31,7 @@ from .profile_publication import (
     backfill_due_sql,
     scheduler_params,
 )
+from .catalog_providers import provider_display_name
 from .redaction import redact_error_text
 
 # Per statement, from the plugin setting ``diagnostic_statement_timeout_ms``.
@@ -1119,6 +1120,7 @@ def _source_html(source):
     readiness = source["readiness"]
     entity_counts = catalog.get("entity_counts") or {}
     tracks = _catalogue_track_count(source)
+    server_kind = escape(provider_display_name(identity.get("provider_type")))
     albums = entity_counts.get("album") or entity_counts.get("albums") or 0
     artists = entity_counts.get("artist") or entity_counts.get("artists") or 0
     libraries = entity_counts.get("library") or entity_counts.get("libraries") or 0
@@ -1133,11 +1135,11 @@ def _source_html(source):
     if empty_catalogue:
         catalogue_state = "empty - not ready"
         sonic_state = "blocked by empty catalogue"
-        catalogue_notice = """
+        catalogue_notice = f"""
           <div class="db-alert db-alert-danger" role="alert">
-            <strong>No Navidrome tracks were published.</strong>
+            <strong>No {server_kind} tracks were published.</strong>
             <span>This catalogue is not usable by Lumae even though the previous publication job
-              recorded “complete.” Check Navidrome access and the Music Libraries selection in
+              recorded “complete.” Check {server_kind} access and the Music Libraries selection in
               AudioMuse, then return to settings and refresh required data.</span>
           </div>
         """
@@ -1228,7 +1230,7 @@ def _source_html(source):
 
         <section class="db-section">
           <div class="db-section-heading">
-            <div><span class="db-kicker">Required for app sync</span><h3>1. Navidrome catalogue</h3></div>
+            <div><span class="db-kicker">Required for app sync</span><h3>1. {server_kind} catalogue</h3></div>
             <span class="db-state {'db-state-danger' if empty_catalogue else ''}">{escape(catalogue_state)}</span>
           </div>
           {catalogue_notice}
@@ -1403,14 +1405,14 @@ def render_database_state(snapshot):
     total_errors = len(snapshot_errors) + recorded_state_errors
     if empty_sources:
         names = ", ".join(
-            escape(str((row.get("identity") or {}).get("name") or "Navidrome"))
+            escape(str((row.get("identity") or {}).get("name") or "Music server"))
             for row in empty_sources
         )
         readiness_notice = f"""
           <section class="db-alert db-alert-danger" role="alert">
             <strong>Lumae is not ready: the published catalogue is empty.</strong>
             <span>{names} contains zero published tracks. A completed empty publication is not
-              usable. Check Navidrome access and AudioMuse Music Libraries, then return to settings
+              usable. Check the music server's access and AudioMuse Music Libraries, then return to settings
               and refresh required data.</span>
           </section>
         """

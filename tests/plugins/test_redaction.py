@@ -18,6 +18,19 @@ redact = redaction.redact_error_text
 
 # Review findings on the first redactor (MEDIUM-1, MEDIUM-2, L1, L2).
 NEW_SECRET_SHAPES = [
+    # Jellyfin's MediaBrowser scheme quotes its token (1.6.0, JF.8).
+    (
+        'GET /Items failed: Authorization: MediaBrowser Token="jf12tok" (401)',
+        ["jf12tok"],
+        "Authorization: [redacted] (401)",
+    ),
+    (
+        'Authorization: MediaBrowser Client="Lumae", Device="Phone", DeviceId="d-1", '
+        'Version="1.6", Token="jf12tok" then retried',
+        ["jf12tok", "d-1"],
+        "Authorization: [redacted] then retried",
+    ),
+    ('header MediaBrowser Token="jf12tok" sent', ["jf12tok"], "MediaBrowser Token=[redacted] sent"),
     # A secret split across lines is matched after whitespace is collapsed.
     (
         "request failed: Authorization:\n  Bearer\n  abc123def456 (401)",
@@ -316,7 +329,8 @@ def _best_of(runs, action):
 ADVERSARIAL_PREFIXED = [
     ("?", "token."), ("&", "secret-"), ("?t", "a"), ("password=", "a."), ('password="', "a"),
     ("token: '", "a "), ("https://", "a."), ("https://", "a "), ("a", "a."),
-    ("Bearer ", "a"), ("Authorization: ", "a"), ("cookie=", "a;"), ("'/", "a "),
+    ("Bearer ", "a"), ("Authorization: ", "a"), ("Authorization: MediaBrowser a=\"", "a"),
+    ("Authorization: ", 'a="a", '), ("cookie=", "a;"), ("'/", "a "),
     ('"/', "a'"), ("'/", "a\\"), ("/", "a/"), ("~/", "a:"), ("C:\\", "a"),
     ("\\\\", "a\\"), ("file://", "a"), ("eyJ", "a-"), ("eyJaaaa.", "a"), ("sk-", "a"),
     ("AKIA", "A"),

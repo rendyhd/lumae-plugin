@@ -15,12 +15,14 @@ inverted ``probes/collections/explain_editions.py``). Art and stream of a
 mixed-catalogue collection follow each item's catalogue.
 """
 
+from contextlib import contextmanager
 import importlib
 import json
 import pathlib
 import re
 
 import pytest
+from types import SimpleNamespace
 
 from test_collection_feed_epoch_postgres import (  # noqa: F401 (fixture)
     _normalized,
@@ -238,23 +240,101 @@ def test_two_active_sources_require_an_explicit_catalogue(workbench, monkeypatch
     assert workbench.call("GET", _with(f"{LIBRARY}/stats", "catalog-a")).status_code == 404
 
 
-def test_stream_and_art_take_the_provider_from_the_source_row(workbench, monkeypatch):
+class _BoundJellyfin:
+    """An AudioMuse Jellyfin module whose helpers answer for one bound server."""
+
+    def __init__(self, base, token):
+        self.base, self.token = base, token
+
+    def _jellyfin_base_url(self):
+        return self.base
+
+    def _jellyfin_headers_from_creds(self):
+        return {"Authorization": f'MediaBrowser Token="{self.token}"'}
+
+    def _jellyfin_user_id(self):
+        return "user-1"
+
+
+class _BoundNavidrome:
+    def __init__(self, url, user):
+        self.context = SimpleNamespace(active_creds=lambda _creds: {
+            "url": url, "user": user, "password": "pw", "api_key": ""})
+
+    @staticmethod
+    def _auth_kwargs_from_creds(creds):
+        return {"username": creds["user"], "password": creds["password"], "api_key": ""}
+
+    @staticmethod
+    def get_navidrome_auth_params(username=None, password=None, api_key=None):
+        return {"u": username, "t": "token", "s": "salt"}
+
+    @staticmethod
+    def _navidrome_request(endpoint, params=None):
+        return {"song": {"coverArt": f"cover-{params['id']}"}}
+
+
+class _PerServerBridge:
+    """``bound_module`` per AudioMuse server: each server's own credentials."""
+
+    def __init__(self, modules, bound):
+        self.modules, self.bound = modules, bound
+
+    @contextmanager
+    def bound_module(self, server_id):
+        self.bound.append(server_id)
+        provider_type, module = self.modules[server_id]
+        yield {"server_id": server_id, "provider_type": provider_type}, module
+
+
+def test_stream_and_art_use_each_sources_own_server_credentials(workbench, monkeypatch):
+    """JF.8: the provider comes from the source row (K10) and the URL and
+    credentials from that source's own AudioMuse server, never the host's
+    legacy globals."""
     _two_sources(workbench)
     library = workbench.library
     for name, value in (("MEDIASERVER_TYPE", "plex"), ("PLEX_URL", "http://plex"),
-                        ("JELLYFIN_URL", "http://jellyfin"), ("HEADERS", {})):
+                        ("NAVIDROME_URL", "http://global-navidrome"),
+                        ("JELLYFIN_URL", "http://global-jellyfin"),
+                        ("HEADERS", {"Authorization": "global-secret"})):
         monkeypatch.setattr(library.config, name, value, raising=False)
+    bound = []
+    servers = {
+        "server-catalog-a": ("navidrome", _BoundNavidrome("http://nav-a/", "alice")),
+        "server-catalog-b": ("jellyfin", _BoundJellyfin("http://jf-b/", "token-b")),
+    }
+    monkeypatch.setattr(library, "_provider_bridge", lambda: _PerServerBridge(servers, bound))
     targets = []
     monkeypatch.setattr(library, "_proxy_stream",
                         lambda target: targets.append(target) or (None, ("stopped", 502)))
     monkeypatch.setattr(library, "_proxy_art", lambda target: targets.append(target))
-    stream = workbench.call("GET", _with(f"{LIBRARY}/stream/al-kid-t1", "catalog-b"))
-    art = workbench.call("GET", _with(f"{LIBRARY}/art/al-kid-t1?size=100", "catalog-b"))
-    assert (stream.status_code, art.status_code) == (502, 404)
-    assert [url for url, _, _ in targets] == [
-        "http://jellyfin/Items/al-kid-t1/Download",
-        "http://jellyfin/Items/al-kid-t1/Images/Primary",
+    for catalog in ("catalog-b", "catalog-a"):
+        stream = workbench.call("GET", _with(f"{LIBRARY}/stream/al-kid-t1", catalog))
+        art = workbench.call("GET", _with(f"{LIBRARY}/art/al-kid-t1?size=100", catalog))
+        assert (stream.status_code, art.status_code) == (502, 404)
+    assert bound == ["server-catalog-b"] * 2 + ["server-catalog-a"] * 2
+    assert targets == [
+        ("http://jf-b/Audio/al-kid-t1/stream",
+         {"Authorization": 'MediaBrowser Token="token-b"'}, {"static": "true"}),
+        ("http://jf-b/Items/al-kid-t1/Images/Primary",
+         {"Authorization": 'MediaBrowser Token="token-b"'}, {"maxWidth": 100, "quality": 90}),
+        ("http://nav-a/rest/stream.view", {},
+         {"id": "al-kid-t1", "u": "alice", "t": "token", "s": "salt"}),
+        ("http://nav-a/rest/getCoverArt.view", {},
+         {"id": "cover-al-kid-t1", "size": 100, "u": "alice", "t": "token", "s": "salt"}),
     ]
+    assert "global" not in json.dumps(targets)
+
+
+def test_stream_refuses_a_server_whose_type_changed(workbench, monkeypatch):
+    _two_sources(workbench)
+    library = workbench.library
+    servers = {"server-catalog-b": ("navidrome", _BoundNavidrome("http://nav/", "bob"))}
+    monkeypatch.setattr(library, "_provider_bridge", lambda: _PerServerBridge(servers, []))
+    monkeypatch.setattr(library, "_proxy_stream", lambda target: pytest.fail("streamed"))
+    response = workbench.call("GET", _with(f"{LIBRARY}/stream/al-kid-t1", "catalog-b"))
+    assert response.status_code == 409
+    assert response.get_json() == {"error": "provider_type_changed"}
 
 
 def _items(db, manager):
@@ -514,9 +594,11 @@ def test_a_mixed_catalogue_collection_streams_and_shows_art_per_item(workbench, 
     _two_sources(workbench)
     library, call = workbench.library, workbench.call
     seen = []
-    monkeypatch.setattr(library, "_resolve_stream_target", lambda item_id, provider: (
+    monkeypatch.setattr(library, "_with_source_module",
+                        lambda catalog, provider, build: build(None))
+    monkeypatch.setattr(library, "_resolve_stream_target", lambda item_id, provider, module=None: (
         seen.append(("stream", item_id, provider)) or (None, ("stopped", 502))))
-    monkeypatch.setattr(library, "_resolve_art_target", lambda item_id, size, provider: (
+    monkeypatch.setattr(library, "_resolve_art_target", lambda item_id, size, provider, module=None: (
         seen.append(("art", item_id, provider))))
     monkeypatch.setattr(library, "_proxy_art", lambda target: None)
     assert call("POST", "/api/collections", {"id": "mix", "name": "Mix"}).status_code == 201

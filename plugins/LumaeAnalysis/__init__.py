@@ -91,7 +91,11 @@ from .catalog_enrichment import (
 )
 from .catalog_readiness import CONTRACT_REVISION, v3_release_readiness
 from . import status_model
-from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
+from .catalog_providers import (
+    ProviderCatalogBridge,
+    SUPPORTED_PROVIDER_TYPES,
+    provider_display_name,
+)
 from .database_state import (
     bounded_reads,
     collect_database_state,
@@ -2672,6 +2676,14 @@ def catalog_health():
                         admission[stream] = stream_admission
                     readiness["admission"] = admission
                     server["v3_readiness"] = readiness
+            # 1.6.0 (JF.8), additive: the server Id bound to this catalogue
+            # (Jellyfin) and the version the identity guard last verified, so
+            # the app can cross-check the server it signed in to.
+            server = {
+                **server,
+                "provider_server_id": server.get("provider_server_id"),
+                "provider_version": (transition or {}).get("current_provider_version"),
+            }
             guarded_servers.append(server)
         servers = guarded_servers
     payload = compatibility.as_dict()

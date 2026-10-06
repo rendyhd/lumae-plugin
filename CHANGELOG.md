@@ -16,6 +16,37 @@ still matters. Exact, code-verified wire behaviour for every version lives in
   artwork now authenticates with the `Authorization: MediaBrowser` header,
   which Jellyfin 12 requires by default). A persisted source of either type
   stays hidden as before: it is never fetched, streamed, rekeyed or deleted.
+- Jellyfin catalogues (Jellyfin 12.0 or later; contract §2.1).
+  `supported_provider_types` is `["jellyfin", "navidrome"]`. The Jellyfin
+  reader walks every selected music library on its own (one scoped `/Items`
+  walk per library, tracks and albums), records library membership exactly
+  as the Navidrome reader does, requests every field the normalizer reads and
+  publishes compact payloads without user data or paths. Artist portraits
+  come from `/Artists` and `/Artists/AlbumArtists` per library (their IDs
+  equal the tracks' artist IDs; `/Persons` IDs never do). Jellyfin
+  MusicBrainz IDs map correctly: `MusicBrainzRecording` is the recording,
+  `MusicBrainzTrack` the release track. Measured against a Jellyfin 12.2.0
+  server: a track's album is its `AlbumId` (its `ParentId` is a folder, a
+  disc folder on multi-disc albums), untagged `0001-01-01` dates are treated
+  as absent, a library the AudioMuse account may not open (401 "not
+  permitted") stops the scan with its own message instead of being read as
+  rejected credentials, and the identity probe asks a starting server again
+  (503, or a camelCase body) before calling it unreachable.
+- Jellyfin identity guard: `/System/Info/Public` binds the server `Id` to the
+  catalogue at the first verified probe; another `Id`, a release before 12.0,
+  a product that is not Jellyfin or a changed server type blocks the
+  catalogue before any read, and a different server is never adopted as the
+  same catalogue. `/api/catalog/health` adds `provider_server_id` and
+  `provider_version` per source. A catalogue never changes server type.
+- The Living Collections stream and artwork proxies use each catalogue's own
+  AudioMuse server credentials instead of the host's global settings (the
+  unadmitted Plex branches are gone). A Jellyfin preview streams
+  `/Audio/{id}/stream?static=true` (the original file, with byte ranges),
+  which unlike `/Items/{id}/Download` works for an account without
+  Jellyfin's download permission. Settings, the database-state page and
+  catalogue errors name the source's own server type instead of Navidrome.
+- Error redaction also masks the quoted token of Jellyfin's
+  `Authorization: MediaBrowser Token="..."` header.
 
 ## 1.5.0 (2026-10-05)
 

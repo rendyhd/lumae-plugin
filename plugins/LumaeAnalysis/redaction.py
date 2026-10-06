@@ -73,11 +73,15 @@ _PATTERNS = (
         re.compile(r'(?<!\\)"' + _PATH_START + r'(?:[^"\\]|\\.)*"'),
         '"' + PATH + '"',
     ),
-    # Authorization headers: the scheme and its credentials.
+    # Authorization headers: the scheme and its credentials, including the
+    # quoted parameter list of Jellyfin's MediaBrowser scheme
+    # (MediaBrowser Client="..", Token="..").
     (
         re.compile(
             r"(?i)\b((?:proxy-)?authorization)(\s*[:=]\s*[\"']?)"
-            r"(?:[A-Za-z][A-Za-z0-9-]{0,31} )?[^\s\"',;]+"
+            r"(?:[A-Za-z][A-Za-z0-9-]{0,31} )?"
+            r"(?:[A-Za-z][A-Za-z0-9_-]{0,31}=\"[^\"]*\""
+            r"(?:\s*,\s*[A-Za-z][A-Za-z0-9_-]{0,31}=\"[^\"]*\")*|[^\s\"',;]+)"
         ),
         r"\1\2" + REDACTED,
     ),

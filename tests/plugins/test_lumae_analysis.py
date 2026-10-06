@@ -144,7 +144,7 @@ def test_plugin_manifest_has_lumae_identity():
         "analysis_schema_version": 2,
         "catalog_builder_version": 5,
         "supported_core_range": ">=2.6.0,<4.0.0",
-        "supported_provider_types": ["navidrome"],
+        "supported_provider_types": ["jellyfin", "navidrome"],
         "features": [
             "dual_core_compat",
             "stable_catalog_instance",
@@ -631,11 +631,19 @@ def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch, core_versio
             {
                 "server_id": "server-a",
                 "name": "Main",
-                "server_type": "jellyfin",
+                "server_type": "emby",
                 "is_default": True,
                 "creds": {"token": "secret"},
                 "url": "https://internal.invalid",
-            }
+            },
+            {
+                "server_id": "server-b",
+                "name": "Jelly",
+                "server_type": "jellyfin",
+                "is_default": False,
+                "creds": {"token": "other-secret"},
+                "url": "https://jellyfin.invalid",
+            },
         ],
         raising=False,
     )
@@ -645,15 +653,22 @@ def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch, core_versio
     assert response.status_code == 200
     body = response.get_json()
     assert body["core_adapter"] == "v3_registry"
+    assert "secret" not in response.get_data(as_text=True)
+    assert "invalid" not in response.get_data(as_text=True)
+    # Emby is not a supported music server (JF.2); Jellyfin is (JF.8).
     assert body["servers"][0] == {
         "server_id": "server-a",
         "catalog_instance_id": None,
         "name": "Main",
-        "provider_type": "jellyfin",
+        "provider_type": "emby",
         "is_default": True,
         "status": "provider_unsupported",
         "supported": False,
     }
+    assert body["servers"][1]["provider_type"] == "jellyfin"
+    assert body["servers"][1]["supported"] is True
+    assert body["servers"][1]["status"] == "not_initialized"
+    assert body["capability"]["supported_provider_types"] == ["jellyfin", "navidrome"]
 
 
 def test_catalog_health_exposes_persisted_v3_0_3_source_readiness(monkeypatch):
@@ -2295,7 +2310,8 @@ def test_collection_preview_target_keeps_provider_credentials_server_side(monkey
     target, error = library._resolve_stream_target("track-1", "jellyfin")
 
     assert error is None
-    assert target[0] == "https://music.example/Items/track-1/Download"
+    assert target[0] == "https://music.example/Audio/track-1/stream"
+    assert target[2] == {"static": "true"}
     assert target[1] == {"Authorization": 'MediaBrowser Token="secret"'}
     assert "secret" not in target[0]
 
@@ -5356,35 +5372,36 @@ def test_provider_bridge_never_exposes_credentials_or_urls():
     ]
 
 
-def test_provider_bridge_admits_only_navidrome_sources():
+def test_provider_bridge_admits_navidrome_and_jellyfin_only():
+    """JF.8: Navidrome and Jellyfin are admitted; anything else (Emby, Lyrion,
+    Plex, an unknown or empty type) stays hidden."""
     from plugins.LumaeAnalysis.catalog_providers import (
         CatalogProviderError,
         ProviderCatalogBridge,
         SUPPORTED_PROVIDER_TYPES,
     )
 
+    types_in_order = ["navidrome", "jellyfin", "emby", "lyrion", "plex", "unknown", ""]
+
     class Adapter:
         def list_servers(self):
             return [
-                {
-                    "server_id": "nav",
-                    "provider_type": "navidrome",
-                    "is_default": True,
-                },
-                {
-                    "server_id": "jelly",
-                    "provider_type": "jellyfin",
-                    "is_default": False,
-                },
+                {"server_id": f"s-{index}", "provider_type": provider_type,
+                 "is_default": index == 0}
+                for index, provider_type in enumerate(types_in_order)
             ]
 
     bridge = ProviderCatalogBridge(Adapter())
 
-    assert SUPPORTED_PROVIDER_TYPES == frozenset({"navidrome"})
-    assert [server["supported"] for server in bridge.list_servers()] == [True, False]
-    assert bridge.require_server("nav")["provider_type"] == "navidrome"
-    with pytest.raises(CatalogProviderError, match="not supported"):
-        bridge.require_server("jelly")
+    assert SUPPORTED_PROVIDER_TYPES == frozenset({"navidrome", "jellyfin"})
+    assert [server["supported"] for server in bridge.list_servers()] == [
+        True, True, False, False, False, False, False,
+    ]
+    assert bridge.require_server("s-0")["provider_type"] == "navidrome"
+    assert bridge.require_server("s-1")["provider_type"] == "jellyfin"
+    for index in range(2, len(types_in_order)):
+        with pytest.raises(CatalogProviderError, match="not supported"):
+            bridge.require_server(f"s-{index}")
 
 
 def test_provider_bridge_has_no_emby_or_lyrion_reader():
@@ -5900,13 +5917,32 @@ class RebindDb(FakeDb):
         self.commits = 0
 
 
-def test_catalogue_source_resolution_hides_persisted_non_navidrome_sources():
+@pytest.mark.parametrize("provider_type", ["emby", "lyrion", "plex", "unknown", ""])
+def test_catalogue_source_resolution_hides_persisted_unsupported_sources(provider_type):
+    """A persisted source of a type Lumae does not support stays hidden (and
+    is never deleted); Navidrome and Jellyfin sources resolve (JF.8)."""
     from plugins.LumaeAnalysis.catalog import resolve_catalog_source
 
-    db = FakeDb(rows=[("catalog-jelly", "server-jelly", "jellyfin")])
+    db = FakeDb(rows=[("catalog-other", "server-other", provider_type)])
 
     with pytest.raises(KeyError, match="Unknown catalogue source"):
-        resolve_catalog_source(db, server_id="server-jelly")
+        resolve_catalog_source(db, server_id="server-other")
+    assert not any(
+        sql.lstrip().upper().startswith(("DELETE", "UPDATE"))
+        for sql, _params in db.cursor_obj.executed
+    )
+
+
+@pytest.mark.parametrize("provider_type", ["navidrome", "jellyfin"])
+def test_catalogue_source_resolution_admits_navidrome_and_jellyfin(provider_type):
+    from plugins.LumaeAnalysis.catalog import resolve_catalog_source
+
+    row = list(_catalog_source_row())
+    row[2] = provider_type
+    source = resolve_catalog_source(FakeDb(rows=[tuple(row)]), server_id="server-a")[0]
+
+    assert source["provider_type"] == provider_type
+    assert source["provider_server_id"] is None
 
 
 def _catalog_source_row(
@@ -5980,7 +6016,31 @@ def test_catalogue_source_accepts_only_a_proven_legacy_server_alias():
         )
 
 
-def test_catalogue_source_migration_does_not_create_non_navidrome_sources():
+@pytest.mark.parametrize("provider_type", ["emby", "lyrion", "plex", "unknown"])
+def test_catalogue_source_migration_does_not_create_unsupported_sources(provider_type):
+    from plugins.LumaeAnalysis.catalog import ensure_catalog_sources
+
+    db = RebindDb([])
+
+    class Bridge:
+        def list_servers(self):
+            return [
+                {
+                    "server_id": "server-other",
+                    "name": "Other",
+                    "provider_type": provider_type,
+                    "is_default": True,
+                }
+            ]
+
+    assert ensure_catalog_sources(db, bridge=Bridge()) == []
+    assert not any(
+        sql.lstrip().startswith("INSERT INTO")
+        for sql, _params in db.cursor_obj.executed
+    )
+
+
+def test_catalogue_source_migration_creates_a_jellyfin_source():
     from plugins.LumaeAnalysis.catalog import ensure_catalog_sources
 
     db = RebindDb([])
@@ -5996,11 +6056,41 @@ def test_catalogue_source_migration_does_not_create_non_navidrome_sources():
                 }
             ]
 
-    assert ensure_catalog_sources(db, bridge=Bridge()) == []
-    assert not any(
-        sql.lstrip().startswith("INSERT INTO")
+    sources = ensure_catalog_sources(db, bridge=Bridge())
+    assert [source["provider_type"] for source in sources] == ["jellyfin"]
+    assert any(
+        sql.lstrip().startswith("INSERT INTO") and "catalog_sources" in sql
         for sql, _params in db.cursor_obj.executed
     )
+
+
+def test_catalogue_source_keeps_its_server_type_when_audiomuse_renames_it():
+    """D-JF.2: a catalogue never changes server type; the source row keeps the
+    type it was created with when AudioMuse later names another one."""
+    from plugins.LumaeAnalysis.catalog import ensure_catalog_sources
+
+    db = RebindDb([("catalog-a", "server-a", "navidrome", "active")])
+
+    class Bridge:
+        def list_servers(self):
+            return [
+                {
+                    "server_id": "server-a",
+                    "name": "Now Jellyfin",
+                    "provider_type": "jellyfin",
+                    "is_default": True,
+                }
+            ]
+
+    ensure_catalog_sources(db, bridge=Bridge())
+    updates = [
+        (sql, params)
+        for sql, params in db.cursor_obj.executed
+        if sql.lstrip().startswith("UPDATE") and "catalog_sources" in sql
+    ]
+    assert updates
+    assert all("provider_type" not in sql for sql, _params in updates)
+    assert all("jellyfin" not in [str(value) for value in params] for _sql, params in updates)
 
 
 def test_v2_source_requires_proven_continuity_before_v3_rebind(monkeypatch):

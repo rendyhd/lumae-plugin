@@ -422,6 +422,7 @@ def render_source_preparation_sections(batch_size):
     for source in sources:
         catalog_instance_id = source["catalog_instance_id"]
         server_id = source["server_id"]
+        server_kind = _pkg.escape(_pkg.provider_display_name(source.get("provider_type")))
         # The settings poll reads the committed snapshot (P2-1). The live
         # aggregate runs only when no snapshot describes this generation.
         counts = _pkg._committed_profile_counts(source) or _pkg.analysis_status_counts(
@@ -462,7 +463,7 @@ def render_source_preparation_sections(batch_size):
             source_status_class = "lumae-source-state-ready"
             readiness_notice = f"""
               <div class="lumae-notice lumae-notice-success" role="status">
-                <strong>Ready for app sync: {published_tracks:,} Navidrome tracks are published.</strong>
+                <strong>Ready for app sync: {published_tracks:,} {server_kind} tracks are published.</strong>
                 <span>The library catalogue and app sync index are complete. Volume, ramp, and
                   sonic coverage are reported separately below.</span>
               </div>
@@ -470,10 +471,10 @@ def render_source_preparation_sections(batch_size):
         elif catalog_status == "complete" and published_tracks == 0:
             source_status = "Not ready - empty catalogue"
             source_status_class = "lumae-source-state-danger"
-            readiness_notice = """
+            readiness_notice = f"""
               <div class="lumae-notice lumae-notice-error" role="alert">
-                <strong>Not ready: no Navidrome tracks were published.</strong>
-                <span>This is not a usable Lumae catalogue. Check Navidrome access and the
+                <strong>Not ready: no {server_kind} tracks were published.</strong>
+                <span>This is not a usable Lumae catalogue. Check {server_kind} access and the
                   <em>Music Libraries</em> selection in AudioMuse, then refresh required data.
                   Lumae will no longer publish a new empty catalogue.</span>
               </div>
@@ -490,10 +491,10 @@ def render_source_preparation_sections(batch_size):
         else:
             source_status = "Not ready"
             source_status_class = "lumae-source-state-danger"
-            readiness_notice = """
+            readiness_notice = f"""
               <div class="lumae-notice lumae-notice-warning" role="status">
                 <strong>Not ready for app sync.</strong>
-                <span>Publish a non-empty Navidrome catalogue and complete the app sync
+                <span>Publish a non-empty {server_kind} catalogue and complete the app sync
                   index by refreshing the required data.</span>
               </div>
             """
@@ -520,7 +521,7 @@ def render_source_preparation_sections(batch_size):
               aria-label="Catalogue readiness for {_pkg.escape(str(source['name']))}">
               <header class="lumae-source-header">
                 <div>
-                  <span class="lumae-kicker">Navidrome source</span>
+                  <span class="lumae-kicker">{server_kind} source</span>
                   <h4>{_pkg.escape(str(source.get('name') or server_id))}</h4>
                 </div>
                 <span class="lumae-source-state {source_status_class}">{source_status}</span>
@@ -548,7 +549,7 @@ def render_source_preparation_sections(batch_size):
                     value="prepare_lumae"{prepare_disabled}>Refresh required data</button>
                 </div>
               </form>
-              <p class="lumae-help">This refresh imports the selected Navidrome libraries first,
+              <p class="lumae-help">This refresh imports the selected {server_kind} libraries first,
                 then publishes the app sync index. Volume, ramp, and sonic work can continue in
                 the background after the library becomes ready.</p>
             </article>
@@ -561,7 +562,7 @@ def render_source_preparation_sections(batch_size):
               aria-label="Volume and ramp status for {_pkg.escape(str(source['name']))}">
               <header class="lumae-source-header">
                 <div>
-                  <span class="lumae-kicker">Navidrome source</span>
+                  <span class="lumae-kicker">{server_kind} source</span>
                   <h4>{_pkg.escape(str(source.get('name') or server_id))}</h4>
                 </div>
                 <span class="lumae-source-state {profile_status_class}">{profile_status}</span>
@@ -605,7 +606,7 @@ def render_source_preparation_sections(batch_size):
         <span class="lumae-section-priority">1 - Required</span>
         <h3>1. Library status</h3>
         <p class="lumae-action-copy">“Ready for app sync” has one precise meaning: at least one
-          Navidrome track is published and the matching app sync index is complete.
+          track from the music server is published and the matching app sync index is complete.
           A completed job with zero tracks is not ready.</p>
         {''.join(catalogue_cards)}
       </section>
@@ -679,7 +680,7 @@ def render_provider_identity_panel():
             <article class="lumae-status-card">
               <span>{_pkg.escape(source['name'])}</span>
               <strong>{state}</strong>
-              <small>Navidrome {version}</small>
+              <small>{_pkg.escape(_pkg.provider_display_name(source.get("provider_type")))} {version}</small>
               <small>Stable target scans: {scan_count}/2</small>
               <small>Exact changes: {int(counts.get('rekey', 0) or 0):,} rekeys,
                 {int(counts.get('addition', 0) or 0):,} additions,
@@ -695,9 +696,10 @@ def render_provider_identity_panel():
       <section class="lumae-panel" aria-label="Provider identity transition">
         <h3>Provider identity safety</h3>
         <p class="lumae-help">Lumae freezes publication at the old complete generation,
-          requires two identical provider scans, and then applies only the exact Navidrome
-          canonical-ID transform in one database transaction. AudioMuse health is checked
-          separately and never authorizes the Lumae rekey.</p>
+          requires two identical provider scans, and then applies only exact provider-ID
+          changes in one database transaction (Navidrome's canonical-ID transform). A
+          Jellyfin catalogue is bound to its server Id; another server is never adopted.
+          AudioMuse health is checked separately.</p>
         <div class="lumae-status-grid">{''.join(cards)}</div>
         <div class="lumae-actions">
           <a class="lumae-button lumae-button-secondary" href="/backup">Open AudioMuse Backup</a>

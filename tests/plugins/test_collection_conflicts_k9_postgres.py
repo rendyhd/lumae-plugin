@@ -792,11 +792,13 @@ def test_library_item_ids_refuse_dot_only_ids(monkeypatch):
         assert library._ITEM_ID_RE.fullmatch(good) is not None, good
     called = []
     monkeypatch.setattr(library, "_route_catalog", lambda: ("catalog-a", "navidrome"))
+    monkeypatch.setattr(library, "_with_source_module",
+                        lambda catalog, provider, build: build(None))
     monkeypatch.setattr(library, "_resolve_stream_target",
-                        lambda item_id, provider: called.append(item_id)
+                        lambda item_id, provider, module=None: called.append(item_id)
                         or (None, ("unsupported", 501)))
     monkeypatch.setattr(library, "_resolve_art_target",
-                        lambda item_id, size, provider: called.append(item_id))
+                        lambda item_id, size, provider, module=None: called.append(item_id))
     app = Flask(__name__)
     blueprint = Blueprint("library_ids", __name__)
     library.register_collection_library_routes(blueprint, lambda view: view)

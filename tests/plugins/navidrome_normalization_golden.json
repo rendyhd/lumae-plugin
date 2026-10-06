@@ -1,0 +1,523 @@
+{
+ "album_artists": [
+  {
+   "album_id": "al-1",
+   "artist_id": "ar-1",
+   "external_ids": {},
+   "identity_provenance": "provider_id",
+   "name": "Band",
+   "position": 0,
+   "role": "album_artist"
+  }
+ ],
+ "albums": [
+  {
+   "added_at": "2026-01-01T00:00:00Z",
+   "album_artist_display": "Band",
+   "album_id": "al-1",
+   "artwork_fp": "446b9ff7895cda0a19393c488a36653599192d588ed5b25675e2d6246a9b458d",
+   "content_kind": "music",
+   "cover_art_id": "al-1_0",
+   "genres": [
+    "Rock"
+   ],
+   "image_tags": {},
+   "metadata_fp": "1072ed19219f79c6818a5662fde9e164e663ab5b23ffc739b53ec6dbea31ecbc",
+   "name": "Album One",
+   "payload": {
+    "_lumae": {
+     "artist_credits": [
+      {
+       "artist_id": "ar-1",
+       "display_name": "Band",
+       "identity_provenance": "provider_id",
+       "position": 0,
+       "role": "album_artist"
+      }
+     ],
+     "compilation": false,
+     "disc_count": 1,
+     "disc_titles": [
+      {
+       "cover_art_id": "mf-tr-1_0",
+       "disc_number": 1,
+       "title": null
+      }
+     ],
+     "duration_ms": 400500,
+     "explicit": false,
+     "external_ids": {
+      "musicbrainz": "mbid-release",
+      "musicbrainz_legacy_entity_context": "album"
+     },
+     "genres": [
+      "Rock"
+     ],
+     "library_ids": [
+      "1"
+     ],
+     "track_count": 2,
+     "year": 1999
+    },
+    "_lumae_library_ids": [
+     "1"
+    ],
+    "artist": "Band",
+    "artistId": "ar-1",
+    "artists": [
+     {
+      "id": "ar-1",
+      "name": "Band"
+     }
+    ],
+    "coverArt": "al-1_0",
+    "created": "2026-01-01T00:00:00Z",
+    "discTitles": [
+     {
+      "disc": 1,
+      "title": "Side A"
+     }
+    ],
+    "duration": 400,
+    "explicitStatus": "clean",
+    "genre": "Rock",
+    "genres": [
+     {
+      "name": "Rock"
+     }
+    ],
+    "id": "al-1",
+    "isCompilation": false,
+    "musicBrainzId": "mbid-release",
+    "name": "Album One",
+    "originalReleaseDate": {
+     "day": 2,
+     "month": 3,
+     "year": 1998
+    },
+    "releaseTypes": [
+     "Album"
+    ],
+    "songCount": 2,
+    "sortName": "album one",
+    "year": 1999
+   },
+   "provider_ids": {
+    "musicbrainz": "mbid-release",
+    "musicbrainz_legacy_entity_context": "album"
+   },
+   "release_type": "['Album']",
+   "sort_name": "album one",
+   "year": 1999
+  }
+ ],
+ "artists": [
+  {
+   "artist_id": "ar-1",
+   "cover_art_id": "ar-1_0",
+   "external_ids": {},
+   "identity_provenance": "provider_id",
+   "metadata_fp": "fa7d85ec1dfb827aa776cbfb624baaed462239cd2261f8407234f84a91a53390",
+   "name": "Band",
+   "payload": {
+    "_lumae": {
+     "library_ids": [
+      "1"
+     ]
+    },
+    "external_ids": {},
+    "identity_provenance": "provider_id",
+    "name": "Band"
+   },
+   "position": 0,
+   "role": "album_artist"
+  },
+  {
+   "artist_id": "ar-2",
+   "cover_art_id": null,
+   "external_ids": {},
+   "identity_provenance": "provider_id",
+   "metadata_fp": "f1cac1b1b47f285f2c251d283c0963f8d5cdd41863b8aed78c203b0d75c4eae3",
+   "name": "Guest",
+   "payload": {
+    "_lumae": {
+     "library_ids": [
+      "1"
+     ]
+    },
+    "external_ids": {},
+    "identity_provenance": "provider_id",
+    "name": "Guest"
+   },
+   "position": 1,
+   "role": "artist"
+  }
+ ],
+ "entity_libraries": [
+  {
+   "entity_id": "al-1",
+   "entity_type": "album",
+   "library_id": "1"
+  },
+  {
+   "entity_id": "ar-1",
+   "entity_type": "artist",
+   "library_id": "1"
+  },
+  {
+   "entity_id": "ar-2",
+   "entity_type": "artist",
+   "library_id": "1"
+  },
+  {
+   "entity_id": "tr-1",
+   "entity_type": "track",
+   "library_id": "1"
+  },
+  {
+   "entity_id": "tr-2",
+   "entity_type": "track",
+   "library_id": "1"
+  }
+ ],
+ "libraries": [
+  {
+   "display_order": null,
+   "library_id": "1",
+   "metadata_fp": "fa015616ed3fee8dc88e1ba8485498a68979687687555fe85d593858ae7cd2fb",
+   "name": "Music",
+   "payload": {
+    "id": "1",
+    "name": "Music"
+   },
+   "sort_name": null
+  },
+  {
+   "display_order": null,
+   "library_id": "2",
+   "metadata_fp": "d19672ab0e31472608938910fe8c5c8b646aa9adde7d96c3baa7de218996fd87",
+   "name": "Audiobooks",
+   "payload": {
+    "id": "2",
+    "name": "Audiobooks"
+   },
+   "sort_name": null
+  }
+ ],
+ "track_artists": [
+  {
+   "artist_id": "ar-1",
+   "external_ids": {},
+   "identity_provenance": "provider_id",
+   "name": "Band",
+   "position": 0,
+   "role": "artist",
+   "track_id": "tr-1"
+  },
+  {
+   "artist_id": "ar-2",
+   "external_ids": {},
+   "identity_provenance": "provider_id",
+   "name": "Guest",
+   "position": 1,
+   "role": "artist",
+   "track_id": "tr-1"
+  },
+  {
+   "artist_id": "ar-1",
+   "external_ids": {},
+   "identity_provenance": "provider_id",
+   "name": "Band",
+   "position": 0,
+   "role": "artist",
+   "track_id": "tr-2"
+  }
+ ],
+ "tracks": [
+  {
+   "album": "Album One",
+   "album_artist_display": "Band",
+   "album_id": "al-1",
+   "analysis_eligible": true,
+   "artist_display": "Band feat. Guest",
+   "artwork_fp": "3aa26a4356b79cfba7af19fa42fce0d724ca8224d637500012069bd1975efcdc",
+   "audio_properties": {
+    "bit_depth": 16,
+    "bit_rate": 900,
+    "channels": 2,
+    "container": "flac",
+    "duration_ms": 200000,
+    "sample_rate": null,
+    "size": 9000000
+   },
+   "compilation": false,
+   "content_kind": "music",
+   "cover_art_id": "mf-tr-1_0",
+   "disc_number": 1,
+   "disc_title": null,
+   "disc_total": 1,
+   "downloadable": true,
+   "duration_ms": 200000,
+   "explicit": false,
+   "external_ids": {
+    "isrc": "['USABC9900001']",
+    "musicbrainz": "mbid-recording-1",
+    "musicbrainz_legacy_entity_context": "track"
+   },
+   "genres": [
+    "Rock"
+   ],
+   "media_fp": "41abbe2728911cd469dc886434790bcf518408e5dae2aba27b13dc0b8aababd6",
+   "metadata_fp": "be4992a1728b1627718fc4632beffe7373f2cdb0f58f154114e50437f47e1b69",
+   "payload": {
+    "_lumae": {
+     "album": "Album One",
+     "artist_credits": [
+      {
+       "artist_id": "ar-1",
+       "display_name": "Band",
+       "identity_provenance": "provider_id",
+       "position": 0,
+       "role": "artist"
+      },
+      {
+       "artist_id": "ar-2",
+       "display_name": "Guest",
+       "identity_provenance": "provider_id",
+       "position": 1,
+       "role": "artist"
+      }
+     ],
+     "audio_properties": {
+      "bit_depth": 16,
+      "bit_rate": 900,
+      "channels": 2,
+      "container": "flac",
+      "duration_ms": 200000,
+      "sample_rate": null,
+      "size": 9000000
+     },
+     "compilation": false,
+     "disc_title": null,
+     "disc_total": 1,
+     "explicit": false,
+     "external_ids": {
+      "isrc": "['USABC9900001']",
+      "musicbrainz": "mbid-recording-1",
+      "musicbrainz_legacy_entity_context": "track"
+     },
+     "genres": [
+      "Rock"
+     ],
+     "library_ids": [
+      "1"
+     ],
+     "replay_gain": {
+      "album_gain_db": -7.1,
+      "album_peak": 0.99,
+      "track_gain_db": -6.5,
+      "track_peak": 0.98
+     },
+     "track_total": 2,
+     "year": 1999
+    },
+    "_lumae_library_ids": [
+     "1"
+    ],
+    "album": "Album One",
+    "albumArtists": [
+     {
+      "id": "ar-1",
+      "name": "Band"
+     }
+    ],
+    "albumId": "al-1",
+    "artist": "Band feat. Guest",
+    "artistId": "ar-1",
+    "artists": [
+     {
+      "id": "ar-1",
+      "name": "Band"
+     },
+     {
+      "id": "ar-2",
+      "name": "Guest"
+     }
+    ],
+    "bitDepth": 16,
+    "bitRate": 900,
+    "bpm": 120,
+    "channelCount": 2,
+    "comment": null,
+    "contentType": "audio/flac",
+    "contributors": [
+     {
+      "artist": {
+       "id": "ar-3",
+       "name": "Writer"
+      },
+      "role": "composer"
+     },
+     {
+      "artist": {
+       "id": "ar-2",
+       "name": "Guest"
+      },
+      "role": "performer",
+      "subRole": "guitar"
+     }
+    ],
+    "coverArt": "mf-tr-1_0",
+    "created": "2026-01-01T00:00:00Z",
+    "discNumber": 1,
+    "displayAlbumArtist": "Band",
+    "displayArtist": "Band feat. Guest",
+    "displayComposer": "Writer",
+    "duration": 200,
+    "explicitStatus": "clean",
+    "genre": "Rock",
+    "genres": [
+     {
+      "name": "Rock"
+     }
+    ],
+    "id": "tr-1",
+    "isDir": false,
+    "isrc": [
+     "USABC9900001"
+    ],
+    "mediaType": "song",
+    "moods": [
+     "happy"
+    ],
+    "musicBrainzId": "mbid-recording-1",
+    "parent": "al-1",
+    "replayGain": {
+     "albumGain": -7.1,
+     "albumPeak": 0.99,
+     "trackGain": -6.5,
+     "trackPeak": 0.98
+    },
+    "samplingRate": 44100,
+    "size": 9000000,
+    "sortName": "first",
+    "suffix": "flac",
+    "title": "First",
+    "track": 1,
+    "type": "music",
+    "year": 1999
+   },
+   "provider_type": "navidrome",
+   "release_type": "['Album']",
+   "replay_gain": {
+    "album_gain_db": -7.1,
+    "album_peak": 0.99,
+    "track_gain_db": -6.5,
+    "track_peak": 0.98
+   },
+   "streamable": true,
+   "title": "First",
+   "track_id": "tr-1",
+   "track_number": 1,
+   "track_total": 2,
+   "year": 1999
+  },
+  {
+   "album": "Album One",
+   "album_artist_display": "Band",
+   "album_id": "al-1",
+   "analysis_eligible": true,
+   "artist_display": "Band",
+   "artwork_fp": "6f80d4917249293339b6a41561aa767c9aa6ee9ba50bf7c93c8d6d23efe2ee5c",
+   "audio_properties": {
+    "bit_depth": null,
+    "bit_rate": 320,
+    "channels": null,
+    "container": "mp3",
+    "duration_ms": 200500,
+    "sample_rate": null,
+    "size": null
+   },
+   "compilation": false,
+   "content_kind": "music",
+   "cover_art_id": null,
+   "disc_number": 1,
+   "disc_title": null,
+   "disc_total": 1,
+   "downloadable": true,
+   "duration_ms": 200500,
+   "explicit": false,
+   "external_ids": {},
+   "genres": [],
+   "media_fp": "99701f361a8bc0be862adbd36d3f8761186cac1a7c54362d92a59dc24fa18e19",
+   "metadata_fp": "79b333bc7512ac9025fe4d5125ab5a32f789b8845d193a45fc833fd672d030f6",
+   "payload": {
+    "_lumae": {
+     "album": "Album One",
+     "artist_credits": [
+      {
+       "artist_id": "ar-1",
+       "display_name": "Band",
+       "identity_provenance": "provider_id",
+       "position": 0,
+       "role": "artist"
+      }
+     ],
+     "audio_properties": {
+      "bit_depth": null,
+      "bit_rate": 320,
+      "channels": null,
+      "container": "mp3",
+      "duration_ms": 200500,
+      "sample_rate": null,
+      "size": null
+     },
+     "compilation": false,
+     "disc_title": null,
+     "disc_total": 1,
+     "explicit": false,
+     "external_ids": {},
+     "genres": [],
+     "library_ids": [
+      "1"
+     ],
+     "replay_gain": {
+      "album_gain_db": null,
+      "album_peak": null,
+      "track_gain_db": null,
+      "track_peak": null
+     },
+     "track_total": 2,
+     "year": null
+    },
+    "album": "Album One",
+    "albumId": "al-1",
+    "artist": "Band",
+    "artistId": "ar-1",
+    "bitRate": 320,
+    "discNumber": 1,
+    "duration": 200.5,
+    "id": "tr-2",
+    "musicFolderId": "1",
+    "suffix": "mp3",
+    "title": "Second",
+    "track": 2
+   },
+   "provider_type": "navidrome",
+   "release_type": "['Album']",
+   "replay_gain": {
+    "album_gain_db": null,
+    "album_peak": null,
+    "track_gain_db": null,
+    "track_peak": null
+   },
+   "streamable": true,
+   "title": "Second",
+   "track_id": "tr-2",
+   "track_number": 2,
+   "track_total": 2,
+   "year": null
+  }
+ ],
+ "unresolved_artist_art": []
+}

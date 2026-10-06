@@ -15,7 +15,11 @@ import uuid
 from plugin.api import logger, table
 
 from . import catalog_search, migrations
-from .catalog_providers import ProviderCatalogBridge, SUPPORTED_PROVIDER_TYPES
+from .catalog_providers import (
+    ProviderCatalogBridge,
+    SUPPORTED_PROVIDER_TYPES,
+    provider_display_name,
+)
 from .provider_identity_guard import inspect_catalog_identity, observe_provider_version
 from .status_model import migrate_status_summary, refresh_status_summary
 
@@ -520,8 +524,15 @@ def _external_ids(row, entity_kind=None):
         "musicbrainz_artist_id": ("musicBrainzArtistId", "MusicBrainzArtist", "musicBrainzArtistIds"),
         "musicbrainz_release_id": ("musicBrainzAlbumId", "MusicBrainzAlbum", "musicBrainzReleaseId"),
         "musicbrainz_release_group_id": ("musicBrainzReleaseGroupId", "MusicBrainzReleaseGroup"),
-        "musicbrainz_recording_id": ("musicBrainzRecordingId", "MusicBrainzTrack"),
-        "musicbrainz_release_track_id": ("musicBrainzTrackId", "musicBrainzReleaseTrackId"),
+        # Jellyfin (10.11+): MusicBrainzRecording is the recording ID (from
+        # MUSICBRAINZ_TRACKID) and MusicBrainzTrack the release-track ID (from
+        # MUSICBRAINZ_RELEASETRACKID). Never the other way round (JF.8).
+        "musicbrainz_recording_id": ("musicBrainzRecordingId", "MusicBrainzRecording"),
+        "musicbrainz_release_track_id": (
+            "musicBrainzTrackId",
+            "musicBrainzReleaseTrackId",
+            "MusicBrainzTrack",
+        ),
     }
     for key, names in aliases.items():
         value = _value(row, key, *names)
@@ -655,12 +666,25 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         replay_gain = _replay_gain_payload(raw)
         art = _art_payload(raw)
         kind = _content_kind(raw)
+        if provider_type == "jellyfin":
+            # A Jellyfin song has no joined artist string: its artists are
+            # ArtistItems. AlbumArtist is only the fallback, so a compilation
+            # track shows its own artist rather than "Various Artists".
+            artist_display = (
+                ", ".join(artist["name"] for artist in artists)
+                or _artist_display(_value(raw, "AlbumArtist"))
+                or None
+            )
+        else:
+            artist_display = (
+                _artist_display(_value(raw, "artist", "Artist", "AlbumArtist"))
+                or ", ".join(artist["name"] for artist in artists)
+                or None
+            )
         metadata = {
             "album_id": album_id,
             "title": title,
-            "artist_display": _artist_display(_value(raw, "artist", "Artist", "AlbumArtist"))
-            or ", ".join(artist["name"] for artist in artists)
-            or None,
+            "artist_display": artist_display,
             "album_artist_display": _artist_display(
                 _value(raw, "albumArtist", "AlbumArtist", "albumartist")
             )
@@ -840,9 +864,10 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         album["payload"]["_lumae"] = enrichment
         album["metadata_fp"] = fingerprint({"base": album["metadata_fp"], "enrichment": enrichment})
 
-    # Navidrome getArtists portraits. Artists absent from the map (guests, or
-    # a failed call) are resolved from the published generation at publish
-    # time, so a known portrait is never erased by a missing lookup.
+    # Artist portraits: Navidrome getArtists, Jellyfin the artist item's
+    # Primary image. Artists absent from the map (guests, or a failed call)
+    # are resolved from the published generation at publish time, so a known
+    # portrait is never erased by a missing lookup.
     artist_cover_art = raw_catalog.get("artist_cover_art")
     if not isinstance(artist_cover_art, dict):
         artist_cover_art = {}
@@ -1388,6 +1413,8 @@ def migrate_catalog(db):
         "refresh_required BOOLEAN NOT NULL DEFAULT TRUE",
         "refresh_reason TEXT",
     )
+    # 1.6.0 (JF.8): the Jellyfin server Id bound to a catalogue.
+    migrations.ensure_columns(cur, t("catalog_sources"), "provider_server_id TEXT")
     cur.execute(
         f"""
         UPDATE {t("catalog_state")}
@@ -1841,6 +1868,29 @@ def _withdraw_orphaned_profiles(db, catalog_instance_id):
     return len(withdrawn)
 
 
+def _require_jellyfin_identity(observation):
+    """A Jellyfin scan runs only against the verified, bound Jellyfin server.
+
+    A blocked identity (another server Id, another server type, a product that
+    is not Jellyfin, a release before 12.0) or one that could not be verified
+    never reaches the provider: fetching would read the wrong library.
+    """
+    if not observation or observation.get("observation") == "bridge_unavailable":
+        return
+    state = observation.get("state")
+    reason = observation.get("detection_reason") or "provider_identity_unverified"
+    if state == "blocked":
+        raise CatalogScanError(
+            f"The Jellyfin server identity check failed ({reason}); Lumae preserved the "
+            "previous complete generation and will not read this server until it matches."
+        )
+    if state == "transition_pending" and reason == "provider_version_unverified":
+        raise CatalogScanError(
+            "Lumae could not verify the Jellyfin server identity; it preserved the "
+            "previous complete generation and will retry."
+        )
+
+
 def refresh_catalog(server_id=None, db=None, bridge=None):
     """Fetch, validate, and atomically publish one provider catalogue generation."""
     scan_started = time.monotonic()
@@ -1855,6 +1905,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             raise CatalogScanError("An explicit server_id is required when multiple servers are configured")
         server_id = servers[0]["server_id"]
     server = provider_bridge.require_server(server_id)
+    server_name = provider_display_name(server["provider_type"])
     ensure_catalog_sources(db, bridge=provider_bridge)
     cur = db.cursor()
     cur.execute(
@@ -1873,6 +1924,11 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         server_id,
         commit=True,
     )
+    # The server type this catalogue was created for (D-JF.2), as the
+    # identity observation read it from the source row.
+    source_provider_type = str(
+        (identity_observation or {}).get("provider_type") or ""
+    ).strip().lower()
     scan_id = str(uuid.uuid4())
     cur.execute(
         f"SELECT published_generation, catalog_epoch, catalog_head_seq, entity_counts, "
@@ -1907,14 +1963,24 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
     db.commit()
 
     try:
+        if source_provider_type and source_provider_type != server["provider_type"]:
+            raise CatalogScanError(
+                f"This catalogue belongs to a {provider_display_name(source_provider_type)} "
+                f"server, but AudioMuse now names a {server_name} server for it. Lumae never "
+                "adopts another server type as the same catalogue: set Lumae up again for "
+                "the new server. The previous catalogue remains available."
+            )
+        if server["provider_type"] == "jellyfin":
+            _require_jellyfin_identity(identity_observation)
         raw = provider_bridge.fetch_catalog(server_id)
         normalized = normalize_provider_catalog(raw, server["provider_type"])
         counts = {entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER}
         snapshot_estimated_bytes = _estimate_snapshot_bytes(normalized)
         if counts["track"] == 0:
             raise CatalogScanError(
-                "Navidrome returned no usable tracks. The empty catalogue was not published; "
-                "check Navidrome access and the Music Libraries selection in AudioMuse."
+                f"{server_name} returned no usable tracks. The empty catalogue was not "
+                f"published; check {server_name} access and the Music Libraries selection "
+                "in AudioMuse."
             )
         track_memberships = [
             row
@@ -1943,7 +2009,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 if invalid_library_ids:
                     detail += f"; {len(invalid_library_ids):,} unknown library IDs were rejected"
                 raise CatalogScanError(
-                    f"Navidrome catalogue membership is incomplete: {detail}. "
+                    f"{server_name} catalogue membership is incomplete: {detail}. "
                     "The corrupt refresh was not published and the previous catalogue remains "
                     "available. Lumae Analysis will retry automatically; check AudioMuse Music "
                     "Libraries if the repair keeps failing."
@@ -2063,7 +2129,7 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                     }
                 db.commit()
                 raise CatalogScanError(
-                    "Navidrome provider ID evidence is incomplete or conflicting; "
+                    f"{server_name} provider ID evidence is incomplete or conflicting; "
                     "Lumae preserved the previous complete generation"
                 )
 
@@ -2564,7 +2630,7 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    c.catalog_builder_version, c.refresh_required, c.refresh_reason,
                    c.fingerprint_schema_version, c.snapshot_estimated_bytes,
                    c.last_scan_change_counts, c.last_scan_change_reason,
-                   c.last_scan_duration_ms
+                   c.last_scan_duration_ms, s.provider_server_id
               FROM {t("catalog_sources")} s
               JOIN {t("catalog_state")} c USING (catalog_instance_id)
               LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
@@ -2588,7 +2654,7 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    c.catalog_builder_version, c.refresh_required, c.refresh_reason,
                    c.fingerprint_schema_version, c.snapshot_estimated_bytes,
                    c.last_scan_change_counts, c.last_scan_change_reason,
-                   c.last_scan_duration_ms
+                   c.last_scan_duration_ms, s.provider_server_id
               FROM {t("catalog_sources")} s
               JOIN {t("catalog_state")} c USING (catalog_instance_id)
               LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
@@ -2612,7 +2678,7 @@ def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=Fa
                    c.catalog_builder_version, c.refresh_required, c.refresh_reason,
                    c.fingerprint_schema_version, c.snapshot_estimated_bytes,
                    c.last_scan_change_counts, c.last_scan_change_reason,
-                   c.last_scan_duration_ms
+                   c.last_scan_duration_ms, s.provider_server_id
               FROM {t("catalog_sources")} s
               JOIN {t("catalog_state")} c USING (catalog_instance_id)
               LEFT JOIN {t("analysis_state")} a USING (catalog_instance_id)
@@ -2688,6 +2754,9 @@ def _source_dto(row):
                 int(row[38]) if len(row) > 38 and row[38] is not None else None
             ),
         },
+        # The bound Jellyfin server Id (null for Navidrome and before the
+        # first verified Jellyfin probe), so the app can cross-check it.
+        "provider_server_id": str(row[39]) if len(row) > 39 and row[39] else None,
         "analysis": {
             "generation": int(row[17] or 0),
             "epoch": str(row[18] or ""),
@@ -3150,12 +3219,15 @@ def ensure_catalog_sources(db, bridge=None):
                 "rebind_status": "active",
             }
         else:
+            # A catalogue keeps the server type it was created for. If
+            # AudioMuse later names another type for the same server, the
+            # refresh and the identity guard stop instead of re-typing it
+            # (always a new setup, never a switch: D-JF.2).
             cur.execute(
-                f"UPDATE {t('catalog_sources')} SET server_name=%s, provider_type=%s, "
+                f"UPDATE {t('catalog_sources')} SET server_name=%s, "
                 "is_default=%s, updated_at=now() WHERE catalog_instance_id=%s",
                 (
                     server["name"],
-                    server["provider_type"],
                     server["is_default"],
                     source["catalog_instance_id"],
                 ),

@@ -8,7 +8,7 @@ The catalog is exposed through `manifest.json`. AudioMuse-AI reads that catalog,
 
 ### Lumae Analysis
 
-Lumae Analysis mirrors a Navidrome catalogue through AudioMuse's own
+Lumae Analysis mirrors a Navidrome or Jellyfin catalogue through AudioMuse's own
 projection and precomputes loudness/MixRamp and SmoothFade edge profiles
 server-side, so the Lumae app can use volume normalization and SmoothFade,
 and browse/manage collections, without doing that work — or holding a
@@ -25,7 +25,7 @@ a running 1.2.5 installation — no 1.2.5 process may keep running once the
 
 ### Capabilities
 
-* **Catalogue.** A source-scoped mirror of the Navidrome catalogue that
+* **Catalogue.** A source-scoped mirror of the Navidrome or Jellyfin catalogue that
   AudioMuse already analyzes: album/artist metadata, credits, soft
   deletions, and cursor-based incremental refresh
   (`docs/contracts/LUMAE_SYNC_CONTRACT.md` §2, `catalog_mirror`). A
@@ -173,8 +173,13 @@ the whole object back — the POST replaces every stored setting.
 
 ## Compatibility
 
-* **Core:** `>=2.6.0,<4.0.0`; provider type `navidrome` only
+* **Core:** `>=2.6.0,<4.0.0`; provider types `navidrome` and, from 1.6.0,
+  `jellyfin` (Jellyfin 12.0 or later, through AudioMuse-AI 3)
   (`catalog_mirror.supported_core_range` / `supported_provider_types`).
+  Emby, Lyrion and any other type are not supported: a persisted source of
+  such a type stays hidden. A Jellyfin catalogue is bound to its server `Id`
+  (`/System/Info/Public`); another server is never adopted as the same
+  catalogue, and a catalogue never changes server type.
 * **Old clients against a 1.3.0 server:** every 1.3.0 change is additive or
   opt-in; a client that ignores unknown health and response keys sees 1.2.5
   behaviour byte-for-byte. See "Keys that do not exist in 1.2.5" in

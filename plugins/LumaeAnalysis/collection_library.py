@@ -16,6 +16,9 @@ LIBRARY_SCOPES = {"all", "albums", "tracks", "artists"}
 # it: the catalogue publishes no year yet, so it sorted by title (LUM-015).
 LIBRARY_SORTS = {"title", "artist", "year"}
 CATALOG_PARAM = "catalog_instance_id"
+# Media servers the workbench streams from and shows artwork of. A persisted
+# source of any other type (Emby, Lyrion, Plex) gets neither (JF.2).
+SERVED_PROVIDER_TYPES = frozenset(("navidrome", "jellyfin"))
 # A provider item id in a stream or art path. Dot-only ids (".", "..") would
 # walk the provider URL they are placed in, so they are refused.
 _ITEM_ID_RE = re.compile(r"(?!\.+\Z)[A-Za-z0-9._~-]{1,256}")
@@ -833,43 +836,57 @@ def album_detail(title=None, artist=None, provider_album_id=None, catalog_instan
 
 
 def _provider_headers(provider_type):
+    """Legacy single-server headers (AudioMuse 2.6, no bound module)."""
     if provider_type == "jellyfin":
         return dict(getattr(config, "HEADERS", {}) or {})
     return {}
 
 
-def _resolve_stream_target(item_id, provider_type):
+def _navidrome_access(module):
+    """``(base_url, auth params, module)`` of the bound Navidrome server.
+
+    AudioMuse 3 resolves the bound server's own credentials through its
+    context, exactly as its ``_navidrome_request`` does; without a bound
+    module (AudioMuse 2.6, one server) the host's single configuration is it.
+    """
+    if module is None:
+        from tasks.mediaserver import navidrome as module
+    context = getattr(module, "context", None)
+    active_creds = getattr(context, "active_creds", None)
+    creds = active_creds(None) if callable(active_creds) else None
+    auth_kwargs = getattr(module, "_auth_kwargs_from_creds", None)
+    if creds and callable(auth_kwargs):
+        auth = module.get_navidrome_auth_params(**auth_kwargs(creds))
+    else:
+        auth = module.get_navidrome_auth_params()
+    base = creds.get("url") if creds and creds.get("url") else getattr(config, "NAVIDROME_URL", "")
+    return str(base or "").rstrip("/"), auth, module
+
+
+def _resolve_stream_target(item_id, provider_type, module=None):
     """Upstream (url, headers, params) for the catalogue's provider (K10:
-    ``provider_type`` comes from the source row, not the host setting)."""
+    ``provider_type`` comes from the source row, not the host setting).
+
+    ``module`` is the AudioMuse provider module with the catalogue's server
+    bound (``_with_source_module``), so the URL and credentials are that
+    server's own (JF.8). Only Navidrome and Jellyfin are served.
+    """
     provider_type = str(provider_type or "").lower()
     if provider_type == "jellyfin":
-        return (
-            f"{str(getattr(config, 'JELLYFIN_URL', '')).rstrip('/')}/Items/{quote(item_id)}/Download",
-            _provider_headers(provider_type),
-            None,
-        ), None
-    if provider_type == "navidrome":
-        from tasks.mediaserver.navidrome import get_navidrome_auth_params
+        if module is None:
+            return (
+                f"{str(getattr(config, 'JELLYFIN_URL', '')).rstrip('/')}/Audio/{quote(item_id)}/stream",
+                _provider_headers(provider_type),
+                {"static": "true"},
+            ), None
+        from .jellyfin_provider import stream_target
 
-        auth = get_navidrome_auth_params()
+        return stream_target(module, item_id, quote), None
+    if provider_type == "navidrome":
+        base, auth, _module = _navidrome_access(module)
         if not auth:
             return None, ("Navidrome credentials are not configured", 500)
-        return (
-            f"{str(getattr(config, 'NAVIDROME_URL', '')).rstrip('/')}/rest/stream.view",
-            {},
-            {"id": item_id, **auth},
-        ), None
-    if provider_type == "plex":
-        from tasks.mediaserver.plex import _resolve_part
-
-        part_key, _ = _resolve_part(item_id)
-        if not part_key:
-            return None, ("Track stream was not found", 404)
-        return (
-            f"{str(getattr(config, 'PLEX_URL', '')).rstrip('/')}{part_key}",
-            {"X-Plex-Token": getattr(config, "PLEX_TOKEN", "")},
-            None,
-        ), None
+        return (f"{base}/rest/stream.view", {}, {"id": item_id, **auth}), None
     return None, ("Preview is not supported for this media server", 501)
 
 
@@ -936,45 +953,73 @@ def _stream_response(upstream):
     return response
 
 
-def _resolve_art_target(item_id, size, provider_type):
+def _resolve_art_target(item_id, size, provider_type, module=None):
     provider_type = str(provider_type or "").lower()
     if provider_type == "navidrome":
-        from tasks.mediaserver.navidrome import _navidrome_request, get_navidrome_auth_params
-
+        base, auth, bound = _navidrome_access(module)
         cover_id = item_id
         try:
-            song = (_navidrome_request("getSong", {"id": item_id}) or {}).get("song") or {}
+            song = (bound._navidrome_request("getSong", {"id": item_id}) or {}).get("song") or {}
             cover_id = str(song.get("coverArt") or item_id)
         except Exception:
             logger.warning("Could not resolve Navidrome cover id for %s", item_id)
-        auth = get_navidrome_auth_params()
         return (
-            f"{str(getattr(config, 'NAVIDROME_URL', '')).rstrip('/')}/rest/getCoverArt.view",
+            f"{base}/rest/getCoverArt.view",
             {},
             {"id": cover_id, "size": size, **(auth or {})},
         )
     if provider_type == "jellyfin":
-        return (
-            f"{str(getattr(config, 'JELLYFIN_URL', '')).rstrip('/')}/Items/{quote(item_id)}/Images/Primary",
-            _provider_headers(provider_type),
-            {"maxWidth": size, "quality": 90},
-        )
-    if provider_type == "plex":
-        base = str(getattr(config, "PLEX_URL", "")).rstrip("/")
-        headers = {"Accept": "application/json", "X-Plex-Token": getattr(config, "PLEX_TOKEN", "")}
-        metadata = http_requests.get(
-            f"{base}/library/metadata/{quote(item_id)}",
-            headers=headers,
-            timeout=_REQUEST_TIMEOUT,
-        )
-        metadata.raise_for_status()
-        items = ((metadata.json().get("MediaContainer") or {}).get("Metadata")) or []
-        item = items[0] if items else {}
-        thumb = item.get("thumb") or item.get("parentThumb") or item.get("grandparentThumb")
-        if not thumb:
-            return None
-        return (f"{base}{thumb}", headers, {"width": size, "height": size})
+        if module is None:
+            return (
+                f"{str(getattr(config, 'JELLYFIN_URL', '')).rstrip('/')}/Items/{quote(item_id)}/Images/Primary",
+                _provider_headers(provider_type),
+                {"maxWidth": size, "quality": 90},
+            )
+        from .jellyfin_provider import art_target
+
+        return art_target(module, item_id, size, quote)
     return None
+
+
+def _catalog_server_id(catalog_instance_id):
+    cur = get_db().cursor()
+    try:
+        cur.execute(
+            f"SELECT current_core_server_id FROM {table('catalog_sources')} "
+            "WHERE catalog_instance_id=%s AND rebind_status='active'",
+            (str(catalog_instance_id),),
+        )
+        row = cur.fetchone()
+    finally:
+        cur.close()
+    return str(row[0]) if row and row[0] else None
+
+
+def _provider_bridge():
+    from .catalog_providers import ProviderCatalogBridge
+
+    return ProviderCatalogBridge()
+
+
+class SourceUnavailable(RuntimeError):
+    pass
+
+
+def _with_source_module(catalog_instance_id, provider_type, build):
+    """Run ``build(module)`` with the catalogue's own server bound (JF.8).
+
+    The workbench proxies then use that server's AudioMuse v3 credentials,
+    never the host's legacy global ``NAVIDROME_URL``/``JELLYFIN_URL``/
+    ``HEADERS``. A server whose type no longer matches the catalogue is
+    refused.
+    """
+    server_id = _catalog_server_id(catalog_instance_id)
+    if not server_id:
+        raise SourceUnavailable("catalog_instance_not_found")
+    with _provider_bridge().bound_module(server_id) as (server, module):
+        if str(server.get("provider_type") or "").lower() != provider_type:
+            raise SourceUnavailable("provider_type_changed")
+        return build(module)
 
 
 def _proxy_art(target):
@@ -1074,10 +1119,19 @@ def register_collection_library_routes(bp, require_enabled):
         if not _ITEM_ID_RE.fullmatch(item_id):
             return jsonify({"error": "Invalid track id"}), 400
         try:
-            _catalog, provider_type = _route_catalog()
+            catalog_instance_id, provider_type = _route_catalog()
             if provider_type is None:
                 return jsonify({"error": "catalog_instance_not_found"}), 404
-            target, target_error = _resolve_stream_target(item_id, provider_type)
+            if provider_type not in SERVED_PROVIDER_TYPES:
+                return jsonify({"error": "Preview is not supported for this media server"}), 501
+            try:
+                target, target_error = _with_source_module(
+                    catalog_instance_id,
+                    provider_type,
+                    lambda module: _resolve_stream_target(item_id, provider_type, module),
+                )
+            except SourceUnavailable as exc:
+                return jsonify({"error": str(exc)}), 409
             if target_error:
                 message, status = target_error
                 return jsonify({"error": message}), status
@@ -1099,10 +1153,14 @@ def register_collection_library_routes(bp, require_enabled):
             return "", 404
         size = _bounded_int(request.args.get("size"), 320, 48, 1200)
         try:
-            _catalog, provider_type = _route_catalog()
-            if provider_type is None:
+            catalog_instance_id, provider_type = _route_catalog()
+            if provider_type is None or provider_type not in SERVED_PROVIDER_TYPES:
                 return "", 404
-            response = _proxy_art(_resolve_art_target(item_id, size, provider_type))
+            response = _proxy_art(_with_source_module(
+                catalog_instance_id,
+                provider_type,
+                lambda module: _resolve_art_target(item_id, size, provider_type, module),
+            ))
             return response if response is not None else ("", 404)
         except CatalogScopeError as exc:
             return jsonify(exc.body()), exc.status

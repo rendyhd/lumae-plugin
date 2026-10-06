@@ -5,19 +5,25 @@ exposes only sanitized server descriptions and raw provider catalogue objects
 to the normalizer; callers must never persist or serialize the bridge itself.
 """
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 
 from plugin.api import logger
 
+from . import jellyfin_provider
 from .core_compat import get_core_adapter
 
 
-# Lumae's mobile catalogue contract is intentionally Navidrome-only for now.
-# The Jellyfin reader below is kept, but Jellyfin is not admitted into a
-# source of truth until the app supports it. Emby and Lyrion are not supported
-# music servers and have no reader (1.6.0, JF.2).
-SUPPORTED_PROVIDER_TYPES = frozenset(("navidrome",))
+# The music servers Lumae's mobile catalogue contract supports: Navidrome and,
+# from 1.6.0, Jellyfin 12.0 or later. Any other type (Emby, Lyrion, Plex, an
+# unknown value) is hidden: never admitted, fetched, rekeyed or deleted.
+SUPPORTED_PROVIDER_TYPES = frozenset(("navidrome", "jellyfin"))
+PROVIDER_DISPLAY_NAMES = {"navidrome": "Navidrome", "jellyfin": "Jellyfin"}
 NAVIDROME_SMALL_SCOPE_ALBUM_LIMIT = 32
+
+
+def provider_display_name(provider_type):
+    """A server type's product name for messages; neutral for anything else."""
+    return PROVIDER_DISPLAY_NAMES.get(normalized_provider_type(provider_type), "music server")
 
 
 class CatalogProviderError(RuntimeError):
@@ -87,9 +93,7 @@ class ProviderCatalogBridge:
             if callable(public_iterator):
                 result = public_iterator()
                 candidate = _coerce_catalog_result(result, self.list_libraries(server_id))
-                if server["provider_type"] != "navidrome" or _has_complete_library_memberships(
-                    candidate
-                ):
+                if _has_complete_library_memberships(candidate):
                     return candidate
                 # A rich iterator is only authoritative for Lumae when it
                 # preserves provider library membership. Older AudioMuse
@@ -102,10 +106,34 @@ class ProviderCatalogBridge:
                 )
             return fetcher(module, self.core, server_id)
 
+    @contextmanager
+    def bound_module(self, server_id):
+        """Yield ``(server, provider module)`` with ``server_id`` bound.
+
+        Inside, the AudioMuse provider module resolves that server's own v3
+        credentials; nothing credentialed leaves the ``with`` block.
+        """
+        server = self.require_server(server_id)
+        bind = getattr(self.core, "bind", None)
+        context = bind(server_id) if callable(bind) else nullcontext()
+        with context:
+            yield server, self.core.provider_module(server["provider_type"])
+
     def probe_server_identity(self, server_id, timeout_seconds=5):
-        """Return credential-free provider identity from a bounded ping."""
+        """Return credential-free provider identity from a bounded ping.
+
+        Navidrome: ``ping``'s ``serverVersion``. Jellyfin:
+        ``/System/Info/Public`` (no credentials), adding the server ``Id``
+        (``server_id``) and ``product_name`` the identity guard binds.
+        """
 
         server = self.require_server(server_id)
+        if server["provider_type"] == "jellyfin":
+            with self.bound_module(server_id) as (_server, module):
+                try:
+                    return jellyfin_provider.probe_identity(module, timeout=timeout_seconds)
+                except jellyfin_provider.JellyfinUnavailable as exc:
+                    raise CatalogProviderError(str(exc)) from exc
         if server["provider_type"] != "navidrome":
             return {
                 "provider_type": server["provider_type"],
@@ -350,40 +378,11 @@ def _navidrome_artist_cover_art(request, folder_ids):
 
 
 def _fetch_jellyfin(module, core, server_id):
-    libraries = list(module.list_libraries() or [])
-    target = getattr(module, "_get_target_library_ids", None)
-    target_ids = target() if callable(target) else None
-    fetch_page = getattr(module, "_fetch_songs_paged", None)
-    if not callable(fetch_page):
-        tracks = core.get_all_songs(server_id, apply_filter=True)
-    elif target_ids is None:
-        tracks = fetch_page(None)
-    else:
-        tracks = []
-        for library_id in sorted(target_ids):
-            page = fetch_page(None, library_id)
-            for row in page:
-                row.setdefault("LibraryId", str(library_id))
-            tracks.extend(page)
-    albums = {}
-    for row in tracks:
-        album_id = row.get("AlbumId") or row.get("ParentId")
-        if not album_id:
-            continue
-        albums.setdefault(
-            str(album_id),
-            {
-                "Id": str(album_id),
-                "Name": row.get("Album") or "Unknown Album",
-                "AlbumArtist": row.get("AlbumArtist"),
-                "ProductionYear": row.get("ProductionYear"),
-                "Genres": row.get("Genres"),
-                "ProviderIds": row.get("AlbumProviderIds") or {},
-                "ImageTags": row.get("AlbumImageTags") or {},
-                "LibraryId": row.get("LibraryId"),
-            },
-        )
-    return {"libraries": libraries, "albums": list(albums.values()), "tracks": list(tracks)}
+    """Jellyfin catalogue, always scoped by music library (JF.8)."""
+    try:
+        return jellyfin_provider.fetch_catalog(module, error_type=CatalogProviderError)
+    except jellyfin_provider.JellyfinUnavailable as exc:
+        raise CatalogProviderError(str(exc)) from exc
 
 
 # Emby and Lyrion are not supported music servers: their readers were removed

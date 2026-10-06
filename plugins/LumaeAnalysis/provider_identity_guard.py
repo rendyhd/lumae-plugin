@@ -1,4 +1,11 @@
-"""Durable admission shield for Navidrome provider-ID transitions."""
+"""Durable admission shield for provider-ID transitions.
+
+Navidrome: the canonical-ID version boundary and its exact codec
+(``provider_identity``). Jellyfin (1.6.0, JF.8): the server ``Id`` from
+``/System/Info/Public`` is bound to the catalogue and a different ``Id``
+blocks it; the release must be 12.0 or later. No Navidrome canonical-ID logic
+ever runs for a Jellyfin source.
+"""
 
 from __future__ import annotations
 
@@ -189,6 +196,10 @@ def migrate_provider_identity(db):
         )
         """
     )
+    # 1.6.0 (JF.8): the Jellyfin server Id bound to a catalogue. Also added
+    # by migrate_catalog; repeated here because this migration is re-run at
+    # Flask startup to repair an update whose install hook rolled back.
+    migrations.ensure_columns(cur, t('catalog_sources'), "provider_server_id TEXT")
     cur.execute(
         f"""
         INSERT INTO {t('provider_identity_transitions')}
@@ -267,7 +278,8 @@ def _source_state(db, server_id, for_update=False):
                p.first_seq, p.last_seq, p.analysis_baseline,
                p.baseline_integrity, p.audiomuse_health, p.manifest_sha256,
                p.catalog_instance_id IS NOT NULL, p.baseline_catalog_generation,
-               p.baseline_analysis_generation, p.detected_at IS NOT NULL
+               p.baseline_analysis_generation, p.detected_at IS NOT NULL,
+               s.provider_type, s.provider_server_id
           FROM {t('catalog_sources')} s
           LEFT JOIN {t('catalog_state')} c USING (catalog_instance_id)
           LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
@@ -311,6 +323,13 @@ def _source_state(db, server_id, for_update=False):
                 "baseline_catalog_generation": int(row[21]) if row[21] is not None else None,
                 "baseline_analysis_generation": int(row[22]) if row[22] is not None else None,
                 "detected": bool(row[23]),
+            }
+        )
+    if len(row) > 25:
+        source.update(
+            {
+                "provider_type": str(row[24] or "").strip().lower() or None,
+                "provider_server_id": str(row[25]) if row[25] else None,
             }
         )
     return source
@@ -488,6 +507,12 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
         # production ProviderCatalogBridge always does.
         return {**source, "observation": "bridge_unavailable", "written": written}
 
+    if source.get("provider_type") == "jellyfin":
+        return _observe_jellyfin(
+            db, bridge, probe, server_id, source, written,
+            commit=commit, refresh_health=refresh_health,
+        )
+
     try:
         identity = probe(server_id)
         current_version = str(identity.get("server_version") or "").strip()
@@ -519,6 +544,30 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
             "state": state,
             "observation": "unverified",
             "last_error": str(exc),
+            "written": written,
+        }
+
+    live_type = str(identity.get("provider_type") or "").strip().lower()
+    if source.get("provider_type") and live_type and live_type != source["provider_type"]:
+        # The AudioMuse server row now names another server type. Its version
+        # says nothing about this catalogue; never adopt it (D-JF.2).
+        observation = {
+            "state": ProviderIdentityTransitionState.BLOCKED.value,
+            "current_version": source.get("current_provider_version"),
+            "detection_reason": "provider_type_changed",
+            "required_action": "set_up_new_catalogue",
+        }
+        if _observation_changes(source, **observation):
+            _update_observation(db, source, **observation)
+            written = True
+        if commit:
+            db.commit()
+        return {
+            **source,
+            "state": observation["state"],
+            "observation": "verified",
+            "detection_reason": observation["detection_reason"],
+            "required_action": observation["required_action"],
             "written": written,
         }
 
@@ -575,6 +624,267 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
         **source,
         "state": next_state,
         "current_provider_version": current_version,
+        "observation": "verified",
+        "provider_identity": identity,
+        "detection_reason": reason,
+        "required_action": action,
+        "audiomuse_health": audiomuse_health,
+        "written": written,
+    }
+
+
+JELLYFIN_REKEY_PENDING_REASON = "provider_ids_moved"
+JELLYFIN_VERIFIED_REASON = "provider_identity_verified"
+
+
+def jellyfin_identity_verdict(source, identity):
+    """``(state, detection_reason, required_action)`` for a probed Jellyfin.
+
+    ``None`` when the probed server is the catalogue's own Jellyfin 12.0+
+    server (or the first one seen, which is then bound). Any other answer
+    blocks the catalogue: a different server ``Id`` is never adopted as the
+    same catalogue, whatever its library looks like.
+    """
+    from .jellyfin_provider import version_supported
+
+    blocked = ProviderIdentityTransitionState.BLOCKED.value
+    if str(identity.get("provider_type") or "").strip().lower() != "jellyfin":
+        return blocked, "provider_type_changed", "set_up_new_catalogue"
+    if "jellyfin" not in str(identity.get("product_name") or "").lower():
+        return blocked, "provider_product_mismatch", "restore_provider_server"
+    if not version_supported(identity.get("server_version")):
+        return blocked, "provider_version_unsupported", "upgrade_jellyfin"
+    bound = source.get("provider_server_id")
+    if bound and str(identity.get("server_id") or "") != bound:
+        return blocked, "provider_server_changed", "restore_provider_server"
+    return None
+
+
+def _jellyfin_observation_changes(source, *, state, current_version, detection_reason,
+                                  required_action, last_error=None):
+    if any(key not in source for key in _OBSERVED_KEYS) or not source["transition_exists"]:
+        return True
+    stored_state = source["state"] or ProviderIdentityTransitionState.NORMAL.value
+    if stored_state != state:
+        return True
+    if state == ProviderIdentityTransitionState.NORMAL.value and (
+        source.get("transition_id")
+        or source["baseline_catalog_generation"] != source["catalog_generation"]
+        or source["baseline_analysis_generation"] != source["analysis_generation"]
+    ):
+        return True
+    if state == ProviderIdentityTransitionState.TRANSITION_PENDING.value and not source["detected"]:
+        return True
+    return (
+        (source["current_provider_version"] or None) != (current_version or None)
+        or (source["detection_reason"] or None) != (detection_reason or None)
+        or (source["required_action"] or None) != (required_action or None)
+        or (source["last_error"] or None) != (str(last_error)[:1000] if last_error else None)
+    )
+
+
+def _update_jellyfin_observation(db, source, *, state, current_version, detection_reason,
+                                 required_action, last_error=None):
+    """Write a Jellyfin observation.
+
+    ``normal`` clears the transition id, so the next rekey always opens with
+    a new one. Entering ``transition_pending`` from any other state opens a
+    new transition id. ``blocked`` resets any target proof: a rekey must be
+    proven again by two scans of the verified server.
+    """
+    stored_state = source.get("state") or ProviderIdentityTransitionState.NORMAL.value
+    normal = state == ProviderIdentityTransitionState.NORMAL.value
+    opens = (
+        state == ProviderIdentityTransitionState.TRANSITION_PENDING.value
+        and stored_state != state
+    )
+    resets_target = normal or opens or state == ProviderIdentityTransitionState.BLOCKED.value
+    transition_id = None if normal else (str(uuid.uuid4()) if opens else source.get("transition_id"))
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        UPDATE {t('provider_identity_transitions')}
+           SET transition_id=%s,
+               state=%s,
+               previous_provider_version=CASE
+                   WHEN %s::text IS NOT NULL AND current_provider_version IS DISTINCT FROM %s
+                   THEN current_provider_version
+                   ELSE previous_provider_version
+               END,
+               current_provider_version=COALESCE(%s, current_provider_version),
+               baseline_catalog_generation=CASE WHEN %s OR %s THEN %s
+                   ELSE baseline_catalog_generation END,
+               baseline_analysis_generation=CASE WHEN %s OR %s THEN %s
+                   ELSE baseline_analysis_generation END,
+               detection_reason=%s,
+               required_action=%s,
+               target_fingerprint=CASE WHEN %s THEN NULL ELSE target_fingerprint END,
+               target_scan_count=CASE WHEN %s THEN 0 ELSE target_scan_count END,
+               first_seq=CASE WHEN %s THEN NULL ELSE first_seq END,
+               last_seq=CASE WHEN %s THEN NULL ELSE last_seq END,
+               manifest_sha256=CASE WHEN %s THEN NULL ELSE manifest_sha256 END,
+               applied_at=CASE WHEN %s THEN NULL ELSE applied_at END,
+               detected_at=CASE WHEN %s THEN NULL
+                                WHEN %s='transition_pending' THEN COALESCE(detected_at, now())
+                                ELSE detected_at END,
+               checked_at=now(),
+               last_error=%s,
+               updated_at=now()
+         WHERE catalog_instance_id=%s
+        """,
+        (
+            transition_id,
+            state,
+            current_version,
+            current_version,
+            current_version,
+            normal,
+            opens,
+            source["catalog_generation"],
+            normal,
+            opens,
+            source["analysis_generation"],
+            detection_reason,
+            required_action,
+            resets_target,
+            resets_target,
+            opens or normal,
+            opens or normal,
+            opens or normal,
+            opens or normal,
+            normal,
+            state,
+            str(last_error)[:1000] if last_error else None,
+            source["catalog_instance_id"],
+        ),
+    )
+    cur.close()
+    return transition_id
+
+
+def _bind_jellyfin_server(db, source, server_identity_id):
+    """Bind the first verified Jellyfin server ``Id`` to the catalogue, once."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        UPDATE {t('catalog_sources')}
+           SET provider_server_id=%s, updated_at=now()
+         WHERE catalog_instance_id=%s AND provider_server_id IS NULL
+        """,
+        (server_identity_id, source["catalog_instance_id"]),
+    )
+    bound = max(int(getattr(cur, "rowcount", 0) or 0), 0)
+    cur.close()
+    return bound > 0
+
+
+def _observe_jellyfin(db, bridge, probe, server_id, source, written, *, commit, refresh_health):
+    """Probe ``/System/Info/Public`` and gate the Jellyfin catalogue on it."""
+
+    stored_state = source.get("state") or ProviderIdentityTransitionState.NORMAL.value
+    try:
+        identity = probe(server_id)
+        current_version = str(identity.get("server_version") or "").strip()
+        if not current_version:
+            raise RuntimeError("Jellyfin did not report its version")
+    except Exception as exc:
+        # As for Navidrome: a published catalogue whose server cannot be
+        # verified closes admission until a probe succeeds.
+        state = stored_state
+        if (
+            source["catalog_generation"] > 0
+            and state != ProviderIdentityTransitionState.APPLIED.value
+        ):
+            state = ProviderIdentityTransitionState.TRANSITION_PENDING.value
+        observation = {
+            "state": state,
+            "current_version": source.get("current_provider_version"),
+            "detection_reason": "provider_version_unverified",
+            "required_action": (
+                "retry_provider_identity_check" if state != "normal" else None
+            ),
+            "last_error": exc,
+        }
+        if _jellyfin_observation_changes(source, **observation):
+            _update_jellyfin_observation(db, source, **observation)
+            written = True
+        if commit:
+            db.commit()
+        return {
+            **source,
+            "state": state,
+            "observation": "unverified",
+            "detection_reason": "provider_version_unverified",
+            "last_error": str(exc),
+            "written": written,
+        }
+
+    verdict = jellyfin_identity_verdict(source, identity)
+    provider_server_id = source.get("provider_server_id")
+    if verdict is not None:
+        next_state, reason, action = verdict
+        # The version of another server is not this catalogue's version.
+        observed_version = (
+            current_version
+            if reason in ("provider_version_unsupported",)
+            else source.get("current_provider_version")
+        )
+    else:
+        observed_version = current_version
+        if not provider_server_id:
+            if _bind_jellyfin_server(db, source, identity["server_id"]):
+                written = True
+            provider_server_id = identity["server_id"]
+        stored_reason = source.get("detection_reason")
+        if source["catalog_generation"] == 0:
+            next_state, reason, action = (
+                ProviderIdentityTransitionState.NORMAL.value, "fresh_catalogue", None
+            )
+        elif (
+            stored_state == ProviderIdentityTransitionState.TRANSITION_PENDING.value
+            and stored_reason == JELLYFIN_REKEY_PENDING_REASON
+        ):
+            next_state, reason, action = (
+                stored_state, JELLYFIN_REKEY_PENDING_REASON, "wait_for_lumae_rekey"
+            )
+        elif stored_state == ProviderIdentityTransitionState.APPLIED.value:
+            next_state = stored_state
+            reason = (
+                stored_reason
+                if stored_reason not in (None, "provider_version_unverified")
+                else JELLYFIN_VERIFIED_REASON
+            )
+            action = source.get("required_action")
+        else:
+            next_state, reason, action = (
+                ProviderIdentityTransitionState.NORMAL.value, JELLYFIN_VERIFIED_REASON, None
+            )
+    observation = {
+        "state": next_state,
+        "current_version": observed_version,
+        "detection_reason": reason,
+        "required_action": action,
+    }
+    if _jellyfin_observation_changes(source, **observation):
+        _update_jellyfin_observation(db, source, **observation)
+        written = True
+    audiomuse_health = source.get("audiomuse_health")
+    if refresh_health and next_state == ProviderIdentityTransitionState.APPLIED.value:
+        adapter = getattr(bridge, "core", None)
+        if adapter is not None and callable(getattr(adapter, "analysis_mapping_sql", None)):
+            from .provider_identity_rekey import refresh_audiomuse_health
+
+            audiomuse_health = refresh_audiomuse_health(
+                db, source["catalog_instance_id"], server_id, adapter, commit=False,
+            )
+            written = True
+    if commit:
+        db.commit()
+    return {
+        **source,
+        "state": next_state,
+        "current_provider_version": observed_version,
+        "provider_server_id": provider_server_id,
         "observation": "verified",
         "provider_identity": identity,
         "detection_reason": reason,
@@ -741,7 +1051,7 @@ def assert_analysis_projection_allowed(db, bridge, server_id):
         return observation
     if observation.get("state") in ("transition_pending", "blocked"):
         raise ProviderIdentityTransitionPending(
-            "Navidrome provider identity is unresolved; the previous Lumae analysis projection is preserved"
+            "Provider identity is unresolved; the previous Lumae analysis projection is preserved"
         )
     source = _source_state(db, server_id)
     if (
