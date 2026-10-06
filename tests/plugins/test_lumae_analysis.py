@@ -7854,26 +7854,39 @@ def test_v3_readiness_keeps_incomplete_evidence_progressively_usable():
     assert "review_state IN ('needs_repair', 'needs_review')" in status_model.link_counts_sql()
 
 
-def test_v3_historical_upgrade_sequence_is_diagnostic_only():
+def test_v3_historical_upgrade_sequence_is_reported_unavailable_not_read():
+    # AudioMuse never keeps the finished analysis -> cleaning -> analysis rows
+    # (a main-task start revokes earlier ones; from 3.2.0 a finished root task
+    # deletes the rest), so readiness no longer reads task_status for them,
+    # even when such rows happen to be present.
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
-        core_version="v3.0.3",
+        core_version="v3.6.3",
         adapter="v3_registry",
     )
+    db = ReadinessDb(
+        coverage=(10, 10, 10, 150.0),
+        tasks=readiness_tasks(),
+        link_counts=(10, 0, 0, 0, 10, 0),
+    )
     result = readiness.v3_release_readiness(
-        ReadinessDb(
-            coverage=(10, 10, 10, 250.0),
-            tasks=readiness_tasks(),
-            link_counts=(10, 0, 0, 0, 10, 0),
-        ),
+        db,
         compatibility,
         readiness_source(),
         readiness_policy(),
     )
 
     assert result["ready"] is True
-    assert result["task_evidence"]["chromaprint_complete_before_cleaning"] is False
-    assert result["task_evidence"]["upgrade_sequence_complete"] is False
+    assert not any("task_status" in sql for sql, _params in db.executed)
+    assert result["task_evidence"] == {
+        "analysis_before_cleaning": None,
+        "cleaning": None,
+        "analysis_after_cleaning": None,
+        "upgrade_sequence_complete": False,
+        "chromaprint_complete_before_cleaning": False,
+        "diagnostics_available": False,
+        "unavailable_reason": "audiomuse_keeps_latest_task_only",
+    }
 
 
 def test_v3_readiness_does_not_depend_on_historical_task_diagnostics():
@@ -8107,9 +8120,9 @@ def test_settings_page_explains_automatic_sonic_status_and_blockers(monkeypatch)
     assert "Full-library verification is still waiting for Chromaprint" in body
     assert "Source-analysis links: 7 usable (5 verified; 2 provisional)" in compact
     assert "1 flagged for repair" in compact
+    assert "upgrade sequence" not in compact
     assert "Analysis task or schedule produces the missing source" in compact
     assert "Technical details" in body
-    assert "diagnostic only; it does not gate readiness" in compact
     assert "Confirm fresh installation" not in body
     assert "Confirm upgraded installation" not in body
     assert "<form" not in body

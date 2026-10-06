@@ -49,7 +49,7 @@ from plugins.LumaeAnalysis.catalog_readiness import (  # noqa: E402  (unchanged 
     _detected_core_version,
     _policy_blockers,
     _stream_admission,
-    _task_evidence,
+    historical_task_evidence,
 )
 from plugins.LumaeAnalysis.core_v3 import AudioMuseV3Adapter  # noqa: E402
 
@@ -102,8 +102,10 @@ class Bridge(RefreshBridge):
 # ---------------------------------------------------------------------------
 # Oracle: pre-P2-1 catalog_readiness (phase/1-stop-the-bleeding e2f0c12),
 # _coverage, _link_coverage and v3_release_readiness verbatim. Its helpers
-# (_task_evidence, _policy_blockers, _stream_admission, _catalogue_admission)
-# are unchanged by P2-1 and imported above.
+# (_policy_blockers, _stream_admission, _catalogue_admission) are unchanged by
+# P2-1 and imported above. The task-row upgrade-sequence diagnostic it read is
+# retired (AudioMuse never keeps those rows); the oracle reads the retired
+# shape, which its own chromaprint step leaves as it is.
 # ---------------------------------------------------------------------------
 
 
@@ -270,7 +272,7 @@ def v3_release_readiness(
             },
         }
     try:
-        tasks = _task_evidence(db)
+        tasks = historical_task_evidence()
     except Exception:
         tasks = {
             "analysis_before_cleaning": None,

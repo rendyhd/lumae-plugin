@@ -155,13 +155,6 @@ def render_v3_readiness_panel():
         suspect_links = int(readiness.get("suspect_link_count") or 0)
         missing_links = int(readiness.get("missing_link_count") or 0)
         coverage = float(readiness.get("chromaprint_coverage") or 0) * 100
-        task_evidence = readiness.get("task_evidence") or {}
-        sequence = bool(task_evidence.get("upgrade_sequence_complete"))
-        sequence_label = (
-            "unavailable"
-            if task_evidence.get("diagnostics_available") is False
-            else ("yes" if sequence else "no")
-        )
         fully_verified = bool(readiness.get("ready"))
         analysis_sync_allowed = bool(readiness.get("analysis_sync_allowed"))
         if "source_rebind_required" in blockers:
@@ -232,8 +225,6 @@ def render_v3_readiness_panel():
                     ({verified_links:,} verified; {provisional_links:,} provisional);
                     {pending_links:,} awaiting analysis; {suspect_links:,} flagged for repair;
                     {missing_links:,} not analyzed.</p>
-                  <p class="lumae-help">Historical AudioMuse upgrade sequence observed:
-                    {sequence_label} (diagnostic only; it does not gate readiness).</p>
                   {f'<ul class="lumae-help">{blocker_html}</ul>' if blocker_html else ''}
                 </div>
               </details>

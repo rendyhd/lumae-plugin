@@ -26,6 +26,16 @@ still matters. Exact, code-verified wire behaviour for every version lives in
   MusicBrainz allowance deferred for an hour waits on the hourly sweep
   instead of an empty task every minute. Each cadence still ticks at or
   before the retry is due.
+- The "Historical AudioMuse upgrade sequence observed" diagnostic is retired.
+  It looked for a finished analysis, then cleaning, then analysis in
+  AudioMuse's `task_status`, which never keeps them: every main-task start
+  marks the earlier finished tasks REVOKED, and from AudioMuse 3.2.0 (the
+  minimum core) each finished task deletes the others. It could only read
+  "no". The settings page drops the line; health keeps
+  `servers[].v3_readiness.task_evidence` with the same keys, now always
+  `diagnostics_available: false` and a new `unavailable_reason:
+  "audiomuse_keeps_latest_task_only"`, and no longer queries `task_status`
+  for it. Readiness never depended on it.
 
 ## 1.5.0 (2026-10-05)
 
