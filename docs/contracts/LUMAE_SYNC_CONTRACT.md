@@ -213,6 +213,26 @@ Jellyfin item IDs are `MD5(type + path)`. Moving, renaming or re-casing a file o
 
 **What moves with the rekey** (as v1): source and published profiles (a published profile is a `deleted` event for the old ID and a `ready` event for the new one; edge profiles are recomputed), Living Collections items (feed events, §5.2), shelves, Vibes, covers and the carried analysis links. Derived rows a target ID still held from an earlier publication (an ID that came back) are removed first. The legacy pre-registry profile table is never touched for Jellyfin. Personal discovery records are not rewritten, as for v1: a client applies the journal or the manifest to its own records.
 
+### 2.3 Tags from Jellyfin files (1.6.0, unreleased)
+
+Jellyfin 12 does not expose several tags that Navidrome serves through OpenSubsonic (measured on 12.2.0: release type, compilation and explicit flags, lyricist/producer/engineer/mixer/remixer/arranger/conductor/performer credits, ISRC, disc subtitle, original date, BPM, sort names, ReplayGain peaks, album gain from tags, and any MP4 ReplayGain; its own `NormalizationGain` is never used). Whenever the plugin holds a Jellyfin track's original file (AudioMuse's analysis hook `audio_path`, or the file the plugin downloads for profiles), it reads the tags in an isolated child process, with mutagen when it is installed, else PyAV's container and stream metadata, and stores them per track. The next catalogue refresh merges them into the raw Jellyfin rows under exactly the OpenSubsonic keys the Navidrome reader produces, so the published fields and payload keys are the same as for Navidrome. Only tags present in the file are emitted; nothing is ever inferred. A Navidrome catalogue never reads files or this table.
+
+| Tag (ID3 / Vorbis / MP4) | Track key (payload) | Album key (payload) | Canonical field |
+|---|---|---|---|
+| `TXXX:MusicBrainz Album Type`, `RELEASETYPE` | — | `releaseTypes` (list) | album `release_type`, inherited by its tracks |
+| `TCMP`, `COMPILATION`, `cpil` | `isCompilation` | `isCompilation` | track `compilation` |
+| `ITUNESADVISORY`, `rtng` (1/4 explicit, 2 clean) | `isExplicit`, `explicitStatus` | `explicitStatus` (`explicit` when any track is) | track `explicit` |
+| `TCOM`, `TEXT`, `TIPL`, `TMCL`, `TPE3`, `TPE4`, `COMPOSER`, `LYRICIST`, `PRODUCER`, `ENGINEER`, `MIXER`, `REMIXER`, `ARRANGER`, `CONDUCTOR`, `PERFORMER` (`Name (instrument)`) | `contributors` (`[{role, subRole?, artist: {name}}]`, role order composer, lyricist, producer, engineer, mixer, remixer, arranger, conductor, performer) | — | — |
+| `TSRC`, `ISRC` | `isrc` (list) | — | `external_ids.isrc` |
+| `TSST`, `DISCSUBTITLE` | `discTitle` | — | `disc_title` (and the album's `disc_titles`) |
+| `TDOR`, `TORY`, `ORIGINALDATE`, `ORIGINALYEAR` | — | `originalReleaseDate` (`{year, month?, day?}`) | — |
+| `TBPM`, `BPM`, `tmpo` | `bpm` | — | — |
+| `REPLAYGAIN_TRACK_GAIN`/`_PEAK`, `REPLAYGAIN_ALBUM_GAIN`/`_PEAK` | `replayGain` (`trackGain`, `trackPeak`, `albumGain`, `albumPeak`) | — | `_lumae.replay_gain` (`track_gain_db`, `track_peak`, `album_gain_db`, `album_peak`) |
+| `TSOT`, `TITLESORT`, `sonm` | `sortName` | — | — |
+| `TSOA`, `ALBUMSORT`, `soal` | — | `sortName` | — |
+
+An album key is emitted only when every tagged track of the album that carries the tag agrees. The keys of a Jellyfin row with file tags are folded into its metadata fingerprint, so a changed tag is an ordinary `upsert` (a retagged file is re-read when its media changes and the plugin analyses it again). A fingerprint rekey (§2.2) carries the moved file's tags to the new ID. Known limits: PyAV does not return ID3 `TIPL` names or the MP4 `tmpo` atom (mutagen does); artist sort names have no OpenSubsonic track or album key and are not emitted; Opus `R128_*` gains are not converted. `release_type` and `external_ids.isrc` keep the Navidrome reader's existing text form of a list (`"['album']"`), on both paths.
+
 ---
 
 ## 3. Profile endpoints

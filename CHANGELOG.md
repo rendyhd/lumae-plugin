@@ -61,6 +61,16 @@ still matters. Exact, code-verified wire behaviour for every version lives in
   has not analysed yet are held back instead of being published as new.
   Health adds `provider_identity_transition.rekey_contract`; the manifest
   route reports each manifest's own `contract`. Navidrome is unaffected.
+- Tags from Jellyfin files (contract §2.3). Whenever the plugin holds a
+  Jellyfin track's original file (AudioMuse's analysis hook or its own
+  profile download) it reads, with mutagen if installed and PyAV otherwise,
+  the tags Jellyfin 12 does not expose: release type, compilation, explicit,
+  credits with roles (composer, lyricist, producer, engineer, mixer,
+  remixer, arranger, conductor, performer with instrument), ISRC, disc
+  subtitle, original date, ReplayGain track and album gain and peak, BPM
+  and title/album sort names. The refresh publishes them under exactly the
+  OpenSubsonic keys the Navidrome reader produces, only when present; a tag
+  change is an ordinary upsert. Navidrome is byte-for-byte unaffected.
 
 ## 1.5.0 (2026-10-05)
 

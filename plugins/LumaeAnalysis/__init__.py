@@ -43,6 +43,7 @@ from .shelves import (
     register_shelf_routes,
 )
 from . import covers, vibes
+from . import file_tags
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -3952,6 +3953,8 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
     if info is None:
         return complete(object(), "skipped_no_file", "missing file path", failure_code="media_unavailable")
     try:
+        # JF.10: a Jellyfin track's tags, read from the downloaded original.
+        file_tags.capture(get_db(), catalog_instance_id, track_id, info["file_path"])
         result = run_file_analysis(analyze_file, info["file_path"])
         outcome = complete(result, "ready", media_sig=info["media_signature"])
         if outcome["status"] == "ready":
@@ -4262,6 +4265,11 @@ def _analyze_song_hook(song):
     if not catalog_instance_id:
         logger.warning("lumae_analysis song hook skipped %s without an exact source", track_id)
         return {"track_id": track_id, "status": "skipped_source_unresolved"}
+    # JF.10: AudioMuse holds the original file now; keep a Jellyfin track's
+    # tags (a no-op for any other source).
+    hook_audio_path = (song or {}).get("audio_path")
+    if hook_audio_path and os.path.exists(hook_audio_path):
+        file_tags.capture(get_db(), catalog_instance_id, track_id, hook_audio_path)
     # An AudioMuse re-analysis pass fires this hook for every song. A current
     # published profile needs no new attempt (AUD-03); changed media, a new
     # analyzer or schema, and failed rows still requalify (LUM-007).

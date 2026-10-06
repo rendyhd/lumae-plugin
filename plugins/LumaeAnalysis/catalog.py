@@ -21,6 +21,7 @@ from .catalog_providers import (
     provider_display_name,
 )
 from .provider_identity_guard import inspect_catalog_identity, observe_provider_version
+from .file_tags import ALBUM_KEYS as FILE_TAG_ALBUM_KEYS, TRACK_KEYS as FILE_TAG_TRACK_KEYS
 from .status_model import migrate_status_summary, refresh_status_summary
 
 
@@ -623,7 +624,9 @@ def normalize_provider_catalog(raw_catalog, provider_type):
             **metadata,
             **art,
             "payload": payload,
-            "metadata_fp": fingerprint(metadata),
+            "metadata_fp": _with_file_tags(
+                fingerprint(metadata), raw, provider_type, FILE_TAG_ALBUM_KEYS
+            ),
             "artwork_fp": fingerprint(art),
         }
 
@@ -716,7 +719,9 @@ def normalize_provider_catalog(raw_catalog, provider_type):
                 "track_id": track_id,
                 **metadata,
                 "payload": payload,
-                "metadata_fp": fingerprint(metadata),
+                "metadata_fp": _with_file_tags(
+                    fingerprint(metadata), raw, provider_type, FILE_TAG_TRACK_KEYS
+                ),
                 "media_fp": fingerprint(media),
                 "artwork_fp": fingerprint(art),
                 "audio_properties": media,
@@ -910,6 +915,20 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         ),
         "unresolved_artist_art": sorted(unresolved_artist_art),
     }
+
+
+def _with_file_tags(metadata_fp, raw, provider_type, keys):
+    """Fold the file tags merged into a Jellyfin row (JF.10) into its
+    metadata fingerprint, so a tag change is an ordinary upsert even for keys
+    that only the payload carries (BPM, credits, ReplayGain, sort names).
+    Navidrome rows, and Jellyfin rows without file tags, keep their
+    fingerprint exactly."""
+    if provider_type != "jellyfin":
+        return metadata_fp
+    tags = {key: raw[key] for key in keys if isinstance(raw, dict) and key in raw}
+    if not tags:
+        return metadata_fp
+    return fingerprint({"base": metadata_fp, "file_tags": tags})
 
 
 def _with_artist_cover_art(artist, cover_art_id):
@@ -2097,6 +2116,14 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
         if server["provider_type"] == "jellyfin":
             _require_jellyfin_identity(identity_observation)
         raw = provider_bridge.fetch_catalog(server_id)
+        if server["provider_type"] == "jellyfin":
+            # JF.10: tags read from the original files, under the
+            # OpenSubsonic keys the Navidrome reader produces.
+            from . import file_tags
+
+            cur = db.cursor()
+            raw = file_tags.merge_into_raw(cur, catalog_instance_id, raw)
+            cur.close()
         normalized = normalize_provider_catalog(raw, server["provider_type"])
         counts = {entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER}
         snapshot_estimated_bytes = _estimate_snapshot_bytes(normalized)

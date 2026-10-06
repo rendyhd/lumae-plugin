@@ -85,6 +85,9 @@ def migrate(cur):
         "publish_failures INTEGER NOT NULL DEFAULT 0",
     )
     migrations.ensure_columns(cur, t('provider_identity_manifests'), "contract TEXT")
+    from .file_tags import migrate as migrate_file_tags
+
+    migrate_file_tags(cur)
 
 
 @dataclass
@@ -594,7 +597,7 @@ def plan(cur, *, catalog_instance_id, server_id, previous_generation, raw, adapt
                 continuity.deferred_pairs[old_id] = pairs.pop(old_id)
     held_back |= set(continuity.deferred_pairs.values())
 
-    if held_back or any(track_id not in pairs for track_id in held):
+    if pairs or held_back or any(track_id not in pairs for track_id in held):
         adjusted = {**raw, "tracks": list(raw.get("tracks") or []),
                     "albums": list(raw.get("albums") or [])}
         _hold_back_raw(
@@ -605,6 +608,15 @@ def plan(cur, *, catalog_instance_id, server_id, previous_generation, raw, adapt
             cur, catalog_instance_id, previous_generation, adjusted,
             [track_id for track_id in held if track_id not in pairs], scanned,
         )
+        if pairs:
+            # A rekey target is the moved file itself: it publishes with the
+            # file tags read under its old ID (JF.10), album keys included.
+            from .file_tags import merge_into_raw
+
+            adjusted = merge_into_raw(
+                cur, catalog_instance_id, adjusted,
+                aliases={new_id: old_id for old_id, new_id in pairs.items()},
+            )
         continuity.raw = adjusted
     continuity.held_back = held_back
     continuity.pairs = pairs
@@ -662,6 +674,10 @@ def validate_mapping(mappings):
 
 def persist(cur, catalog_instance_id, continuity, rekeyed=()):
     """Write the held table in the refresh's own transaction."""
+    from . import file_tags
+
+    # A file gone for good takes its stored tags with it.
+    file_tags.forget(cur, catalog_instance_id, continuity.expired)
     release = set(continuity.release) | set(rekeyed)
     if release:
         cur.execute(
@@ -763,6 +779,10 @@ def rekey_spec(continuity, catalog_instance_id):
         )
 
     def after(cur, source, _plan, _transition_id):
+        from . import file_tags
+
+        # The moved file is the same file: its stored tags move with it.
+        file_tags.rekey(cur, source, mappings["track"])
         persist(cur, source, continuity, rekeyed=mappings["track"].keys())
 
     return RekeySpec(
