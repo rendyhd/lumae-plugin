@@ -9,9 +9,16 @@ from . import migrations
 from .personal_discovery import principal, identifier
 from .credits_musicbrainz import Client, MusicBrainzDeferred, _quoted
 from .credits_service import paused, playback_pending
+from .reconcile import arm_reconcile
 
 SCHEMA_VERSION = 1
 KINDS = {"artist", "release-group", "release", "recording"}
+# 1.2.2-1.5.0 ran jobs from their own every-minute cron row.
+LEGACY_CRON_TASK_TYPE = "plugin.lumae_analysis.music_metadata"
+# Before background work, a job runs only this long after the last one was
+# claimed: just under two minute ticks, so lookups and library backfill
+# batches alternate on the watchdog despite a few seconds of tick latency.
+SHARE_SECONDS = 110
 
 
 def migrate(db):
@@ -27,11 +34,14 @@ def migrate(db):
         migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS lumae_metadata_due ON {table('metadata_jobs')}(status,not_before)")
 
 
-def ensure_schedule(db):
+def retire_schedule(db):
+    """Delete the legacy every-minute cron row; the catalogue watchdog runs jobs.
+
+    It fired 1,440 times a day, almost always on an empty queue, and AudioMuse
+    records every firing in its ten-row task history, pushing real tasks out.
+    """
     with db.cursor() as cur:
-        cur.execute("""INSERT INTO cron(name,task_type,cron_expr,enabled)
-            VALUES(%s,%s,%s,TRUE)
-            ON CONFLICT(task_type) DO NOTHING""", ('Lumae album metadata', 'plugin.lumae_analysis.music_metadata', '* * * * *'))
+        cur.execute("DELETE FROM cron WHERE task_type=%s", (LEGACY_CRON_TASK_TYPE,))
 
 
 def validate_entity(entity):
@@ -79,6 +89,8 @@ def submit(db, user, entities):
         for entity in entities:
             fingerprint = hashlib.sha256(json.dumps(entity, sort_keys=True).encode()).hexdigest()
             cur.execute(f"INSERT INTO {table('metadata_jobs')}(principal,id,fingerprint,input) VALUES(%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING", (user, entity["id"], fingerprint, json.dumps(entity)))
+    if not paused():
+        arm_reconcile(db, "metadata_requested")  # Same transaction as the jobs.
     return {"schema_version": 1, "job_ids": [e["id"] for e in entities], "status": "queued"}, 202
 
 
@@ -219,6 +231,24 @@ def run_one(*, db=None, client_factory=Client, critical=playback_pending):
         applied = cur.rowcount == 1
     db.commit()
     return {"status": status if applied else "superseded", "job_id": job_id}
+
+
+def reconcile(db, before_background=False):
+    """Run one due job on a watchdog tick, taking turns with background work."""
+    if paused():
+        return None
+    with db.cursor() as cur:
+        cur.execute(f"""SELECT EXISTS(SELECT 1 FROM {table('metadata_jobs')}
+                WHERE not_before<=now() AND (status IN ('pending','deferred')
+                    OR (status='running' AND lease_until<now()))),
+            EXTRACT(EPOCH FROM now()-COALESCE((SELECT max(last_work) FROM {table('metadata_accounts')}),'epoch'))""")
+        due, idle_seconds = cur.fetchone()
+    db.commit()
+    if not due or (before_background and float(idle_seconds) < SHARE_SECONDS):
+        return None
+    result = run_one(db=db)
+    # Nothing claimed (playback first, or another worker won): the tick goes on.
+    return result if result.get("job_id") else None
 
 
 def register_routes(bp):

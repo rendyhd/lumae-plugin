@@ -114,10 +114,18 @@
     {
       "version": "1.6.0",
       "min_core_version": "3.2.0",
-      "changelog": "Jellyfin: Lumae Analysis mirrors a Jellyfin 12.0 or later library next to Navidrome (supported_provider_types jellyfin and navidrome), reading each music library inside the bound AudioMuse server with that server's own credentials, and binds each Jellyfin catalogue to its server Id from /System/Info/Public: another server, product, release or server type blocks the catalogue and is never adopted. Health adds provider_server_id and provider_version per source. A moved, renamed or re-cased Jellyfin file keeps its identity: a missing track is held for 14 days and, when AudioMuse maps a new ID to the same content fingerprint, the move is published as an atomic provider_identity_rekey_v2 (journal rekeys and a manifest; collections, shelves, Vibes, covers and profiles follow). Tags Jellyfin does not expose (release type, compilation, explicit, credits with roles, ISRC, disc subtitle, original date, ReplayGain gains and peaks, BPM, sort names) are read from the original files and published under the OpenSubsonic keys Navidrome uses. Health keeps every applied rekey (last_applied_transition_id and retained_transitions) and each v2 manifest names its previous_transition_id. Emby and Lyrion are removed. Navidrome behaviour is unchanged.",
+      "changelog": "Jellyfin: Lumae Analysis mirrors a Jellyfin 12.0 or later library next to Navidrome (supported_provider_types jellyfin and navidrome), reading each music library inside the bound AudioMuse server with that server's own credentials, and binds each Jellyfin catalogue to its server Id from /System/Info/Public: another server, product, release or server type blocks the catalogue and is never adopted; as for Navidrome from 1.5.1, a probe that fails stores only its error and the refresh never reads an unverified server. Health adds provider_server_id and provider_version per source. A moved, renamed or re-cased Jellyfin file keeps its identity: a missing track is held for 14 days and, when AudioMuse maps a new ID to the same content fingerprint, the move is published as an atomic provider_identity_rekey_v2 (journal rekeys and a manifest; collections, shelves, Vibes, covers and profiles follow). Tags Jellyfin does not expose (release type, compilation, explicit, credits with roles, ISRC, disc subtitle, original date, ReplayGain gains and peaks, BPM, sort names) are read from the original files and published under the OpenSubsonic keys Navidrome uses. Health keeps every applied rekey (last_applied_transition_id and retained_transitions) and each v2 manifest names its previous_transition_id. Emby and Lyrion are removed. Navidrome behaviour is unchanged. Includes every 1.5.1 fix.",
       "imageUrl": "",
-      "checksum": "0c66e800fb14231d1d0831a16d2af24f",
+      "checksum": "dcec5ee9845234b07a0f7054c6c0d510",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.6.0.zip"
+    },
+    {
+      "version": "1.5.1",
+      "min_core_version": "3.2.0",
+      "changelog": "A slow or failed Navidrome ping no longer pauses sync: up to 1.5.0 one failed provider ping closed catalogue and analysis sync for the Lumae app and failed the analysis projection until a catalogue refresh, up to 30 minutes later. Now only the error is stored (shown under Provider identity safety); the call that saw it still fails closed, and the next verified ping lifts the hold. The analysis_projection task reports a by-design hold (identity unverified or pending, AudioMuse migration not ready, no published catalogue) as deferred instead of failing. MusicBrainz lookups run on the catalogue watchdog instead of an every-minute cron task that flooded AudioMuse's Recent tasks list. The settings page drops the AudioMuse upgrade-sequence diagnostic, which AudioMuse can no longer feed.",
+      "imageUrl": "",
+      "checksum": "5c18b1bbf7de0a3fda59f5d9c4663e37",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.5.1.zip"
     },
     {
       "version": "1.5.0",

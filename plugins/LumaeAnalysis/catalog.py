@@ -1903,7 +1903,10 @@ def _require_jellyfin_identity(observation):
             f"The Jellyfin server identity check failed ({reason}); Lumae preserved the "
             "previous complete generation and will not read this server until it matches."
         )
-    if state == "transition_pending" and reason == "provider_version_unverified":
+    # From 1.5.1 a failed probe keeps the stored state (applied, a pending
+    # rekey, normal) and stores only its error; whatever that state, this
+    # scan never reads a server it could not verify.
+    if observation.get("observation") == "unverified":
         raise CatalogScanError(
             "Lumae could not verify the Jellyfin server identity; it preserved the "
             "previous complete generation and will retry."

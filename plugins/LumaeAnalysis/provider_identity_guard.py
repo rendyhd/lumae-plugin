@@ -32,8 +32,24 @@ def t(name):
     return table(name)
 
 
+# What a failed ping wrote up to 1.5.0. It no longer writes them; a verified
+# ping clears them from rows that still carry them.
+_UNVERIFIED_REASON = "provider_version_unverified"
+_UNVERIFIED_ACTION = "retry_provider_identity_check"
+
+
 class ProviderIdentityTransitionPending(RuntimeError):
-    pass
+    """Analysis projection is held back until the provider identity is safe.
+
+    ``reason`` says why: ``provider_identity_unverified`` (the provider did
+    not answer the version check; nothing is stored), ``provider_identity_pending``
+    (a stored transition is pending or blocked) or ``audiomuse_migration_pending``
+    (the Lumae rekey is applied, AudioMuse's own migration is not ready).
+    """
+
+    def __init__(self, message, reason="provider_identity_pending"):
+        super().__init__(message)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -523,19 +539,31 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
         if not current_version:
             raise RuntimeError("Navidrome ping did not expose serverVersion")
     except Exception as exc:
-        state = source.get("state") or ProviderIdentityTransitionState.NORMAL.value
+        # A failed ping is not evidence: only the error is recorded. The
+        # stored state, reason and action stay as the last verified
+        # observation left them. Up to 1.5.0 a timed-out ping stored
+        # transition_pending, which closed catalogue and analysis admission
+        # for every client and failed the analysis projection until a
+        # catalogue refresh re-inspected the IDs (the provider_identity_recheck
+        # cron, up to 30 minutes later); a later successful ping kept it
+        # pending, because an unresolved state is never trusted on version.
+        #
+        # This call still fails closed. A published catalogue whose provider
+        # version cannot be confirmed is gated as transition_pending for the
+        # caller only: a refresh inspects the ID sets before it publishes, and
+        # a projection waits for a verified version.
+        stored_state = source.get("state") or ProviderIdentityTransitionState.NORMAL.value
+        gate_state = stored_state
         if (
             source["catalog_generation"] > 0
-            and state != ProviderIdentityTransitionState.APPLIED.value
+            and stored_state == ProviderIdentityTransitionState.NORMAL.value
         ):
-            state = ProviderIdentityTransitionState.TRANSITION_PENDING.value
+            gate_state = ProviderIdentityTransitionState.TRANSITION_PENDING.value
         observation = {
-            "state": state,
+            "state": stored_state,
             "current_version": source.get("current_provider_version"),
-            "detection_reason": "provider_version_unverified",
-            "required_action": (
-                "retry_provider_identity_check" if state != "normal" else None
-            ),
+            "detection_reason": source.get("detection_reason"),
+            "required_action": source.get("required_action"),
             "last_error": exc,
         }
         if _observation_changes(source, **observation):
@@ -545,7 +573,8 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
             db.commit()
         return {
             **source,
-            "state": state,
+            "state": gate_state,
+            "stored_state": stored_state,
             "observation": "unverified",
             "last_error": str(exc),
             "written": written,
@@ -592,8 +621,16 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
             action = None
         elif already_checked and not unresolved:
             next_state = source.get("state") or ProviderIdentityTransitionState.NORMAL.value
-            reason = source.get("detection_reason") or "provider_ids_checked"
+            reason = source.get("detection_reason")
             action = source.get("required_action")
+            # A verified ping retires what a failed one wrote up to 1.5.0. An
+            # applied transition's real action is restored by its AudioMuse
+            # health check (below, or the provider_identity_recheck cron).
+            if reason == _UNVERIFIED_REASON:
+                reason = None
+            if action == _UNVERIFIED_ACTION:
+                action = None
+            reason = reason or "provider_ids_checked"
         else:
             next_state = ProviderIdentityTransitionState.TRANSITION_PENDING.value
             reason = "provider_version_boundary" if after_boundary else "provider_version_uncertain"
@@ -794,21 +831,28 @@ def _observe_jellyfin(db, bridge, probe, server_id, source, written, *, commit, 
         if not current_version:
             raise RuntimeError("Jellyfin did not report its version")
     except Exception as exc:
-        # As for Navidrome: a published catalogue whose server cannot be
-        # verified closes admission until a probe succeeds.
-        state = stored_state
+        # As for Navidrome from 1.5.1: a failed probe is not evidence. Only
+        # the error is stored; the state, reason and action stay as the last
+        # verified probe left them, so a blocked catalogue stays blocked, an
+        # applied one keeps its action and a proven move keeps its pending
+        # rekey (provider_ids_moved) and target proof. Client admission is
+        # not closed by an unanswered probe.
+        #
+        # This call still fails closed: a published catalogue is gated as
+        # transition_pending for the caller only, a refresh never reads an
+        # unverified Jellyfin (catalog._require_jellyfin_identity) and a
+        # projection waits for a verified probe.
+        gate_state = stored_state
         if (
             source["catalog_generation"] > 0
-            and state != ProviderIdentityTransitionState.APPLIED.value
+            and stored_state == ProviderIdentityTransitionState.NORMAL.value
         ):
-            state = ProviderIdentityTransitionState.TRANSITION_PENDING.value
+            gate_state = ProviderIdentityTransitionState.TRANSITION_PENDING.value
         observation = {
-            "state": state,
+            "state": stored_state,
             "current_version": source.get("current_provider_version"),
-            "detection_reason": "provider_version_unverified",
-            "required_action": (
-                "retry_provider_identity_check" if state != "normal" else None
-            ),
+            "detection_reason": source.get("detection_reason"),
+            "required_action": source.get("required_action"),
             "last_error": exc,
         }
         if _jellyfin_observation_changes(source, **observation):
@@ -818,9 +862,9 @@ def _observe_jellyfin(db, bridge, probe, server_id, source, written, *, commit, 
             db.commit()
         return {
             **source,
-            "state": state,
+            "state": gate_state,
+            "stored_state": stored_state,
             "observation": "unverified",
-            "detection_reason": "provider_version_unverified",
             "last_error": str(exc),
             "written": written,
         }
@@ -857,10 +901,13 @@ def _observe_jellyfin(db, bridge, probe, server_id, source, written, *, commit, 
             next_state = stored_state
             reason = (
                 stored_reason
-                if stored_reason not in (None, "provider_version_unverified")
+                if stored_reason not in (None, _UNVERIFIED_REASON)
                 else JELLYFIN_VERIFIED_REASON
             )
             action = source.get("required_action")
+            if action == _UNVERIFIED_ACTION:
+                # Its real action comes back with the AudioMuse health check.
+                action = None
         else:
             next_state, reason, action = (
                 ProviderIdentityTransitionState.NORMAL.value, JELLYFIN_VERIFIED_REASON, None
@@ -1056,6 +1103,16 @@ def assert_analysis_projection_allowed(db, bridge, server_id):
     if not observation or observation.get("observation") == "bridge_unavailable":
         return observation
     if observation.get("state") in ("transition_pending", "blocked"):
+        if (
+            observation.get("observation") == "unverified"
+            and observation.get("stored_state") == ProviderIdentityTransitionState.NORMAL.value
+        ):
+            server = "Jellyfin" if observation.get("provider_type") == "jellyfin" else "Navidrome"
+            raise ProviderIdentityTransitionPending(
+                f"{server} did not answer the provider identity check; the previous "
+                "Lumae analysis projection is preserved until it does",
+                reason="provider_identity_unverified",
+            )
         raise ProviderIdentityTransitionPending(
             "Provider identity is unresolved; the previous Lumae analysis projection is preserved"
         )
@@ -1067,7 +1124,8 @@ def assert_analysis_projection_allowed(db, bridge, server_id):
     ):
         raise ProviderIdentityTransitionPending(
             "Lumae provider IDs are safe, but AudioMuse migration is not ready; "
-            "the carried-forward analysis projection is preserved"
+            "the carried-forward analysis projection is preserved",
+            reason="audiomuse_migration_pending",
         )
     return observation
 

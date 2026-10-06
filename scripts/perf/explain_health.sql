@@ -27,11 +27,6 @@ SELECT count(*) FILTER (WHERE status='ready'), count(*) FILTER (WHERE status='pe
        count(*) FILTER (WHERE status='ready' AND NOT evidence_complete)
   FROM plugin_lumae_analysis__track_analysis_links
  WHERE catalog_instance_id=:'source' AND projection_generation=:projection_generation;
-\echo === task evidence
-EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, SUMMARY ON)
-SELECT task_id, task_type, status, end_time, details, timestamp FROM task_status
- WHERE parent_task_id IS NULL AND task_type IN ('cleaning','main_analysis') AND status='SUCCESS'
- ORDER BY COALESCE(end_time, EXTRACT(EPOCH FROM timestamp)) DESC LIMIT 100;
 \echo === AudioMuse health active-task probe (runs when transition state=applied)
 EXPLAIN (ANALYZE, BUFFERS, COSTS OFF, SUMMARY ON)
 SELECT COUNT(*) FROM task_status

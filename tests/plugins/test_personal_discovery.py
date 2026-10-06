@@ -21,6 +21,10 @@ def api(lumae_postgres_db, monkeypatch):
     monkeypatch.setattr(meta, "get_db", lambda: lumae_postgres_db)
     monkeypatch.setattr(mod, "collections_enabled", lambda: True)
     monkeypatch.setattr(meta, "paused", lambda: False)
+    armed = []
+    # The watchdog control table belongs to the full migration (migrated_db).
+    monkeypatch.setattr(meta, "arm_reconcile", lambda _db, reason: armed.append(reason))
+    monkeypatch.setattr(meta, "armed", armed, raising=False)
     app = Flask(__name__)
     app.register_blueprint(plugin.bp)
     @app.before_request
@@ -113,6 +117,53 @@ def test_metadata_budget_and_lease_recovery(api, monkeypatch):
     assert meta.run_one(db=db, client_factory=FakeClient, critical=lambda db: False)['status'] == 'unresolved'
     assert client.get('/api/music_metadata/status').get_json()['jobs'][0]['revisions'] == {'consent': 1}
     assert client.post('/api/music_metadata/prepare', json=[]).status_code == 400
+
+
+def test_accepted_lookups_wake_the_watchdog_unless_paused(api, monkeypatch):
+    client, _, meta, _ = api
+    entity = {'id': uid(), 'kind': 'artist', 'title': 'Artist'}
+    assert client.post('/api/music_metadata/prepare', json={'entities': [entity]}).status_code == 202
+    assert meta.armed == ['metadata_requested']
+    assert client.post('/api/music_metadata/prepare', json={'entities': [{**entity, 'title': 'other'}]}).status_code == 409
+    assert client.post('/api/music_metadata/prepare', json={'entities': []}).status_code == 400
+    assert meta.armed == ['metadata_requested']
+    monkeypatch.setattr(meta, 'paused', lambda: True)
+    assert client.post('/api/music_metadata/prepare', json={'entities': [{'id': uid(), 'kind': 'artist', 'title': 'B'}]}).status_code == 202
+    assert meta.armed == ['metadata_requested']
+
+
+def test_watchdog_lookups_take_turns_with_background_work(api, monkeypatch):
+    client, _, meta, db = api
+    from plugin.api import table
+    class FakeClient:
+        def __init__(self, db, **kwargs):
+            pass
+        def get(self, kind, entity_id=None, **kwargs):
+            return {'artists': []}
+    run_one = meta.run_one
+    monkeypatch.setattr(meta, 'run_one', lambda db: run_one(db=db, client_factory=FakeClient, critical=lambda db: False))
+    assert meta.reconcile(db) is None
+    first, second = ({'id': uid(), 'kind': 'artist', 'title': name} for name in ('A', 'B'))
+    client.post('/api/music_metadata/prepare', json={'entities': [first, second]})
+    # Never served before: the lookup goes ahead of background work.
+    assert meta.reconcile(db, before_background=True)['status'] == 'unresolved'
+    # Served moments ago: background work takes this tick, idle ticks still serve it.
+    assert meta.reconcile(db, before_background=True) is None
+    assert meta.reconcile(db)['status'] == 'unresolved'
+    assert meta.reconcile(db) is None
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {table('metadata_jobs')} SET status='deferred', not_before=now()+interval '1 hour'")
+    db.commit()
+    assert meta.reconcile(db) is None
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {table('metadata_jobs')} SET not_before=now()")
+    db.commit()
+    monkeypatch.setattr(meta, 'paused', lambda: True)
+    assert meta.reconcile(db) is None
+    monkeypatch.setattr(meta, 'paused', lambda: False)
+    # Playback work first: nothing is claimed and the tick moves on.
+    monkeypatch.setattr(meta, 'run_one', lambda db: run_one(db=db, client_factory=FakeClient, critical=lambda db: True))
+    assert meta.reconcile(db) is None
 
 
 def test_metadata_limits_cancellation_and_auth(api):

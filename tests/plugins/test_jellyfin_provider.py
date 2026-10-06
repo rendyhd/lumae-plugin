@@ -468,25 +468,121 @@ def test_an_unsupported_jellyfin_identity_blocks_before_any_read(migrated_db, kw
     assert _source(migrated_db)[0][2] is None
 
 
-def test_an_unverifiable_published_jellyfin_closes_admission_until_it_answers(migrated_db):
+def _transition_row(db):
+    with db.cursor() as cur:
+        cur.execute(
+            f"SELECT state, detection_reason, required_action, current_provider_version, "
+            f"transition_id, target_fingerprint, target_scan_count, rekey_contract, last_error "
+            f"FROM {P}provider_identity_transitions")
+        row = cur.fetchone()
+    db.commit()
+    return row
+
+
+def test_an_unverifiable_jellyfin_stores_only_its_error_and_is_never_read(migrated_db):
+    """1.5.1 for Jellyfin: a failed probe is not evidence.
+
+    Only ``last_error`` is stored, so client admission stays open; the call
+    that saw the failure still fails closed: the refresh never reads the
+    server and the projection defers as ``provider_identity_unverified``.
+    """
     from plugins.LumaeAnalysis.catalog import CatalogScanError
+    from plugins.LumaeAnalysis.provider_identity_guard import (
+        ProviderIdentityTransitionPending,
+        assert_analysis_projection_allowed,
+        observe_provider_version,
+    )
 
     bridge = JellyfinBridge(jellyfin_raw_catalog())
     _publish(migrated_db, bridge)
+    assert _publish(migrated_db, bridge)["change_reason"] == "no_change"
+    before = _transition_row(migrated_db)
+    assert before[:3] == ("normal", "provider_identity_verified", None)
     bridge.probe_error = RuntimeError("connection refused")
 
     with pytest.raises(CatalogScanError, match="could not verify"):
         _publish(migrated_db, bridge)
-    state, reason, action, _version, transition_id = _transition(migrated_db)
-    assert (state, reason, action) == ("transition_pending", "provider_version_unverified",
-                                      "retry_provider_identity_check")
-    assert transition_id
-    assert bridge.fetches == 1
+    assert bridge.fetches == 2
+    after = _transition_row(migrated_db)
+    assert after[:8] == before[:8]
+    assert "connection refused" in after[8]
+
+    observation = observe_provider_version(migrated_db, bridge, "server-j")
+    assert (observation["state"], observation["stored_state"], observation["observation"]) == (
+        "transition_pending", "normal", "unverified")
+    with pytest.raises(ProviderIdentityTransitionPending, match="Jellyfin did not answer") as exc:
+        assert_analysis_projection_allowed(migrated_db, bridge, "server-j")
+    assert exc.value.reason == "provider_identity_unverified"
+    assert _transition_row(migrated_db)[:8] == before[:8]
 
     bridge.probe_error = None
     assert _publish(migrated_db, bridge)["change_reason"] == "no_change"
-    assert _transition(migrated_db)[0] == "normal"
-    assert _transition(migrated_db)[4] is None
+    assert _transition_row(migrated_db)[:3] == ("normal", "provider_identity_verified", None)
+    assert _transition_row(migrated_db)[8] is None
+    assert bridge.fetches == 3
+
+
+def test_an_unverifiable_jellyfin_never_lifts_a_block(migrated_db):
+    from plugins.LumaeAnalysis.catalog import CatalogScanError
+
+    bridge = JellyfinBridge(jellyfin_raw_catalog())
+    _publish(migrated_db, bridge)
+    other = JellyfinBridge(jellyfin_raw_catalog(("other",)), server_id=SERVER_B)
+    with pytest.raises(CatalogScanError, match="provider_server_changed"):
+        _publish(migrated_db, other)
+    other.probe_error = RuntimeError("timed out")
+
+    with pytest.raises(CatalogScanError, match="provider_server_changed"):
+        _publish(migrated_db, other)
+    row = _transition_row(migrated_db)
+    assert row[:3] == ("blocked", "provider_server_changed", "restore_provider_server")
+    assert "timed out" in row[8]
+    assert other.fetches == 0
+
+
+@pytest.mark.parametrize(
+    ("state", "reason", "action"),
+    [
+        ("transition_pending", "provider_ids_moved", "wait_for_lumae_rekey"),
+        ("applied", "provider_ids_moved", "wait_for_audiomuse_analysis"),
+    ],
+)
+def test_an_unverifiable_jellyfin_keeps_a_pending_or_applied_rekey(migrated_db, state, reason,
+                                                                   action):
+    """Up to the unreleased 1.6.0 builds a failed probe rewrote the reason, so
+    the next verified probe dropped a proven move back to ``normal``."""
+    from plugins.LumaeAnalysis.catalog import CatalogScanError
+    from plugins.LumaeAnalysis.provider_identity_guard import observe_provider_version
+
+    bridge = JellyfinBridge(jellyfin_raw_catalog())
+    _publish(migrated_db, bridge)
+    with migrated_db.cursor() as cur:
+        cur.execute(
+            f"""UPDATE {P}provider_identity_transitions
+                   SET state=%s, detection_reason=%s, required_action=%s,
+                       transition_id='t-moved', target_fingerprint='fp-target',
+                       target_scan_count=1, rekey_contract='provider_identity_rekey_v2'""",
+            (state, reason, action),
+        )
+    migrated_db.commit()
+    before = _transition_row(migrated_db)
+    bridge.probe_error = RuntimeError("connection reset")
+
+    with pytest.raises(CatalogScanError, match="could not verify"):
+        _publish(migrated_db, bridge)
+    assert bridge.fetches == 1
+    after = _transition_row(migrated_db)
+    assert after[:8] == before[:8]
+    assert "connection reset" in after[8]
+    assert observe_provider_version(migrated_db, bridge, "server-j")["state"] == state
+
+    bridge.probe_error = None
+    verified = observe_provider_version(migrated_db, bridge, "server-j", refresh_health=False)
+    assert (verified["state"], verified["detection_reason"], verified["required_action"]) == (
+        state, reason, action)
+    row = _transition_row(migrated_db)
+    assert row[:8] == before[:8]
+    assert row[8] is None
 
 
 def test_a_navidrome_catalogue_whose_server_turns_into_jellyfin_stops(migrated_db):

@@ -42,6 +42,27 @@ def t(name):
     return table(name)
 
 
+class AnalysisProjectionDeferred(CatalogScanError):
+    """The projection cannot run yet, by design; the published one is kept.
+
+    ``reason`` is a stable code: ``catalog_source_missing`` (this server has no
+    Lumae catalogue: not Navidrome or Jellyfin, not prepared yet, or awaiting continuity
+    review), ``catalog_not_published`` (its first catalogue scan has not
+    published), or a ``ProviderIdentityTransitionPending`` reason
+    (``provider_identity_unverified``, ``provider_identity_pending``,
+    ``audiomuse_migration_pending``).
+
+    Still a ``CatalogScanError``: catalogue preparation and analysis-run
+    finalization record it and retry with their own back-off, as before. The
+    ``analysis_projection`` task reports it as a deferral rather than a
+    failure, because retrying seconds later cannot change any of these.
+    """
+
+    def __init__(self, message, reason):
+        super().__init__(message)
+        self.reason = reason
+
+
 def dedup_policy():
     threshold = getattr(config, "DUPLICATE_DISTANCE_THRESHOLD_COSINE", None)
     scheme = getattr(config, "CATALOGUE_ID_SCHEME_VERSION", None)
@@ -808,11 +829,21 @@ def _project_analysis(server_id=None, db=None, adapter=None):
     adapter = adapter or get_core_adapter()
     server_id = server_id or adapter.active_server_id()
     sources = resolve_catalog_source(db, server_id=server_id)
+    if not sources:
+        raise AnalysisProjectionDeferred(
+            "Analysis projection requires one explicit catalogue source; "
+            "this server has none",
+            "catalog_source_missing",
+        )
     if len(sources) != 1:
         raise CatalogScanError("Analysis projection requires one explicit catalogue source")
     source = sources[0]
     if source["catalog"]["status"] != "complete":
-        raise CatalogScanError("Provider catalogue must be complete before analysis projection")
+        # Only a catalogue that has never published is not complete.
+        raise AnalysisProjectionDeferred(
+            "Provider catalogue must be complete before analysis projection",
+            "catalog_not_published",
+        )
     catalog_instance_id = source["catalog_instance_id"]
     catalog_generation = source["catalog"]["generation"]
     if callable(getattr(adapter, "provider_module", None)):
@@ -823,7 +854,9 @@ def _project_analysis(server_id=None, db=None, adapter=None):
                 server_id,
             )
         except ProviderIdentityTransitionPending as exc:
-            raise CatalogScanError(str(exc)) from exc
+            raise AnalysisProjectionDeferred(
+                str(exc), getattr(exc, "reason", "provider_identity_pending")
+            ) from exc
     cur = db.cursor()
     track_ids = _active_catalog_track_ids(cur, catalog_instance_id, catalog_generation)
     track_set = set(track_ids)

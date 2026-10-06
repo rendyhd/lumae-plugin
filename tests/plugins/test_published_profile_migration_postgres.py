@@ -55,7 +55,7 @@ def _setup(db, monkeypatch, mod, *, two_sources):
     monkeypatch.setattr(mod, "ensure_catalog_sources", lambda *_args: None)
     monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
     monkeypatch.setattr(mod, "_safe_reconcile_schedule", lambda *_args: None)
-    monkeypatch.setattr(mod.music_metadata, "ensure_schedule", lambda *_args: None)
+    monkeypatch.setattr(mod.music_metadata, "retire_schedule", lambda *_args: None)
     for name in (
         "ensure_catalog_refresh_schedule",
         "ensure_catalog_reconcile_schedule",

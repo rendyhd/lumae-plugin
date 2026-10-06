@@ -70,7 +70,6 @@ EXPECTED_DOTTED_PATHS = {
     "cron:catalog_reconcile": "plugins.LumaeAnalysis.catalog_reconcile_task",
     "cron:collection_retention": "plugins.LumaeAnalysis.collection_retention_task",
     "cron:catalog_refresh": "plugins.LumaeAnalysis.catalog_refresh_task",
-    "cron:music_metadata": "plugins.LumaeAnalysis.music_metadata.run_one",
     "cron:provider_identity_recheck": "plugins.LumaeAnalysis.provider_identity_recheck_task",
     "on_flask_start": "plugins.LumaeAnalysis.observe_provider_identities_on_start",
     "on_install": "plugins.LumaeAnalysis.migrate",

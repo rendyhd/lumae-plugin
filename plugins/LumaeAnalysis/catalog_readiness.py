@@ -9,8 +9,6 @@ Coverage and link counts come from the committed status summary
 request never scans the library for them (P2-1).
 """
 
-import json
-
 from . import status_model
 
 
@@ -32,91 +30,24 @@ def _detected_core_version(compatibility):
     return str(getattr(compatibility, "core_version", "") or "").strip()
 
 
-def _task_details(value):
-    if isinstance(value, dict):
-        return value
-    if isinstance(value, str):
-        try:
-            parsed = json.loads(value)
-            return parsed if isinstance(parsed, dict) else {}
-        except ValueError:
-            return {}
-    return {}
+def historical_task_evidence():
+    """The retired analysis -> cleaning -> analysis upgrade-sequence diagnostic.
 
-
-def _task_time(end_time, timestamp):
-    if end_time is not None:
-        try:
-            return float(end_time)
-        except (TypeError, ValueError):
-            pass
-    if hasattr(timestamp, "timestamp"):
-        return float(timestamp.timestamp())
-    return None
-
-
-def _task_dto(row):
-    ended = _task_time(row[3], row[5])
-    details = _task_details(row[4])
+    It read finished ``main_analysis`` and ``cleaning`` rows from AudioMuse's
+    ``task_status``, which never keeps that history: every main-task start
+    marks the earlier finished root tasks REVOKED, and from 3.2.0 (the minimum
+    core) each finished root task deletes all the others. The sequence could
+    never be read back, so health keeps the shape and says why instead of
+    reporting it as "not observed". Readiness never depended on it.
+    """
     return {
-        "task_id": str(row[0]),
-        "task_type": str(row[1]),
-        "completed_at_unix": ended,
-        "failed_servers": list(details.get("failed_servers") or []),
-    }
-
-
-def _task_evidence(db):
-    cur = db.cursor()
-    try:
-        cur.execute(
-            "SELECT task_id, task_type, status, end_time, details, timestamp "
-            "FROM task_status "
-            "WHERE parent_task_id IS NULL "
-            "AND task_type IN ('cleaning', 'main_analysis') "
-            "AND status = 'SUCCESS' "
-            "ORDER BY COALESCE(end_time, EXTRACT(EPOCH FROM timestamp)) DESC "
-            "LIMIT 100"
-        )
-        tasks = [_task_dto(row) for row in cur.fetchall()]
-    finally:
-        cur.close()
-
-    cleanings = [row for row in tasks if row["task_type"] == "cleaning"]
-    analyses = [
-        row
-        for row in tasks
-        if row["task_type"] == "main_analysis" and not row["failed_servers"]
-    ]
-    cleaning = cleanings[0] if cleanings else None
-    cleaning_time = cleaning and cleaning["completed_at_unix"]
-    before = None
-    after = None
-    if cleaning_time is not None:
-        before = next(
-            (
-                row
-                for row in analyses
-                if row["completed_at_unix"] is not None
-                and row["completed_at_unix"] < cleaning_time
-            ),
-            None,
-        )
-        after = next(
-            (
-                row
-                for row in analyses
-                if row["completed_at_unix"] is not None
-                and row["completed_at_unix"] > cleaning_time
-            ),
-            None,
-        )
-    return {
-        "analysis_before_cleaning": before,
-        "cleaning": cleaning,
-        "analysis_after_cleaning": after,
-        "upgrade_sequence_complete": bool(before and cleaning and after),
-        "diagnostics_available": True,
+        "analysis_before_cleaning": None,
+        "cleaning": None,
+        "analysis_after_cleaning": None,
+        "upgrade_sequence_complete": False,
+        "chromaprint_complete_before_cleaning": False,
+        "diagnostics_available": False,
+        "unavailable_reason": "audiomuse_keeps_latest_task_only",
     }
 
 
@@ -280,31 +211,6 @@ def v3_release_readiness(
                 "analysis": analysis_admission,
             },
         }
-    try:
-        tasks = _task_evidence(db)
-    except Exception:
-        tasks = {
-            "analysis_before_cleaning": None,
-            "cleaning": None,
-            "analysis_after_cleaning": None,
-            "upgrade_sequence_complete": False,
-            "diagnostics_available": False,
-        }
-
-    cleaning = tasks.get("cleaning") or {}
-    cleaning_time = cleaning.get("completed_at_unix")
-    latest_chromaprint_at = coverage.get("latest_chromaprint_at_unix")
-    chromaprint_complete_before_cleaning = bool(
-        cleaning_time is not None
-        and latest_chromaprint_at is not None
-        and latest_chromaprint_at <= cleaning_time
-    )
-    task_order_complete = tasks["upgrade_sequence_complete"]
-    tasks["chromaprint_complete_before_cleaning"] = chromaprint_complete_before_cleaning
-    tasks["upgrade_sequence_complete"] = bool(
-        task_order_complete and chromaprint_complete_before_cleaning
-    )
-
     blockers = _policy_blockers(policy)
     admission_blockers = list(blockers)
     if source.get("analysis", {}).get("status") != "complete":
@@ -371,7 +277,7 @@ def v3_release_readiness(
         "verification_mode": "automatic" if analysis_sync_allowed else None,
         "administrator_acknowledged": False,
         "acknowledged_at": None,
-        "task_evidence": tasks,
+        "task_evidence": historical_task_evidence(),
         "blockers": blockers,
         "admission": {
             "catalog": catalog_admission,

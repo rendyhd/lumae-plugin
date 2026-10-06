@@ -150,7 +150,7 @@ def test_current_release_contains_supported_source_only():
             assert package.read("__init__.py") == (ROOT / "plugins/LumaeAnalysis/__init__.py").read_bytes()
         assert b"def _drop_dj_tables" in package.read("__init__.py")
     # Earlier archives are immutable.
-    for version in ("1.5.0", "1.4.0", "1.3.4", "1.3.3", "1.3.2", "1.3.1", "1.3.0", "1.2.5", "1.2.4"):
+    for version in ("1.5.1", "1.5.0", "1.4.0", "1.3.4", "1.3.3", "1.3.2", "1.3.1", "1.3.0", "1.2.5", "1.2.4"):
         previous = next(item for item in metadata["versions"] if item["version"] == version)
         archive = ROOT / f"dist/lumae_analysis/lumae_analysis_{version}.zip"
         assert hashlib.md5(archive.read_bytes()).hexdigest() == previous["checksum"]

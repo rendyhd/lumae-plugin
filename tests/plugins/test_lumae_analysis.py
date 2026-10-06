@@ -3504,7 +3504,7 @@ class ReconcileScheduleCursor:
 
 
 class ReconcileScheduleDb:
-    def __init__(self, summary=(0, 0, None, None)):
+    def __init__(self, summary=(0, 0, None, None, None)):
         self.summary = summary
         self.mode = "idle"
         self.cron_expr = "11 * * * *"
@@ -4712,9 +4712,12 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
     ) in db.cursor_obj.executed
+    assert (
+        "DELETE FROM cron WHERE task_type=%s",
+        ("plugin.lumae_analysis.music_metadata",),
+    ) in db.cursor_obj.executed
     cron_inserts = [params for sql, params in db.cursor_obj.executed if "INSERT INTO cron" in sql]
     assert cron_inserts == [
-        ("Lumae album metadata", "plugin.lumae_analysis.music_metadata", "* * * * *"),
         (
             mod.CATALOG_REFRESH_TASK_TYPE,
             mod.CATALOG_REFRESH_TASK_TYPE,
@@ -5043,13 +5046,20 @@ def test_reconcile_watchdog_processes_only_the_highest_priority_action(monkeypat
 @pytest.mark.parametrize(
     ("summary", "expected_mode", "expected_cron"),
     [
-        ((2, 0, None, None), "active", "* * * * *"),
-        ((0, 1, None, None), "waiting", "*/5 * * * *"),
-        ((0, 0, 1, "2026-08-26T22:01:00Z"), "backoff", "* * * * *"),
-        ((0, 0, 2, "2026-08-26T22:05:00Z"), "backoff", "*/5 * * * *"),
-        ((0, 0, 3, "2026-08-26T22:15:00Z"), "backoff", "*/15 * * * *"),
-        ((0, 0, 4, "2026-08-26T23:00:00Z"), "backoff", "11 * * * *"),
-        ((0, 0, None, None), "idle", "11 * * * *"),
+        ((2, 0, None, None, None), "active", "* * * * *"),
+        ((0, 1, None, None, None), "waiting", "*/5 * * * *"),
+        ((0, 0, 1, "2026-08-26T22:01:00Z", 30), "backoff", "* * * * *"),
+        ((0, 0, 2, "2026-08-26T22:05:00Z", 120), "backoff", "*/5 * * * *"),
+        ((0, 0, 3, "2026-08-26T22:15:00Z", 600), "backoff", "*/15 * * * *"),
+        ((0, 0, 4, "2026-08-26T23:00:00Z", 30), "backoff", "11 * * * *"),
+        # A first retry far off does not tick every minute until it is due:
+        # each cadence still ticks at or before the retry (an hour-long
+        # MusicBrainz allowance deferral waits on the hourly sweep).
+        ((0, 0, 1, "2026-08-26T22:06:00Z", 300), "backoff", "*/5 * * * *"),
+        ((0, 0, 1, "2026-08-26T22:20:00Z", 1200), "backoff", "*/15 * * * *"),
+        ((0, 0, 1, "2026-08-26T23:00:00Z", 3600), "backoff", "11 * * * *"),
+        ((0, 0, 1, "2026-08-26T22:01:00Z", 59), "backoff", "* * * * *"),
+        ((0, 0, None, None, None), "idle", "11 * * * *"),
     ],
 )
 def test_reconcile_schedule_adapts_to_durable_work(summary, expected_mode, expected_cron):
@@ -5066,6 +5076,59 @@ def test_reconcile_schedule_adapts_to_durable_work(summary, expected_mode, expec
     sql = "\n".join(statement for statement, _params in db.cursor_obj.executed)
     assert "FOR UPDATE" in sql
     assert "worker heartbeat expired" in sql
+
+
+@pytest.mark.parametrize(
+    ("background", "metadata_results", "expected_action", "expected_turns"),
+    [
+        # A due lookup whose turn has come runs before the library backfill.
+        (True, {True: {"status": "verified", "job_id": "job-a"}}, "music_metadata", [True]),
+        # A lookup that ran recently waits; the backfill takes this tick.
+        (True, {}, "profile_backfill", [True]),
+        # With no background work left, a due lookup runs on every tick.
+        (False, {False: {"status": "verified", "job_id": "job-a"}}, "music_metadata", [True, False]),
+        (False, {}, None, [True, False]),
+    ],
+)
+def test_reconcile_serves_metadata_lookups_taking_turns_with_background_work(
+    monkeypatch, background, metadata_results, expected_action, expected_turns
+):
+    mod = load_plugin()
+    turns = []
+    actions = []
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    for name in ("next_settled_analysis_run", "next_preparation_run", "next_relationship_run"):
+        monkeypatch.setattr(mod, name, lambda db=None, server_id=None: None)
+    monkeypatch.setattr(
+        mod,
+        "next_profile_backfill_run",
+        lambda db=None, server_id=None: ("server-a", "catalog-a", 0) if background else None,
+    )
+    monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
+    monkeypatch.setattr(mod, "_safe_credits_reconcile", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "_safe_reconcile_schedule", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "_run_reconcile_action",
+        lambda _db, action, *_args: actions.append(action) or {"status": "complete"},
+    )
+    _stub_edge_reconcile(monkeypatch, mod)
+
+    def metadata(_db, before_background=False):
+        turns.append(before_background)
+        return metadata_results.get(before_background)
+
+    monkeypatch.setattr(mod.music_metadata, "reconcile", metadata)
+
+    result = mod.catalog_reconcile_task()
+
+    assert result.get("action") == expected_action
+    assert turns == expected_turns
+    assert actions == (["profile_backfill"] if expected_action == "profile_backfill" else [])
+    if expected_action == "music_metadata":
+        assert result["result"]["job_id"] == "job-a"
+    if expected_action is None:
+        assert result["status"] == "current"
 
 
 def test_reconcile_work_admission_arms_minute_cadence_in_callers_transaction():
@@ -6468,6 +6531,83 @@ def test_analysis_projection_clears_durable_reconcile_only_after_success(monkeyp
             "enqueue_job": False,
         }
     ]
+
+
+@pytest.mark.parametrize(
+    "reason",
+    [
+        "provider_identity_unverified",
+        "provider_identity_pending",
+        "audiomuse_migration_pending",
+        "catalog_source_missing",
+        "catalog_not_published",
+    ],
+)
+def test_analysis_projection_task_reports_a_by_design_hold_as_deferred(monkeypatch, reason):
+    # 1.5.0 raised these, so AudioMuse retried twice and marked the task FAIL.
+    from plugins.LumaeAnalysis.catalog_analysis import AnalysisProjectionDeferred
+
+    mod = load_plugin()
+
+    class Db:
+        rollbacks = 0
+
+        def rollback(self):
+            self.rollbacks += 1
+
+    db = Db()
+    adapter = types.SimpleNamespace(mode="v3_registry", active_server_id=lambda: "server-a")
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: adapter)
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(
+        mod,
+        "project_analysis",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            AnalysisProjectionDeferred("Navidrome did not answer", reason)
+        ),
+    )
+    monkeypatch.setattr(
+        mod,
+        "complete_projection_reconcile",
+        lambda *_args: pytest.fail("a deferred projection must keep the reconcile request"),
+    )
+    monkeypatch.setattr(
+        mod,
+        "start_relationship_preparation",
+        lambda **_kwargs: pytest.fail("a deferred projection admits no relationship work"),
+    )
+
+    result = mod.analysis_projection_task("server-a")
+
+    assert result == {
+        "status": "deferred",
+        "reason": reason,
+        "server_id": "server-a",
+        "message": "Analysis projection deferred: Navidrome did not answer",
+    }
+    # The read transaction the projection opened is ended, not left idle.
+    assert db.rollbacks == 1
+
+
+def test_analysis_projection_task_still_raises_a_retryable_race(monkeypatch):
+    # A catalogue replaced mid-projection is what AudioMuse's retry is for.
+    from plugins.LumaeAnalysis.catalog import CatalogScanError
+
+    mod = load_plugin()
+    adapter = types.SimpleNamespace(mode="v3_registry", active_server_id=lambda: "server-a")
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: adapter)
+    monkeypatch.setattr(
+        mod,
+        "project_analysis",
+        lambda **_kwargs: (_ for _ in ()).throw(
+            CatalogScanError(
+                "The provider catalogue changed during the analysis projection; retry it"
+            )
+        ),
+    )
+
+    with pytest.raises(CatalogScanError, match="retry it"):
+        mod.analysis_projection_task("server-a")
 
 
 def test_audiomuse_fail_status_is_terminal_for_provider_rekey_checks():
@@ -7938,26 +8078,39 @@ def test_v3_readiness_keeps_incomplete_evidence_progressively_usable():
     assert "review_state IN ('needs_repair', 'needs_review')" in status_model.link_counts_sql()
 
 
-def test_v3_historical_upgrade_sequence_is_diagnostic_only():
+def test_v3_historical_upgrade_sequence_is_reported_unavailable_not_read():
+    # AudioMuse never keeps the finished analysis -> cleaning -> analysis rows
+    # (a main-task start revokes earlier ones; from 3.2.0 a finished root task
+    # deletes the rest), so readiness no longer reads task_status for them,
+    # even when such rows happen to be present.
     readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
     compatibility = types.SimpleNamespace(
-        core_version="v3.0.3",
+        core_version="v3.6.3",
         adapter="v3_registry",
     )
+    db = ReadinessDb(
+        coverage=(10, 10, 10, 150.0),
+        tasks=readiness_tasks(),
+        link_counts=(10, 0, 0, 0, 10, 0),
+    )
     result = readiness.v3_release_readiness(
-        ReadinessDb(
-            coverage=(10, 10, 10, 250.0),
-            tasks=readiness_tasks(),
-            link_counts=(10, 0, 0, 0, 10, 0),
-        ),
+        db,
         compatibility,
         readiness_source(),
         readiness_policy(),
     )
 
     assert result["ready"] is True
-    assert result["task_evidence"]["chromaprint_complete_before_cleaning"] is False
-    assert result["task_evidence"]["upgrade_sequence_complete"] is False
+    assert not any("task_status" in sql for sql, _params in db.executed)
+    assert result["task_evidence"] == {
+        "analysis_before_cleaning": None,
+        "cleaning": None,
+        "analysis_after_cleaning": None,
+        "upgrade_sequence_complete": False,
+        "chromaprint_complete_before_cleaning": False,
+        "diagnostics_available": False,
+        "unavailable_reason": "audiomuse_keeps_latest_task_only",
+    }
 
 
 def test_v3_readiness_does_not_depend_on_historical_task_diagnostics():
@@ -8191,9 +8344,9 @@ def test_settings_page_explains_automatic_sonic_status_and_blockers(monkeypatch)
     assert "Full-library verification is still waiting for Chromaprint" in body
     assert "Source-analysis links: 7 usable (5 verified; 2 provisional)" in compact
     assert "1 flagged for repair" in compact
+    assert "upgrade sequence" not in compact
     assert "Analysis task or schedule produces the missing source" in compact
     assert "Technical details" in body
-    assert "diagnostic only; it does not gate readiness" in compact
     assert "Confirm fresh installation" not in body
     assert "Confirm upgraded installation" not in body
     assert "<form" not in body
@@ -8369,7 +8522,6 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
     ]
     assert ctx.cron_tasks == [
-        ("music_metadata", mod.music_metadata.run_one, "default"),
         ("catalog_reconcile", mod.catalog_reconcile_task, "default"),
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
@@ -9486,6 +9638,52 @@ def test_refresh_shield_stops_before_provider_diff_publication(monkeypatch):
     assert not any("SET published_generation=" in sql for sql, _ in db.executed)
 
 
+def test_refresh_during_a_failed_ping_still_inspects_ids_before_publishing(monkeypatch):
+    # A failed ping no longer stores transition_pending, but a refresh that
+    # runs while the provider version cannot be confirmed must not publish a
+    # re-keyed library as removals and additions: it inspects the ID sets.
+    from plugins.LumaeAnalysis import catalog
+
+    transition = TransitionRow()
+    transition.install(monkeypatch)
+    db = RefreshDb(
+        previous_counts={"track": 1},
+        previous_generation=1,
+        published_fingerprints={
+            "catalog_tracks": [("old-id", "metadata", "media", None)],
+        },
+    )
+
+    class SlowPingBridge(RefreshBridge):
+        @staticmethod
+        def probe_server_identity(_server_id):
+            raise TimeoutError("Navidrome ping timed out after 5 s")
+
+    bridge = SlowPingBridge(
+        {
+            "libraries": [{"id": "library-1", "name": "Music"}],
+            "tracks": [
+                {"id": "new-id", "title": "Song", "_lumae_library_ids": ["library-1"]}
+            ],
+        }
+    )
+    inspected = []
+    monkeypatch.setattr(
+        catalog,
+        "inspect_catalog_identity",
+        lambda *args, **_kwargs: inspected.append(args[2]) or {"state": "transition_pending"},
+    )
+
+    result = catalog.refresh_catalog("server-a", db=db, bridge=bridge)
+
+    assert inspected == [["new-id"]]
+    assert result["change_reason"] == "provider_identity_wait"
+    assert not any("SET published_generation=" in sql for sql, _ in db.executed)
+    # The ping failure itself stored only its error.
+    assert transition.row["state"] == "normal"
+    assert transition.row["last_error"] == "Navidrome ping timed out after 5 s"
+
+
 def test_safe_provider_version_publishes_ordinary_catalog_removals(monkeypatch):
     from plugins.LumaeAnalysis import catalog
 
@@ -9574,7 +9772,7 @@ def test_analysis_shield_runs_before_reading_current_audiomuse_mapping(monkeypat
         ),
     )
 
-    with pytest.raises(catalog_analysis.CatalogScanError, match="identity pending"):
+    with pytest.raises(catalog_analysis.CatalogScanError, match="identity pending") as held:
         catalog_analysis.project_analysis(
             "server-a",
             db=db,
@@ -9582,6 +9780,79 @@ def test_analysis_shield_runs_before_reading_current_audiomuse_mapping(monkeypat
         )
 
     assert not any("FROM fake_mapping" in sql for sql, _ in db.executed)
+    assert isinstance(held.value, catalog_analysis.AnalysisProjectionDeferred)
+    assert held.value.reason == "provider_identity_pending"
+
+
+@pytest.mark.parametrize(
+    "reason", ["provider_identity_unverified", "audiomuse_migration_pending"]
+)
+def test_analysis_shield_hold_reason_reaches_the_deferral(monkeypatch, reason):
+    from plugins.LumaeAnalysis import catalog_analysis
+    from plugins.LumaeAnalysis.provider_identity_guard import ProviderIdentityTransitionPending
+
+    class GuardedProjectionAdapter(ProjectionAdapter):
+        @staticmethod
+        def provider_module(_provider_type):
+            return object()
+
+    monkeypatch.setattr(
+        catalog_analysis,
+        "assert_analysis_projection_allowed",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(
+            ProviderIdentityTransitionPending("held", reason=reason)
+        ),
+    )
+
+    with pytest.raises(catalog_analysis.AnalysisProjectionDeferred) as held:
+        catalog_analysis.project_analysis(
+            "server-a", db=ProjectionDb(), adapter=GuardedProjectionAdapter()
+        )
+
+    assert held.value.reason == reason
+
+
+@pytest.mark.parametrize(
+    ("sources", "reason"),
+    [
+        # Not Navidrome, not prepared yet, or awaiting continuity review.
+        ([], "catalog_source_missing"),
+        # The first catalogue scan has not published.
+        (
+            [{"catalog_instance_id": "catalog-a", "catalog": {"status": "scanning", "generation": 0}}],
+            "catalog_not_published",
+        ),
+    ],
+)
+def test_projection_defers_when_there_is_no_published_catalogue(monkeypatch, sources, reason):
+    from plugins.LumaeAnalysis import catalog_analysis
+
+    monkeypatch.setattr(catalog_analysis, "resolve_catalog_source", lambda *_a, **_k: sources)
+    db = ProjectionDb()
+
+    with pytest.raises(catalog_analysis.AnalysisProjectionDeferred) as held:
+        catalog_analysis.project_analysis("server-a", db=db, adapter=ProjectionAdapter())
+
+    assert held.value.reason == reason
+    # Preparation and run finalization still see a CatalogScanError.
+    assert isinstance(held.value, catalog_analysis.CatalogScanError)
+    assert db.executed == []
+
+
+def test_projection_with_two_catalogues_for_one_server_is_still_an_error(monkeypatch):
+    from plugins.LumaeAnalysis import catalog_analysis
+
+    source = {"catalog_instance_id": "catalog-a", "catalog": {"status": "complete", "generation": 3}}
+    monkeypatch.setattr(
+        catalog_analysis,
+        "resolve_catalog_source",
+        lambda *_a, **_k: [source, {**source, "catalog_instance_id": "catalog-b"}],
+    )
+
+    with pytest.raises(catalog_analysis.CatalogScanError) as held:
+        catalog_analysis.project_analysis("server-a", db=ProjectionDb(), adapter=ProjectionAdapter())
+
+    assert not isinstance(held.value, catalog_analysis.AnalysisProjectionDeferred)
 
 
 def _identity_fixture_catalog(track_id, album_id, artist_id):
@@ -9862,6 +10133,8 @@ def test_transient_probe_failure_does_not_discard_an_applied_transition(monkeypa
         "transition_id": "transition-a",
         "state": "applied",
         "current_provider_version": "0.64.0",
+        "detection_reason": "provider_version_boundary",
+        "required_action": "run_audiomuse_provider_migration",
     }
     captured = {}
     monkeypatch.setattr(guard, "_source_state", lambda *_args, **_kwargs: source)
@@ -9882,7 +10155,11 @@ def test_transient_probe_failure_does_not_discard_an_applied_transition(monkeypa
 
     assert result["state"] == "applied"
     assert captured["state"] == "applied"
-    assert captured["required_action"] == "retry_provider_identity_check"
+    # A failed ping records its error and nothing else (1.5.1): the applied
+    # transition keeps the action its AudioMuse health check set.
+    assert captured["detection_reason"] == "provider_version_boundary"
+    assert captured["required_action"] == "run_audiomuse_provider_migration"
+    assert str(captured["last_error"]) == "provider offline"
 
 
 def test_safe_provider_version_clears_a_stale_blocked_transition(monkeypatch):
@@ -9922,6 +10199,248 @@ def test_safe_provider_version_clears_a_stale_blocked_transition(monkeypatch):
     assert captured["state"] == "normal"
     assert captured["detection_reason"] == "pre_transition_version"
     assert captured["required_action"] is None
+
+
+class TransitionRow:
+    """One provider_identity_transitions row as observe_provider_version reads
+    and writes it: a checked, normal source on a post-boundary Navidrome."""
+
+    def __init__(self, **overrides):
+        self.row = {
+            "catalog_instance_id": "catalog-a",
+            "catalog_generation": 8,
+            "analysis_generation": 6,
+            "transition_id": None,
+            "state": "normal",
+            "current_provider_version": "0.64.0",
+            "last_checked_provider_version": "0.64.0",
+            "detection_reason": "provider_ids_unchanged",
+            "required_action": None,
+            "last_error": None,
+            "audiomuse_health": None,
+            "transition_exists": True,
+            "baseline_catalog_generation": 8,
+            "baseline_analysis_generation": 6,
+            "detected": False,
+            **overrides,
+        }
+        self.writes = 0
+
+    def install(self, monkeypatch):
+        from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+        monkeypatch.setattr(guard, "_source_state", lambda *_args, **_kwargs: dict(self.row))
+        monkeypatch.setattr(guard, "_ensure_transition_row", lambda *_args: None)
+        monkeypatch.setattr(guard, "_update_observation", self.update)
+        return guard
+
+    def update(self, _db, source, *, state, current_version, detection_reason,
+               required_action, last_error=None):
+        from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+        self.writes += 1
+        if guard._starts_new_transition(source, state):
+            self.row["transition_id"] = "transition-new"
+        self.row.update(
+            state=state,
+            current_provider_version=current_version,
+            detection_reason=detection_reason,
+            required_action=required_action,
+            last_error=str(last_error)[:1000] if last_error else None,
+        )
+        if state == "transition_pending":
+            self.row["detected"] = True
+
+
+class ScriptedProbe:
+    """A provider that answers each ping with the next scripted outcome."""
+
+    def __init__(self, *outcomes):
+        self.outcomes = list(outcomes)
+
+    def probe_server_identity(self, _server_id):
+        outcome = self.outcomes.pop(0)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return {"server_version": outcome}
+
+
+IDENTITY_DB = types.SimpleNamespace(commit=lambda: None)
+
+
+def test_one_failed_ping_no_longer_holds_back_the_next_projection(monkeypatch):
+    # The 1.5.0 incident: a slow ping stored transition_pending, every later
+    # (successful) ping kept it pending, and the scheduled analysis projection
+    # failed all of AudioMuse's retries until a catalogue refresh.
+    transition = TransitionRow()
+    guard = transition.install(monkeypatch)
+    provider = ScriptedProbe(TimeoutError("Navidrome ping timed out after 5 s"), "0.64.0")
+
+    with pytest.raises(guard.ProviderIdentityTransitionPending) as held:
+        guard.assert_analysis_projection_allowed(IDENTITY_DB, provider, "server-a")
+    assert held.value.reason == "provider_identity_unverified"
+    assert "did not answer" in str(held.value)
+    # Only the error is stored: admission stays open for clients.
+    assert transition.row["state"] == "normal"
+    assert transition.row["transition_id"] is None
+    assert transition.row["detection_reason"] == "provider_ids_unchanged"
+    assert transition.row["required_action"] is None
+    assert transition.row["last_error"] == "Navidrome ping timed out after 5 s"
+
+    observation = guard.assert_analysis_projection_allowed(IDENTITY_DB, provider, "server-a")
+
+    assert observation["observation"] == "verified"
+    assert observation["state"] == "normal"
+    assert transition.row["state"] == "normal"
+    assert transition.row["last_error"] is None
+
+
+def test_a_failed_ping_still_gates_its_own_caller_closed(monkeypatch):
+    transition = TransitionRow()
+    guard = transition.install(monkeypatch)
+
+    result = guard.observe_provider_version(
+        IDENTITY_DB, ScriptedProbe(RuntimeError("provider offline")), "server-a"
+    )
+
+    # The caller sees an unverified identity as pending: a refresh inspects
+    # the ID sets before it publishes, a projection waits. The row does not.
+    assert result["state"] == "transition_pending"
+    assert result["stored_state"] == "normal"
+    assert result["observation"] == "unverified"
+    assert result["last_error"] == "provider offline"
+    assert result["written"] is True
+    assert transition.row["state"] == "normal"
+
+
+def test_a_repeated_identical_ping_failure_writes_nothing_more(monkeypatch):
+    # Health is polled; an unchanged failure must not write on every request.
+    transition = TransitionRow()
+    guard = transition.install(monkeypatch)
+    provider = ScriptedProbe(RuntimeError("provider offline"), RuntimeError("provider offline"))
+
+    assert guard.observe_provider_version(IDENTITY_DB, provider, "server-a")["written"] is True
+    assert guard.observe_provider_version(IDENTITY_DB, provider, "server-a")["written"] is False
+    assert transition.writes == 1
+
+
+def test_a_failed_ping_on_an_unpublished_catalogue_does_not_gate(monkeypatch):
+    transition = TransitionRow(catalog_generation=0, analysis_generation=0,
+                               baseline_catalog_generation=0, baseline_analysis_generation=0)
+    guard = transition.install(monkeypatch)
+
+    result = guard.observe_provider_version(
+        IDENTITY_DB, ScriptedProbe(RuntimeError("provider offline")), "server-a"
+    )
+
+    assert result["state"] == "normal"
+    assert transition.row["state"] == "normal"
+
+
+@pytest.mark.parametrize(
+    ("stored_state", "action"),
+    [
+        ("transition_pending", "wait_for_lumae_rekey"),
+        ("blocked", "resolve_provider_identity_conflict"),
+    ],
+)
+def test_a_failed_ping_leaves_an_unresolved_transition_exactly_as_it_was(
+    monkeypatch, stored_state, action
+):
+    transition = TransitionRow(
+        state=stored_state,
+        transition_id="transition-a",
+        detection_reason="incomplete",
+        required_action=action,
+        detected=True,
+    )
+    guard = transition.install(monkeypatch)
+
+    with pytest.raises(guard.ProviderIdentityTransitionPending) as held:
+        guard.assert_analysis_projection_allowed(
+            IDENTITY_DB, ScriptedProbe(RuntimeError("provider offline")), "server-a"
+        )
+
+    assert held.value.reason == "provider_identity_pending"
+    # Up to 1.5.0 a failed ping turned blocked into pending and replaced the
+    # action with retry_provider_identity_check.
+    assert transition.row["state"] == stored_state
+    assert transition.row["transition_id"] == "transition-a"
+    assert transition.row["detection_reason"] == "incomplete"
+    assert transition.row["required_action"] == action
+    assert transition.row["last_error"] == "provider offline"
+
+
+@pytest.mark.parametrize("stored_state", ["normal", "applied"])
+def test_a_verified_ping_retires_the_unverified_annotation_of_1_5_0(monkeypatch, stored_state):
+    transition = TransitionRow(
+        state=stored_state,
+        transition_id="transition-a" if stored_state == "applied" else None,
+        audiomuse_health="ready" if stored_state == "applied" else None,
+        detection_reason="provider_version_unverified",
+        required_action="retry_provider_identity_check",
+        last_error="provider offline",
+    )
+    guard = transition.install(monkeypatch)
+
+    result = guard.observe_provider_version(
+        IDENTITY_DB, ScriptedProbe("0.64.0"), "server-a", refresh_health=False
+    )
+
+    assert result["state"] == stored_state
+    assert transition.row["state"] == stored_state
+    assert transition.row["detection_reason"] == "provider_ids_checked"
+    assert transition.row["required_action"] is None
+    assert transition.row["last_error"] is None
+
+
+def test_audiomuse_migration_hold_names_its_reason(monkeypatch):
+    transition = TransitionRow(
+        state="applied",
+        transition_id="transition-a",
+        audiomuse_health="repair_required",
+        required_action="run_audiomuse_provider_migration",
+    )
+    guard = transition.install(monkeypatch)
+
+    with pytest.raises(guard.ProviderIdentityTransitionPending) as held:
+        guard.assert_analysis_projection_allowed(
+            IDENTITY_DB, ScriptedProbe("0.64.0"), "server-a"
+        )
+
+    assert held.value.reason == "audiomuse_migration_pending"
+
+
+def test_identity_card_shows_a_failed_check_without_its_credentials(monkeypatch):
+    # A failed ping changes only last_error now, so the card must show it.
+    mod = load_plugin()
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(
+        mod,
+        "resolve_catalog_source",
+        lambda *_args, **_kwargs: [{"catalog_instance_id": "catalog-a", "name": "Main"}],
+    )
+    transition = {
+        "state": "normal",
+        "current_provider_version": "0.64.0",
+        "required_action": None,
+        "counts": {},
+        "last_error": (
+            "HTTPConnectionPool(host='navidrome', port=4533): Read timed out. "
+            "(url: /rest/ping?u=admin&p=enc:7375706572736563726574&v=1.16.1)"
+        ),
+    }
+    monkeypatch.setattr(mod, "provider_transition_health", lambda *_args: transition)
+
+    html = mod.render_provider_identity_panel()
+
+    assert "Last identity check failed: " in html
+    assert "Read timed out" in html
+    assert "73757065727365637265" not in html
+    assert "<strong>normal</strong>" in html
+
+    transition["last_error"] = None
+    assert "Last identity check failed" not in mod.render_provider_identity_panel()
 
 
 def test_identity_recheck_schedule_skips_normal_sources(monkeypatch):
@@ -10021,6 +10540,51 @@ def test_identity_recheck_releases_completed_migration_and_projects_inline(monke
     assert projected == ["server-a"]
     assert db.commits == 1
     assert db.rollbacks == 0
+
+
+def test_identity_recheck_keeps_the_request_when_the_projection_defers(monkeypatch):
+    mod = load_plugin()
+
+    class Bridge:
+        @staticmethod
+        def list_servers():
+            return [{"server_id": "server-a", "supported": True}]
+
+    class Db:
+        commits = 0
+
+        def commit(self):
+            self.commits += 1
+
+    deferred = {
+        "status": "deferred",
+        "reason": "provider_identity_unverified",
+        "server_id": "server-a",
+        "message": "Analysis projection deferred: Navidrome did not answer",
+    }
+    monkeypatch.setattr(mod, "get_db", lambda: Db())
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: object())
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
+    monkeypatch.setattr(
+        mod,
+        "resolve_catalog_source",
+        lambda *_args, **_kwargs: [{"catalog_instance_id": "catalog-a"}],
+    )
+    monkeypatch.setattr(
+        mod,
+        "provider_transition_health",
+        lambda *_args: {"state": "applied", "audiomuse_health": "ready"},
+    )
+    monkeypatch.setattr(mod, "projection_reconcile_required", lambda *_args: True)
+    monkeypatch.setattr(mod, "analysis_projection_task", lambda server_id=None: deferred)
+
+    result = mod.provider_identity_recheck_task()
+
+    entry = result["results"][0]
+    # Not processed: the durable request stays, so the next recheck projects.
+    assert entry["projection_processed"] is False
+    assert entry["projection"] == deferred
+    assert "error" not in entry
 
 
 def test_identity_recheck_durable_request_projects_when_startup_was_already_ready(

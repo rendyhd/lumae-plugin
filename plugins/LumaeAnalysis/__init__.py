@@ -68,6 +68,7 @@ from .catalog import (
     verify_library_scope,
 )
 from .catalog_analysis import (
+    AnalysisProjectionDeferred,
     GenerationExpired,
     dedup_policy,
     project_analysis,
@@ -972,6 +973,15 @@ def _safe_credits_reconcile(db, server_id, before_background):
         return None
 
 
+def _safe_metadata_reconcile(db, before_background):
+    try:
+        return music_metadata.reconcile(db, before_background=before_background)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis MusicBrainz lookups unavailable")
+        return None
+
+
 def catalog_reconcile_task():
     """Execute at most one durable action for the active source, then retune cadence."""
     db = get_db()
@@ -1040,6 +1050,10 @@ def catalog_reconcile_task():
         if credits_result:
             return {"status": "processed", "action": "credits", "result": credits_result}
 
+        metadata_result = _safe_metadata_reconcile(db, before_background=True)
+        if metadata_result:
+            return {"status": "processed", "action": "music_metadata", "result": metadata_result}
+
         relationship = next_relationship_run(db=db, server_id=server_id)
         if relationship:
             result = _run_reconcile_action(
@@ -1087,6 +1101,10 @@ def catalog_reconcile_task():
         if credits_result:
             return {"status": "processed", "action": "credits", "result": credits_result}
 
+        metadata_result = _safe_metadata_reconcile(db, before_background=False)
+        if metadata_result:
+            return {"status": "processed", "action": "music_metadata", "result": metadata_result}
+
         return {
             "status": "current",
             "requested": int(requested),
@@ -1109,7 +1127,30 @@ def analysis_projection_task(server_id=None):
     resolved_server_id = _resolve_task_server_id(adapter, server_id)
     if not resolved_server_id:
         return {"status": "skipped", "reason": "source_rebind_required"}
-    result = project_analysis(server_id=resolved_server_id, adapter=adapter)
+    try:
+        result = project_analysis(server_id=resolved_server_id, adapter=adapter)
+    except AnalysisProjectionDeferred as exc:
+        # Held back by design, and a retry seconds later cannot change that:
+        # the published projection stays, and the next trigger (this
+        # schedule, an analysis run, catalogue preparation or the identity
+        # recheck) projects. Raising made AudioMuse retry twice and mark the
+        # task FAIL (1.5.0 and earlier).
+        _rollback_if_possible(get_db())
+        # A server Lumae does not mirror (not Navidrome or Jellyfin) is skipped on every
+        # all-servers run; its task row says so, which is enough.
+        if exc.reason != "catalog_source_missing":
+            logger.warning(
+                "lumae_analysis deferred the analysis projection for %s (%s): %s",
+                resolved_server_id,
+                exc.reason,
+                exc,
+            )
+        return {
+            "status": "deferred",
+            "reason": exc.reason,
+            "server_id": resolved_server_id,
+            "message": f"Analysis projection deferred: {exc}",
+        }
     if not result.get("catalog_instance_id"):
         return result
     complete_projection_reconcile(get_db(), result["catalog_instance_id"])
@@ -1229,8 +1270,16 @@ def provider_identity_recheck_task(server_id=None):
                 # its own transactional publication. This task already owns a
                 # root worker slot, so it must not enqueue another root task.
                 db.commit()
-                result["projection"] = analysis_projection_task(server["server_id"])
-                result["projection_processed"] = True
+                projection = analysis_projection_task(server["server_id"])
+                result["projection"] = projection
+                # A projection that did not run (deferred: e.g. the provider
+                # stopped answering since the health check) leaves the durable
+                # reconcile request set, so the next recheck projects again.
+                result["projection_processed"] = (projection or {}).get("status") not in (
+                    "deferred",
+                    "paused",
+                    "skipped",
+                )
             else:
                 db.commit()
         except Exception as exc:
@@ -1655,7 +1704,7 @@ def migrate(db):
     covers.migrate_covers(db)
     personal_discovery.migrate(db)
     music_metadata.migrate(db)
-    music_metadata.ensure_schedule(db)
+    music_metadata.retire_schedule(db)
     ensure_catalog_refresh_schedule(db)
     ensure_catalog_reconcile_schedule(db)
     ensure_provider_identity_recheck_schedule(db)
@@ -5966,7 +6015,6 @@ def register(ctx):
     ctx.add_task("edge_backfill", edge_backfill_task, queue="default")
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_task("credits", credits_service.run_one, queue="default")
-    ctx.add_cron_task("music_metadata", music_metadata.run_one, queue="default")
     ctx.add_task(
         "relationship_preparation", relationship_preparation_task, queue="default"
     )

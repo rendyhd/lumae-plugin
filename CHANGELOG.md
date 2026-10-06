@@ -12,8 +12,9 @@ still matters. Exact, code-verified wire behaviour for every version lives in
 Jellyfin. The plugin mirrors a Jellyfin 12.0+ library next to Navidrome,
 keeps a moved Jellyfin file's identity through fingerprint rekeys, and fills
 in the tags Jellyfin does not expose from the original files. Emby and
-Lyrion are gone. Navidrome behaviour is unchanged. Minimum AudioMuse core
-stays 3.2.0 (per-server Jellyfin access with `Authorization: MediaBrowser`).
+Lyrion are gone. Navidrome behaviour is unchanged, and every 1.5.1 fix is
+included. Minimum AudioMuse core stays 3.2.0 (per-server Jellyfin access
+with `Authorization: MediaBrowser`).
 
 - Emby and Lyrion are gone. Neither was ever admitted as a Lumae catalogue
   source; their dormant catalogue readers and the Emby and Lyrion stream and
@@ -46,7 +47,12 @@ stays 3.2.0 (per-server Jellyfin access with `Authorization: MediaBrowser`).
   a product that is not Jellyfin or a changed server type blocks the
   catalogue before any read, and a different server is never adopted as the
   same catalogue. `/api/catalog/health` adds `provider_server_id` and
-  `provider_version` per source. A catalogue never changes server type.
+  `provider_version` per source. A catalogue never changes server type. A
+  probe that fails gets 1.5.1's protection: only its error is stored (the
+  state, reason and action keep their values, so a block is never lifted
+  and a proven move keeps its pending rekey), client admission stays open,
+  and the call that saw it fails closed: the refresh never reads an
+  unverified server and the projection defers.
 - The Living Collections stream and artwork proxies use each catalogue's own
   AudioMuse server credentials instead of the host's global settings (the
   unadmitted Plex branches are gone). A Jellyfin preview streams
@@ -86,6 +92,64 @@ stays 3.2.0 (per-server Jellyfin access with `Authorization: MediaBrowser`).
   and title/album sort names. The refresh publishes them under exactly the
   OpenSubsonic keys the Navidrome reader produces, only when present; a tag
   change is an ordinary upsert. Navidrome is byte-for-byte unaffected.
+
+## 1.5.1 (2026-10-06)
+
+- MusicBrainz lookups (`/api/music_metadata/prepare`) run on the catalogue
+  watchdog instead of their own every-minute cron task. That task fired
+  1,440 times a day, nearly always on an empty queue, and AudioMuse records
+  every firing in its ten-row "Recent tasks" history ("Songs analyzed: 0"),
+  so real host tasks dropped out of it within ten minutes. The migration
+  deletes the `plugin.lumae_analysis.music_metadata` cron row and the task
+  is no longer registered. An accepted lookup wakes the watchdog in the same
+  transaction; while a library backfill runs, lookups and backfill batches
+  take turns tick by tick, and once background work is done a due lookup
+  runs on every tick (one a minute, as before). An idle install
+  now shows about three Lumae tasks an hour (the :11 sweep and the :02/:32
+  identity recheck). The settings scheduler panel counts pending lookups.
+- The watchdog's retry backoff also looks at how far away the soonest retry
+  is: it never ticks faster than that retry needs, so a lookup the daily
+  MusicBrainz allowance deferred for an hour waits on the hourly sweep
+  instead of an empty task every minute. Each cadence still ticks at or
+  before the retry is due.
+- The "Historical AudioMuse upgrade sequence observed" diagnostic is retired.
+  It looked for a finished analysis, then cleaning, then analysis in
+  AudioMuse's `task_status`, which never keeps them: every main-task start
+  marks the earlier finished tasks REVOKED, and from AudioMuse 3.2.0 (the
+  minimum core) each finished task deletes the others. It could only read
+  "no". The settings page drops the line; health keeps
+  `servers[].v3_readiness.task_evidence` with the same keys, now always
+  `diagnostics_available: false` and a new `unavailable_reason:
+  "audiomuse_keeps_latest_task_only"`, and no longer queries `task_status`
+  for it. Readiness never depended on it.
+- A slow or failed Navidrome ping no longer pauses sync (contract §2,
+  `GET /api/catalog/health`). The plugin pings Navidrome (5 s timeout) on
+  every catalogue health request and before every catalogue refresh and
+  analysis projection, to notice an upgrade that changes track IDs. Up to
+  1.5.0 one failed ping stored a pending provider-identity transition: health
+  told the Lumae app that catalogue and analysis sync were not admitted, and
+  every later successful ping kept it pending until the
+  `provider_identity_recheck` task refreshed the catalogue, up to 30 minutes
+  later. Now a failed ping stores only its error, shown on the settings page
+  under Provider identity safety and in health
+  `provider_identity_transition.last_error`; state, reason and action keep
+  their stored values. The call that saw the failure still fails closed: a
+  catalogue refresh inspects the old and new track IDs before it publishes,
+  and an analysis projection waits for a verified version. A verified ping
+  clears the `provider_version_unverified` / `retry_provider_identity_check`
+  values 1.5.0 could leave behind.
+- The `analysis_projection` task no longer shows as FAIL when it is held back
+  by design (RCA: [docs/analysis-projection-fail-rca-2026-10-06.md](docs/analysis-projection-fail-rca-2026-10-06.md)):
+  the provider identity is unverified or mid-transition, AudioMuse's provider
+  migration is not ready, the server has no Lumae catalogue (not Navidrome, or
+  not prepared yet), or its catalogue has never published. It returns
+  `status: "deferred"` with a `reason` and a message for the task list; the
+  published projection is kept and the next trigger projects. Raising made
+  AudioMuse retry twice and then mark the task FAIL. A projection that loses a
+  race with a catalogue refresh still raises, so AudioMuse's retry covers it.
+  Catalogue preparation and analysis-run finalization retry as before, and the
+  provider-identity recheck keeps its projection request when the projection
+  defers.
 
 ## 1.5.0 (2026-10-05)
 
