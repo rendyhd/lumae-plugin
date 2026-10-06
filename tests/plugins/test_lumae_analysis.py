@@ -3485,7 +3485,7 @@ class ReconcileScheduleCursor:
 
 
 class ReconcileScheduleDb:
-    def __init__(self, summary=(0, 0, None, None)):
+    def __init__(self, summary=(0, 0, None, None, None)):
         self.summary = summary
         self.mode = "idle"
         self.cron_expr = "11 * * * *"
@@ -4693,9 +4693,12 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (mod.BACKFILL_TASK_TYPE,),
     ) in db.cursor_obj.executed
+    assert (
+        "DELETE FROM cron WHERE task_type=%s",
+        ("plugin.lumae_analysis.music_metadata",),
+    ) in db.cursor_obj.executed
     cron_inserts = [params for sql, params in db.cursor_obj.executed if "INSERT INTO cron" in sql]
     assert cron_inserts == [
-        ("Lumae album metadata", "plugin.lumae_analysis.music_metadata", "* * * * *"),
         (
             mod.CATALOG_REFRESH_TASK_TYPE,
             mod.CATALOG_REFRESH_TASK_TYPE,
@@ -5024,13 +5027,20 @@ def test_reconcile_watchdog_processes_only_the_highest_priority_action(monkeypat
 @pytest.mark.parametrize(
     ("summary", "expected_mode", "expected_cron"),
     [
-        ((2, 0, None, None), "active", "* * * * *"),
-        ((0, 1, None, None), "waiting", "*/5 * * * *"),
-        ((0, 0, 1, "2026-08-26T22:01:00Z"), "backoff", "* * * * *"),
-        ((0, 0, 2, "2026-08-26T22:05:00Z"), "backoff", "*/5 * * * *"),
-        ((0, 0, 3, "2026-08-26T22:15:00Z"), "backoff", "*/15 * * * *"),
-        ((0, 0, 4, "2026-08-26T23:00:00Z"), "backoff", "11 * * * *"),
-        ((0, 0, None, None), "idle", "11 * * * *"),
+        ((2, 0, None, None, None), "active", "* * * * *"),
+        ((0, 1, None, None, None), "waiting", "*/5 * * * *"),
+        ((0, 0, 1, "2026-08-26T22:01:00Z", 30), "backoff", "* * * * *"),
+        ((0, 0, 2, "2026-08-26T22:05:00Z", 120), "backoff", "*/5 * * * *"),
+        ((0, 0, 3, "2026-08-26T22:15:00Z", 600), "backoff", "*/15 * * * *"),
+        ((0, 0, 4, "2026-08-26T23:00:00Z", 30), "backoff", "11 * * * *"),
+        # A first retry far off does not tick every minute until it is due:
+        # each cadence still ticks at or before the retry (an hour-long
+        # MusicBrainz allowance deferral waits on the hourly sweep).
+        ((0, 0, 1, "2026-08-26T22:06:00Z", 300), "backoff", "*/5 * * * *"),
+        ((0, 0, 1, "2026-08-26T22:20:00Z", 1200), "backoff", "*/15 * * * *"),
+        ((0, 0, 1, "2026-08-26T23:00:00Z", 3600), "backoff", "11 * * * *"),
+        ((0, 0, 1, "2026-08-26T22:01:00Z", 59), "backoff", "* * * * *"),
+        ((0, 0, None, None, None), "idle", "11 * * * *"),
     ],
 )
 def test_reconcile_schedule_adapts_to_durable_work(summary, expected_mode, expected_cron):
@@ -5047,6 +5057,59 @@ def test_reconcile_schedule_adapts_to_durable_work(summary, expected_mode, expec
     sql = "\n".join(statement for statement, _params in db.cursor_obj.executed)
     assert "FOR UPDATE" in sql
     assert "worker heartbeat expired" in sql
+
+
+@pytest.mark.parametrize(
+    ("background", "metadata_results", "expected_action", "expected_turns"),
+    [
+        # A due lookup whose turn has come runs before the library backfill.
+        (True, {True: {"status": "verified", "job_id": "job-a"}}, "music_metadata", [True]),
+        # A lookup that ran recently waits; the backfill takes this tick.
+        (True, {}, "profile_backfill", [True]),
+        # With no background work left, a due lookup runs on every tick.
+        (False, {False: {"status": "verified", "job_id": "job-a"}}, "music_metadata", [True, False]),
+        (False, {}, None, [True, False]),
+    ],
+)
+def test_reconcile_serves_metadata_lookups_taking_turns_with_background_work(
+    monkeypatch, background, metadata_results, expected_action, expected_turns
+):
+    mod = load_plugin()
+    turns = []
+    actions = []
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    for name in ("next_settled_analysis_run", "next_preparation_run", "next_relationship_run"):
+        monkeypatch.setattr(mod, name, lambda db=None, server_id=None: None)
+    monkeypatch.setattr(
+        mod,
+        "next_profile_backfill_run",
+        lambda db=None, server_id=None: ("server-a", "catalog-a", 0) if background else None,
+    )
+    monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
+    monkeypatch.setattr(mod, "_safe_credits_reconcile", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "_safe_reconcile_schedule", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        mod,
+        "_run_reconcile_action",
+        lambda _db, action, *_args: actions.append(action) or {"status": "complete"},
+    )
+    _stub_edge_reconcile(monkeypatch, mod)
+
+    def metadata(_db, before_background=False):
+        turns.append(before_background)
+        return metadata_results.get(before_background)
+
+    monkeypatch.setattr(mod.music_metadata, "reconcile", metadata)
+
+    result = mod.catalog_reconcile_task()
+
+    assert result.get("action") == expected_action
+    assert turns == expected_turns
+    assert actions == (["profile_backfill"] if expected_action == "profile_backfill" else [])
+    if expected_action == "music_metadata":
+        assert result["result"]["job_id"] == "job-a"
+    if expected_action is None:
+        assert result["status"] == "current"
 
 
 def test_reconcile_work_admission_arms_minute_cadence_in_callers_transaction():
@@ -8222,7 +8285,6 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
     ]
     assert ctx.cron_tasks == [
-        ("music_metadata", mod.music_metadata.run_one, "default"),
         ("catalog_reconcile", mod.catalog_reconcile_task, "default"),
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
         ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),

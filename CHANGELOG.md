@@ -7,6 +7,26 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased (1.5.1)
+
+- MusicBrainz lookups (`/api/music_metadata/prepare`) run on the catalogue
+  watchdog instead of their own every-minute cron task. That task fired
+  1,440 times a day, nearly always on an empty queue, and AudioMuse records
+  every firing in its ten-row "Recent tasks" history ("Songs analyzed: 0"),
+  so real host tasks dropped out of it within ten minutes. The migration
+  deletes the `plugin.lumae_analysis.music_metadata` cron row and the task
+  is no longer registered. An accepted lookup wakes the watchdog in the same
+  transaction; while a library backfill runs, lookups and backfill batches
+  take turns tick by tick, and once background work is done a due lookup
+  runs on every tick (one a minute, as before). An idle install
+  now shows about three Lumae tasks an hour (the :11 sweep and the :02/:32
+  identity recheck). The settings scheduler panel counts pending lookups.
+- The watchdog's retry backoff also looks at how far away the soonest retry
+  is: it never ticks faster than that retry needs, so a lookup the daily
+  MusicBrainz allowance deferred for an hour waits on the hourly sweep
+  instead of an empty task every minute. Each cadence still ticks at or
+  before the retry is due.
+
 ## 1.5.0 (2026-10-05)
 
 - Custom covers (health `capabilities.covers`, contract §5.6). The Lumae app

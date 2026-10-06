@@ -17,6 +17,14 @@ DEFERRED_MARKER = "deferred_host_busy"
 WAITING_CRON = "*/5 * * * *"
 BACKOFF_15_CRON = "*/15 * * * *"
 IDLE_CRON = "11 * * * *"
+# Retry cadences, fastest first, each with the longest gap it can leave
+# before its next tick.
+BACKOFF_LADDER = (
+    (ACTIVE_CRON, 60),
+    (WAITING_CRON, 5 * 60),
+    (BACKOFF_15_CRON, 15 * 60),
+    (IDLE_CRON, 60 * 60),
+)
 EVENT_RETENTION_PER_SOURCE = 25
 
 _current_event_id = ContextVar("lumae_reconcile_event_id", default=None)
@@ -37,7 +45,10 @@ def _work_table(name):
 def migrate_reconcile(db):
     """Create additive operational state without changing app-facing schemas."""
     from .credits_store import migrate as migrate_credits
+    from .music_metadata import migrate as migrate_metadata
+    # _work_summary and read_reconcile_status read both job tables.
     migrate_credits(db)
+    migrate_metadata(db)
     cur = db.cursor()
     for name in ("analysis_runs", "preparation_state", "profile_backfill_state", "relationship_state"):
         migrations.ensure_columns(
@@ -240,6 +251,12 @@ def _work_summary(cur):
                    attempts,not_before
               FROM {_work_table('credits_jobs')}
              WHERE status IN('pending','failed') OR (status='running' AND lease_until<now())
+            UNION ALL
+            SELECT CASE WHEN not_before>now() THEN 'retry' ELSE 'ready' END,
+                   attempts, not_before
+              FROM {_work_table('metadata_jobs')}
+             WHERE status IN ('pending', 'deferred')
+                OR (status='running' AND lease_until<now())
         ), totals AS (
             SELECT count(*) FILTER (WHERE kind='ready') AS ready_count,
                    count(*) FILTER (WHERE kind='waiting') AS waiting_count
@@ -252,17 +269,35 @@ def _work_summary(cur):
              LIMIT 1
         )
         SELECT totals.ready_count, totals.waiting_count,
-               retry.retry_count, retry.next_retry_at
+               retry.retry_count, retry.next_retry_at,
+               GREATEST(0, EXTRACT(EPOCH FROM (retry.next_retry_at - now())))
           FROM totals LEFT JOIN retry ON TRUE
         """
     )
-    row = cur.fetchone() or (0, 0, None, None)
+    row = cur.fetchone() or (0, 0, None, None, None)
     return {
         "ready": int(row[0] or 0),
         "waiting": int(row[1] or 0),
         "retry_count": int(row[2] or 0),
         "next_retry_at": row[3],
+        "retry_in_seconds": float(row[4]) if row[4] is not None else None,
     }
+
+
+def _backoff_cron(attempt, retry_in_seconds):
+    """Back off by attempt, and never tick faster than the soonest retry needs.
+
+    A cadence whose gap fits in the time left before the retry is due still
+    ticks at or before that moment, so a retry an hour away (a MusicBrainz
+    allowance deferral) waits on the hourly sweep and the cadence tightens as
+    it nears, instead of an empty AudioMuse task every minute meanwhile.
+    """
+    step = min(max(int(attempt or 0) - 1, 0), len(BACKOFF_LADDER) - 1)
+    if retry_in_seconds is not None:
+        for index, (_cron_expr, gap_seconds) in enumerate(BACKOFF_LADDER):
+            if retry_in_seconds >= gap_seconds:
+                step = max(step, index)
+    return BACKOFF_LADDER[step][0]
 
 
 def _recover_interrupted_events(cur):
@@ -303,15 +338,7 @@ def reconcile_schedule_from_state(db, paused=False, commit=True):
             mode, cron_expr, reason = "waiting", WAITING_CRON, "analysis_parent_running"
             next_retry_at = None
         elif next_retry_at is not None:
-            attempt = state["retry_count"]
-            if attempt <= 1:
-                cron_expr = ACTIVE_CRON
-            elif attempt == 2:
-                cron_expr = WAITING_CRON
-            elif attempt == 3:
-                cron_expr = BACKOFF_15_CRON
-            else:
-                cron_expr = IDLE_CRON
+            cron_expr = _backoff_cron(state["retry_count"], state["retry_in_seconds"])
             mode, reason = "backoff", "retry_backoff"
         else:
             mode, cron_expr, reason = "idle", IDLE_CRON, "catalog_current"
@@ -521,6 +548,9 @@ def read_reconcile_status(db):
               UNION ALL
               SELECT 'MusicBrainz credits' FROM {_work_table('credits_jobs')}
                WHERE status IN ('pending','failed','running')
+              UNION ALL
+              SELECT 'MusicBrainz lookups' FROM {_work_table('metadata_jobs')}
+               WHERE status IN ('pending','deferred','running')
           ) work
          GROUP BY action ORDER BY action
         """

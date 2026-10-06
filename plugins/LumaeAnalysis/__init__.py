@@ -967,6 +967,15 @@ def _safe_credits_reconcile(db, server_id, before_background):
         return None
 
 
+def _safe_metadata_reconcile(db, before_background):
+    try:
+        return music_metadata.reconcile(db, before_background=before_background)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis MusicBrainz lookups unavailable")
+        return None
+
+
 def catalog_reconcile_task():
     """Execute at most one durable action for the active source, then retune cadence."""
     db = get_db()
@@ -1035,6 +1044,10 @@ def catalog_reconcile_task():
         if credits_result:
             return {"status": "processed", "action": "credits", "result": credits_result}
 
+        metadata_result = _safe_metadata_reconcile(db, before_background=True)
+        if metadata_result:
+            return {"status": "processed", "action": "music_metadata", "result": metadata_result}
+
         relationship = next_relationship_run(db=db, server_id=server_id)
         if relationship:
             result = _run_reconcile_action(
@@ -1081,6 +1094,10 @@ def catalog_reconcile_task():
         credits_result = _safe_credits_reconcile(db, server_id, before_background=False)
         if credits_result:
             return {"status": "processed", "action": "credits", "result": credits_result}
+
+        metadata_result = _safe_metadata_reconcile(db, before_background=False)
+        if metadata_result:
+            return {"status": "processed", "action": "music_metadata", "result": metadata_result}
 
         return {
             "status": "current",
@@ -1650,7 +1667,7 @@ def migrate(db):
     covers.migrate_covers(db)
     personal_discovery.migrate(db)
     music_metadata.migrate(db)
-    music_metadata.ensure_schedule(db)
+    music_metadata.retire_schedule(db)
     ensure_catalog_refresh_schedule(db)
     ensure_catalog_reconcile_schedule(db)
     ensure_provider_identity_recheck_schedule(db)
@@ -5946,7 +5963,6 @@ def register(ctx):
     ctx.add_task("edge_backfill", edge_backfill_task, queue="default")
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_task("credits", credits_service.run_one, queue="default")
-    ctx.add_cron_task("music_metadata", music_metadata.run_one, queue="default")
     ctx.add_task(
         "relationship_preparation", relationship_preparation_task, queue="default"
     )

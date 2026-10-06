@@ -107,6 +107,9 @@ pending, running, deferred, verified, ambiguous, unresolved, failed, cancelled.
 `POST /api/music_metadata/cancel` with `{id: UUID}` invalidates a pending/running
 job's lease. Expired five-minute leases are reclaimable after worker loss;
 stale/cancelled workers cannot publish. Account fairness uses last-served time.
+Jobs run one at a time on the plugin's background watchdog: a minute apart
+when the server has no other background work, about two minutes apart while
+a library backfill runs (1.5.1; earlier releases used an every-minute task).
 
 Verification is conservative: typed ID lookup, or a unique exact normalized
 name/artist search followed by entity lookup. Ambiguous/truncated matches have
