@@ -84,7 +84,9 @@ def migrate(cur):
         "rekey_contract TEXT",
         "publish_failures INTEGER NOT NULL DEFAULT 0",
     )
-    migrations.ensure_columns(cur, t('provider_identity_manifests'), "contract TEXT")
+    migrations.ensure_columns(
+        cur, t('provider_identity_manifests'), "contract TEXT", "previous_transition_id TEXT"
+    )
     from .file_tags import migrate as migrate_file_tags
 
     migrate_file_tags(cur)
@@ -659,7 +661,11 @@ def derive(cur, catalog_instance_id, previous_generation, continuity, normalized
 
 def validate_mapping(mappings):
     """The v2 rules: 32 lowercase hex Jellyfin IDs, one-to-one, old != new,
-    and no ID both old and new."""
+    and no ID both old and new anywhere in the manifest."""
+    all_old = {old_id for mapping in mappings.values() for old_id in mapping}
+    all_new = {new_id for mapping in mappings.values() for new_id in mapping.values()}
+    if all_old & all_new:
+        raise ValueError("A Jellyfin ID is both old and new in one rekey")
     for entity_type, mapping in mappings.items():
         olds = set(mapping)
         news = list(mapping.values())

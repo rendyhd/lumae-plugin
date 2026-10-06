@@ -558,3 +558,63 @@ def test_navidrome_never_holds_or_rekeys_by_fingerprint(migrated_db):
     assert _published(db) == {"t-1", "t-3"}
     assert _rekeys(db) == []
     assert _held(db) == {}
+
+
+def test_health_keeps_every_applied_transition_and_v2_manifests_chain(migrated_db, monkeypatch):
+    """A phone that missed a transition still sees it: health names the last
+    applied one whatever the current state, lists the retained chain, and
+    each v2 manifest names its predecessor (hashed with the rest)."""
+    from plugins.LumaeAnalysis import provider_identity_rekey
+    from plugins.LumaeAnalysis.provider_identity_guard import provider_transition_health
+    from plugins.LumaeAnalysis.provider_identity_rekey import _manifest_hash, read_transition_manifest
+
+    db = migrated_db
+    bridge, source = _start(db, _album_tracks(labels=("one",)), [_album()],
+                            {jid("one"): fp("one")})
+    assert provider_transition_health(db, source)["retained_transitions"] == []
+    assert provider_transition_health(db, source)["last_applied_transition_id"] is None
+    ids = [jid("one"), jid("first/one"), jid("second/one")]
+    applied = []
+    for step in (1, 2):
+        bridge.raw = _raw(_album_tracks(labels=("one",), ids={"one": ids[step]}), [_album()])
+        _map(db, {ids[step]: fp("one")})
+        applied.append(_refresh(db, bridge)["provider_identity_transition"])
+
+    manifests = [read_transition_manifest(db, transition_id=t["transition_id"]) for t in applied]
+    assert [m["previous_transition_id"] for m in manifests] == [None, applied[0]["transition_id"]]
+    for manifest in manifests:
+        hashed = {key: value for key, value in manifest.items()
+                  if key not in ("manifest_sha256", "created_at")}
+        assert _manifest_hash(hashed) == manifest["manifest_sha256"]
+        assert manifest["published_catalog_generation"] == manifest["baseline_catalog_generation"] + 1
+        assert manifest["published_analysis_generation"] == manifest["baseline_analysis_generation"] + 1
+        counts = manifest["counts"]
+        assert manifest["last_seq"] - manifest["first_seq"] + 1 == (
+            counts["rekey"] + counts["addition"] + counts["confirmed_removal"])
+        assert counts["conflict"] == 0 and manifest["analysis_baseline"]["integrity"] is True
+
+    # A third move whose publication keeps failing is abandoned: the state
+    # returns to normal, but the applied transitions stay in health.
+    bridge.raw = _raw(_album_tracks(labels=("one",), ids={"one": jid("third/one")}), [_album()])
+    _map(db, {jid("third/one"): fp("one")})
+    monkeypatch.setattr(provider_identity_rekey, "_publish_provider_identity_rekey",
+                        lambda *args, **kwargs: (_ for _ in ()).throw(ValueError("simulated")))
+    for _attempt in range(3):
+        with pytest.raises(ValueError):
+            _refresh(db, bridge)
+    health = provider_transition_health(db, source)
+    assert (health["state"], health["detection_reason"]) == ("normal", "provider_rekey_abandoned")
+    assert health["last_applied_transition_id"] == applied[1]["transition_id"]
+    assert health["last_applied_contract"] == V2
+    assert (health["last_applied_first_seq"], health["last_applied_last_seq"],
+            health["last_applied_manifest_sha256"]) == (
+        applied[1]["first_seq"], applied[1]["last_seq"], applied[1]["manifest_sha256"])
+    assert [(t["transition_id"], t["previous_transition_id"], t["first_seq"], t["last_seq"])
+            for t in health["retained_transitions"]] == [
+        (applied[0]["transition_id"], None, applied[0]["first_seq"], applied[0]["last_seq"]),
+        (applied[1]["transition_id"], applied[0]["transition_id"],
+         applied[1]["first_seq"], applied[1]["last_seq"]),
+    ]
+    # The manifest route serves every retained transition, not only the latest.
+    assert read_transition_manifest(db, transition_id=applied[0]["transition_id"])[
+        "transition_id"] == applied[0]["transition_id"]

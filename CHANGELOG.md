@@ -61,6 +61,12 @@ still matters. Exact, code-verified wire behaviour for every version lives in
   has not analysed yet are held back instead of being published as new.
   Health adds `provider_identity_transition.rekey_contract`; the manifest
   route reports each manifest's own `contract`. Navidrome is unaffected.
+- Health never loses an applied provider-identity transition:
+  `provider_identity_transition` adds `last_applied_transition_id`,
+  `last_applied_contract`, `last_applied_first_seq`, `last_applied_last_seq`,
+  `last_applied_manifest_sha256` and `retained_transitions` (the newest 100,
+  oldest first), whatever the current state; every v2 manifest names its
+  `previous_transition_id` (hashed), so a client can walk the chain.
 - Tags from Jellyfin files (contract §2.3). Whenever the plugin holds a
   Jellyfin track's original file (AudioMuse's analysis hook or its own
   profile download) it reads, with mutagen if installed and PyAV otherwise,

@@ -1072,6 +1072,12 @@ def assert_analysis_projection_allowed(db, bridge, server_id):
     return observation
 
 
+def _transition_history(db, catalog_instance_id):
+    from .provider_identity_rekey import transition_history
+
+    return transition_history(db, catalog_instance_id)
+
+
 def provider_transition_health(db, catalog_instance_id):
     cur = db.cursor()
     try:
@@ -1122,6 +1128,9 @@ def provider_transition_health(db, catalog_instance_id):
         # 1.6.0: "provider_identity_rekey_v2" for a Jellyfin fingerprint
         # rekey; null for Navidrome (v1) and when no rekey is under way.
         "rekey_contract": str(row[17]) if len(row) > 17 and row[17] else None,
+        # 1.6.0: the last applied transition and the retained chain, kept
+        # whatever the current state (abandoned, blocked, back to normal).
+        **_transition_history(db, catalog_instance_id),
         "catalog_sync_allowed": not blocked,
         "analysis_sync_allowed": not blocked,
         "audiomuse_projection_ingest_allowed": not blocked

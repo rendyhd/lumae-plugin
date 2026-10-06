@@ -879,6 +879,21 @@ def _publish_provider_identity_rekey(
         audiomuse_health = inspect_audiomuse_health(cur, adapter, server_id, carried_links)
     collection_events, collection_deferrals = _rekey_collections(
         cur, catalog_instance_id, plan.mappings)
+    previous_transition_id = None
+    if spec is not None:
+        # v2 manifests chain to the catalogue's previous transition (any
+        # contract), so a client can walk every retained transition in order.
+        cur.execute(
+            f"""
+            SELECT transition_id FROM {t('provider_identity_manifests')}
+             WHERE catalog_instance_id=%s
+             ORDER BY published_catalog_generation DESC, created_at DESC
+             LIMIT 1
+            """,
+            (catalog_instance_id,),
+        )
+        row = cur.fetchone()
+        previous_transition_id = str(row[0]) if row and row[0] else None
     manifest = {
         "contract": contract,
         "transition_id": transition_id,
@@ -896,6 +911,9 @@ def _publish_provider_identity_rekey(
         "analysis_baseline": baseline,
         "mappings": list(plan.mappings),
     }
+    if spec is not None:
+        # Hashed with the rest of a v2 manifest; v1 manifests never carry it.
+        manifest["previous_transition_id"] = previous_transition_id
     manifest_sha256 = _manifest_hash(manifest)
     cur.execute(
         f"""
@@ -927,10 +945,11 @@ def _publish_provider_identity_rekey(
         ),
     )
     if contract != CONTRACT_V1:
-        # The manifest's contract; v1 rows keep NULL (read as v1).
+        # The manifest's contract and chain link; v1 rows keep NULL (read as v1).
         cur.execute(
-            f"UPDATE {t('provider_identity_manifests')} SET contract=%s WHERE transition_id=%s",
-            (contract, transition_id),
+            f"UPDATE {t('provider_identity_manifests')} "
+            "SET contract=%s, previous_transition_id=%s WHERE transition_id=%s",
+            (contract, previous_transition_id, transition_id),
         )
     if spec is None:
         required_action = (
@@ -1132,7 +1151,7 @@ def read_transition_manifest(db, *, transition_id=None, catalog_instance_id=None
                published_analysis_generation, provider_version_before,
                provider_version_after, target_fingerprint, first_seq, last_seq,
                counts, analysis_baseline, mappings, manifest_sha256, created_at,
-               contract
+               contract, previous_transition_id
           FROM {t('provider_identity_manifests')}
          WHERE {where}
          ORDER BY created_at DESC LIMIT 1
@@ -1143,9 +1162,10 @@ def read_transition_manifest(db, *, transition_id=None, catalog_instance_id=None
     cur.close()
     if row is None:
         raise KeyError("transition_manifest_not_found")
-    return {
+    contract = str(row[16]) if len(row) > 16 and row[16] else CONTRACT_V1
+    manifest = {
         # NULL (every manifest before 1.6.0, and every Navidrome one) is v1.
-        "contract": str(row[16]) if len(row) > 16 and row[16] else CONTRACT_V1,
+        "contract": contract,
         "transition_id": str(row[0]),
         "catalog_instance_id": str(row[1]),
         "baseline_catalog_generation": int(row[2]),
@@ -1164,4 +1184,61 @@ def read_transition_manifest(db, *, transition_id=None, catalog_instance_id=None
         "mappings": row[13] if isinstance(row[13], list) else json.loads(row[13]),
         "manifest_sha256": str(row[14]),
         "created_at": row[15].isoformat() if hasattr(row[15], "isoformat") else row[15],
+    }
+    if contract != CONTRACT_V1:
+        # Part of a v2 manifest's hashed descriptor; null for the first.
+        manifest["previous_transition_id"] = (
+            str(row[17]) if len(row) > 17 and row[17] else None
+        )
+    return manifest
+
+
+RETAINED_TRANSITIONS_LIMIT = 100
+
+
+def transition_history(db, catalog_instance_id):
+    """The catalogue's applied transitions from their retained manifests.
+
+    Every manifest is kept and served by the manifest route; health lists
+    the newest ``RETAINED_TRANSITIONS_LIMIT``, oldest first, and names the
+    last applied one, so a client that missed a transition (also one later
+    abandoned or followed by a block that cleared) still sees it.
+    """
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""
+            SELECT transition_id, contract, previous_transition_id,
+                   published_catalog_generation, first_seq, last_seq, manifest_sha256
+              FROM {t('provider_identity_manifests')}
+             WHERE catalog_instance_id=%s
+             ORDER BY published_catalog_generation DESC, created_at DESC
+             LIMIT %s
+            """,
+            (catalog_instance_id, RETAINED_TRANSITIONS_LIMIT),
+        )
+        rows = cur.fetchall() or []
+    finally:
+        cur.close()
+    retained = [
+        {
+            "transition_id": str(row[0]),
+            "contract": str(row[1]) if row[1] else CONTRACT_V1,
+            "previous_transition_id": str(row[2]) if row[2] else None,
+            "published_catalog_generation": int(row[3]),
+            "first_seq": int(row[4]),
+            "last_seq": int(row[5]),
+            "manifest_sha256": str(row[6]),
+        }
+        for row in reversed(rows)
+        if isinstance(row, (tuple, list)) and len(row) >= 7
+    ]
+    latest = retained[-1] if retained else {}
+    return {
+        "last_applied_transition_id": latest.get("transition_id"),
+        "last_applied_contract": latest.get("contract"),
+        "last_applied_first_seq": latest.get("first_seq"),
+        "last_applied_last_seq": latest.get("last_seq"),
+        "last_applied_manifest_sha256": latest.get("manifest_sha256"),
+        "retained_transitions": retained,
     }
