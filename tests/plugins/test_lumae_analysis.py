@@ -7659,6 +7659,56 @@ def test_progressive_evidence_uses_inconclusive_fingerprints_provisionally():
     assert {link["review_state"] for link in links.values()} == {"provisional"}
 
 
+def test_jellyfin_release_track_ids_are_no_recording_evidence():
+    """Jellyfin's ProviderIds.MusicBrainzTrack is the release-track ID.
+
+    One recording on two releases (an album and a compilation) has one
+    MusicBrainzRecording and two MusicBrainzTrack values. For a Jellyfin source
+    only MusicBrainzRecording (and ISRC) is recording evidence; the Navidrome
+    default keeps the key list it always had.
+    """
+    from plugins.LumaeAnalysis.catalog_analysis import (
+        RECORDING_ID_KEYS,
+        _recording_ids,
+        _suspect_analysis_ids,
+    )
+
+    def occurrence(recording, release_track):
+        return {
+            "title": "Song",
+            "artist": "Artist",
+            "duration_ms": 180000,
+            "payload": {
+                "ProviderIds": {
+                    "MusicBrainzRecording": recording,
+                    "MusicBrainzTrack": release_track,
+                }
+            },
+        }
+
+    links = {"a": {"analysis_id": "canonical-1"}, "b": {"analysis_id": "canonical-1"}}
+    one_recording = {"a": occurrence("rec-1", "reltrack-a"), "b": occurrence("rec-1", "reltrack-b")}
+    two_recordings = {"a": occurrence("rec-1", "reltrack-a"), "b": occurrence("rec-2", "reltrack-b")}
+    release_track_only = {
+        "a": {**one_recording["a"], "payload": {"ProviderIds": {"MusicBrainzTrack": "reltrack-a"}}},
+        "b": {**one_recording["b"], "payload": {"ProviderIds": {"MusicBrainzTrack": "reltrack-b"}}},
+    }
+
+    assert _suspect_analysis_ids(one_recording, links, provider_type="jellyfin") == set()
+    assert _suspect_analysis_ids(release_track_only, links, provider_type="jellyfin") == set()
+    assert _suspect_analysis_ids(two_recordings, links, provider_type="jellyfin") == {"canonical-1"}
+    # Navidrome (and the default) keep the key list unchanged.
+    assert RECORDING_ID_KEYS == ("MusicBrainzTrack", "MusicBrainzRecording", "ISRC", "isrc")
+    for provider_type in ("navidrome", None):
+        assert _suspect_analysis_ids(release_track_only, links, provider_type=provider_type) == {
+            "canonical-1"
+        }
+        assert _suspect_analysis_ids(two_recordings, links, provider_type=provider_type) == {
+            "canonical-1"
+        }
+    assert _recording_ids(one_recording["a"]) == {"rec-1", "reltrack-a"}
+
+
 def test_v3_0_3_dedup_policy_and_duration_backstop(monkeypatch):
     from plugins.LumaeAnalysis.catalog_analysis import _suspect_analysis_ids, dedup_policy
 

@@ -31,7 +31,10 @@ stays 3.2.0 (per-server Jellyfin access with `Authorization: MediaBrowser`).
   come from `/Artists` and `/Artists/AlbumArtists` per library (their IDs
   equal the tracks' artist IDs; `/Persons` IDs never do). Jellyfin
   MusicBrainz IDs map correctly: `MusicBrainzRecording` is the recording,
-  `MusicBrainzTrack` the release track. Measured against a Jellyfin 12.2.0
+  `MusicBrainzTrack` the release track, so the analysis projection's
+  suspect-group check reads only `MusicBrainzRecording` (and ISRC) as
+  recording evidence for a Jellyfin catalogue: one recording on two releases
+  is no conflict. Measured against a Jellyfin 12.2.0
   server: a track's album is its `AlbumId` (its `ParentId` is a folder, a
   disc folder on multi-disc albums), untagged `0001-01-01` dates are treated
   as absent, a library the AudioMuse account may not open (401 "not

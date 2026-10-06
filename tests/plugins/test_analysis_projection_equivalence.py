@@ -1301,6 +1301,43 @@ def test_one_item_serves_every_provider_occurrence_of_an_agreeing_group(
     migrated_db.rollback()
 
 
+@pytest.mark.parametrize("provider_type", ["navidrome", "jellyfin"])
+def test_jellyfin_release_track_ids_are_no_recording_evidence(
+    migrated_db, projection_config, provider_type
+):
+    """Jellyfin's ``MusicBrainzTrack`` is a release-track ID; Navidrome is unchanged.
+
+    The seed's group 483-485 conflicts only through a top-level
+    ``MusicBrainzTrack`` (483) and a ``providerIds.MusicBrainzRecording``
+    (484). On Navidrome the group stays suspect, as before; on Jellyfin only
+    ``MusicBrainzRecording`` is recording evidence, so it is not. Groups whose
+    durations or metadata contradict each other stay suspect on both.
+    """
+    seed(migrated_db)
+    with migrated_db.cursor() as cur:
+        for table in ("catalog_sources", "catalog_state"):
+            cur.execute(
+                f"UPDATE {T}{table} SET provider_type=%s WHERE catalog_instance_id=%s",
+                (provider_type, SOURCE),
+            )
+    migrated_db.commit()
+    catalog_analysis.project_analysis(SERVER, db=migrated_db, adapter=V3Adapter())
+    with migrated_db.cursor() as cur:
+        cur.execute(
+            f"SELECT provider_track_id, conflict_flags FROM {T}track_analysis_links "
+            "WHERE catalog_instance_id=%s",
+            (SOURCE,),
+        )
+        flags = {row[0]: set(row[1] or ()) for row in cur.fetchall()}
+    recording_only = {
+        index: "provider_evidence_conflict" in flags[track_id(index)] for index in (483, 484, 485)
+    }
+    assert recording_only == {index: provider_type == "navidrome" for index in (483, 484, 485)}
+    # the pending pair 680/681 contradicts itself by duration on both
+    for index in (680, 681):
+        assert "provider_evidence_conflict" in flags[track_id(index)]
+
+
 def test_failed_generation_is_republished_even_without_changes(twin_dbs, projection_config):
     old_db, new_db = twin_dbs
     for db in twin_dbs:

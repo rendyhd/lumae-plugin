@@ -505,18 +505,32 @@ def _normalized_identity(value):
     return " ".join(str(value or "").casefold().split())
 
 
-def _recording_ids(track):
+RECORDING_ID_KEYS = ("MusicBrainzTrack", "MusicBrainzRecording", "ISRC", "isrc")
+# Jellyfin's ProviderIds.MusicBrainzTrack is the release-track ID (from
+# MUSICBRAINZ_RELEASETRACKID): one recording on two releases carries two
+# values, so it is no recording evidence there. Only MusicBrainzRecording is.
+JELLYFIN_RECORDING_ID_KEYS = ("MusicBrainzRecording", "ISRC", "isrc")
+
+
+def _recording_id_keys(provider_type):
+    if provider_type == "jellyfin":
+        return JELLYFIN_RECORDING_ID_KEYS
+    return RECORDING_ID_KEYS
+
+
+def _recording_ids(track, keys=RECORDING_ID_KEYS):
     payload = track.get("payload") or {}
     provider_ids = payload.get("ProviderIds") or payload.get("providerIds") or {}
     result = set()
-    for key in ("MusicBrainzTrack", "MusicBrainzRecording", "ISRC", "isrc"):
+    for key in keys:
         value = provider_ids.get(key) or payload.get(key)
         if value:
             result.add(str(value).casefold())
     return result
 
 
-def _suspect_analysis_ids(tracks, links, policy=None):
+def _suspect_analysis_ids(tracks, links, policy=None, provider_type=None):
+    keys = _recording_id_keys(provider_type)
     policy = policy or dedup_policy()
     tolerance_seconds = policy.get("duration_tolerance_seconds")
     tolerance_ms = 3000 if tolerance_seconds is None else max(0, tolerance_seconds * 1000)
@@ -528,7 +542,7 @@ def _suspect_analysis_ids(tracks, links, policy=None):
     for analysis_id, occurrences in grouped.items():
         if len(occurrences) < 2:
             continue
-        recording_sets = [ids for ids in map(_recording_ids, occurrences) if ids]
+        recording_sets = [ids for ids in (_recording_ids(row, keys) for row in occurrences) if ids]
         recording_conflict = (
             len(recording_sets) > 1
             and not set.intersection(*recording_sets)
@@ -886,7 +900,10 @@ def _project_analysis(server_id=None, db=None, adapter=None):
         # The catalogue generation was replaced and pruned since its track IDs
         # were read. Suspect detection needs every occurrence of a group.
         raise _changed_during_projection(cur, db, "The provider catalogue")
-    _apply_provider_conflicts(links, _suspect_analysis_ids(details, links, policy))
+    _apply_provider_conflicts(
+        links,
+        _suspect_analysis_ids(details, links, policy, provider_type=source.get("provider_type")),
+    )
     del details
 
     changed_items = []
