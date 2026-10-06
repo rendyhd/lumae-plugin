@@ -132,8 +132,9 @@ def test_reader_scopes_every_request_by_library_and_merges_memberships():
     assert tracks[jid("one")]["_lumae_library_ids"] == [LIB_A]
     for row in raw["tracks"]:
         assert set(row) - set(jp.TRACK_KEYS) <= {"MediaSources", "PrimaryImageItemId",
-                                                 "_lumae_library_ids"}
+                                                 "_lumae_library_ids", "suffix"}
         assert "Path" not in json.dumps(row) and "UserData" not in row
+        assert row["suffix"] == "flac"
     assert tracks[jid("one")]["MediaSources"] == [{
         "Container": "flac", "Size": 30_000_001, "Bitrate": 1_000_000,
         "MediaStreams": [{"Type": "Audio", "Codec": "flac", "BitRate": 1_000_000,
@@ -260,6 +261,74 @@ def test_probe_retries_a_starting_server_and_reads_either_casing(monkeypatch):
     with pytest.raises(jp.JellyfinHttpError):
         jp.probe_identity(module)
     assert len(http.calls) == 1
+
+
+def _suffix_item(path=None, container=None, source_container=None, codec=None):
+    source = {"Protocol": "File", "MediaStreams": []}
+    if path is not None:
+        source["Path"] = path
+    if source_container is not None:
+        source["Container"] = source_container
+    if codec is not None:
+        source["MediaStreams"].append({"Type": "Audio", "Codec": codec})
+    item = {"Id": jid("x"), "Name": "X", "Type": "Audio", "MediaSources": [source]}
+    if container is not None:
+        item["Container"] = container
+    return item
+
+
+FFPROBE_MP4 = "mov,mp4,m4a,3gp,3g2,mj2"
+
+
+def _strings(value):
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in _strings(item)]
+    if isinstance(value, list):
+        return [text for item in value for text in _strings(item)]
+    return [value] if isinstance(value, str) else []
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        # Measured on 12.2.0: item Container is ffprobe's demuxer list, the
+        # media source says m4a, an Ogg Opus file's containers say ogg.
+        ({"path": "/music/a/One.M4A", "container": FFPROBE_MP4, "source_container": "m4a",
+          "codec": "aac"}, "m4a"),
+        ({"path": "/music/a/two.m4a", "container": FFPROBE_MP4, "source_container": "m4a",
+          "codec": "alac"}, "m4a"),
+        ({"path": "/music/a/three.opus", "container": "ogg", "source_container": "ogg",
+          "codec": "opus"}, "opus"),
+        ({"path": "/music/a/four.mp3", "container": "mp3", "codec": "mp3"}, "mp3"),
+        ({"path": "C:\\Music\\Five.FLAC", "codec": "flac"}, "flac"),
+        # No usable extension: a single-token container, then the codec.
+        ({"path": "/music/a/no-extension", "source_container": "flac"}, "flac"),
+        ({"container": FFPROBE_MP4, "source_container": FFPROBE_MP4, "codec": "alac"}, "m4a"),
+        ({"container": FFPROBE_MP4, "codec": "vorbis"}, "ogg"),
+        ({"codec": "pcm_s16le"}, "wav"),
+        ({"container": FFPROBE_MP4, "codec": "dsd_lsbf"}, None),
+        ({}, None),
+    ],
+)
+def test_track_suffix_is_the_file_extension_never_a_demuxer_list(kwargs, expected):
+    from plugins.LumaeAnalysis import jellyfin_provider as jp
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    item = _suffix_item(**kwargs)
+    assert jp.track_suffix(item) == expected
+    row = jp.track_row(item, [LIB_A])
+    assert not [value for value in _strings({key: value for key, value in row.items()
+                                             if key in ("Container", "MediaSources", "suffix")})
+                if "," in value]
+    assert "Path" not in json.dumps(row)
+    assert row.get("suffix") == expected
+    if kwargs.get("container") == FFPROBE_MP4:
+        assert "Container" not in row
+    track = normalize_provider_catalog(
+        {"libraries": [{"id": LIB_A, "name": "Music"}], "albums": [], "tracks": [row],
+         "artist_cover_art": {}}, "jellyfin")["tracks"][0]
+    assert track["audio_properties"]["container"] == expected
+    assert track["payload"].get("suffix") == expected
 
 
 def test_rows_drop_folder_parents_and_untagged_sentinel_dates():

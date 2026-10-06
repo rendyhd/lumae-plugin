@@ -41,7 +41,12 @@ with `Authorization: MediaBrowser`).
   as absent, a library the AudioMuse account may not open (401 "not
   permitted") stops the scan with its own message instead of being read as
   rejected credentials, and the identity probe asks a starting server again
-  (503, or a camelCase body) before calling it unreachable.
+  (503, or a camelCase body) before calling it unreachable. A track's
+  `suffix` (its published container, which clients use for decodability and
+  download extensions) is the file's own extension (`m4a`, `opus`, ...), not
+  Jellyfin's `Container`, which is ffprobe's demuxer list for MP4
+  (`mov,mp4,m4a,3gp,3g2,mj2`) and `ogg` for an Opus file; a comma list is
+  never published.
 - Jellyfin identity guard: `/System/Info/Public` binds the server `Id` to the
   catalogue at the first verified probe; another `Id`, a release before 12.0,
   a product that is not Jellyfin or a changed server type blocks the

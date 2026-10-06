@@ -116,7 +116,7 @@
       "min_core_version": "3.2.0",
       "changelog": "Jellyfin: Lumae Analysis mirrors a Jellyfin 12.0 or later library next to Navidrome (supported_provider_types jellyfin and navidrome), reading each music library inside the bound AudioMuse server with that server's own credentials, and binds each Jellyfin catalogue to its server Id from /System/Info/Public: another server, product, release or server type blocks the catalogue and is never adopted; as for Navidrome from 1.5.1, a probe that fails stores only its error and the refresh never reads an unverified server. Health adds provider_server_id and provider_version per source. A moved, renamed or re-cased Jellyfin file keeps its identity: a missing track is held for 14 days and, when AudioMuse maps a new ID to the same content fingerprint, the move is published as an atomic provider_identity_rekey_v2 (journal rekeys and a manifest; collections, shelves, Vibes, covers and profiles follow). Tags Jellyfin does not expose (release type, compilation, explicit, credits with roles, ISRC, disc subtitle, original date, ReplayGain gains and peaks, BPM, sort names) are read from the original files and published under the OpenSubsonic keys Navidrome uses. Health keeps every applied rekey (last_applied_transition_id and retained_transitions) and each v2 manifest names its previous_transition_id. Emby and Lyrion are removed. Navidrome behaviour is unchanged. Includes every 1.5.1 fix.",
       "imageUrl": "",
-      "checksum": "36b35fd4ec0b5d3e4a5f89b93624600f",
+      "checksum": "b84e1a7e90a0524c74fc514af31cf2da",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.6.0.zip"
     },
     {

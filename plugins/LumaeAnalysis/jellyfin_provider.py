@@ -69,6 +69,19 @@ _SENTINEL_DATE_PREFIX = "0001-01-01"
 ARTIST_PATHS = ("/Artists", "/Artists/AlbumArtists")
 
 MEDIA_SOURCE_KEYS = ("Container", "Size", "Bitrate")
+
+# The file suffix clients use for decodability (iOS cannot decode Ogg/Opus)
+# and download extensions. Jellyfin's item ``Container`` is ffprobe's demuxer
+# list ("mov,mp4,m4a,3gp,3g2,mj2" for an M4A) and its media-source
+# ``Container`` calls an Ogg Opus file "ogg", so the suffix is the file's own
+# extension, as Navidrome's ``suffix`` is (measured on 12.2.0). Only a single
+# lower-case token is ever published, never a comma list.
+_SUFFIX_RE = re.compile(r"^[a-z0-9]{1,10}$")
+CODEC_SUFFIXES = {
+    "aac": "m4a", "alac": "m4a", "ape": "ape", "flac": "flac", "mp2": "mp2", "mp3": "mp3",
+    "opus": "opus", "vorbis": "ogg", "wavpack": "wv", "wmav1": "wma", "wmav2": "wma",
+    "wmapro": "wma", "wmalossless": "wma",
+}
 MEDIA_STREAM_KEYS = (
     "Type", "Codec", "BitRate", "SampleRate", "BitDepth", "Channels", "ChannelLayout",
 )
@@ -239,12 +252,52 @@ def _paged_items(http, base_url, headers, params, path="/Items"):
         start += len(items)
 
 
+def _single_token(value):
+    text = str(value or "").strip().lower()
+    return text if _SUFFIX_RE.match(text) else None
+
+
+def _path_suffix(path):
+    name = re.split(r"[\\/]", str(path or ""))[-1]
+    if "." not in name.strip("."):
+        return None
+    return _single_token(name.rsplit(".", 1)[1])
+
+
+def track_suffix(item):
+    """The file suffix of a Jellyfin track, or ``None``.
+
+    The file's extension (``MediaSources[0].Path``, which ``MediaSources``
+    carries; the path itself is never published), else a single-token
+    container, else the first audio stream's codec.
+    """
+    sources = [source for source in item.get("MediaSources") or [] if isinstance(source, dict)]
+    first = sources[0] if sources else {}
+    for candidate in (
+        _path_suffix(first.get("Path")),
+        _path_suffix(item.get("Path")),
+        _single_token(first.get("Container")),
+        _single_token(item.get("Container")),
+    ):
+        if candidate:
+            return candidate
+    for stream in first.get("MediaStreams") or []:
+        if isinstance(stream, dict) and str(stream.get("Type") or "").lower() == "audio":
+            codec = str(stream.get("Codec") or "").strip().lower()
+            if codec.startswith("pcm_"):
+                return "wav"
+            return CODEC_SUFFIXES.get(codec)
+    return None
+
+
 def _compact_media_sources(value):
     sources = []
     for source in value if isinstance(value, list) else []:
         if not isinstance(source, dict):
             continue
         compact = {key: source[key] for key in MEDIA_SOURCE_KEYS if source.get(key) is not None}
+        if "Container" in compact and not _single_token(compact["Container"]):
+            del compact["Container"]
         streams = [
             {key: stream[key] for key in MEDIA_STREAM_KEYS if stream.get(key) is not None}
             for stream in source.get("MediaStreams") or []
@@ -277,6 +330,13 @@ def track_row(item, library_ids):
     )
     if row.get("AlbumId"):
         row.pop("ParentId", None)
+    if "Container" in row and not _single_token(row["Container"]):
+        del row["Container"]
+    suffix = track_suffix(item)
+    if suffix:
+        # Under Navidrome's OpenSubsonic key, which the normalizer publishes
+        # as the track's audio container.
+        row["suffix"] = suffix
     media = _compact_media_sources(item.get("MediaSources"))
     if media:
         row["MediaSources"] = media
