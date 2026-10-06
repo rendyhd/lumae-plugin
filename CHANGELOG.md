@@ -91,7 +91,9 @@ with `Authorization: MediaBrowser`).
   subtitle, original date, ReplayGain track and album gain and peak, BPM
   and title/album sort names. The refresh publishes them under exactly the
   OpenSubsonic keys the Navidrome reader produces, only when present; a tag
-  change is an ordinary upsert. Navidrome is byte-for-byte unaffected.
+  change is an ordinary upsert. An album sort tag (ALBUMSORT, TSOA, `soal`)
+  is the album's canonical `sort_name`, ahead of the `SortName` Jellyfin
+  computes for every album. Navidrome is byte-for-byte unaffected.
 
 ## 1.5.1 (2026-10-06)
 

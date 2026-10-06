@@ -565,6 +565,20 @@ def _content_kind(row):
     return lowered
 
 
+def _album_sort_keys(provider_type):
+    """Payload keys for an album's canonical ``sort_name``, first wins.
+
+    Jellyfin computes its own ``SortName`` for every album, so the album sort
+    tag of the original files (ALBUMSORT / TSOA / soal), which file_tags
+    merges under the OpenSubsonic ``sortName`` key, must come first or it
+    never reaches a client. A Navidrome payload has only ``sortName``; its
+    order is unchanged.
+    """
+    if provider_type == "jellyfin":
+        return ("sortName", "SortName")
+    return ("SortName", "sortName")
+
+
 def normalize_provider_catalog(raw_catalog, provider_type):
     """Normalize provider occurrences without consulting AudioMuse score rows."""
     raw_catalog = raw_catalog or {}
@@ -605,7 +619,7 @@ def normalize_provider_catalog(raw_catalog, provider_type):
         art = _art_payload(raw)
         metadata = {
             "name": name,
-            "sort_name": _text(_value(raw, "SortName", "sortName")),
+            "sort_name": _text(_value(raw, *_album_sort_keys(provider_type))),
             "album_artist_display": _artist_display(
                 _value(raw, "AlbumArtist", "albumArtist", "albumartist")
             )

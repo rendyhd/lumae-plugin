@@ -242,7 +242,7 @@ Jellyfin 12 does not expose several tags that Navidrome serves through OpenSubso
 | `TBPM`, `BPM`, `tmpo` | `bpm` | — | — |
 | `REPLAYGAIN_TRACK_GAIN`/`_PEAK`, `REPLAYGAIN_ALBUM_GAIN`/`_PEAK` | `replayGain` (`trackGain`, `trackPeak`, `albumGain`, `albumPeak`) | — | `_lumae.replay_gain` (`track_gain_db`, `track_peak`, `album_gain_db`, `album_peak`) |
 | `TSOT`, `TITLESORT`, `sonm` | `sortName` | — | — |
-| `TSOA`, `ALBUMSORT`, `soal` | — | `sortName` | — |
+| `TSOA`, `ALBUMSORT`, `soal` | — | `sortName` | album `sort_name` (before Jellyfin's own `SortName`, which stays in the payload) |
 
 An album key is emitted only when every tagged track of the album that carries the tag agrees. The keys of a Jellyfin row with file tags are folded into its metadata fingerprint, so a changed tag is an ordinary `upsert` (a retagged file is re-read when its media changes and the plugin analyses it again). A fingerprint rekey (§2.2) carries the moved file's tags to the new ID. Known limits: PyAV does not return ID3 `TIPL` names or the MP4 `tmpo` atom (mutagen does); artist sort names have no OpenSubsonic track or album key and are not emitted; Opus `R128_*` gains are not converted. `release_type` and `external_ids.isrc` keep the Navidrome reader's existing text form of a list (`"['album']"`), on both paths.
 

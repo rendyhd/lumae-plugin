@@ -327,6 +327,33 @@ def test_merged_tags_normalize_like_the_navidrome_reader():
         != j_track["metadata_fp"]
 
 
+def test_an_album_sort_tag_is_the_jellyfin_albums_canonical_sort_name():
+    """ALBUMSORT / TSOA / soal beats Jellyfin's own computed SortName; without
+    the tag the album keeps Jellyfin's; Navidrome's key order is unchanged."""
+    load_plugin()
+    from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
+
+    tagged = normalize_provider_catalog(_jellyfin_raw({"one": EXPECTED}), "jellyfin")
+    plain = normalize_provider_catalog(_jellyfin_raw(), "jellyfin")
+    other = normalize_provider_catalog(
+        _jellyfin_raw({"one": {key: value for key, value in EXPECTED.items()
+                               if key != "album_sort"}}), "jellyfin")
+
+    assert tagged["albums"][0]["sort_name"] == "Album, The"
+    assert tagged["albums"][0]["payload"]["SortName"] == "album"
+    assert plain["albums"][0]["sort_name"] == "album"
+    assert other["albums"][0]["sort_name"] == "album"
+    assert tagged["albums"][0]["metadata_fp"] != plain["albums"][0]["metadata_fp"]
+
+    navidrome_raw = navidrome_catalog()
+    assert normalize_provider_catalog(navidrome_raw, "navidrome")["albums"][0]["sort_name"] \
+        == navidrome_raw["albums"][0]["sortName"]
+    both = navidrome_catalog()
+    both["albums"][0]["SortName"] = "provider order"
+    assert normalize_provider_catalog(both, "navidrome")["albums"][0]["sort_name"] \
+        == "provider order"
+
+
 def test_navidrome_fingerprints_never_fold_file_tags():
     load_plugin()
     from plugins.LumaeAnalysis.catalog import _with_file_tags
@@ -410,6 +437,12 @@ def test_captured_tags_publish_as_ordinary_upserts(migrated_db, tmp_path):
     assert payload["contributors"][-1] == {
         "role": "performer", "subRole": "guitar", "artist": {"name": "Gus Guitar"}}
     assert "bpm" not in _payload(db, jid("two"))
+    # The album sort tag is the album's canonical sort name.
+    assert _rows(db, f"""
+        SELECT a.sort_name FROM {P}catalog_albums a
+          JOIN {P}catalog_state s USING (catalog_instance_id)
+         WHERE a.published_generation=s.published_generation AND a.album_id=%s""",
+                 (jid("album"),)) == [("Album, The",)]
     assert _refresh(db, bridge)["change_reason"] == "no_change"
 
     # A retagged file is an ordinary upsert of that track only.
