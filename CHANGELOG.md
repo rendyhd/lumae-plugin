@@ -36,6 +36,34 @@ still matters. Exact, code-verified wire behaviour for every version lives in
   `diagnostics_available: false` and a new `unavailable_reason:
   "audiomuse_keeps_latest_task_only"`, and no longer queries `task_status`
   for it. Readiness never depended on it.
+- A slow or failed Navidrome ping no longer pauses sync (contract §2,
+  `GET /api/catalog/health`). The plugin pings Navidrome (5 s timeout) on
+  every catalogue health request and before every catalogue refresh and
+  analysis projection, to notice an upgrade that changes track IDs. Up to
+  1.5.0 one failed ping stored a pending provider-identity transition: health
+  told the Lumae app that catalogue and analysis sync were not admitted, and
+  every later successful ping kept it pending until the
+  `provider_identity_recheck` task refreshed the catalogue, up to 30 minutes
+  later. Now a failed ping stores only its error, shown on the settings page
+  under Provider identity safety and in health
+  `provider_identity_transition.last_error`; state, reason and action keep
+  their stored values. The call that saw the failure still fails closed: a
+  catalogue refresh inspects the old and new track IDs before it publishes,
+  and an analysis projection waits for a verified version. A verified ping
+  clears the `provider_version_unverified` / `retry_provider_identity_check`
+  values 1.5.0 could leave behind.
+- The `analysis_projection` task no longer shows as FAIL when it is held back
+  by design (RCA: [docs/analysis-projection-fail-rca-2026-10-06.md](docs/analysis-projection-fail-rca-2026-10-06.md)):
+  the provider identity is unverified or mid-transition, AudioMuse's provider
+  migration is not ready, the server has no Lumae catalogue (not Navidrome, or
+  not prepared yet), or its catalogue has never published. It returns
+  `status: "deferred"` with a `reason` and a message for the task list; the
+  published projection is kept and the next trigger projects. Raising made
+  AudioMuse retry twice and then mark the task FAIL. A projection that loses a
+  race with a catalogue refresh still raises, so AudioMuse's retry covers it.
+  Catalogue preparation and analysis-run finalization retry as before, and the
+  provider-identity recheck keeps its projection request when the projection
+  defers.
 
 ## 1.5.0 (2026-10-05)
 

@@ -658,6 +658,13 @@ def render_provider_identity_panel():
             str(transition.get("audiomuse_health") or "not checked")
         )
         scan_count = int(transition.get("target_scan_count") or 0)
+        # A failed ping changes only last_error (1.5.1), so this is where it shows.
+        check_error = (
+            '<small class="lumae-notice lumae-notice-error">Last identity check failed: '
+            f'{_pkg.escape(_pkg.redact_stored_error(transition["last_error"]))}</small>'
+            if transition.get("last_error")
+            else ""
+        )
         manifest_link = ""
         if transition.get("state") == "applied" and transition.get("transition_id"):
             manifest_link = (
@@ -678,6 +685,7 @@ def render_provider_identity_panel():
                 {int(counts.get('conflict', 0) or 0):,} conflicts</small>
               <small>Stored analysis baseline: {baseline}; AudioMuse: {audiomuse_health}</small>
               <small>{action}</small>
+              {check_error}
               <div class="lumae-actions">{manifest_link}</div>
             </article>
             """

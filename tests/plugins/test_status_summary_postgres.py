@@ -929,6 +929,80 @@ def test_a_changed_provider_version_is_written_once_and_committed_by_the_route(v
     assert routes.connection.commits == 0
 
 
+def _transition_row(db):
+    with db.cursor() as cur:
+        cur.execute(
+            f"SELECT state, transition_id, detection_reason, required_action, last_error, "
+            f"projection_reconcile_required FROM {P}provider_identity_transitions"
+        )
+        row = cur.fetchone()
+    db.commit()
+    return row
+
+
+def test_a_failed_ping_holds_back_one_projection_and_nothing_else(v3_routes, monkeypatch):
+    """The 1.5.0 incident, end to end on PostgreSQL.
+
+    A ping that timed out stored transition_pending: client admission closed,
+    every later ping kept it pending, and the scheduled analysis projection
+    raised on all of AudioMuse's retries (task FAIL) until a catalogue refresh
+    re-inspected the IDs. Now the failure is recorded and nothing else.
+    """
+    routes = v3_routes
+    _get(routes, "/api/catalog/health")
+    state, transition_id, reason, action, error, reconcile = _transition_row(routes.db)
+    assert (state, error) == ("normal", None)
+
+    navidrome = sys.modules["tasks.mediaserver.navidrome"]
+    answering = navidrome._navidrome_request
+
+    def timed_out(endpoint, timeout=None):
+        routes.ping["calls"] += 1
+        raise TimeoutError("Navidrome ping timed out after 5 s")
+
+    monkeypatch.setattr(navidrome, "_navidrome_request", timed_out)
+    response = _get(routes, "/api/catalog/health")
+
+    # One write, the error, committed by the route.
+    assert len(routes.connection.writes()) == 1
+    assert routes.connection.commits == 1
+    assert _transition_row(routes.db) == (
+        "normal", transition_id, reason, action, "Navidrome ping timed out after 5 s", reconcile,
+    )
+    server = response.get_json()["servers"][0]
+    assert server["catalog_sync_allowed"] is True
+    assert server["analysis_sync_allowed"] is True
+    assert server["provider_identity_transition"]["state"] == "normal"
+    assert "timed out" in server["provider_identity_transition"]["last_error"]
+    assert "provider_identity_transition" not in server["v3_readiness"]["blockers"]
+
+    # Health is polled: the same failure again writes nothing.
+    _get(routes, "/api/catalog/health")
+    assert routes.connection.writes() == []
+
+    # The scheduled projection waits for a verified version instead of failing.
+    monkeypatch.setattr(catalog_analysis, "get_db", lambda: routes.connection)
+    monkeypatch.setattr(
+        routes.mod,
+        "start_relationship_preparation",
+        lambda **_kwargs: {"queued": False, "coalesced": False},
+    )
+    result = routes.mod.analysis_projection_task(SERVER)
+    assert result["status"] == "deferred"
+    assert result["reason"] == "provider_identity_unverified"
+    assert routes.connection.transaction_id() is None
+    assert _transition_row(routes.db)[0] == "normal"
+    assert _transition_row(routes.db)[5] == reconcile
+
+    # Navidrome answers again: the very next projection runs.
+    monkeypatch.setattr(navidrome, "_navidrome_request", answering)
+    result = routes.mod.analysis_projection_task(SERVER)
+    assert result["catalog_instance_id"] == current_source(routes.db)["catalog_instance_id"]
+    assert result.get("status") != "deferred"
+    state, _transition_id, _reason, _action, error, reconcile = _transition_row(routes.db)
+    assert (state, error, reconcile) == ("normal", None, False)
+
+
 def test_catalog_health_leaves_an_applied_transitions_audiomuse_health_to_the_cron(
     v3_routes, monkeypatch
 ):

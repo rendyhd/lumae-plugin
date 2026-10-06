@@ -4,6 +4,16 @@ Lumae Analysis 1.1.9 publishes catalogue schema 3. Schema 3 is additive to the
 ordinary schema-2 stream and adds one atomic `provider_identity_rekey_v1`
 event range for Navidrome's canonical-ID transition.
 
+Version 1.5.1 no longer treats a failed provider ping as evidence. The call
+that could not confirm the Navidrome version still fails closed (a catalogue
+refresh inspects the exact track-ID sets before it publishes; an analysis
+projection waits), but only the error is stored, so client admission stays
+open and the next verified ping lifts the hold. Up to 1.5.0 one failed ping
+stored a pending transition until the next recheck scan. The scheduled
+analysis projection reports a by-design hold (unverified or pending identity,
+AudioMuse migration not ready, no published catalogue) as `deferred` instead
+of failing its task.
+
 Version 1.1.9 treats the provider-version observation as the identity-inspection
 admission gate. Trusted pre-canonical Navidrome releases publish ordinary track
 removals and library-scope changes through the normal catalogue diff, while
@@ -161,7 +171,8 @@ separate facts.
 
 Version observation closes the provider-ID admission gate; it never authorizes
 a write. While the gate is closed, the last complete catalogue and analysis
-generations remain published and provider-ID mutations are denied.
+generations remain published and provider-ID mutations are denied. A ping that
+fails closes the gate for its own call only and stores just its error.
 
 The plugin scans a pending source at minutes 2 and 32 of every hour. The
 scheduled analysis projection remains at minute 47 of every sixth hour. A

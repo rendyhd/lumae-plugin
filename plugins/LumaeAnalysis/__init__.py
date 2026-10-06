@@ -67,6 +67,7 @@ from .catalog import (
     verify_library_scope,
 )
 from .catalog_analysis import (
+    AnalysisProjectionDeferred,
     GenerationExpired,
     dedup_policy,
     project_analysis,
@@ -1121,7 +1122,30 @@ def analysis_projection_task(server_id=None):
     resolved_server_id = _resolve_task_server_id(adapter, server_id)
     if not resolved_server_id:
         return {"status": "skipped", "reason": "source_rebind_required"}
-    result = project_analysis(server_id=resolved_server_id, adapter=adapter)
+    try:
+        result = project_analysis(server_id=resolved_server_id, adapter=adapter)
+    except AnalysisProjectionDeferred as exc:
+        # Held back by design, and a retry seconds later cannot change that:
+        # the published projection stays, and the next trigger (this
+        # schedule, an analysis run, catalogue preparation or the identity
+        # recheck) projects. Raising made AudioMuse retry twice and mark the
+        # task FAIL (1.5.0 and earlier).
+        _rollback_if_possible(get_db())
+        # A server Lumae does not mirror (not Navidrome) is skipped on every
+        # all-servers run; its task row says so, which is enough.
+        if exc.reason != "catalog_source_missing":
+            logger.warning(
+                "lumae_analysis deferred the analysis projection for %s (%s): %s",
+                resolved_server_id,
+                exc.reason,
+                exc,
+            )
+        return {
+            "status": "deferred",
+            "reason": exc.reason,
+            "server_id": resolved_server_id,
+            "message": f"Analysis projection deferred: {exc}",
+        }
     if not result.get("catalog_instance_id"):
         return result
     complete_projection_reconcile(get_db(), result["catalog_instance_id"])
@@ -1241,8 +1265,16 @@ def provider_identity_recheck_task(server_id=None):
                 # its own transactional publication. This task already owns a
                 # root worker slot, so it must not enqueue another root task.
                 db.commit()
-                result["projection"] = analysis_projection_task(server["server_id"])
-                result["projection_processed"] = True
+                projection = analysis_projection_task(server["server_id"])
+                result["projection"] = projection
+                # A projection that did not run (deferred: e.g. the provider
+                # stopped answering since the health check) leaves the durable
+                # reconcile request set, so the next recheck projects again.
+                result["projection_processed"] = (projection or {}).get("status") not in (
+                    "deferred",
+                    "paused",
+                    "skipped",
+                )
             else:
                 db.commit()
         except Exception as exc:
