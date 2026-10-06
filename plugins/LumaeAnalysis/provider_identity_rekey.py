@@ -1,16 +1,24 @@
-"""Exact, atomic publication of Navidrome's uniform canonical provider IDs.
+"""Exact, atomic publication of provider-ID transitions.
 
-The resolver deliberately uses only the last complete Lumae generation, the
+``provider_identity_rekey_v1`` (Navidrome's uniform canonical IDs): the
+resolver deliberately uses only the last complete Lumae generation, the
 deterministic Navidrome codec, and two identical provider scans. AudioMuse is
 inspected only after the Lumae-owned catalogue and analysis identity have been
 made safe; it can never authorize this write.
+
+``provider_identity_rekey_v2`` (1.6.0, JF.9): a moved or renamed Jellyfin
+file gets a new item ID. ``jellyfin_continuity`` pairs the held-missing old ID
+with the new one when AudioMuse maps both to the same content fingerprint, and
+publishes the pair through the same transaction, staged event range, manifest
+and plugin-owned state rekey as v1 (``RekeySpec``).
 """
 
 from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from typing import Callable, Optional
 
 from plugin.api import table
 
@@ -20,6 +28,31 @@ from .provider_identity import canonicalize_navidrome_id
 
 REKEY_REASON = "navidrome_uniform_canonical_ids_v1"
 REKEY_ENTITY_TYPES = ("artist", "album", "track")
+CONTRACT_V1 = "provider_identity_rekey_v1"
+CONTRACT_V2 = "provider_identity_rekey_v2"
+
+
+@dataclass(frozen=True)
+class RekeySpec:
+    """What a contract other than v1 changes in the atomic publication.
+
+    ``None`` (the default everywhere) is v1 exactly as before 1.6.0. v2
+    supplies an explicit one-to-one ``mapping`` ({entity_type: {old: new}})
+    instead of the Navidrome codec, per-event fingerprint evidence, its own
+    target fingerprint and AudioMuse health, and hooks for the
+    Jellyfin-only state (held-missing tracks, stale derived rows).
+    """
+
+    contract: str
+    change_reason: str
+    provider_type: str
+    mapping: dict
+    target_fingerprint: Callable
+    base_evidence: dict = field(default_factory=dict)
+    event_evidence: Optional[Callable] = None
+    audiomuse_health: Optional[Callable] = None
+    before_rekey: Optional[Callable] = None
+    after_rekey: Optional[Callable] = None
 
 
 def t(name):
@@ -51,8 +84,13 @@ def _row_fingerprints(entity_type, row):
     return tuple(values)
 
 
-def build_provider_identity_rekey_plan(previous, normalized):
-    """Build a one-to-one plan; ambiguous convergence is a hard failure."""
+def build_provider_identity_rekey_plan(previous, normalized, mapping=None):
+    """Build a one-to-one plan; ambiguous convergence is a hard failure.
+
+    Without ``mapping`` the candidates are the Navidrome codec (v1). With it
+    (v2), exactly its pairs; each must name a published old ID and a target
+    ID that is not already published.
+    """
 
     from .catalog import ENTITY_COLLECTIONS, ENTITY_ORDER, ENTITY_TABLES
 
@@ -72,7 +110,13 @@ def build_provider_identity_rekey_plan(previous, normalized):
         claimed_targets = set()
 
         candidates = {}
-        if entity_type in REKEY_ENTITY_TYPES:
+        if entity_type in REKEY_ENTITY_TYPES and mapping is not None:
+            for old_id, new_id in sorted((mapping.get(entity_type) or {}).items()):
+                old_id, new_id = str(old_id), str(new_id)
+                if old_id == new_id or old_id not in old or new_id not in target:
+                    raise ValueError("Fingerprint rekey mapping does not match the target")
+                candidates[old_id] = new_id
+        elif entity_type in REKEY_ENTITY_TYPES:
             for old_id in old:
                 converted = canonicalize_navidrome_id(old_id)
                 if converted.recognized and converted.changed and converted.value in target:
@@ -298,7 +342,7 @@ def _update_by_mapping(cur, table_name, column, mappings, where_sql="", where_pa
     )
 
 
-def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings):
+def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings, legacy_profiles=True):
     tracks = [row for row in mappings if row["entity_type"] == "track"]
     exact = _exact_mapping(mappings)
 
@@ -321,8 +365,8 @@ def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings):
             (catalog_instance_id, [row["new_id"] for row in tracks]),
         )
     # The legacy table belongs to the sole pre-registry Navidrome source. Do
-    # not guess ownership on a multi-source installation.
-    if tracks:
+    # not guess ownership on a multi-source installation, nor for Jellyfin.
+    if tracks and legacy_profiles:
         old_ids = [row["old_id"] for row in tracks]
         new_ids = [row["new_id"] for row in tracks]
         cur.execute(
@@ -562,8 +606,12 @@ def _publish_provider_identity_rekey(
     adapter,
     scan_id=None,
     scan_duration_ms=None,
+    spec=None,
 ):
-    """Publish catalogue, plugin state, and carried analysis in one transaction."""
+    """Publish catalogue, plugin state, and carried analysis in one transaction.
+
+    ``spec`` is ``None`` for v1 (unchanged since 1.1.x) or a ``RekeySpec``.
+    """
 
     from .catalog import (
         CATALOG_FINGERPRINT_SCHEMA_VERSION,
@@ -582,8 +630,13 @@ def _publish_provider_identity_rekey(
         utc_now,
     )
 
-    if target_scan_fingerprint(normalized) != str(target_fingerprint):
+    computed_fingerprint = (
+        spec.target_fingerprint(normalized) if spec else target_scan_fingerprint(normalized)
+    )
+    if computed_fingerprint != str(target_fingerprint):
         raise ValueError("Normalized target no longer matches its stable-scan fingerprint")
+    contract = spec.contract if spec else CONTRACT_V1
+    change_reason = spec.change_reason if spec else REKEY_REASON
 
     cur = db.cursor()
     cur.execute(
@@ -661,7 +714,9 @@ def _publish_provider_identity_rekey(
         )
         for entity_type in ENTITY_ORDER
     }
-    plan = build_provider_identity_rekey_plan(previous, normalized)
+    plan = build_provider_identity_rekey_plan(
+        previous, normalized, spec.mapping if spec else None
+    )
     if not plan.mappings:
         raise ValueError("Identity proof contains no exact provider-ID rekeys")
 
@@ -681,7 +736,14 @@ def _publish_provider_identity_rekey(
     # LUM-016: the catalog_state row is already held (FOR UPDATE above).
     catalog_search.mark_search_text(
         cur, catalog_instance_id, next_generation, catalog_search.fold_available(cur))
-    _rekey_plugin_owned_state(cur, catalog_instance_id, plan.mappings)
+    if spec is None:
+        _rekey_plugin_owned_state(cur, catalog_instance_id, plan.mappings)
+    else:
+        if spec.before_rekey:
+            spec.before_rekey(cur, catalog_instance_id, plan)
+        _rekey_plugin_owned_state(
+            cur, catalog_instance_id, plan.mappings, legacy_profiles=False
+        )
 
     track_mapping = {
         row["old_id"]: row["new_id"]
@@ -707,10 +769,15 @@ def _publish_provider_identity_rekey(
         "deterministic": True,
         "analysis_identity_preserved": True,
     }
+    if spec is not None:
+        evidence.update(spec.base_evidence)
     next_seq = head_seq
     first_seq = head_seq + 1
     for event in plan.events:
         next_seq += 1
+        event_evidence = evidence
+        if spec is not None and spec.event_evidence and event.operation == "rekey":
+            event_evidence = {**evidence, **spec.event_evidence(event)}
         cur.execute(
             f"""
             INSERT INTO {t('catalog_changes')}
@@ -727,10 +794,10 @@ def _publish_provider_identity_rekey(
                 event.entity_type,
                 event.entity_id,
                 event.operation,
-                REKEY_REASON,
+                change_reason,
                 event.old_entity_id,
                 canonical_json(event.payload) if event.payload is not None else None,
-                canonical_json(evidence),
+                canonical_json(event_evidence),
                 JOURNAL_WRITER_GENERATION,
             ),
         )
@@ -740,7 +807,7 @@ def _publish_provider_identity_rekey(
         entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER
     }
     coverage = _coverage(normalized)
-    scope = catalog_scope_evidence(normalized, "navidrome")
+    scope = catalog_scope_evidence(normalized, spec.provider_type if spec else "navidrome")
     field_support = {
         name: "observed" if value["present"] else "not_observed"
         for name, value in coverage.items()
@@ -770,7 +837,7 @@ def _publish_provider_identity_rekey(
             canonical_json(scope["scope_summary"]),
             snapshot_estimated_bytes,
             canonical_json(plan.counts),
-            REKEY_REASON,
+            change_reason,
             int(scan_duration_ms or 0),
             catalog_instance_id,
         ),
@@ -806,11 +873,14 @@ def _publish_provider_identity_rekey(
         (catalog_instance_id, previous_generation, transition_id),
     )
 
-    audiomuse_health = inspect_audiomuse_health(cur, adapter, server_id, carried_links)
+    if spec is not None and spec.audiomuse_health:
+        audiomuse_health = spec.audiomuse_health(cur, adapter, server_id, plan)
+    else:
+        audiomuse_health = inspect_audiomuse_health(cur, adapter, server_id, carried_links)
     collection_events, collection_deferrals = _rekey_collections(
         cur, catalog_instance_id, plan.mappings)
     manifest = {
-        "contract": "provider_identity_rekey_v1",
+        "contract": contract,
         "transition_id": transition_id,
         "catalog_instance_id": catalog_instance_id,
         "baseline_catalog_generation": previous_generation,
@@ -856,7 +926,18 @@ def _publish_provider_identity_rekey(
             manifest_sha256,
         ),
     )
-    required_action = None if audiomuse_health == "ready" else "run_audiomuse_provider_migration"
+    if contract != CONTRACT_V1:
+        # The manifest's contract; v1 rows keep NULL (read as v1).
+        cur.execute(
+            f"UPDATE {t('provider_identity_manifests')} SET contract=%s WHERE transition_id=%s",
+            (contract, transition_id),
+        )
+    if spec is None:
+        required_action = (
+            None if audiomuse_health == "ready" else "run_audiomuse_provider_migration"
+        )
+    else:
+        required_action = None if audiomuse_health == "ready" else "wait_for_audiomuse_analysis"
     cur.execute(
         f"""
         UPDATE {t('provider_identity_transitions')}
@@ -888,6 +969,17 @@ def _publish_provider_identity_rekey(
             transition_id,
         ),
     )
+    if spec is not None:
+        cur.execute(
+            f"""
+            UPDATE {t('provider_identity_transitions')}
+               SET rekey_contract=%s, publish_failures=0, updated_at=now()
+             WHERE catalog_instance_id=%s AND transition_id=%s
+            """,
+            (contract, catalog_instance_id, transition_id),
+        )
+        if spec.after_rekey:
+            spec.after_rekey(cur, catalog_instance_id, plan, transition_id)
     if scan_id:
         cur.execute(
             f"""
@@ -900,7 +992,7 @@ def _publish_provider_identity_rekey(
                     {
                         "input_counts": counts,
                         "change_counts": plan.counts,
-                        "change_reason": REKEY_REASON,
+                        "change_reason": change_reason,
                         "duration_ms": int(scan_duration_ms or 0),
                         "generation": next_generation,
                         "head_seq": last_seq,
@@ -935,11 +1027,13 @@ def _publish_provider_identity_rekey(
         "snapshot_estimated_bytes": snapshot_estimated_bytes,
         "fingerprint_schema_version": CATALOG_FINGERPRINT_SCHEMA_VERSION,
         "change_counts": plan.counts,
-        "change_reason": REKEY_REASON,
+        "change_reason": change_reason,
         "duration_ms": int(scan_duration_ms or 0),
         "changes": len(plan.events),
         "provider_identity_transition": {
             "state": "applied",
+            # v1 results are unchanged since 1.1.x; only v2 names its contract.
+            **({"contract": contract} if spec is not None else {}),
             "transition_id": transition_id,
             "first_seq": first_seq,
             "last_seq": last_seq,
@@ -980,6 +1074,28 @@ def refresh_audiomuse_health(db, catalog_instance_id, server_id, adapter, commit
     if state is None or str(state[0]) != "applied":
         cur.close()
         return None
+    from .jellyfin_continuity import CONTRACT as V2, audiomuse_busy, transition_contract
+
+    if transition_contract(cur, catalog_instance_id) == V2:
+        # v2 pairs are AudioMuse's own current mappings: AudioMuse has no
+        # provider migration to run, and held tracks are expected to have
+        # lost theirs. Only a running analysis makes it not ready.
+        health = "busy" if audiomuse_busy(cur) else "ready"
+        cur.execute(
+            f"""
+            UPDATE {t('provider_identity_transitions')}
+               SET audiomuse_health=%s,
+                   required_action=CASE WHEN %s='ready' THEN NULL
+                                        ELSE 'wait_for_audiomuse_analysis' END,
+                   checked_at=now(), updated_at=now()
+             WHERE catalog_instance_id=%s AND state='applied'
+            """,
+            (health, health, catalog_instance_id),
+        )
+        cur.close()
+        if commit:
+            db.commit()
+        return health
     links = _load_analysis_links(cur, catalog_instance_id, int(state[1] or 0))
     health = inspect_audiomuse_health(cur, adapter, server_id, links)
     cur.execute(
@@ -1015,7 +1131,8 @@ def read_transition_manifest(db, *, transition_id=None, catalog_instance_id=None
                published_catalog_generation, baseline_analysis_generation,
                published_analysis_generation, provider_version_before,
                provider_version_after, target_fingerprint, first_seq, last_seq,
-               counts, analysis_baseline, mappings, manifest_sha256, created_at
+               counts, analysis_baseline, mappings, manifest_sha256, created_at,
+               contract
           FROM {t('provider_identity_manifests')}
          WHERE {where}
          ORDER BY created_at DESC LIMIT 1
@@ -1027,7 +1144,8 @@ def read_transition_manifest(db, *, transition_id=None, catalog_instance_id=None
     if row is None:
         raise KeyError("transition_manifest_not_found")
     return {
-        "contract": "provider_identity_rekey_v1",
+        # NULL (every manifest before 1.6.0, and every Navidrome one) is v1.
+        "contract": str(row[16]) if len(row) > 16 and row[16] else CONTRACT_V1,
         "transition_id": str(row[0]),
         "catalog_instance_id": str(row[1]),
         "baseline_catalog_generation": int(row[2]),

@@ -47,6 +47,20 @@ still matters. Exact, code-verified wire behaviour for every version lives in
   catalogue errors name the source's own server type instead of Navidrome.
 - Error redaction also masks the quoted token of Jellyfin's
   `Authorization: MediaBrowser Token="..."` header.
+- A moved, renamed or re-cased Jellyfin file keeps its identity (contract
+  §2.2, `provider_identity_rekey_v2`). A track missing from a complete scan
+  is held, published unchanged, for 14 days; when AudioMuse maps a new ID to
+  the same content fingerprint as exactly one held ID, the move publishes
+  through the existing atomic provider-identity rekey (two identical scans,
+  one transaction, manifest), with album and artist rekeys derived only when
+  unambiguous: collections, shelves, Vibes, covers and profiles follow it on
+  the server, and the journal's rekey events let the app move its own
+  ratings and plays. Duplicates never rekey, a track that comes back is no
+  rekey, moving files back is a rekey to the original IDs, and an unpaired
+  held track is deleted after 14 days. Likely move targets that AudioMuse
+  has not analysed yet are held back instead of being published as new.
+  Health adds `provider_identity_transition.rekey_contract`; the manifest
+  route reports each manifest's own `contract`. Navidrome is unaffected.
 
 ## 1.5.0 (2026-10-05)
 

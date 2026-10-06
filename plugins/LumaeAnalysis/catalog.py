@@ -1892,7 +1892,131 @@ def _require_jellyfin_identity(observation):
 
 
 def refresh_catalog(server_id=None, db=None, bridge=None):
-    """Fetch, validate, and atomically publish one provider catalogue generation."""
+    """Fetch, validate, and atomically publish one provider catalogue generation.
+
+    A Jellyfin fingerprint rekey (``provider_identity_rekey_v2``, JF.9) needs
+    two identical scans, like v1. The scan that opens the proof is confirmed
+    by a second scan at once, so a moved album does not keep the catalogue in
+    ``transition_pending`` until the next scheduled recheck.
+    """
+    if db is None:
+        from plugin.api import get_db
+
+        db = get_db()
+    result = _refresh_catalog_once(server_id, db, bridge)
+    transition = result.get("provider_identity_transition") or {}
+    if (
+        result.get("change_reason") == "provider_identity_wait"
+        and transition.get("contract") == "provider_identity_rekey_v2"
+        and int(transition.get("target_scan_count") or 0) == 1
+    ):
+        result = _refresh_catalog_once(result.get("server_id") or server_id, db, bridge)
+    return result
+
+
+def _jellyfin_rekey_step(
+    db,
+    *,
+    continuity,
+    catalog_instance_id,
+    server_id,
+    provider_bridge,
+    identity_observation,
+    normalized,
+    counts,
+    scan_id,
+    scan_started,
+    previous_generation,
+    epoch,
+    head_seq,
+    previous_counts,
+):
+    """Advance or publish a Jellyfin fingerprint rekey; ``None`` when there is
+    nothing to rekey and the ordinary diff publishes (JF.9)."""
+    from . import jellyfin_continuity
+    from .provider_identity_rekey import publish_provider_identity_rekey
+
+    cur = db.cursor()
+    if not continuity.pairs:
+        jellyfin_continuity.close_pending_transition(cur, catalog_instance_id)
+        cur.close()
+        return None
+    spec = jellyfin_continuity.rekey_spec(continuity, catalog_instance_id)
+    target = spec.target_fingerprint(normalized)
+    inspection = jellyfin_continuity.advance_transition(
+        cur,
+        catalog_instance_id,
+        observed_version=(identity_observation or {}).get("current_provider_version"),
+        target=target,
+        mapping_count=sum(len(mapping) for mapping in continuity.mappings.values()),
+    )
+    cur.close()
+    duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))
+    if inspection["target_scan_count"] >= 2:
+        try:
+            result = publish_provider_identity_rekey(
+                db,
+                catalog_instance_id=catalog_instance_id,
+                server_id=server_id,
+                normalized=normalized,
+                target_fingerprint=target,
+                current_provider_version=inspection["current_provider_version"],
+                adapter=getattr(provider_bridge, "core", None),
+                scan_id=scan_id,
+                scan_duration_ms=duration_ms,
+                spec=spec,
+            )
+        except Exception as exc:
+            jellyfin_continuity.record_publish_failure(
+                db, catalog_instance_id, inspection["transition_id"], continuity, exc
+            )
+            raise
+        result["jellyfin_continuity"] = continuity.counts()
+        return result
+    # The first scan of the proof publishes nothing, exactly like v1's wait.
+    cur = db.cursor()
+    jellyfin_continuity.persist(cur, catalog_instance_id, continuity)
+    progress = {
+        "input_counts": counts,
+        "change_counts": inspection["counts"],
+        "change_reason": "provider_identity_wait",
+        "duration_ms": duration_ms,
+        "generation": previous_generation,
+        "head_seq": head_seq,
+        "target_scan_count": inspection["target_scan_count"],
+    }
+    cur.execute(
+        f"UPDATE {t('catalog_scans')} SET status='complete', "
+        "completed_at=now(), progress=%s::jsonb WHERE scan_id=%s",
+        (_json_param(progress), scan_id),
+    )
+    cur.execute(
+        f"""
+        UPDATE {t('catalog_state')}
+           SET status='complete', last_scan_change_reason='provider_identity_wait',
+               last_scan_duration_ms=%s, last_error=NULL, updated_at=now()
+         WHERE catalog_instance_id=%s
+        """,
+        (duration_ms, catalog_instance_id),
+    )
+    cur.close()
+    db.commit()
+    return {
+        "catalog_instance_id": catalog_instance_id,
+        "server_id": server_id,
+        "generation": previous_generation,
+        "cursor": {"epoch": str(epoch), "seq": head_seq},
+        "counts": _state_counts(previous_counts),
+        "change_counts": inspection["counts"],
+        "change_reason": "provider_identity_wait",
+        "duration_ms": duration_ms,
+        "changes": 0,
+        "provider_identity_transition": inspection,
+        "jellyfin_continuity": continuity.counts(),
+    }
+
+
+def _refresh_catalog_once(server_id=None, db=None, bridge=None):
     scan_started = time.monotonic()
     if db is None:
         from plugin.api import get_db
@@ -2043,13 +2167,60 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         head_seq = int(head_seq)
         previous_fingerprint_schema = int(previous_fingerprint_schema or 1)
 
+        # JF.9: a Jellyfin catalogue holds tracks missing from this scan,
+        # holds back their likely move targets and rekeys proven moves. Never
+        # for Navidrome, whose identity stays with the v1 path below.
+        continuity = None
+        if server["provider_type"] == "jellyfin":
+            from . import jellyfin_continuity
+
+            cur = db.cursor()
+            continuity = jellyfin_continuity.plan(
+                cur,
+                catalog_instance_id=catalog_instance_id,
+                server_id=server_id,
+                previous_generation=previous_generation,
+                raw=raw,
+                adapter=getattr(provider_bridge, "core", None),
+            )
+            if continuity.raw is not raw:
+                # Held tracks re-enter from their published payloads, so the
+                # normalizer rebuilds them (and their albums' totals) exactly.
+                normalized = normalize_provider_catalog(continuity.raw, "jellyfin")
+            jellyfin_continuity.derive(
+                cur, catalog_instance_id, previous_generation, continuity, normalized
+            )
+            cur.close()
+            counts = {
+                entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER
+            }
+            snapshot_estimated_bytes = _estimate_snapshot_bytes(normalized)
+            rekeyed = _jellyfin_rekey_step(
+                db,
+                continuity=continuity,
+                catalog_instance_id=catalog_instance_id,
+                server_id=server_id,
+                provider_bridge=provider_bridge,
+                identity_observation=identity_observation,
+                normalized=normalized,
+                counts=counts,
+                scan_id=scan_id,
+                scan_started=scan_started,
+                previous_generation=previous_generation,
+                epoch=epoch,
+                head_seq=head_seq,
+                previous_counts=previous_counts,
+            )
+            if rekeyed is not None:
+                return rekeyed
+
         identity_state = (
             identity_observation.get("state") if identity_observation else None
         )
         # The version observation is the admission gate. A trusted pre-transition
         # release can legitimately lose tracks or change library scope; treating
         # those removals as incomplete rekey evidence permanently blocks refresh.
-        if identity_state in ("transition_pending", "blocked"):
+        if identity_state in ("transition_pending", "blocked") and continuity is None:
             from .provider_identity_rekey import (
                 publish_provider_identity_rekey,
                 target_scan_fingerprint,
@@ -2241,13 +2412,15 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 "progress=%s::jsonb WHERE scan_id=%s",
                 (_json_param(progress), scan_id),
             )
+            if continuity is not None:
+                jellyfin_continuity.persist(cur, catalog_instance_id, continuity)
             cur.close()
             db.commit()
             _withdraw_orphaned_profiles(db, catalog_instance_id)
             # P2-1: the catalogue is unchanged, but AudioMuse may have mapped
             # or fingerprinted tracks since (an analysis run ends here).
             refresh_status_summary(db, catalog_instance_id, getattr(provider_bridge, "core", None))
-            return {
+            result = {
                 "catalog_instance_id": catalog_instance_id,
                 "server_id": server_id,
                 "generation": previous_generation,
@@ -2264,6 +2437,9 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
                 "duration_ms": duration_ms,
                 "changes": 0,
             }
+            if continuity is not None:
+                result["jellyfin_continuity"] = continuity.counts()
+            return result
 
         search_folded = None
         for entity_type in ENTITY_ORDER:
@@ -2416,13 +2592,15 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
         from .catalog_enrichment import refresh_profile_retention
 
         refresh_profile_retention(cur, catalog_instance_id, counts["track"])
+        if continuity is not None:
+            jellyfin_continuity.persist(cur, catalog_instance_id, continuity)
         cur.close()
         db.commit()
         _after_publication(db, catalog_instance_id, generation)
         # P2-1: readiness reads these counts instead of scanning the library.
         # Counted after the commit, so catalog_state is not held meanwhile.
         refresh_status_summary(db, catalog_instance_id, getattr(provider_bridge, "core", None))
-        return {
+        result = {
             "catalog_instance_id": catalog_instance_id,
             "server_id": server_id,
             "generation": generation,
@@ -2439,6 +2617,9 @@ def refresh_catalog(server_id=None, db=None, bridge=None):
             "duration_ms": duration_ms,
             "changes": len(ordered_changes),
         }
+        if continuity is not None:
+            result["jellyfin_continuity"] = continuity.counts()
+        return result
     except Exception as exc:
         rollback = getattr(db, "rollback", None)
         if callable(rollback):

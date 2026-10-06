@@ -196,6 +196,24 @@ as a normal atomic analysis generation. Health reports `ready`,
 Provider Migration is sufficient. `repair_required` is reserved for internally
 contradictory mappings, not a valid change in canonical analysis grouping.
 
+## Jellyfin moves (1.6.0)
+
+Jellyfin item IDs are path hashes, so a moved, renamed or re-cased file gets
+new track and album IDs. A Jellyfin track missing from a complete scan of a
+library that is still read is held (published unchanged) for 14 days in
+`jellyfin_missing_tracks`. When AudioMuse maps a new ID to the same `fp_…`
+content fingerprint as exactly one held ID, and no other current track,
+the pair is published through the same atomic rekey as above as contract
+`provider_identity_rekey_v2`: two identical scans (the confirming scan runs
+straight after the first), one transaction, the same manifest fields, plus
+album and artist rekeys derived only when unambiguous. Unanalysed likely
+move targets are held back; duplicates never pair; a held ID that comes
+back is released without a rekey; an unpaired held track becomes an
+ordinary deletion after 14 days. AudioMuse being busy, or an incomplete
+analysis baseline, postpones pairs. Three failed publications abandon the
+pairs (`provider_rekey_abandoned`). Navidrome never takes this path. See
+`docs/contracts/LUMAE_SYNC_CONTRACT.md` §2.2.
+
 Download retained evidence from:
 
 ```text

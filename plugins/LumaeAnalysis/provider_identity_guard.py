@@ -200,6 +200,10 @@ def migrate_provider_identity(db):
     # by migrate_catalog; repeated here because this migration is re-run at
     # Flask startup to repair an update whose install hook rolled back.
     migrations.ensure_columns(cur, t('catalog_sources'), "provider_server_id TEXT")
+    # 1.6.0 (JF.9): held-missing Jellyfin tracks and the rekey v2 columns.
+    from .jellyfin_continuity import migrate as migrate_jellyfin_continuity
+
+    migrate_jellyfin_continuity(cur)
     cur.execute(
         f"""
         INSERT INTO {t('provider_identity_transitions')}
@@ -727,6 +731,7 @@ def _update_jellyfin_observation(db, source, *, state, current_version, detectio
                detected_at=CASE WHEN %s THEN NULL
                                 WHEN %s='transition_pending' THEN COALESCE(detected_at, now())
                                 ELSE detected_at END,
+               rekey_contract=CASE WHEN %s THEN NULL ELSE rekey_contract END,
                checked_at=now(),
                last_error=%s,
                updated_at=now()
@@ -754,6 +759,7 @@ def _update_jellyfin_observation(db, source, *, state, current_version, detectio
             opens or normal,
             normal,
             state,
+            opens or normal,
             str(last_error)[:1000] if last_error else None,
             source["catalog_instance_id"],
         ),
@@ -1075,7 +1081,8 @@ def provider_transition_health(db, catalog_instance_id):
                    current_provider_version, detection_reason, required_action,
                    counts, target_fingerprint, checked_at, last_error,
                    first_seq, last_seq, target_scan_count, analysis_baseline,
-                   baseline_integrity, audiomuse_health, manifest_sha256
+                   baseline_integrity, audiomuse_health, manifest_sha256,
+                   rekey_contract
               FROM {t('provider_identity_transitions')}
              WHERE catalog_instance_id=%s
             """,
@@ -1112,6 +1119,9 @@ def provider_transition_health(db, catalog_instance_id):
         "baseline_integrity": bool(row[14]) if row[14] is not None else None,
         "audiomuse_health": str(row[15]) if row[15] else None,
         "manifest_sha256": str(row[16]) if row[16] else None,
+        # 1.6.0: "provider_identity_rekey_v2" for a Jellyfin fingerprint
+        # rekey; null for Navidrome (v1) and when no rekey is under way.
+        "rekey_contract": str(row[17]) if len(row) > 17 and row[17] else None,
         "catalog_sync_allowed": not blocked,
         "analysis_sync_allowed": not blocked,
         "audiomuse_projection_ingest_allowed": not blocked
