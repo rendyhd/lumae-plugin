@@ -2300,10 +2300,14 @@ def test_collection_preview_target_keeps_provider_credentials_server_side(monkey
     assert "secret" not in target[0]
 
 
-def test_collection_preview_uses_emby_base_url_without_legacy_prefix(monkeypatch):
+@pytest.mark.parametrize("provider_type", ["emby", "lyrion"])
+def test_collection_preview_has_no_emby_or_lyrion_reader(monkeypatch, provider_type):
+    """JF.2: Emby and Lyrion are not supported servers; a persisted source of
+    either type gets no stream or artwork, whatever the host is configured as."""
     library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
-    monkeypatch.setattr(library.config, "MEDIASERVER_TYPE", "emby", raising=False)
+    monkeypatch.setattr(library.config, "MEDIASERVER_TYPE", provider_type, raising=False)
     monkeypatch.setattr(library.config, "EMBY_URL", "https://emby.example", raising=False)
+    monkeypatch.setattr(library.config, "LYRION_URL", "https://lyrion.example", raising=False)
     monkeypatch.setattr(
         library.config,
         "HEADERS",
@@ -2311,13 +2315,12 @@ def test_collection_preview_uses_emby_base_url_without_legacy_prefix(monkeypatch
         raising=False,
     )
 
-    target, error = library._resolve_stream_target("track-2", "emby")
-    art_target = library._resolve_art_target("track-2", 480, "emby")
+    target, error = library._resolve_stream_target("track-2", provider_type)
+    art_target = library._resolve_art_target("track-2", 480, provider_type)
 
-    assert error is None
-    assert target[0] == "https://emby.example/Items/track-2/Download"
-    assert art_target[0] == "https://emby.example/Items/track-2/Images/Primary"
-    assert target[1] == {"X-Emby-Token": "server-secret"}
+    assert target is None
+    assert error == ("Preview is not supported for this media server", 501)
+    assert art_target is None
 
 
 def test_enabled_collections_api_lists_mixed_item_counts(monkeypatch):
@@ -5384,6 +5387,38 @@ def test_provider_bridge_admits_only_navidrome_sources():
         bridge.require_server("jelly")
 
 
+def test_provider_bridge_has_no_emby_or_lyrion_reader():
+    """JF.2: Emby and Lyrion readers are gone; a server of either type is
+    never admitted, fetched or probed."""
+    from plugins.LumaeAnalysis import catalog_providers
+    from plugins.LumaeAnalysis.catalog_providers import (
+        CatalogProviderError,
+        ProviderCatalogBridge,
+    )
+
+    class Adapter:
+        def list_servers(self):
+            return [
+                {"server_id": "emby", "provider_type": "emby", "is_default": True},
+                {"server_id": "lyrion", "provider_type": "lyrion", "is_default": False},
+            ]
+
+        def provider_module(self, _provider_type):
+            raise AssertionError("an unsupported provider module was imported")
+
+    bridge = ProviderCatalogBridge(Adapter())
+
+    assert set(catalog_providers.PROVIDER_FETCHERS) == {"navidrome", "jellyfin"}
+    assert not hasattr(catalog_providers, "_fetch_lyrion")
+    assert not hasattr(catalog_providers, "_fetch_jellyfin_or_emby")
+    assert [server["supported"] for server in bridge.list_servers()] == [False, False]
+    for server_id in ("emby", "lyrion"):
+        with pytest.raises(CatalogProviderError, match="not supported"):
+            bridge.fetch_catalog(server_id)
+        with pytest.raises(CatalogProviderError, match="not supported"):
+            bridge.probe_server_identity(server_id)
+
+
 def test_navidrome_catalog_uses_folder_album_queries_when_song_rows_lack_folder_ids():
     from plugins.LumaeAnalysis.catalog import normalize_provider_catalog
     from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
@@ -6462,34 +6497,6 @@ def test_flask_start_rolls_back_a_failed_identity_schema_repair(monkeypatch):
                 "LibraryId": "library-1",
                 "Path": "C:\\never-send\\this.flac",
                 "UserData": {"PlayCount": 99},
-            },
-        ),
-        (
-            "emby",
-            {
-                "Id": "track-1",
-                "Name": "Song",
-                "ParentId": "album-1",
-                "Album": "Record",
-                "Artists": ["Artist"],
-                "IndexNumber": 4,
-                "ParentIndexNumber": 2,
-                "RunTimeTicks": 2_012_500_000,
-                "LibraryId": "library-1",
-            },
-        ),
-        (
-            "lyrion",
-            {
-                "id": "track-1",
-                "title": "Song",
-                "album_id": "album-1",
-                "album": "Record",
-                "artist": "Artist",
-                "tracknum": 4,
-                "discnumber": 2,
-                "duration": 201.25,
-                "url": "file:///never/send/this.flac",
             },
         ),
     ],

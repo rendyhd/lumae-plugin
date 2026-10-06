@@ -7,6 +7,16 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased (1.6.0)
+
+- Emby and Lyrion are gone. Neither was ever admitted as a Lumae catalogue
+  source; their dormant catalogue readers and the Emby and Lyrion stream and
+  artwork branches of the Living Collections workbench are removed, as is the
+  Emby artwork branch of the private FederatedAlbums plugin (its Jellyfin
+  artwork now authenticates with the `Authorization: MediaBrowser` header,
+  which Jellyfin 12 requires by default). A persisted source of either type
+  stays hidden as before: it is never fetched, streamed, rekeyed or deleted.
+
 ## 1.5.0 (2026-10-05)
 
 - Custom covers (health `capabilities.covers`, contract §5.6). The Lumae app

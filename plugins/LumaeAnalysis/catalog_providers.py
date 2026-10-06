@@ -13,8 +13,9 @@ from .core_compat import get_core_adapter
 
 
 # Lumae's mobile catalogue contract is intentionally Navidrome-only for now.
-# Keep the other normalizers below as future-facing compatibility code, but do
-# not admit those providers into a source of truth until the app supports them.
+# The Jellyfin reader below is kept, but Jellyfin is not admitted into a
+# source of truth until the app supports it. Emby and Lyrion are not supported
+# music servers and have no reader (1.6.0, JF.2).
 SUPPORTED_PROVIDER_TYPES = frozenset(("navidrome",))
 NAVIDROME_SMALL_SCOPE_ALBUM_LIMIT = 32
 
@@ -94,12 +95,11 @@ class ProviderCatalogBridge:
                 # preserves provider library membership. Older AudioMuse
                 # iterators omit it, so use the credential-contained provider
                 # bridge rather than publishing an ambiguous catalogue.
-            fetcher = {
-                "navidrome": _fetch_navidrome,
-                "jellyfin": _fetch_jellyfin_or_emby,
-                "emby": _fetch_jellyfin_or_emby,
-                "lyrion": _fetch_lyrion,
-            }[server["provider_type"]]
+            fetcher = PROVIDER_FETCHERS.get(server["provider_type"])
+            if fetcher is None:
+                raise CatalogProviderError(
+                    f"Provider {server['provider_type'] or 'unknown'} has no Lumae catalogue reader"
+                )
             return fetcher(module, self.core, server_id)
 
     def probe_server_identity(self, server_id, timeout_seconds=5):
@@ -349,7 +349,7 @@ def _navidrome_artist_cover_art(request, folder_ids):
     return cover_art
 
 
-def _fetch_jellyfin_or_emby(module, core, server_id):
+def _fetch_jellyfin(module, core, server_id):
     libraries = list(module.list_libraries() or [])
     target = getattr(module, "_get_target_library_ids", None)
     target_ids = target() if callable(target) else None
@@ -386,25 +386,10 @@ def _fetch_jellyfin_or_emby(module, core, server_id):
     return {"libraries": libraries, "albums": list(albums.values()), "tracks": list(tracks)}
 
 
-def _fetch_lyrion(module, core, server_id):
-    libraries = list(module.list_libraries() or [])
-    request = getattr(module, "_jsonrpc_request", None)
-    if callable(request):
-        response = request("titles", [0, 999999, "tags:galduAyRKNSECTIQZ"])
-        tracks = (response or {}).get("titles_loop") or []
-    else:
-        tracks = core.get_all_songs(server_id, apply_filter=True)
-    albums = {}
-    for row in tracks:
-        album_id = row.get("album_id") or row.get("albumid")
-        if album_id:
-            albums.setdefault(
-                str(album_id),
-                {
-                    "id": str(album_id),
-                    "title": row.get("album"),
-                    "albumartist": row.get("albumartist"),
-                    "year": row.get("year"),
-                },
-            )
-    return {"libraries": libraries, "albums": list(albums.values()), "tracks": list(tracks)}
+# Emby and Lyrion are not supported music servers: their readers were removed
+# in 1.6.0 (JF.2). A persisted source of either type stays hidden and is never
+# fetched, streamed or deleted.
+PROVIDER_FETCHERS = {
+    "navidrome": _fetch_navidrome,
+    "jellyfin": _fetch_jellyfin,
+}

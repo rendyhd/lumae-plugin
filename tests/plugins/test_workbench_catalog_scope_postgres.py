@@ -241,7 +241,7 @@ def test_two_active_sources_require_an_explicit_catalogue(workbench, monkeypatch
 def test_stream_and_art_take_the_provider_from_the_source_row(workbench, monkeypatch):
     _two_sources(workbench)
     library = workbench.library
-    for name, value in (("MEDIASERVER_TYPE", "emby"), ("EMBY_URL", "http://emby"),
+    for name, value in (("MEDIASERVER_TYPE", "plex"), ("PLEX_URL", "http://plex"),
                         ("JELLYFIN_URL", "http://jellyfin"), ("HEADERS", {})):
         monkeypatch.setattr(library.config, name, value, raising=False)
     targets = []

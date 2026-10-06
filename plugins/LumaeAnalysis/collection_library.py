@@ -833,7 +833,7 @@ def album_detail(title=None, artist=None, provider_album_id=None, catalog_instan
 
 
 def _provider_headers(provider_type):
-    if provider_type in {"jellyfin", "emby"}:
+    if provider_type == "jellyfin":
         return dict(getattr(config, "HEADERS", {}) or {})
     return {}
 
@@ -848,12 +848,6 @@ def _resolve_stream_target(item_id, provider_type):
             _provider_headers(provider_type),
             None,
         ), None
-    if provider_type == "emby":
-        return (
-            f"{str(getattr(config, 'EMBY_URL', '')).rstrip('/')}/Items/{quote(item_id)}/Download",
-            _provider_headers(provider_type),
-            None,
-        ), None
     if provider_type == "navidrome":
         from tasks.mediaserver.navidrome import get_navidrome_auth_params
 
@@ -864,12 +858,6 @@ def _resolve_stream_target(item_id, provider_type):
             f"{str(getattr(config, 'NAVIDROME_URL', '')).rstrip('/')}/rest/stream.view",
             {},
             {"id": item_id, **auth},
-        ), None
-    if provider_type == "lyrion":
-        return (
-            f"{str(getattr(config, 'LYRION_URL', '')).rstrip('/')}/music/{quote(item_id)}/download",
-            {},
-            None,
         ), None
     if provider_type == "plex":
         from tasks.mediaserver.plex import _resolve_part
@@ -970,18 +958,6 @@ def _resolve_art_target(item_id, size, provider_type):
             f"{str(getattr(config, 'JELLYFIN_URL', '')).rstrip('/')}/Items/{quote(item_id)}/Images/Primary",
             _provider_headers(provider_type),
             {"maxWidth": size, "quality": 90},
-        )
-    if provider_type == "emby":
-        return (
-            f"{str(getattr(config, 'EMBY_URL', '')).rstrip('/')}/Items/{quote(item_id)}/Images/Primary",
-            _provider_headers(provider_type),
-            {"maxWidth": size, "quality": 90},
-        )
-    if provider_type == "lyrion":
-        return (
-            f"{str(getattr(config, 'LYRION_URL', '')).rstrip('/')}/music/{quote(item_id)}/cover.jpg",
-            {},
-            {"size": size},
         )
     if provider_type == "plex":
         base = str(getattr(config, "PLEX_URL", "")).rstrip("/")

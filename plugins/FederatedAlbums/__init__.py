@@ -540,12 +540,14 @@ def _media_artwork_request(item_id, size):
     size = max(64, min(1200, int(size or 300)))
     headers = {"Accept": "image/*"}
     params = {}
-    if provider in ("jellyfin", "emby"):
-        base = config.JELLYFIN_URL if provider == "jellyfin" else config.EMBY_URL
-        token = config.JELLYFIN_TOKEN if provider == "jellyfin" else config.EMBY_TOKEN
+    if provider == "jellyfin":
+        base = config.JELLYFIN_URL
+        token = config.JELLYFIN_TOKEN
         if not base or not token:
             return None
-        headers["X-Emby-Token"] = token
+        # Jellyfin 12 disables the legacy X-Emby-Token header by default; the
+        # MediaBrowser scheme works on every supported Jellyfin release.
+        headers["Authorization"] = f'MediaBrowser Token="{token}"'
         url = f"{base.rstrip('/')}/Items/{quote(str(item_id), safe='')}/Images/Primary"
         params = {"maxWidth": size, "quality": 90}
     elif provider == "plex":
