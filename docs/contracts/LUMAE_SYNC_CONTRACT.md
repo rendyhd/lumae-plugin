@@ -244,7 +244,24 @@ Jellyfin 12 does not expose several tags that Navidrome serves through OpenSubso
 | `TSOT`, `TITLESORT`, `sonm` | `sortName` | — | — |
 | `TSOA`, `ALBUMSORT`, `soal` | — | `sortName` | album `sort_name` (before Jellyfin's own `SortName`, which stays in the payload) |
 
-An album key is emitted only when every tagged track of the album that carries the tag agrees. The keys of a Jellyfin row with file tags are folded into its metadata fingerprint, so a changed tag is an ordinary `upsert` (a retagged file is re-read when its media changes and the plugin analyses it again). A fingerprint rekey (§2.2) carries the moved file's tags to the new ID. Known limits: PyAV does not return ID3 `TIPL` names or the MP4 `tmpo` atom (mutagen does); artist sort names have no OpenSubsonic track or album key and are not emitted; Opus `R128_*` gains are not converted. `release_type` and `external_ids.isrc` keep the Navidrome reader's existing text form of a list (`"['album']"`), on both paths.
+An album key is emitted only when every tagged track of the album that carries the tag agrees. The keys of a Jellyfin row with file tags are folded into its metadata fingerprint, so a changed tag is an ordinary `upsert` (a retagged file is re-read when its media changes and the plugin analyses it again). A fingerprint rekey (§2.2) carries the moved file's tags to the new ID. Known limits: PyAV does not return ID3 `TIPL` names or the MP4 `tmpo` atom (mutagen does); artist sort names have no OpenSubsonic track or album key and are not emitted; Opus `R128_*` gains are not converted. `release_type` and `external_ids.isrc` keep the Navidrome reader's existing text form of a list (`"['album']"`), on both paths (§2.4).
+
+### 2.4 `release_type` and `external_ids.isrc` are text; a list is its Python list text
+
+Album and track `release_type` and track `external_ids.isrc` are text (a string or `null`), never a JSON array. The plugin publishes each through `_text` (`catalog.py`: `str(value)`, NFC, trimmed, `""` → `null`), so what a client receives depends on what the server sent:
+
+| Server value | Published text |
+|---|---|
+| a string (`"album"`, `"Album"`) | that string (`"album"`, `"Album"`) |
+| a list: OpenSubsonic `releaseTypes: ["album", "compilation"]`, `isrc: ["NLTST2400001"]`; Jellyfin file tags (§2.3) the same | its Python list literal text: `"['album', 'compilation']"`, `"['NLTST2400001']"` |
+| an empty list | `"[]"` |
+| missing, `null` or empty text | `null` |
+
+List text follows Python's `repr` of each element: single quotes; double quotes when the element holds a single quote and no double quote (`"[\"rock 'n' roll\"]"`); backslash escapes for a backslash, the quote and non-printable characters (`\\`, `\'`, `\t`, `\n`, `\r`, `\xNN`, `\uNNNN`, `\UNNNNNNNN`), printable non-ASCII as is; `, ` between elements, in the server's order and case. A track without its own value carries its album's `release_type` text unchanged. The raw provider `payload` keeps the server's own array (`payload.releaseTypes`, `payload.isrc`).
+
+**Clients** must decode both a plain string and the list text, by scanning it, never by evaluating it as code, and must not compare the field with a single value (`release_type = 'album'` never matches a list). Unknown elements carry no meaning. Lumae (app step AS.25) decodes it in `src/lib/releaseTypes.ts` (`parseReleaseTypeList`, which also accepts a JSON array string, a `,`/`;`/`/`/`|`-separated string and an array) for every release-type read, stores the published text unchanged, and reads no ISRC.
+
+**Kept for stability.** This text is the published format, not a defect to be fixed in place: `release_type` is part of every album's and track's `metadata_fp`, and `external_ids` of every track's, so publishing a real array or another text form would change almost every catalogue row at once: a catalogue-wide `upsert` wave to every phone, and Lumae Radio preparing its stations again. A different form needs a new, capability-gated field (§8 rules 1 and 2).
 
 ---
 
