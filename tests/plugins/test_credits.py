@@ -308,7 +308,7 @@ def test_verified_identity_redirect_is_throttled_and_cannot_leave_musicbrainz(cr
         client.get("recording", uid(23))
 
 
-def test_http_lock_is_shared_across_workers_and_empty_credits_expire_after_seven_days(credits_db):
+def test_http_lock_is_shared_across_workers_and_responses_expire_after_three_days(credits_db):
     import psycopg2
     other = psycopg2.connect(__import__("os").environ["LUMAE_POSTGRES_TEST_DSN"])
     cur = other.cursor()
@@ -330,11 +330,82 @@ def test_http_lock_is_shared_across_workers_and_empty_credits_expire_after_seven
                                json=lambda: {"id": uid(20), "title": "Album", "relations": []})
     client.http = SimpleNamespace(get=lambda *args, **kwargs: response)
     client.get("release", uid(20), inc=mb.RELEASE_INC)
+    response.json = lambda: {"releases": [{"id": uid(21)}]}
+    client.get("release", query="release:x", limit=12)
     cur = credits_db.cursor()
+    # A release without credits and a search result alike: three days.
     cur.execute("SELECT EXTRACT(EPOCH FROM(expires_at-now()))/86400 FROM plugin_lumae_analysis__credits_http_cache")
-    assert 6.9 < float(cur.fetchone()[0]) <= 7
+    days = [float(row[0]) for row in cur.fetchall()]
+    assert len(days) == 2 and all(2.9 < value <= 3 for value in days)
     cur.close()
     credits_db.commit()
+
+
+def _cache(db, rows):
+    cur = db.cursor()
+    for key, days in rows:
+        cur.execute("""INSERT INTO plugin_lumae_analysis__credits_http_cache(request_key,payload,expires_at)
+            VALUES(%s,'{}',now()+(%s*interval '1 day'))""", (key, days))
+    cur.close()
+    db.commit()
+
+
+def _cached(db):
+    cur = db.cursor()
+    cur.execute("SELECT request_key FROM plugin_lumae_analysis__credits_http_cache ORDER BY request_key")
+    keys = [row[0] for row in cur.fetchall()]
+    cur.close()
+    db.commit()
+    return keys
+
+
+def test_http_cache_purge_drops_expired_and_older_thirty_day_responses_in_batches(credits_db):
+    # 1.6.0 cached full releases for 30 days and deleted them a week after expiry.
+    _cache(credits_db, [("expired", -0.01), ("fresh", 2.5), ("legacy-29d", 29),
+                        ("legacy-4d", 4), ("legacy-expired", -6)])
+    cur = credits_db.cursor()
+    assert store.purge_http_cache(cur, batch=2) == 2
+    credits_db.commit()
+    store.purge_http_cache_fully(credits_db, batch=2)
+    assert _cached(credits_db) == ["fresh"]
+    assert store.purge_http_cache(cur) == 0
+    cur.close()
+    credits_db.commit()
+
+
+def test_credits_watchdog_purges_the_cache_while_every_album_is_current(credits_db, monkeypatch):
+    _cache(credits_db, [("expired", -1), ("fresh", 1)])
+    monkeypatch.setattr(service, "paused", lambda: True)
+    assert service.reconcile(credits_db) is None
+    assert _cached(credits_db) == ["expired", "fresh"]
+    monkeypatch.setattr(service, "paused", lambda: False)
+    monkeypatch.setattr(service, "resolve_catalog_source", lambda db, server_id=None: [])
+    assert service.reconcile(credits_db) is None
+    assert _cached(credits_db) == ["fresh"]
+
+
+def test_compaction_keeps_two_snapshots_of_the_catalogues_albums(credits_db):
+    db = credits_db
+    cur = db.cursor()
+    cur.execute("""UPDATE plugin_lumae_analysis__catalog_state SET entity_counts='{"album": 600}'
+        WHERE catalog_instance_id='c'""")
+    store.ensure_stream(cur, "c")
+    # Five rematches of 600 albums: 3,000 versions, far below 1.6.0's fixed 50,000.
+    cur.execute("""INSERT INTO plugin_lumae_analysis__credits_versions(catalog_instance_id,seq,album_id,payload)
+        SELECT 'c',s,'album-'||(s%600),'{}'::jsonb FROM generate_series(1,3000) s""")
+    cur.execute("UPDATE plugin_lumae_analysis__credits_stream SET head_seq=3000 WHERE catalog_instance_id='c'")
+    db.commit()
+    store.compact(db, "c")
+    assert store.status(db, "c")["floor_seq"] == 1800
+    cur.execute("""SELECT count(*) FILTER (WHERE seq>=1800), count(*) FILTER (WHERE seq<1800),
+        count(DISTINCT album_id) FROM plugin_lumae_analysis__credits_versions WHERE catalog_instance_id='c'""")
+    # Everything in the window, and below it each album's baseline (album-0's is seq 1800).
+    assert cur.fetchone() == (1201, 599, 600)
+    cur.close()
+    db.commit()
+    # A catalogue without counts keeps the 1,000-version floor.
+    store.compact(db, "other")
+    assert store.status(db, "other")["floor_seq"] == 0
 
 
 def test_expired_bootstrap_and_compacted_delta_cursors_require_a_fresh_snapshot(credits_db):

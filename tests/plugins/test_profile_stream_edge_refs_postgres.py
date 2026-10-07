@@ -722,7 +722,8 @@ def _replay(client, after, *, edge_refs, local=None, fetched=None):
 
 # ---------------------------------------------------------------------------
 # Mixed journal: rows journalled before K6 embed their edge and have no
-# reference. They are never rewritten, and every reader serves them as before.
+# reference. Every reader serves them as before. From 1.6.1 the migration
+# rewrites those whose edge is still stored to the K6 form, which reads the same.
 # ---------------------------------------------------------------------------
 
 
@@ -810,9 +811,71 @@ def test_mixed_old_and_new_journal_rows_read_correctly_in_both_modes(source_db):
     _assert_replacement_follows(db)
 
 
-def test_upgrade_adds_the_columns_and_never_rewrites_old_rows(source_db, run_plugin_migration):
+def test_externalized_old_rows_read_exactly_as_before_in_every_mode(source_db,
+                                                                   run_plugin_migration):
+    """1.6.1: the migration rewrites a pre-K6 row whose embedded edge is still
+    stored to its waveform payload plus a reference. /changes (both modes,
+    byte for byte) and v2 catch-ups (both modes) serve exactly what they served
+    before. A row whose edge was replaced keeps its frozen copy."""
+    db, client = source_db, _app()
+    for track in TRACKS[:4]:
+        _complete(db, track, -14.0)
+        _publish_edge(db, track)
+    # Catch-ups are captured on first read: one pair read before, one after.
+    sessions = [_v2_create(client, 3, **extra)[0][2]
+                for extra in ({}, {"edge_refs": True}, {}, {"edge_refs": True})]
+    after = _head(db)
+    old = [_pre_k6_event(db, track, -13.0, b"wave-2")[0] for track in TRACKS[:3]]
+    _complete(db, TRACKS[3], -12.0, start=b"wave-2")                # K6 kept row
+    _publish_edge(db, TRACKS[2], variant="b")                        # replaces old[2]'s edge
+    cursor = opaque_cursor(SOURCE, PROFILE_EPOCH, after)
+
+    def changes():
+        return [[raw for _s, raw, _b in _changes(client, cursor, 2, **extra)]
+                for extra in ({}, {"edge_refs": "1"})]
+
+    def catchups(pair):
+        return [_catchup_events(client, session["session_token"]) for session in pair]
+
+    stored = _journal(db, after)
+    before = changes(), catchups(sessions[:2])
+    run_plugin_migration(db)
+    journal = _journal(db, after)
+    for seq in old[:2]:
+        edge = stored[seq][2]["edge_profile"]
+        assert journal[seq][2] == _without_edge(stored[seq][2])
+        assert journal[seq][3] == {"profile_digest": edge["profile_digest"]}
+    assert journal[old[2]] == stored[old[2]]
+    assert {seq: row for seq, row in journal.items() if seq not in old} == \
+        {seq: row for seq, row in stored.items() if seq not in old}
+    assert (changes(), catchups(sessions[2:])) == before
+    _assert_replacement_follows(db)
+    versions = _execute(db, f"SELECT seq, xmin::text FROM {P}profile_changes ORDER BY seq")
+    assert enrichment.externalize_journal_edges(db, batch_size=1) == 0
+    assert _execute(db, f"SELECT seq, xmin::text FROM {P}profile_changes ORDER BY seq") == versions
+
+
+def test_externalizing_walks_every_batch_and_skips_other_revisions(source_db):
+    db, client = source_db, _app()
+    for track in TRACKS[:5]:
+        _complete(db, track, -14.0)
+        _publish_edge(db, track)
+    old = [_pre_k6_event(db, track, -13.0, b"wave-2")[0] for track in TRACKS[:5]]
+    # An embedded edge of another revision than its event's is never referenced.
+    _execute(db, f"""UPDATE {P}profile_changes
+                        SET payload=jsonb_set(payload, '{{edge_profile,media_revision}}', '"sha256:x"')
+                      WHERE catalog_instance_id=%s AND seq=%s""", (SOURCE, old[4]))
+    before = _events(client, 0)
+    assert enrichment.externalize_journal_edges(db, batch_size=2) == 4
+    journal = _journal(db)
+    assert [journal[seq][3] is not None for seq in old] == [True] * 4 + [False]
+    assert _events(client, 0) == before
+
+
+def test_upgrade_adds_the_columns_and_externalizes_old_rows_once(source_db, run_plugin_migration):
     """The K6 migration is additive: a pre-K6 schema gains the nullable
-    columns, its journal rows keep their payload, and a re-run is a no-op."""
+    columns, a row whose embedded edge is still stored moves to the K6 form
+    and reads the same, and a re-run is a no-op."""
     db, client = source_db, _app()
     _complete(db, TRACKS[0], -14.0)
     _publish_edge(db, TRACKS[0])
@@ -829,12 +892,15 @@ def test_upgrade_adds_the_columns_and_never_rewrites_old_rows(source_db, run_plu
     before = _execute(db, f"SELECT seq, payload::text, xmin::text FROM {P}profile_changes "
                           "ORDER BY seq")
     run_plugin_migration(db)
+    upgraded = _execute(db, f"SELECT seq, payload::text, xmin::text FROM {P}profile_changes "
+                            "ORDER BY seq")
     run_plugin_migration(db)
-    after = _execute(db, f"SELECT seq, payload::text, xmin::text FROM {P}profile_changes "
-                         "ORDER BY seq")
-    assert after == before  # not rewritten (same row versions)
-    assert _execute(db, f"SELECT count(*) FROM {P}profile_changes WHERE edge_ref IS NULL") \
-        == [(2,)]
+    assert _execute(db, f"SELECT seq, payload::text, xmin::text FROM {P}profile_changes "
+                        "ORDER BY seq") == upgraded  # the re-run rewrites nothing
+    assert upgraded[0] == before[0]  # the first publication carried no edge
+    assert _execute(db, f"SELECT seq, edge_ref FROM {P}profile_changes ORDER BY seq") == \
+        [(1, None), (2, {"profile_digest": payload["edge_profile"]["profile_digest"]})]
+    assert "edge_profile" not in json.loads(upgraded[1][1])
     columns = _execute(db, """SELECT table_name, column_name, is_nullable, column_default
                                 FROM information_schema.columns
                                WHERE table_schema=current_schema()

@@ -3450,6 +3450,7 @@ class CronCursor(FakeCursor):
         self.feed_version = 1
         self.current_row = None
         self.timeouts = ("0", "0")
+        self.rowcount = 0
 
     def execute(self, sql, params=None):
         super().execute(sql, params)
@@ -4706,7 +4707,9 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
 
     mod.migrate(db)
 
-    assert db.commits == 2
+    # The migration, the preparation enqueue, then the storage reclaim's own
+    # short transactions (1.6.1: MusicBrainz cache, journal edges).
+    assert db.commits == 4
     assert queued == []
     assert (
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
@@ -4914,7 +4917,7 @@ def test_migrate_is_idempotent_and_preserves_existing_plugin_tables(monkeypatch)
     first_sql = [sql for sql, _params in db.cursor_obj.executed]
     mod.migrate(db)
 
-    assert db.commits == 4
+    assert db.commits == 8
     assert all("DROP TABLE" not in sql.upper() or "DJ_" in sql.upper() for sql, _params in db.cursor_obj.executed)
     assert sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql, _ in db.cursor_obj.executed) == (
         2 * sum("CREATE TABLE IF NOT EXISTS" in sql.upper() for sql in first_sql)

@@ -14,8 +14,9 @@ from plugin.api import table
 from .catalog import canonical_json
 from .credits_matching import (
     choose_release, identity_values, mbid, verify_recording,
-    name_score, artist_name, SUPPORTED_ROLES,
+    name_score, artist_name,
 )
+from .credits_store import HTTP_CACHE_TTL_DAYS
 
 USER_AGENT = "Lumae-Analysis-Credits/1 (+https://github.com/rendyhd/lumae-plugin)"
 BASE_URL = "https://musicbrainz.org/ws/2/"
@@ -39,16 +40,6 @@ def retry_after(value, fallback=60):
                                        datetime.now(timezone.utc)).total_seconds())))
         except (TypeError, ValueError, OverflowError):
             return fallback
-
-
-def has_credit_relationships(entity):
-    for relation in entity.get("relations") or []:
-        if relation.get("type") in SUPPORTED_ROLES and mbid((relation.get("artist") or {}).get("id")):
-            return True
-        if relation.get("work") and has_credit_relationships(relation["work"]):
-            return True
-    return any(has_credit_relationships(track.get("recording") or {})
-               for medium in entity.get("media") or [] for track in medium.get("tracks") or [])
 
 
 class Client:
@@ -142,13 +133,12 @@ class Client:
                 payload = response.json()
                 if not isinstance(payload, dict):
                     raise MusicBrainzDeferred("MusicBrainz response was not an object", 3600)
-            empty = not payload or (not entity_id and not payload.get(entity + "s"))
-            if entity_id and "artist-rels" in params.get("inc", "") and not has_credit_relationships(payload):
-                empty = True
+            # The cache only spans one album's deferrals and retries: matching
+            # publishes what it needs, and a full release is up to megabytes.
             cur.execute(f"""INSERT INTO {table('credits_http_cache')}(request_key,payload,expires_at)
                 VALUES(%s,%s::jsonb,now()+(%s*interval '1 day')) ON CONFLICT(request_key) DO UPDATE
                 SET payload=excluded.payload,expires_at=excluded.expires_at""",
-                        (key, canonical_json(payload), 7 if empty else 30))
+                        (key, canonical_json(payload), HTTP_CACHE_TTL_DAYS))
             self.db.commit()
             return payload
         finally:

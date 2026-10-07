@@ -92,6 +92,11 @@ def reconcile(db, server_id=None, before_background=False):
     """One credits album per turn, with time sharing alongside existing background work."""
     if paused():
         return None
+    # Expired responses go even while every album is current (one bounded batch).
+    cur = db.cursor()
+    store.purge_http_cache(cur)
+    cur.close()
+    db.commit()
     sources = resolve_catalog_source(db, server_id=server_id)
     for source in sources:
         catalog_id = source["catalog_instance_id"]
