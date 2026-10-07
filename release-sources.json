@@ -1,9 +1,8 @@
 {
   "plugins": {
     "LumaeAnalysis": {
-      "mode": "pinned-artifact",
-      "version": "1.6.0",
-      "checksum": "b84e1a7e90a0524c74fc514af31cf2da"
+      "mode": "source",
+      "version": "1.6.1"
     },
     "FederatedAlbums": {
       "mode": "private",

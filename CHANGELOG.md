@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased (1.6.1)
+## 1.6.1 (2026-10-07)
 
 Storage. On a 36k-track production library the plugin held 3.0 GB of a
 3.7 GB AudioMuse backup, a third of it MusicBrainz responses kept for later.
