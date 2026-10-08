@@ -5,3 +5,4 @@ psycopg2-binary>=2.9,<3
 requests>=2.32,<3
 scipy>=1.14,<2
 psutil==6.1.1
+mutagen>=1.47,<2
