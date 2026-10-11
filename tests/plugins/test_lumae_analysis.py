@@ -27,6 +27,8 @@ plugin_api_module.get_db = lambda: None
 plugin_api_module.get_setting = lambda _key, default=None: default
 plugin_api_module.logger = types.SimpleNamespace(
     warning=lambda *args, **kwargs: None,
+    info=lambda *args, **kwargs: None,
+    debug=lambda *args, **kwargs: None,
     exception=lambda *args, **kwargs: None,
 )
 plugin_api_module.render_page = lambda body, title=None: body
@@ -5003,8 +5005,16 @@ def test_reconcile_watchdog_is_a_noop_for_current_attested_catalogues(monkeypatc
     )
     _stub_edge_reconcile(monkeypatch, mod)
 
-    assert mod.catalog_reconcile_task() == {
+    result = mod.catalog_reconcile_task()
+    assert {key: result[key] for key in (
+        "status", "message", "status_message", "tracks_analyzed", "actions", "requested",
+        "plugin_version", "catalog_builder_version",
+    )} == {
         "status": "current",
+        "message": "Lumae: up to date",
+        "status_message": "Lumae: up to date",
+        "tracks_analyzed": 0,
+        "actions": [],
         "requested": 0,
         "plugin_version": mod.PLUGIN_VERSION,
         "catalog_builder_version": mod.CATALOG_BUILDER_VERSION,
@@ -5038,11 +5048,11 @@ def test_reconcile_watchdog_processes_only_the_highest_priority_action(monkeypat
         ),
     )
 
-    assert mod.catalog_reconcile_task() == {
-        "status": "processed",
-        "action": "analysis_run",
-        "result": {"status": "complete"},
-    }
+    result = mod.catalog_reconcile_task()
+    assert result["status"] == "processed"
+    assert [(entry["action"], entry["status"], entry["count"]) for entry in result["actions"]] == [
+        ("analysis_run", "complete", 1)]
+    assert result["message"].startswith("Lumae: 1 analysis run in ")
     assert calls == [("analysis", ("server-a", "catalog-a", "run-a"))]
 
 
@@ -5125,11 +5135,13 @@ def test_reconcile_serves_metadata_lookups_taking_turns_with_background_work(
 
     result = mod.catalog_reconcile_task()
 
-    assert result.get("action") == expected_action
+    assert [entry["action"] for entry in result["actions"]] == (
+        [expected_action] if expected_action else [])
     assert turns == expected_turns
     assert actions == (["profile_backfill"] if expected_action == "profile_backfill" else [])
     if expected_action == "music_metadata":
-        assert result["result"]["job_id"] == "job-a"
+        assert result["actions"][0]["status"] == "verified"
+        assert result["message"].startswith("Lumae: 1 MusicBrainz lookup in ")
     if expected_action is None:
         assert result["status"] == "current"
 

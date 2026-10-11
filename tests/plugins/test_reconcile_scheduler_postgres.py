@@ -6,6 +6,10 @@ Plan: docs/plan/LUMAE_SCHEDULER_PLAN_2026-10-11.md (1.6.2: S1-S6).
   keeps its own retry time. The tick used to reset it, so the row was due at
   once, the watchdog stayed on minute cadence after the backfill had
   finished, and the edge pass ordered after it never ran.
+* S5 (AUD-18): the tick returns what it did (``tracks_analyzed``, one
+  sentence as ``message``/``status_message``, actions, remaining work,
+  cadence), logs one INFO line, journals credits, MusicBrainz and on-demand
+  turns, and the journal keeps a day of events.
 * S6 (AUD-18): an administrator's disable of Lumae's cron rows on AudioMuse's
   Scheduled Tasks page stays, and the settings page says what stops.
 """
@@ -65,7 +69,6 @@ def tick(migrated_db, monkeypatch):
     monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
     monkeypatch.setattr(mod, "report_edge_runtime", lambda *args, **kwargs: None)
     monkeypatch.setattr(mod, "serve_deferred_interactive", lambda *args, **kwargs: 0)
-    monkeypatch.setattr(mod, "refresh_status_snapshot", lambda *args, **kwargs: 0)
     monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
     for name in ("next_settled_analysis_run", "next_preparation_run", "next_relationship_run"):
         monkeypatch.setattr(mod, name, lambda db=None, server_id=None: None)
@@ -144,8 +147,8 @@ def test_waiting_retry_keeps_the_backfill_retry_time(tick, monkeypatch, retry_co
 
     result = mod.catalog_reconcile_task()
 
-    assert result["action"] == "profile_backfill"
-    assert result["result"]["status"] == "waiting_retry"
+    assert [(entry["action"], entry["status"]) for entry in result["actions"]] == [
+        ("profile_backfill", "waiting_retry")]
     assert analysed == []
     status, next_retry_at, stored_retry_count = _backfill_row(db)
     assert status == "queued"
@@ -182,7 +185,7 @@ def test_complete_backfill_stays_complete(tick, monkeypatch):
 
     result = mod.catalog_reconcile_task()
 
-    assert result["result"]["status"] == "complete"
+    assert result["actions"][0]["status"] == "complete"
     assert _backfill_row(db) == ("complete", None, 0)
     assert _rows(db, f"SELECT mode FROM {P}reconcile_control")[0][0] == "idle"
 
@@ -252,3 +255,168 @@ def test_the_settings_page_says_what_stops_while_a_row_is_disabled(tick, disable
     assert ("The provider identity recheck is disabled" in html) is (RECHECK in disabled)
     for task_type in disabled:
         assert f"<code>{task_type}</code>" in html
+
+
+# ---------------------------------------------------------------- S5 report
+def _events(db):
+    return _rows(
+        db,
+        f"SELECT action, status, phase, summary FROM {P}reconcile_events "
+        "WHERE status <> 'running' ORDER BY event_id",
+    )
+
+
+def _info_lines(monkeypatch):
+    lines = []
+    monkeypatch.setattr(_reconcile(), "logger", type("Logger", (), {
+        "info": staticmethod(lambda message, *args: lines.append(message % args)),
+        "debug": staticmethod(lambda *args, **kwargs: None),
+        "warning": staticmethod(lambda *args, **kwargs: None),
+        "exception": staticmethod(lambda *args, **kwargs: None),
+    })())
+    return lines
+
+
+def test_a_waveform_batch_reports_its_tracks_and_matches_its_event(tick, monkeypatch):
+    mod, db = tick
+    for track in ("track-a", "track-b", "track-c"):
+        _track(db, track)
+    _queued_backfill(db)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 2)
+    monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: {
+        "processed": len(ids), "attempted": len(ids), "ready": len(ids) - 1, "failed": 1,
+        "skipped": 0})
+    lines = _info_lines(monkeypatch)
+
+    result = mod.catalog_reconcile_task()
+
+    [(action, status, phase, summary)] = _events(db)
+    assert (action, status, phase) == ("profile_backfill", "success", "completed with warnings")
+    assert result["tracks_analyzed"] == summary["ready"] == 1
+    [entry] = result["actions"]
+    assert (entry["action"], entry["count"], entry["failed"]) == ("profile_backfill", 1, 1)
+    assert result["remaining"]["waveforms"] == 3
+    assert result["message"] == result["status_message"]
+    assert result["message"].startswith("Lumae: 1 waveform (1 failed) in ")
+    assert result["message"].endswith("; 3 tracks left")
+    assert result["cadence"] == "* * * * *"
+    [line] = lines
+    assert line.startswith("lumae_analysis watchdog: " + result["message"])
+    assert "profile_backfill queued 1/1 failed" in line and "cadence * * * * *" in line
+
+
+@pytest.mark.parametrize(
+    ("stub", "value", "action", "message", "tracks"),
+    [
+        ("serve_deferred_interactive", 3, "interactive", "Lumae: 3 on-demand tracks in ", 3),
+        ("_safe_credits_reconcile",
+         {"status": "published", "album_id": "album-a", "match_status": "matched", "credits": 4},
+         "credits", "Lumae: 1 credits album in ", 0),
+        ("_safe_metadata_reconcile", {"status": "verified", "job_id": "job-a"},
+         "music_metadata", "Lumae: 1 MusicBrainz lookup in ", 0),
+        ("_safe_credits_reconcile", {"status": "deferred", "album_id": "album-a",
+                                     "retry_seconds": 60}, "credits", "Lumae: 1 credits album in ", 0),
+    ],
+)
+def test_credits_lookups_and_on_demand_turns_are_journaled(
+    tick, monkeypatch, stub, value, action, message, tracks,
+):
+    mod, db = tick
+    monkeypatch.setattr(mod, stub, lambda *args, **kwargs: value)
+
+    result = mod.catalog_reconcile_task()
+
+    [(event_action, status, phase, summary)] = _events(db)
+    assert event_action == action
+    assert status == ("deferred" if phase == "deferred" else "success")
+    assert summary["status"] == phase
+    assert [entry["action"] for entry in result["actions"]] == [action]
+    assert result["message"].startswith(message)
+    assert result["tracks_analyzed"] == tracks
+    if action == "interactive":
+        assert summary["served"] == 3
+    if action == "credits" and phase == "published":
+        assert (summary["match_status"], summary["credits"]) == ("matched", 4)
+
+
+def test_idle_and_paused_ticks_say_so(tick, monkeypatch):
+    mod, db = tick
+    lines = _info_lines(monkeypatch)
+    idle = mod.catalog_reconcile_task()
+    assert (idle["status"], idle["message"], idle["cadence"]) == (
+        "current", "Lumae: up to date", "11 * * * *")
+    assert idle["actions"] == [] and idle["tracks_analyzed"] == 0
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: True)
+    paused = mod.catalog_reconcile_task()
+    assert (paused["status"], paused["message"], paused["cadence"]) == (
+        "paused", "Lumae: paused", "11 * * * *")
+    assert len(lines) == 2 and lines[1].startswith("lumae_analysis watchdog: Lumae: paused")
+    assert _events(db) == []
+
+
+def test_a_failed_action_still_logs_its_tick(tick, monkeypatch):
+    mod, db = tick
+    _queued_backfill(db)
+    monkeypatch.setattr(mod, "profile_backfill_task", lambda *_args: (_ for _ in ()).throw(
+        RuntimeError("decoder crashed")))
+    lines = _info_lines(monkeypatch)
+    with pytest.raises(RuntimeError):
+        mod.catalog_reconcile_task()
+    [line] = lines
+    assert line.startswith("lumae_analysis watchdog: Lumae: an action failed")
+    assert "actions profile_backfill failed 0 " in line
+    assert _events(db)[0][:2] == ("profile_backfill", "failed")
+
+
+def test_the_journal_keeps_a_day_per_source_within_its_bounds(tick):
+    mod, db = tick
+    reconcile = _reconcile()
+    with db.cursor() as cur:
+        cur.execute(
+            f"INSERT INTO {P}catalog_sources (catalog_instance_id, current_core_server_id, "
+            "provider_type, server_name, is_default, rebind_status) "
+            "VALUES ('catalog-b', 'server-b', 'navidrome', 'B', FALSE, 'active')"
+        )
+        # catalog-a: 1,100 events in the last day and 100 older; catalog-b:
+        # 30 events older than a day; one event still running.
+        cur.execute(
+            f"""INSERT INTO {P}reconcile_events (catalog_instance_id, action, status, phase,
+                    started_at, completed_at)
+                SELECT 'catalog-a', 'profile_backfill', 'success', 'complete',
+                       now() - make_interval(hours => CASE WHEN i <= 100 THEN 30 ELSE 1 END),
+                       now() - make_interval(hours => CASE WHEN i <= 100 THEN 30 ELSE 1 END)
+                  FROM generate_series(1, 1200) i
+                UNION ALL
+                SELECT 'catalog-b', 'credits', 'success', 'published',
+                       now() - interval '30 hours', now() - interval '30 hours'
+                  FROM generate_series(1, 30)"""
+        )
+        cur.execute(
+            f"INSERT INTO {P}reconcile_events (catalog_instance_id, action, status, phase, "
+            "started_at) VALUES ('catalog-b', 'edge_backfill', 'running', 'claiming', "
+            "now() - interval '3 days')"
+        )
+    db.commit()
+
+    reconcile.record_event(db, "credits", SERVER, "catalog-a", "success", phase="published",
+                           duration_ms=1200)
+
+    counts = dict(_rows(
+        db,
+        f"SELECT catalog_instance_id || ':' || (status = 'running')::text, count(*) "
+        f"FROM {P}reconcile_events GROUP BY 1",
+    ))
+    assert counts == {"catalog-a:false": 1000, "catalog-b:false": 25, "catalog-b:true": 1}
+    # catalog-a keeps its newest: the one just recorded and the last day's.
+    assert _rows(
+        db,
+        f"SELECT count(*) FROM {P}reconcile_events WHERE catalog_instance_id='catalog-a' "
+        "AND completed_at < now() - interval '1 day'",
+    ) == [(0,)]
+    assert _rows(
+        db,
+        f"SELECT duration_ms, completed_at - started_at FROM {P}reconcile_events "
+        "WHERE catalog_instance_id='catalog-a' ORDER BY event_id DESC LIMIT 1",
+    )[0][0] == 1200
+    # The settings journal still shows the latest 25.
+    assert len(reconcile.read_reconcile_status(db)["events"]) == 25

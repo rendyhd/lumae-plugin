@@ -3,8 +3,9 @@
 from contextvars import ContextVar
 from datetime import datetime, timezone
 import json
+import time
 
-from plugin.api import get_db, table
+from plugin.api import get_db, logger, table
 
 from . import migrations
 
@@ -27,7 +28,17 @@ BACKOFF_LADDER = (
     (BACKOFF_15_CRON, 15 * 60),
     (IDLE_CRON, 60 * 60),
 )
-EVENT_RETENTION_PER_SOURCE = 25
+# The journal keeps a day of events per source, at least the latest
+# EVENT_RETENTION_MIN and at most EVENT_RETENTION_MAX; the settings page shows
+# the latest EVENT_JOURNAL_LIMIT. 25 events were about 25 minutes at minute
+# cadence, which rotated a long tick out before anyone looked (AUD-18).
+EVENT_RETENTION_HOURS = 24
+EVENT_RETENTION_MIN = 25
+EVENT_RETENTION_MAX = 1000
+EVENT_JOURNAL_LIMIT = 25
+# AudioMuse shows the tick's message as its task message, and with AM-2 as
+# its Recent tasks note.
+TICK_MESSAGE_MAX = 100
 
 _current_event_id = ContextVar("lumae_reconcile_event_id", default=None)
 
@@ -495,12 +506,49 @@ def finish_event(db, event_id, status, *, phase, summary=None, error=None, next_
             event_id,
         ),
     )
+    _trim_events(cur)
+    cur.close()
+    db.commit()
+    _current_event_id.set(None)
+
+
+def record_event(db, action, server_id, catalog_instance_id, status, *, phase,
+                 duration_ms, summary=None, error=None):
+    """A finished event in one statement, for work that knows it ran only
+    once it has (credits, MusicBrainz lookups, on-demand work)."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        INSERT INTO {events_table()}
+            (server_id, catalog_instance_id, action, status, phase, started_at,
+             heartbeat_at, completed_at, duration_ms, summary, last_error)
+        VALUES (%s, %s, %s, %s, %s, now() - make_interval(secs => %s / 1000.0),
+                now(), now(), %s, %s::jsonb, %s)
+        """,
+        (
+            server_id,
+            catalog_instance_id,
+            action,
+            status,
+            str(phase)[:200],
+            int(duration_ms),
+            int(duration_ms),
+            json.dumps(summary or {}, default=str),
+            str(error)[:2000] if error else None,
+        ),
+    )
+    _trim_events(cur)
+    cur.close()
+    db.commit()
+
+
+def _trim_events(cur):
     cur.execute(
         f"""
         DELETE FROM {events_table()} e
          USING (
              SELECT event_id FROM (
-                 SELECT event_id,
+                 SELECT event_id, COALESCE(completed_at, started_at) AS finished_at,
                         row_number() OVER (
                             PARTITION BY COALESCE(catalog_instance_id, '')
                             ORDER BY event_id DESC
@@ -509,14 +557,12 @@ def finish_event(db, event_id, status, *, phase, summary=None, error=None, next_
                   WHERE status <> 'running'
              ) ranked
              WHERE position > %s
+                OR (position > %s AND finished_at < now() - make_interval(hours => %s))
          ) expired
          WHERE e.event_id=expired.event_id
         """,
-        (EVENT_RETENTION_PER_SOURCE,),
+        (EVENT_RETENTION_MAX, EVENT_RETENTION_MIN, EVENT_RETENTION_HOURS),
     )
-    cur.close()
-    db.commit()
-    _current_event_id.set(None)
 
 
 def discard_event(db, event_id):
@@ -571,7 +617,7 @@ def read_reconcile_status(db):
          ORDER BY (status='running') DESC, event_id DESC
          LIMIT %s
         """,
-        (EVENT_RETENTION_PER_SOURCE,),
+        (EVENT_JOURNAL_LIMIT,),
     )
     rows = cur.fetchall()
     cur.execute(
@@ -611,3 +657,164 @@ def iso(value):
             current = current.replace(tzinfo=timezone.utc)
         return current.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return str(value)
+
+
+def remaining_work(db):
+    """Per-queue counts for the tick report: waveform tracks left on active
+    sources (from the settings snapshot), unfinished edge passes and
+    relationship builds, and due credits albums and MusicBrainz lookups."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT
+            (SELECT COALESCE(sum(GREATEST(0, ss.profile_total_count - ss.profile_ready_count
+                                             - ss.profile_failed_count - ss.profile_skipped_count)), 0)
+               FROM {table('status_summary')} ss
+               JOIN {table('catalog_sources')} s USING (catalog_instance_id)
+              WHERE s.rebind_status='active'),
+            (SELECT count(*) FROM {_work_table('edge_backfill_state')}
+              WHERE status IN ('queued', 'running', 'failed')),
+            (SELECT count(*) FROM {_work_table('relationship_state')}
+              WHERE status IN ('queued', 'failed', 'waiting_for_index', 'running')),
+            (SELECT count(*) FROM {_work_table('credits_jobs')}
+              WHERE status IN ('pending', 'failed', 'running') AND not_before <= now()),
+            (SELECT count(*) FROM {_work_table('metadata_jobs')}
+              WHERE status IN ('pending', 'deferred', 'running') AND not_before <= now())
+        """
+    )
+    row = cur.fetchone()
+    cur.close()
+    db.commit()
+    keys = ("waveforms", "edge_passes", "relationships", "credits_albums", "lookups")
+    return {key: int(value or 0) for key, value in zip(keys, row or ())}
+
+
+# (singular, plural) of what one unit of each action is, in report order:
+# tracks first.
+ACTION_UNITS = {
+    "profile_backfill": ("waveform", "waveforms"),
+    "edge_backfill": ("edge", "edges"),
+    "interactive": ("on-demand track", "on-demand tracks"),
+    "credits": ("credits album", "credits albums"),
+    "music_metadata": ("MusicBrainz lookup", "MusicBrainz lookups"),
+    "relationships": ("relationship step", "relationship steps"),
+    "analysis_run": ("analysis run", "analysis runs"),
+    "catalog_preparation": ("catalogue preparation", "catalogue preparations"),
+}
+# Their counts are tracks analysed: the host's "Songs analyzed" note.
+TRACK_ACTIONS = ("interactive", "profile_backfill", "edge_backfill")
+
+
+def action_counts(action, result):
+    """``(done, failed)`` units of one action's result."""
+    result = result if isinstance(result, dict) else {}
+    if action == "interactive":
+        return int(result.get("served") or 0), 0
+    if action in ("profile_backfill", "edge_backfill"):
+        return int(result.get("ready") or 0), int(result.get("failed") or 0)
+    status = str(result.get("status") or "")
+    if status in ("failed", "failure", "error"):
+        return 0, 1
+    if status in ("current", "coalesced", "paused"):
+        return 0, 0
+    return 1, 0
+
+
+def _units(count, action):
+    singular, plural = ACTION_UNITS.get(action, (action, action))
+    return f"{count:,} {singular if count == 1 else plural}"
+
+
+class TickReport:
+    """What one watchdog tick did, returned as the host's task details.
+
+    AudioMuse takes ``status_message``, then ``message``, as the task's
+    message, and labels a type containing "analysis" with ``tracks_analyzed``
+    ("Songs analyzed: N") unless AM-2 shows the message instead.
+    """
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.actions = []
+        self.requested = 0
+        self.yielded_to = None
+        self.remaining = None
+        self.cadence = None
+
+    def add(self, action, result, duration_ms):
+        """One run of ``action``; runs of the same action share one entry, so
+        the details stay small however many runs a tick has."""
+        done, failed = action_counts(action, result)
+        status = (str((result or {}).get("status") or "complete")
+                  if isinstance(result, dict) or result is None else str(result))
+        entry = next((entry for entry in self.actions if entry["action"] == action), None)
+        if entry is None:
+            entry = {"action": action, "status": "", "runs": 0, "count": 0, "failed": 0, "ms": 0}
+            self.actions.append(entry)
+        entry["status"] = status[:40]
+        entry["runs"] += 1
+        entry["count"] += done
+        entry["failed"] += failed
+        entry["ms"] += int(duration_ms)
+
+    def tracks_analyzed(self):
+        return sum(entry["count"] for entry in self.actions if entry["action"] in TRACK_ACTIONS)
+
+    def message(self, status):
+        if status == "paused":
+            return "Lumae: paused"
+        if status == "yielded":
+            return f"Lumae: yielded to {self.yielded_to}"[:TICK_MESSAGE_MAX]
+        if status == "same_dispatch":
+            return "Lumae: ran earlier in this task"
+        phrases = []
+        totals = {entry["action"]: (entry["count"], entry["failed"]) for entry in self.actions}
+        for action in ACTION_UNITS:
+            done, failed = totals.get(action, (0, 0))
+            if done or failed:
+                phrases.append(_units(done, action) + (f" ({failed:,} failed)" if failed else ""))
+        left = (self.remaining or {}).get("waveforms") or 0
+        if phrases:
+            body = ", ".join(phrases) + f" in {round(time.monotonic() - self.started)} s"
+            if status == "failed":
+                body += ", then an action failed"
+        elif status == "failed":
+            body = "an action failed"
+        else:
+            body = "nothing ready" if left else "up to date"
+        tail = f"; {left:,} tracks left" if left else ""
+        for message in (f"Lumae: {body}{tail}", f"Lumae: {body}"):
+            if len(message) <= TICK_MESSAGE_MAX:
+                return message
+        return f"Lumae: {body}"[:TICK_MESSAGE_MAX - 1] + "…"
+
+    def result(self, status, **extra):
+        message = self.message(status)
+        return {
+            "status": status,
+            "message": message,
+            "status_message": message,
+            "tracks_analyzed": self.tracks_analyzed(),
+            "actions": list(self.actions),
+            "requested": int(self.requested or 0),
+            "remaining": self.remaining,
+            "yielded_to": self.yielded_to,
+            "cadence": self.cadence,
+            **extra,
+        }
+
+    def log(self, status):
+        """The tick's one INFO line."""
+        actions = ", ".join(
+            f"{entry['action']} {entry['status']} {entry['count']}"
+            + (f"/{entry['failed']} failed" if entry["failed"] else "")
+            + (f" in {entry['runs']} runs" if entry["runs"] > 1 else "") + f" {entry['ms']} ms"
+            for entry in self.actions
+        ) or "none"
+        remaining = ", ".join(f"{key} {value:,}" for key, value in (self.remaining or {}).items())
+        logger.info(
+            "lumae_analysis watchdog: %s [status %s; actions %s; remaining %s; cadence %s%s]",
+            self.message(status), status, actions, remaining or "unknown",
+            self.cadence or "unchanged",
+            f"; yielded to {self.yielded_to}" if self.yielded_to else "",
+        )
