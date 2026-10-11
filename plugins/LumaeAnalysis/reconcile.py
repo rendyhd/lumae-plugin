@@ -435,11 +435,13 @@ def _recover_interrupted_events(cur):
     )
 
 
-def reconcile_schedule_from_state(db, paused=False, commit=True, yield_to=None):
+def reconcile_schedule_from_state(db, paused=False, commit=True, yield_to=None,
+                                  host_retries=True):
     """Choose cadence from durable state while excluding concurrent lost wakes.
 
     ``yield_to``: the tick left the queue to that host work (plan S1); the
     watchdog waits on the yield cadence until a tick finds nothing to yield to.
+    ``host_retries``: the host retries a refused fire (``cron_retry``).
     """
     cur = db.cursor()
     _lock_control(cur)
@@ -454,7 +456,13 @@ def reconcile_schedule_from_state(db, paused=False, commit=True, yield_to=None):
         )
     elif yield_to:
         mode, reason, next_retry_at = "waiting", f"yield:{yield_to}", None
-        cron_expr, avoid = yield_cron(lumae_row_minutes(cur)), False
+        if host_retries:
+            cron_expr, avoid = yield_cron(lumae_row_minutes(cur)), False
+        else:
+            # Before cron_retry (AudioMuse 3.2.x) a fire refused while the
+            # host's job runs is not retried: a yield minute would wait an
+            # hour after the job, and there is no retry pass to meet.
+            cron_expr = WAITING_CRON
     else:
         state = _work_summary(cur)
         next_retry_at = state["next_retry_at"]

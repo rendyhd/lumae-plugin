@@ -805,12 +805,13 @@ def _rollback_if_possible(db):
         rollback()
 
 
-def _safe_reconcile_schedule(db, paused=None, yield_to=None):
+def _safe_reconcile_schedule(db, paused=None, yield_to=None, host_retries=True):
     try:
         return reconcile_schedule_from_state(
             db,
             paused=maintenance_paused() if paused is None else bool(paused),
             yield_to=yield_to,
+            host_retries=host_retries,
         )
     except Exception:
         _rollback_if_possible(db)
@@ -1114,7 +1115,8 @@ def catalog_reconcile_task():
         status = "yielded" if report.yielded_to else _reconcile_tick(
             db, report, host_yield, every_source=bool(task_id))
     finally:
-        schedule = _safe_reconcile_schedule(db, yield_to=report.yielded_to)
+        schedule = _safe_reconcile_schedule(db, yield_to=report.yielded_to,
+                                            host_retries=host_yield.cron_retry is True)
         if status != "yielded":
             # The waveform counts that /settings/status reads follow the
             # tick's work, and a publication left without a summary gets
