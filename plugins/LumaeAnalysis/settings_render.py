@@ -1115,13 +1115,22 @@ def render_reconcile_status_panel():
         """
     control = snapshot["control"]
     mode = control.get("mode") or "unknown"
+    cron_expr = control.get("cron_expr") or ""
+    reason = control.get("reason") or ""
     cadence = {
-        "active": "Every minute while work is ready",
+        "active": "Every minute while work is ready"
+        + ("" if cron_expr == "* * * * *"
+           else f" ({cron_expr.split(' ')[0]}: not when Lumae’s other schedules are due)"),
         "waiting": "Every five minutes while AudioMuse analysis finishes",
-        "backoff": f"Retry schedule: {control.get('cron_expr') or 'adaptive'}",
+        "backoff": f"Retry schedule: {cron_expr or 'adaptive'}",
         "idle": "Hourly safety sweep at :11",
         "paused": "Paused; hourly safety check at :11",
     }.get(mode, "Schedule unavailable")
+    if mode == "waiting" and reason.startswith("yield:"):
+        cadence = (
+            f"Waiting for AudioMuse ({reason[len('yield:'):]}) to start or finish its own "
+            f"work; next check at minute {cron_expr.split(' ')[0]}"
+        )
     pending = snapshot.get("pending") or {}
     pending_html = "".join(
         f"<li><strong>{int(count):,}</strong> {_pkg.escape(str(label))}</li>"

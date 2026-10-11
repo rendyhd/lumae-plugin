@@ -18,6 +18,9 @@ from test_lumae_analysis import load_plugin
 
 LEGACY = "plugin.lumae_analysis.music_metadata"
 RECONCILE = "plugin.lumae_analysis.catalog_reconcile"
+# Minute cadence leaves out the minutes of the installed identity recheck
+# (2,32) and collection retention (23 3 * * *) rows (plan S1).
+EVERY_MINUTE = "0,1,3-22,24-31,33-59 * * * *"
 
 
 def _rows(db, sql, params=()):
@@ -78,9 +81,9 @@ def test_lookups_arm_the_watchdog_and_let_it_idle_once_served(migrated_db, monke
     assert meta.submit(db, "user:alice", [entity])[1] == 202
     db.commit()
     assert _rows(db, "SELECT cron_expr FROM cron WHERE task_type=%s", (RECONCILE,)) == [
-        ("* * * * *",)
+        (EVERY_MINUTE,)
     ]
-    assert _schedule(db) == ("active", "* * * * *")
+    assert _schedule(db) == ("active", EVERY_MINUTE)
     status = importlib.import_module("plugins.LumaeAnalysis.reconcile").read_reconcile_status(db)
     db.commit()
     assert status["pending"]["MusicBrainz lookups"] == 1
@@ -126,5 +129,5 @@ def test_a_deferred_lookup_backs_off_by_how_far_away_its_retry_is(migrated_db):
     assert defer(61) == ("backoff", "11 * * * *")
     assert defer(20) == ("backoff", "*/15 * * * *")
     assert defer(6) == ("backoff", "*/5 * * * *")
-    assert defer(0.5) == ("backoff", "* * * * *")
-    assert defer(0) == ("active", "* * * * *")
+    assert defer(0.5) == ("backoff", EVERY_MINUTE)
+    assert defer(0) == ("active", EVERY_MINUTE)

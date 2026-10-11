@@ -3349,6 +3349,9 @@ class AnalysisRunCursor:
         self.current_row = None
         self.executed = []
 
+    def fetchall(self):
+        return []
+
     def execute(self, sql, params=None):
         self.executed.append((sql, params))
         normalized = " ".join(sql.split())

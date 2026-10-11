@@ -2,7 +2,9 @@
 
 from contextvars import ContextVar
 from datetime import datetime, timezone
+import importlib
 import json
+import random
 import time
 
 from plugin.api import get_db, logger, table
@@ -27,6 +29,17 @@ BACKOFF_LADDER = (
     (WAITING_CRON, 5 * 60),
     (BACKOFF_15_CRON, 15 * 60),
     (IDLE_CRON, 60 * 60),
+)
+# While it yields (plan S1), the watchdog ticks once, at a random minute this
+# many minutes ahead, re-picked on every yielding tick. AudioMuse's retry pass
+# runs about every 11 minutes (CRON_RETRY_INTERVAL_MINUTES, stamped after the
+# pass), so a fixed cadence could meet it on every pass.
+YIELD_MINUTES = (5, 15)
+# AudioMuse's main jobs and side jobs: its cron gate refuses every start
+# while one is live. A host with task_types adds BATCH_GATE_TASK_TYPES.
+HOST_BLOCKING_TASK_TYPES = (
+    "main_analysis", "main_clustering", "cleaning", "provider_migration",
+    "server_sweep", "naming_preview",
 )
 # The journal keeps a day of events per source, at least the latest
 # EVENT_RETENTION_MIN and at most EVENT_RETENTION_MAX; the settings page shows
@@ -140,7 +153,92 @@ def _lock_control(cur):
     return cur.fetchone()
 
 
-def _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at=None):
+def cron_minutes(expr):
+    """The minutes a cron expression's minute field names, as AudioMuse's
+    matcher reads it (``*``, numbers, lists, ``a-b``, ``*/n``, ``a-b/n``,
+    ``a/n``); None when the field is unparseable."""
+    try:
+        field = str(expr).split()[0]
+        minutes = set()
+        for part in field.split(","):
+            base, slash, step = part.strip().partition("/")
+            step = int(step) if slash else 1
+            if base == "*":
+                start, end = 0, 59
+            elif "-" in base:
+                start, end = (int(value) for value in base.split("-", 1))
+            else:
+                start = int(base)
+                end = 59 if slash else start
+            if step < 1 or not 0 <= start <= end <= 59:
+                return None
+            minutes.update(range(start, end + 1, step))
+        return minutes
+    except (ValueError, IndexError):
+        return None
+
+
+def _minute_field(minutes):
+    """``0,1,3-31,33-59`` for a set of minutes: runs of three or more as ranges."""
+    parts, ordered, index = [], sorted(minutes), 0
+    while index < len(ordered):
+        end = index
+        while end + 1 < len(ordered) and ordered[end + 1] == ordered[end] + 1:
+            end += 1
+        if end - index >= 2:
+            parts.append(f"{ordered[index]}-{ordered[end]}")
+        else:
+            parts.extend(str(value) for value in ordered[index:end + 1])
+        index = end + 1
+    return ",".join(parts)
+
+
+def lumae_row_minutes(cur):
+    """The minutes at which Lumae's other enabled cron rows are due.
+
+    AudioMuse's minute pass dispatches due rows in cron.id order, and the
+    watchdog's row comes first, so a watchdog due in the same minute was
+    queued first and the other row refused (the reporter's 06:02). Minutes
+    only: a daily row costs the watchdog one minute an hour. A row due every
+    minute, or with an unparseable minute field, excludes nothing.
+    """
+    cur.execute(
+        "SELECT cron_expr FROM cron WHERE starts_with(task_type, %s) AND task_type <> %s "
+        "AND enabled",
+        (LUMAE_TASK_TYPE_PREFIX, CATALOG_RECONCILE_TASK_TYPE),
+    )
+    excluded = set()
+    for (expr,) in cur.fetchall() or ():
+        minutes = cron_minutes(expr)
+        if minutes and len(minutes) < 60:
+            excluded |= minutes
+    return excluded
+
+
+def avoid_minutes(cron_expr, excluded):
+    """``cron_expr`` without the ``excluded`` minutes; unchanged when it
+    would have none left or its minute field is unparseable."""
+    minutes = cron_minutes(cron_expr)
+    if not minutes or not excluded or not minutes & excluded or not minutes - excluded:
+        return cron_expr
+    return " ".join([_minute_field(minutes - excluded)] + str(cron_expr).split()[1:])
+
+
+def yield_cron(excluded=(), now=None, rng=None):
+    """One random minute YIELD_MINUTES ahead (local time, as the host's cron
+    matcher reads it), off Lumae's other rows' minutes when it can be."""
+    rng = rng or random
+    current = time.localtime(now).tm_min
+    ahead = [(current + offset) % 60 for offset in range(YIELD_MINUTES[0], YIELD_MINUTES[1] + 1)]
+    minute = rng.choice([value for value in ahead if value not in excluded] or ahead)
+    return f"{minute} * * * *"
+
+
+def _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at=None, *, avoid=True):
+    """Store the cadence; returns the cron expression written. ``avoid``
+    takes Lumae's other rows' minutes out of it (plan S1)."""
+    if avoid:
+        cron_expr = avoid_minutes(cron_expr, lumae_row_minutes(cur))
     cur.execute(
         f"""
         UPDATE {control_table()}
@@ -176,6 +274,7 @@ def _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at=None):
             cron_expr,
         ),
     )
+    return cron_expr
 
 
 def arm_reconcile(db, reason="work_admitted", commit=False):
@@ -193,11 +292,11 @@ def set_paused(db, paused, commit=True):
         return reconcile_schedule_from_state(db, paused=False, commit=commit)
     cur = db.cursor()
     _lock_control(cur)
-    _set_schedule_locked(cur, "paused", IDLE_CRON, "maintenance_paused")
+    cron_expr = _set_schedule_locked(cur, "paused", IDLE_CRON, "maintenance_paused")
     cur.close()
     if commit:
         db.commit()
-    return {"mode": "paused", "cron_expr": IDLE_CRON, "next_retry_at": None}
+    return {"mode": "paused", "cron_expr": cron_expr, "next_retry_at": None}
 
 
 def _work_summary(cur):
@@ -331,11 +430,16 @@ def _recover_interrupted_events(cur):
     )
 
 
-def reconcile_schedule_from_state(db, paused=False, commit=True):
-    """Choose cadence from durable state while excluding concurrent lost wakes."""
+def reconcile_schedule_from_state(db, paused=False, commit=True, yield_to=None):
+    """Choose cadence from durable state while excluding concurrent lost wakes.
+
+    ``yield_to``: the tick left the queue to that host work (plan S1); the
+    watchdog waits on the yield cadence until a tick finds nothing to yield to.
+    """
     cur = db.cursor()
     _lock_control(cur)
     _recover_interrupted_events(cur)
+    avoid = True
     if paused:
         mode, cron_expr, reason, next_retry_at = (
             "paused",
@@ -343,6 +447,9 @@ def reconcile_schedule_from_state(db, paused=False, commit=True):
             "maintenance_paused",
             None,
         )
+    elif yield_to:
+        mode, reason, next_retry_at = "waiting", f"yield:{yield_to}", None
+        cron_expr, avoid = yield_cron(lumae_row_minutes(cur)), False
     else:
         state = _work_summary(cur)
         next_retry_at = state["next_retry_at"]
@@ -357,7 +464,7 @@ def reconcile_schedule_from_state(db, paused=False, commit=True):
             mode, reason = "backoff", "retry_backoff"
         else:
             mode, cron_expr, reason = "idle", IDLE_CRON, "catalog_current"
-    _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at)
+    cron_expr = _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at, avoid=avoid)
     cur.execute(
         f"UPDATE {control_table()} SET last_sweep_at=now() "
         "WHERE name='catalog_reconcile'"
@@ -818,3 +925,88 @@ class TickReport:
             self.cadence or "unchanged",
             f"; yielded to {self.yielded_to}" if self.yielded_to else "",
         )
+
+
+def host_blocking_task_types():
+    """The root task types AudioMuse's cron gate waits for, besides plugins."""
+    types = set(HOST_BLOCKING_TASK_TYPES)
+    try:
+        host = importlib.import_module("task_types")
+        types.update(str(name) for name in getattr(host, "BATCH_GATE_TASK_TYPES", ())
+                     if not str(name).startswith("plugin."))
+    except Exception:
+        pass
+    return sorted(types)
+
+
+class HostYield:
+    """What a tick leaves AudioMuse's queue to (plan S1, AUD-13).
+
+    - A ``cron_retry`` row other than the watchdog's own: a schedule the host
+      refused while a plugin task was live (its own, another plugin's, or one
+      of Lumae's other rows). At minute cadence its retry always lost to the
+      next watchdog fire until it expired. ``cron_retry`` exists from
+      AudioMuse 3.3.0; before, the host's gate ignores plugin tasks.
+    - A live AudioMuse main job or side job: the host's gate refuses every
+      start behind it.
+    Each check fails open: a missing table or a raising query turns only that
+    check off for the rest of the tick, logged once at DEBUG.
+    """
+
+    def __init__(self):
+        self.cron_retry = None  # None: not checked yet this tick
+        self.live_tasks = True
+
+    def check(self, db):
+        target = None
+        if self.cron_retry is not False:
+            target = self._safely(db, "cron_retry", self._retry_row)
+        if target is None and self.live_tasks:
+            target = self._safely(db, "live_tasks", self._live_root)
+        return target
+
+    def _safely(self, db, check, query):
+        cur = None
+        try:
+            cur = db.cursor()
+            target = query(cur)
+            cur.close()
+            db.commit()
+            return target
+        except Exception:
+            rollback = getattr(db, "rollback", None)
+            if callable(rollback):
+                try:
+                    rollback()
+                except Exception:
+                    pass
+            setattr(self, check, False)
+            logger.debug("lumae_analysis turned off the %s yield check for this tick", check,
+                         exc_info=True)
+            return None
+
+    def _retry_row(self, cur):
+        if self.cron_retry is None:
+            cur.execute("SELECT to_regclass('cron_retry') IS NOT NULL")
+            self.cron_retry = bool(cur.fetchone()[0])
+            if not self.cron_retry:
+                return None
+        cur.execute(
+            "SELECT task_type FROM cron_retry WHERE task_type <> %s ORDER BY task_type LIMIT 1",
+            (CATALOG_RECONCILE_TASK_TYPE,),
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+
+    def _live_root(self, cur):
+        cur.execute(
+            """
+            SELECT task_type FROM task_status
+             WHERE parent_task_id IS NULL AND task_type = ANY(%s)
+               AND status IN ('NEW', 'QUEUED', 'PENDING', 'STARTED', 'RUNNING', 'PROGRESS')
+             ORDER BY task_type LIMIT 1
+            """,
+            (host_blocking_task_types(),),
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row else None

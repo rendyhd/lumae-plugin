@@ -6,6 +6,9 @@ Plan: docs/plan/LUMAE_SCHEDULER_PLAN_2026-10-11.md (1.6.2: S1-S6).
   keeps its own retry time. The tick used to reset it, so the row was due at
   once, the watchdog stayed on minute cadence after the backfill had
   finished, and the edge pass ordered after it never ran.
+* S1 (AUD-13): while AudioMuse has a refused schedule in ``cron_retry`` or a
+  main job running, the tick does no work and waits on the yield cadence;
+  minute cadence leaves out the minutes of Lumae's other enabled rows.
 * S5 (AUD-18): the tick returns what it did (``tracks_analyzed``, one
   sentence as ``message``/``status_message``, actions, remaining work,
   cadence), logs one INFO line, journals credits, MusicBrainz and on-demand
@@ -14,6 +17,8 @@ Plan: docs/plan/LUMAE_SCHEDULER_PLAN_2026-10-11.md (1.6.2: S1-S6).
   Scheduled Tasks page stays, and the settings page says what stops.
 """
 import importlib
+import random
+import time
 
 import pytest
 
@@ -26,6 +31,10 @@ SOURCE = "catalog-a"
 SERVER = "server-a"
 RECONCILE = "plugin.lumae_analysis.catalog_reconcile"
 RECHECK = "plugin.lumae_analysis.provider_identity_recheck"
+COLLECTION_RETENTION = "plugin.lumae_analysis.collection_retention"
+# Minute cadence on the migrated schema: without the minutes of the installed
+# identity recheck (2,32) and collection retention (23 3 * * *) rows (S1).
+EVERY_MINUTE = "0,1,3-22,24-31,33-59 * * * *"
 
 
 def _rows(db, sql, params=()):
@@ -208,7 +217,7 @@ def test_a_disabled_watchdog_stays_disabled_through_every_cadence_and_a_reinstal
     _disable(db, RECONCILE)
 
     reconcile.arm_reconcile(db, "work_admitted", commit=True)
-    assert _cron(db) == reconcile.ACTIVE_CRON
+    assert _cron(db) == EVERY_MINUTE
     reconcile.set_paused(db, True)
     assert _cron(db) == reconcile.IDLE_CRON
     _queued_backfill(db)
@@ -299,10 +308,10 @@ def test_a_waveform_batch_reports_its_tracks_and_matches_its_event(tick, monkeyp
     assert result["message"] == result["status_message"]
     assert result["message"].startswith("Lumae: 1 waveform (1 failed) in ")
     assert result["message"].endswith("; 3 tracks left")
-    assert result["cadence"] == "* * * * *"
+    assert result["cadence"] == EVERY_MINUTE
     [line] = lines
     assert line.startswith("lumae_analysis watchdog: " + result["message"])
-    assert "profile_backfill queued 1/1 failed" in line and "cadence * * * * *" in line
+    assert "profile_backfill queued 1/1 failed" in line and f"cadence {EVERY_MINUTE}" in line
 
 
 @pytest.mark.parametrize(
@@ -420,3 +429,216 @@ def test_the_journal_keeps_a_day_per_source_within_its_bounds(tick):
     )[0][0] == 1200
     # The settings journal still shows the latest 25.
     assert len(reconcile.read_reconcile_status(db)["events"]) == 25
+
+
+# ---------------------------------------------------------------- S1 yield
+def _cron_retry(db, *task_types):
+    with db.cursor() as cur:
+        cur.execute(
+            "CREATE TABLE IF NOT EXISTS cron_retry (task_type TEXT PRIMARY KEY, "
+            "retry_until DOUBLE PRECISION, attempts INTEGER DEFAULT 0, "
+            "first_blocked_at DOUBLE PRECISION, blocker_task_id TEXT, blocker_task_type TEXT)"
+        )
+        for task_type in task_types:
+            cur.execute(
+                "INSERT INTO cron_retry (task_type, retry_until, first_blocked_at) "
+                "VALUES (%s, extract(epoch FROM now()) + 14400, extract(epoch FROM now()))",
+                (task_type,),
+            )
+    db.commit()
+
+
+def _live_root(db, task_type, status="RUNNING", task_id="host-task"):
+    with db.cursor() as cur:
+        cur.execute(
+            "INSERT INTO task_status (task_id, parent_task_id, task_type, status) "
+            "VALUES (%s, NULL, %s, %s)",
+            (task_id, task_type, status),
+        )
+    db.commit()
+
+
+def _ready_work(mod, db, monkeypatch):
+    """Ready waveform work: the cadence would be minute cadence."""
+    _track(db, "track-a")
+    _queued_backfill(db)
+    ran = []
+    monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: ran.append(ids) or {
+        "processed": len(ids), "attempted": len(ids), "ready": 0, "failed": 0, "skipped": 0})
+    return ran
+
+
+def _yield_minute(db):
+    mode, cron_expr, reason = _rows(
+        db, f"SELECT mode, cron_expr, reason FROM {P}reconcile_control")[0]
+    assert _cron(db) == cron_expr
+    minute, rest = cron_expr.split(" ", 1)
+    assert rest == "* * * *"
+    ahead = (int(minute) - time.localtime().tm_min) % 60
+    return mode, reason, ahead
+
+
+@pytest.mark.parametrize("blocked", [["analysis"], [COLLECTION_RETENTION],
+                                     ["analysis", COLLECTION_RETENTION]])
+def test_a_refused_schedule_makes_the_tick_yield(tick, monkeypatch, blocked):
+    mod, db = tick
+    ran = _ready_work(mod, db, monkeypatch)
+    _cron_retry(db, RECONCILE, *blocked)
+    monkeypatch.setattr(mod, "serve_deferred_interactive",
+                        lambda *args, **kwargs: pytest.fail("a yielding tick serves nothing"))
+
+    result = mod.catalog_reconcile_task()
+
+    assert (result["status"], result["yielded_to"]) == ("yielded", sorted(blocked)[0])
+    assert result["message"] == f"Lumae: yielded to {sorted(blocked)[0]}"
+    assert result["actions"] == [] and ran == [] and _events(db) == []
+    mode, reason, ahead = _yield_minute(db)
+    assert (mode, reason) == ("waiting", f"yield:{sorted(blocked)[0]}")
+    assert 5 <= ahead <= 15
+    assert result["cadence"] == _cron(db)
+    # The settings page says why.
+    assert "Waiting for AudioMuse" in mod.render_reconcile_status_panel()
+
+
+def test_the_watchdogs_own_retry_row_is_not_a_reason_to_yield(tick, monkeypatch):
+    mod, db = tick
+    ran = _ready_work(mod, db, monkeypatch)
+    _cron_retry(db, RECONCILE)
+    result = mod.catalog_reconcile_task()
+    assert result["status"] == "processed" and result["yielded_to"] is None
+    assert ran == [["track-a"]]
+
+
+def test_the_tick_resumes_and_returns_to_minute_cadence_once_the_retry_clears(tick, monkeypatch):
+    mod, db = tick
+    ran = _ready_work(mod, db, monkeypatch)
+    _cron_retry(db, "analysis")
+    assert mod.catalog_reconcile_task()["status"] == "yielded"
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM cron_retry")
+    db.commit()
+
+    result = mod.catalog_reconcile_task()
+
+    assert result["status"] == "processed" and ran == [["track-a"]]
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {P}profile_backfill_state SET status='queued', next_retry_at=NULL")
+    db.commit()
+    assert _reconcile().reconcile_schedule_from_state(db)["cron_expr"] == EVERY_MINUTE
+    assert _rows(db, f"SELECT mode, reason FROM {P}reconcile_control")[0] == (
+        "active", "runnable_work")
+
+
+@pytest.mark.parametrize(("task_type", "status", "yields"), [
+    ("main_analysis", "RUNNING", True),
+    ("main_analysis", "NEW", True),
+    ("main_clustering", "STARTED", True),
+    ("cleaning", "PENDING", True),
+    ("server_sweep", "PROGRESS", True),
+    ("main_analysis", "SUCCESS", False),
+    ("plugin.lumae_analysis.analyze_edges_task", "RUNNING", False),
+    ("plugin.other_plugin.sync", "RUNNING", False),
+    ("alchemy_radio", "RUNNING", False),
+    ("album_analysis", "RUNNING", False),
+])
+def test_a_live_audiomuse_main_job_makes_the_tick_yield(tick, monkeypatch, task_type, status,
+                                                        yields):
+    """Without cron_retry (AudioMuse before 3.3.0) only live tasks count."""
+    mod, db = tick
+    ran = _ready_work(mod, db, monkeypatch)
+    _live_root(db, task_type, status)
+    assert _rows(db, "SELECT to_regclass('cron_retry')") == [(None,)]
+
+    result = mod.catalog_reconcile_task()
+
+    assert result["yielded_to"] == (task_type if yields else None)
+    assert (ran == []) is yields
+
+
+def test_a_child_of_a_main_job_is_not_a_root(tick, monkeypatch):
+    mod, db = tick
+    _ready_work(mod, db, monkeypatch)
+    with db.cursor() as cur:
+        cur.execute("INSERT INTO task_status (task_id, parent_task_id, task_type, status) "
+                    "VALUES ('child', 'parent', 'main_analysis', 'RUNNING')")
+    db.commit()
+    assert mod.catalog_reconcile_task()["yielded_to"] is None
+
+
+def test_minute_cadence_skips_only_enabled_lumae_rows(tick):
+    _mod, db = tick
+    reconcile = _reconcile()
+
+    def armed():
+        reconcile.arm_reconcile(db, "work_admitted", commit=True)
+        return _cron(db)
+
+    assert armed() == EVERY_MINUTE
+    with db.cursor() as cur:
+        cur.execute("UPDATE cron SET enabled=TRUE WHERE task_type IN (%s, %s)",
+                    ("plugin.lumae_analysis.catalog_refresh",
+                     "plugin.lumae_analysis.analysis_projection"))
+    db.commit()
+    assert armed() == "0,1,3-16,18-22,24-31,33-46,48-59 * * * *"
+    for task_type in ("plugin.lumae_analysis.catalog_refresh",
+                      "plugin.lumae_analysis.analysis_projection", COLLECTION_RETENTION):
+        _disable(db, task_type)
+    assert armed() == "0,1,3-31,33-59 * * * *"
+    _disable(db, RECHECK)
+    assert armed() == "* * * * *"
+    # Another plugin's rows are not Lumae's to avoid.
+    with db.cursor() as cur:
+        cur.execute("INSERT INTO cron (name, task_type, cron_expr, enabled) "
+                    "VALUES ('other', 'plugin.other.sync', '7 * * * *', TRUE)")
+    db.commit()
+    assert armed() == "* * * * *"
+
+
+def test_the_host_loop_dispatches_a_refused_row_at_the_first_retry_pass_after_the_yield(
+    tick, monkeypatch,
+):
+    """AudioMuse runs its minute pass, then (every 11 minutes here) its retry
+    pass, in the same loop iteration. At minute cadence the watchdog queued
+    by the minute pass blocked every retry milliseconds later."""
+    mod, db = tick
+    reconcile = _reconcile()
+    _cron_retry(db, "analysis")
+    # The watchdog always has work.
+    monkeypatch.setattr(reconcile, "_work_summary", lambda cur: {
+        "ready": 1, "waiting": 0, "retry_count": 0, "next_retry_at": None,
+        "retry_in_seconds": None})
+    monkeypatch.setattr(mod, "_reconcile_tick", lambda db, report: "processed")
+    reconcile.arm_reconcile(db, "work_admitted", commit=True)
+    start = time.mktime((2026, 10, 11, 2, 0, 0, 0, 0, -1))
+    clock = {"now": start}
+    real_yield_cron = reconcile.yield_cron
+    monkeypatch.setattr(reconcile, "yield_cron",
+                        lambda excluded=(), now=None, rng=None: real_yield_cron(
+                            excluded, now=clock["now"], rng=random.Random(4)))
+    dispatched_at = None
+    for minute in range(40):
+        clock["now"] = start + minute * 60
+        # Minute pass: the watchdog, if due and nothing blocks it.
+        live = _rows(db, "SELECT count(*) FROM task_status WHERE status IN ('NEW', 'RUNNING')")
+        queued = (_reconcile().cron_minutes(_cron(db)) and minute in _reconcile().cron_minutes(
+            _cron(db)) and live == [(0,)])
+        if queued:
+            _live_root(db, RECONCILE, "NEW", task_id=f"tick-{minute}")
+        # Retry pass, milliseconds later.
+        if minute % 11 == 5 and _rows(db, "SELECT 1 FROM cron_retry WHERE task_type='analysis'"):
+            if _rows(db, "SELECT count(*) FROM task_status WHERE status IN ('NEW', 'RUNNING')") \
+                    == [(0,)]:
+                with db.cursor() as cur:
+                    cur.execute("DELETE FROM cron_retry WHERE task_type='analysis'")
+                db.commit()
+                dispatched_at = minute
+                break
+        if queued:
+            mod.catalog_reconcile_task()
+            with db.cursor() as cur:
+                cur.execute("UPDATE task_status SET status='SUCCESS' WHERE task_id=%s",
+                            (f"tick-{minute}",))
+            db.commit()
+    # The first tick yielded at 02:00 to a minute 5-15 ahead that is not the
+    # 02:05 retry pass, so that pass dispatched the row.
+    assert dispatched_at == 5

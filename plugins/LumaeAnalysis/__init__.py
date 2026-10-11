@@ -147,6 +147,7 @@ from .collection_manager import (
 from .reconcile import (
     DEFERRED_MARKER,
     IDLE_CRON as RECONCILE_IDLE_CRON,
+    HostYield,
     TickReport,
     arm_reconcile,
     begin_event,
@@ -802,11 +803,12 @@ def _rollback_if_possible(db):
         rollback()
 
 
-def _safe_reconcile_schedule(db, paused=None):
+def _safe_reconcile_schedule(db, paused=None, yield_to=None):
     try:
         return reconcile_schedule_from_state(
             db,
             paused=maintenance_paused() if paused is None else bool(paused),
+            yield_to=yield_to,
         )
     except Exception:
         _rollback_if_possible(db)
@@ -1060,14 +1062,19 @@ def catalog_reconcile_task():
         return report.result("paused", **versions)
     status = "failed"
     try:
-        status = _reconcile_tick(db, report)
+        # While AudioMuse has a refused schedule to retry or a main job
+        # running, the tick does no work (plan S1, AUD-13).
+        report.yielded_to = HostYield().check(db)
+        status = "yielded" if report.yielded_to else _reconcile_tick(db, report)
     finally:
-        schedule = _safe_reconcile_schedule(db)
-        # The waveform counts that /settings/status reads follow the tick's
-        # work, and a publication left without a summary gets one (P2-1).
-        refresh_status_snapshot(db, publications=True)
+        schedule = _safe_reconcile_schedule(db, yield_to=report.yielded_to)
+        if not report.yielded_to:
+            # The waveform counts that /settings/status reads follow the
+            # tick's work, and a publication left without a summary gets
+            # one (P2-1).
+            refresh_status_snapshot(db, publications=True)
+            report.remaining = _safe_remaining_work(db)
         report.cadence = (schedule or {}).get("cron_expr")
-        report.remaining = _safe_remaining_work(db)
         report.log(status)
     return report.result(status, **versions)
 
