@@ -394,17 +394,20 @@ def edge_profile_status(db, catalog_id):
     }
 
 
-def edge_backfill_candidates(db, catalog_id, after='', limit=100):
+def _edge_due_sql():
     # Published waveform rows without an edge for their media (P3-7): an edge
     # is published only for, and read only through, such a row. An attempt
     # row may be unpublished or describe other media than what is published.
-    cur = db.cursor()
-    cur.execute(f"""SELECT p.track_id FROM {table('published_source_profiles')} p {edge_join()}
+    return f"""{table('published_source_profiles')} p {edge_join()}
         LEFT JOIN {table('edge_profile_jobs')} j ON j.catalog_instance_id=p.catalog_instance_id AND j.track_id=p.track_id
-        WHERE p.catalog_instance_id=%s AND p.media_signature IS NOT NULL
-          AND p.track_id>%s AND edge.payload IS NULL
+        WHERE p.catalog_instance_id=%s AND p.media_signature IS NOT NULL AND edge.payload IS NULL
           AND (j.track_id IS NULL OR j.updated_at < now()-interval '6 hours'
-               OR (j.status='failed' AND j.last_error='edge-enqueue-failed'))
+               OR (j.status='failed' AND j.last_error='edge-enqueue-failed'))"""
+
+
+def edge_backfill_candidates(db, catalog_id, after='', limit=100):
+    cur = db.cursor()
+    cur.execute(f"""SELECT p.track_id FROM {_edge_due_sql()} AND p.track_id>%s
         ORDER BY p.track_id LIMIT %s""", (catalog_id, after, max(1, min(100, int(limit)))))
     ids = [row[0] for row in cur.fetchall()]
     cur.close()
@@ -487,6 +490,27 @@ def arm_edge_backfill(db, catalog_id=None, include_complete=True):
     db.commit()
     cur.close()
     return armed
+
+
+def rewind_edge_backfill(db, catalog_id, track_id):
+    """Make the source's pass due and reach ``track_id``; returns whether it changed.
+
+    Only when the track is a pass candidate. A finished or parked pass starts
+    again; a queued pass already past the track restarts from the beginning,
+    which costs one scan because candidates skip tracks that have an edge. A
+    running or failed pass is left as it is.
+    """
+    cur = db.cursor()
+    cur.execute(f"""UPDATE {table('edge_backfill_state')} SET status='queued', next_retry_at=NULL,
+            cursor='', updated_at=now()
+        WHERE catalog_instance_id=%s
+          AND (status IN ('complete', 'waiting_runtime') OR (status='queued' AND cursor>=%s))
+          AND EXISTS (SELECT 1 FROM {_edge_due_sql()} AND p.track_id=%s)""",
+                (catalog_id, track_id, catalog_id, track_id))
+    rewound = (cur.rowcount or 0) > 0
+    db.commit()
+    cur.close()
+    return rewound
 
 
 def park_edge_backfill(db):

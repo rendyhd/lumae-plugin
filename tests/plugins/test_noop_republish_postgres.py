@@ -375,21 +375,120 @@ def test_serializer_emits_float4_ref_lufs_on_every_path():
     )["ref_lufs"] is None
 
 
+def _edge_pass(db, status, cursor="", next_retry_hours=None):
+    with db.cursor() as cur:
+        cur.execute(
+            f"""INSERT INTO {P}edge_backfill_state
+                (catalog_instance_id, status, cursor, next_retry_at)
+                VALUES (%s, %s, %s, CASE WHEN %s::int IS NULL THEN NULL
+                                         ELSE now()+make_interval(hours => %s::int) END)""",
+            (SOURCE, status, cursor, next_retry_hours, next_retry_hours),
+        )
+    db.commit()
+
+
+def _pass_row(db):
+    return _fetch(
+        db,
+        f"""SELECT status, cursor, next_retry_at IS NULL FROM {P}edge_backfill_state
+             WHERE catalog_instance_id=%s""",
+        (SOURCE,),
+    )[0]
+
+
+def _record_reconcile_arms(mod, monkeypatch):
+    reasons = []
+    monkeypatch.setattr(
+        mod, "arm_reconcile", lambda _db, reason="", commit=False: reasons.append(reason),
+    )
+    return reasons
+
+
 def test_song_hook_on_current_row_heals_a_missing_edge(source_db, monkeypatch, tmp_path):
+    """The hook queues no task: a finished pass is made due and the watchdog armed."""
     mod = load_plugin()
     db = source_db
     _complete(db, "track-a", _result())
-    assert _snapshot(db, "track-a")["jobs"] == []
+    _edge_pass(db, "complete", next_retry_hours=6)
+    reasons = _record_reconcile_arms(mod, monkeypatch)
 
     outcome, seen = _hook(mod, monkeypatch, tmp_path, real_edge_upgrade=True)
 
     assert outcome == {"track_id": "track-a", "status": "current"}
     assert seen["mark_pending"] == 0 and seen["analyzed"] == 0
-    assert seen["edge_batches"] == [["track-a"]]
-    jobs = _snapshot(db, "track-a")["jobs"]
-    assert [(job[0], job[2]) for job in jobs] == [
-        (opaque_revision("catalog-media:rev-a"), "pending")
-    ]
+    assert seen["edge_batches"] == []
+    assert _snapshot(db, "track-a")["jobs"] == []
+    assert _pass_row(db) == ("queued", "", True)
+    assert reasons == ["edge_backfill_ready"]
+    assert store.edge_backfill_candidates(db, SOURCE) == ["track-a"]
+
+
+def test_song_hook_ready_track_leaves_its_edge_to_the_pass(source_db, monkeypatch, tmp_path):
+    mod = load_plugin()
+    db = source_db
+    _edge_pass(db, "complete", next_retry_hours=6)
+    reasons = _record_reconcile_arms(mod, monkeypatch)
+
+    outcome, seen = _hook(mod, monkeypatch, tmp_path, real_edge_upgrade=True)
+
+    assert outcome == {"track_id": "track-a", "status": "ready"}
+    assert seen["analyzed"] == 1 and seen["edge_batches"] == []
+    assert _snapshot(db, "track-a")["jobs"] == []
+    assert _pass_row(db) == ("queued", "", True)
+    assert reasons == ["edge_backfill_ready"]
+
+
+@pytest.mark.parametrize(
+    ("cursor", "expected"),
+    [("track-z", ("queued", "", True)), ("track-a", ("queued", "", True)),
+     ("track-0", ("queued", "track-0", True))],
+)
+def test_song_hook_rewinds_a_queued_pass_only_when_past_the_track(
+    source_db, monkeypatch, tmp_path, cursor, expected,
+):
+    mod = load_plugin()
+    db = source_db
+    _complete(db, "track-a", _result())
+    _edge_pass(db, "queued", cursor=cursor)
+    reasons = _record_reconcile_arms(mod, monkeypatch)
+
+    _hook(mod, monkeypatch, tmp_path, real_edge_upgrade=True)
+
+    assert _pass_row(db) == expected
+    assert reasons == (["edge_backfill_ready"] if cursor >= "track-a" else [])
+
+
+@pytest.mark.parametrize("status", ["running", "failed"])
+def test_song_hook_leaves_a_running_or_failed_pass_alone(
+    source_db, monkeypatch, tmp_path, status,
+):
+    mod = load_plugin()
+    db = source_db
+    _complete(db, "track-a", _result())
+    _edge_pass(db, status, cursor="track-z", next_retry_hours=1 if status == "failed" else None)
+    before = _pass_row(db)
+    reasons = _record_reconcile_arms(mod, monkeypatch)
+
+    _hook(mod, monkeypatch, tmp_path, real_edge_upgrade=True)
+
+    assert _pass_row(db) == before
+    assert reasons == []
+
+
+def test_song_hook_does_not_rewind_for_a_track_in_back_off(source_db, monkeypatch, tmp_path):
+    """A failed edge job waits out its back-off; the pass would skip it anyway."""
+    mod = load_plugin()
+    db = source_db
+    _complete(db, "track-a", _result())
+    jobs, _ready = store.claim_edge_jobs(db, SOURCE, ["track-a"])
+    assert store.update_edge_job(db, SOURCE, jobs[0], "failed", "decode")
+    _edge_pass(db, "complete", next_retry_hours=6)
+    reasons = _record_reconcile_arms(mod, monkeypatch)
+
+    _hook(mod, monkeypatch, tmp_path, real_edge_upgrade=True)
+
+    assert _pass_row(db) == ("complete", "", False)
+    assert reasons == []
 
 
 def test_song_hook_on_current_row_with_current_edge_requests_no_job(
@@ -399,10 +498,14 @@ def test_song_hook_on_current_row_with_current_edge_requests_no_job(
     db = source_db
     _complete(db, "track-a", _result())
     _publish_edge(db, "track-a")
+    _edge_pass(db, "complete", next_retry_hours=6)
     before = _snapshot(db, "track-a")
+    reasons = _record_reconcile_arms(mod, monkeypatch)
 
     outcome, seen = _hook(mod, monkeypatch, tmp_path, real_edge_upgrade=True)
 
     assert outcome == {"track_id": "track-a", "status": "current"}
     assert seen["edge_batches"] == []
     assert _snapshot(db, "track-a") == before
+    assert _pass_row(db) == ("complete", "", False)
+    assert reasons == []
