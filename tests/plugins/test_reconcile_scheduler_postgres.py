@@ -6,6 +6,8 @@ Plan: docs/plan/LUMAE_SCHEDULER_PLAN_2026-10-11.md (1.6.2: S1-S6).
   keeps its own retry time. The tick used to reset it, so the row was due at
   once, the watchdog stayed on minute cadence after the backfill had
   finished, and the edge pass ordered after it never ran.
+* S6 (AUD-18): an administrator's disable of Lumae's cron rows on AudioMuse's
+  Scheduled Tasks page stays, and the settings page says what stops.
 """
 import importlib
 
@@ -19,6 +21,7 @@ P = "plugin_lumae_analysis__"
 SOURCE = "catalog-a"
 SERVER = "server-a"
 RECONCILE = "plugin.lumae_analysis.catalog_reconcile"
+RECHECK = "plugin.lumae_analysis.provider_identity_recheck"
 
 
 def _rows(db, sql, params=()):
@@ -182,3 +185,70 @@ def test_complete_backfill_stays_complete(tick, monkeypatch):
     assert result["result"]["status"] == "complete"
     assert _backfill_row(db) == ("complete", None, 0)
     assert _rows(db, f"SELECT mode FROM {P}reconcile_control")[0][0] == "idle"
+
+
+def _enabled(db, task_type):
+    return _rows(db, "SELECT enabled FROM cron WHERE task_type=%s", (task_type,))
+
+
+def _disable(db, task_type):
+    with db.cursor() as cur:
+        cur.execute("UPDATE cron SET enabled=FALSE WHERE task_type=%s", (task_type,))
+    db.commit()
+
+
+def test_a_disabled_watchdog_stays_disabled_through_every_cadence_and_a_reinstall(
+    tick, monkeypatch, run_plugin_migration,
+):
+    mod, db = tick
+    reconcile = _reconcile()
+    _disable(db, RECONCILE)
+
+    reconcile.arm_reconcile(db, "work_admitted", commit=True)
+    assert _cron(db) == reconcile.ACTIVE_CRON
+    reconcile.set_paused(db, True)
+    assert _cron(db) == reconcile.IDLE_CRON
+    _queued_backfill(db)
+    assert reconcile.reconcile_schedule_from_state(db)["mode"] == "active"
+    monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: pytest.fail(ids))
+    mod.catalog_reconcile_task()
+    assert _rows(db, f"SELECT mode FROM {P}reconcile_control")[0][0] == "idle"
+    assert _enabled(db, RECONCILE) == [(False,)]
+
+    run_plugin_migration(db)
+    assert _enabled(db, RECONCILE) == [(False,)]
+
+
+def test_the_identity_recheck_is_installed_enabled_and_keeps_a_later_change(
+    migrated_db, run_plugin_migration,
+):
+    db = migrated_db
+    assert _rows(db, "SELECT cron_expr, enabled FROM cron WHERE task_type=%s", (RECHECK,)) == [
+        ("2,32 * * * *", True)]
+    with db.cursor() as cur:
+        cur.execute("UPDATE cron SET enabled=FALSE, cron_expr='5 * * * *' WHERE task_type=%s",
+                    (RECHECK,))
+    db.commit()
+    run_plugin_migration(db)
+    assert _rows(db, "SELECT cron_expr, enabled FROM cron WHERE task_type=%s", (RECHECK,)) == [
+        ("5 * * * *", False)]
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM cron WHERE task_type=%s", (RECHECK,))
+    db.commit()
+    run_plugin_migration(db)
+    assert _enabled(db, RECHECK) == [(True,)]
+
+
+@pytest.mark.parametrize("disabled", [(), (RECONCILE,), (RECHECK,), (RECONCILE, RECHECK)])
+def test_the_settings_page_says_what_stops_while_a_row_is_disabled(tick, disabled):
+    mod, db = tick
+    for task_type in disabled:
+        _disable(db, task_type)
+
+    html = mod.render_reconcile_status_panel()
+
+    assert ("The catalogue watchdog is disabled" in html) is (RECONCILE in disabled)
+    assert ("Lumae does no background work" in html) is (RECONCILE in disabled)
+    assert ("The provider identity recheck is disabled" in html) is (RECHECK in disabled)
+    for task_type in disabled:
+        assert f"<code>{task_type}</code>" in html

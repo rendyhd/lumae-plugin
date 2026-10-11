@@ -9,7 +9,9 @@ from plugin.api import get_db, table
 from . import migrations
 
 
+LUMAE_TASK_TYPE_PREFIX = "plugin.lumae_analysis."
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
+PROVIDER_IDENTITY_RECHECK_TASK_TYPE = "plugin.lumae_analysis.provider_identity_recheck"
 ACTIVE_CRON = "* * * * *"
 # On-demand work AudioMuse refused to queue (``last_error`` of a pending
 # interactive attempt or edge job). It is runnable work for the watchdog.
@@ -149,10 +151,12 @@ def _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at=None):
             next_retry_at,
         ),
     )
+    # The cadence only: an administrator's disable on AudioMuse's Scheduled
+    # Tasks page stays (1.6.1 re-enabled the row on every change, AUD-18).
     cur.execute(
-        "UPDATE cron SET name=%s, cron_expr=%s, enabled=TRUE "
+        "UPDATE cron SET name=%s, cron_expr=%s "
         "WHERE task_type=%s AND (name IS DISTINCT FROM %s "
-        "OR cron_expr IS DISTINCT FROM %s OR enabled IS DISTINCT FROM TRUE)",
+        "OR cron_expr IS DISTINCT FROM %s)",
         (
             CATALOG_RECONCILE_TASK_TYPE,
             cron_expr,
@@ -570,6 +574,11 @@ def read_reconcile_status(db):
         (EVENT_RETENTION_PER_SOURCE,),
     )
     rows = cur.fetchall()
+    cur.execute(
+        "SELECT task_type, enabled FROM cron WHERE starts_with(task_type, %s)",
+        (LUMAE_TASK_TYPE_PREFIX,),
+    )
+    schedules = {str(task_type): enabled for task_type, enabled in cur.fetchall()}
     cur.close()
     keys = (
         "event_id", "server_id", "catalog_instance_id", "action", "status", "phase",
@@ -588,6 +597,8 @@ def read_reconcile_status(db):
         },
         "pending": pending,
         "events": events,
+        # task_type -> enabled for every Lumae cron row.
+        "schedules": schedules,
     }
 
 

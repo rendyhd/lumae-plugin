@@ -544,11 +544,12 @@ def ensure_catalog_reconcile_schedule(db):
 
 
 def ensure_provider_identity_recheck_schedule(db):
+    """Enabled on install; an administrator's later change to the row is kept
+    (1.6.1 re-enabled it on every install, AUD-18)."""
     cur = db.cursor()
     cur.execute(
         "INSERT INTO cron (name, task_type, cron_expr, enabled) "
-        "VALUES (%s, %s, %s, TRUE) ON CONFLICT (task_type) DO UPDATE SET "
-        "cron_expr=EXCLUDED.cron_expr, enabled=TRUE",
+        "VALUES (%s, %s, %s, TRUE) ON CONFLICT (task_type) DO NOTHING",
         (
             PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
             PROVIDER_IDENTITY_RECHECK_TASK_TYPE,

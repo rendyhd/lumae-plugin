@@ -1179,6 +1179,30 @@ def render_reconcile_status_panel():
         if control.get("next_retry_at")
         else ""
     )
+    schedules = snapshot.get("schedules") or {}
+    disabled_html = ""
+    if schedules.get(_pkg.CATALOG_RECONCILE_TASK_TYPE) is False:
+        disabled_html += f"""
+          <div class="lumae-notice lumae-notice-warning" role="status">
+            <strong>The catalogue watchdog is disabled in AudioMuse’s Scheduled Tasks.</strong>
+            <span>While it is, Lumae does no background work: waveform and edge backfills,
+              album and artist relationships, credits and MusicBrainz lookups wait, finished
+              AudioMuse analysis runs are not picked up, and on-demand requests AudioMuse
+              refused to queue are not served. Enable
+              <code>{_pkg.escape(_pkg.CATALOG_RECONCILE_TASK_TYPE)}</code> there to resume.</span>
+          </div>
+        """
+    if schedules.get(_pkg.PROVIDER_IDENTITY_RECHECK_TASK_TYPE) is False:
+        disabled_html += f"""
+          <div class="lumae-notice lumae-notice-warning" role="status">
+            <strong>The provider identity recheck is disabled in AudioMuse’s Scheduled Tasks.</strong>
+            <span>While it is, a pending media-server ID change and a finished AudioMuse
+              provider migration are carried through only by a catalogue refresh or an
+              analysis run, not every 30 minutes. Enable
+              <code>{_pkg.escape(_pkg.PROVIDER_IDENTITY_RECHECK_TASK_TYPE)}</code> there to
+              resume.</span>
+          </div>
+        """
     return f"""
       <section class="lumae-panel" aria-label="Background reconcile status"
         data-lumae-active="{str(bool(running)).lower()}">
@@ -1186,6 +1210,7 @@ def render_reconcile_status_panel():
         <h3>Background reconcile is {_pkg.escape(str(mode).replace('_', ' '))}</h3>
         <p class="lumae-action-copy">{_pkg.escape(cadence)}. AudioMuse may label these tasks
           “Songs analyzed: 0”; the action and phase below are Lumae’s authoritative status.</p>
+        {disabled_html}
         {running_html}
         <ul class="lumae-help">{pending_html}</ul>
         {next_retry}
