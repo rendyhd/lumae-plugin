@@ -5240,7 +5240,9 @@ def test_reconcile_profile_batch_reports_track_outcomes_without_batch_retry(
     expected_state = "queued" if more_work else "complete"
     assert result["status"] == expected_state
     assert states == [expected_state]
-    assert retries == [{"work_key": "catalog-a", "failed": False}]
+    # A finished backfill keeps the retry time it stored (AUD-15).
+    assert retries == [{"work_key": "catalog-a", "failed": False,
+                        "keep_next_retry": not more_work}]
     assert len(events) == 1
     event = events[0]
     # The batch completed normally, even when every individual track failed.

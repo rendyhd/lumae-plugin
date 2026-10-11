@@ -924,6 +924,13 @@ def _run_reconcile_action(
                 catalog_instance_id,
                 work_key=work_key,
                 failed=False,
+                # A finished backfill stored its soonest track retry (or
+                # none); clearing it made the row due at once and held
+                # minute cadence after the backfill (AUD-15).
+                keep_next_retry=(
+                    action == "profile_backfill"
+                    and result_status in ("waiting_retry", "complete")
+                ),
             )
             finish_event(
                 db,

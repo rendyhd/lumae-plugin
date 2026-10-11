@@ -367,7 +367,9 @@ def _retry_target(action):
     raise ValueError(f"Unknown reconciliation action: {action}")
 
 
-def update_work_retry(db, action, catalog_instance_id, work_key=None, *, failed=True):
+def update_work_retry(db, action, catalog_instance_id, work_key=None, *, failed=True,
+                      keep_next_retry=False):
+    """``keep_next_retry``: a success that stored its own ``next_retry_at``."""
     table_name = _retry_target(action)
     cur = db.cursor()
     if failed:
@@ -398,9 +400,9 @@ def update_work_retry(db, action, catalog_instance_id, work_key=None, *, failed=
         if action == "analysis_run":
             where += " AND run_id=%s"
             params.append(work_key)
+        reset = "retry_count=0" if keep_next_retry else "retry_count=0, next_retry_at=NULL"
         cur.execute(
-            f"UPDATE {_work_table(table_name)} "
-            f"SET retry_count=0, next_retry_at=NULL WHERE {where}",
+            f"UPDATE {_work_table(table_name)} SET {reset} WHERE {where}",
             tuple(params),
         )
         cur.close()
