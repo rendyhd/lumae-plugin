@@ -591,7 +591,7 @@ Gate: `capabilities.edge_profiles.schema_versions` includes `3` (§2). Decisions
 **Payload.** v3 is a deterministic projection of the stored edge:
 
 - `schema_version: 3`. Every other v2 field is unchanged, including `analyzer_version` (`"lumae-edge-v2.0.0"`), `measurement`, `landmarks` and the windows' `origin_frame`, `covered_frames`, `bin_count`, `boundaries` and `valid`.
-- Windows (`head`, `tail` and the optional `ending`) carry `level_cdb`, `true_peak_cdb`, `low_power_cdb`, `mid_power_cdb`, `high_power_cdb` and `onset_density_q15`: **no `peak_cdb` and no `spectral_flux_q15`** (D3; no client planner reads them). About a third smaller than v2.
+- Windows (`head`, `tail` and the optional `ending`) carry `level_cdb`, `true_peak_cdb`, `low_power_cdb`, `mid_power_cdb`, `high_power_cdb` and `onset_density_q15`: **no `peak_cdb` and no `spectral_flux_q15`** (D3; no client planner reads them). About a sixth smaller than v2 (a full-length edge: about 16 KB of canonical JSON against 19.5 KB).
 - Optional, always together: `landmarks.music_end_frame` and `ending` (D9, below).
 - `profile_digest`: §4.2 over the v3 object. It differs from the v2 digest of the same edge.
 
