@@ -35,6 +35,11 @@ BACKOFF_LADDER = (
 # runs about every 11 minutes (CRON_RETRY_INTERVAL_MINUTES, stamped after the
 # pass), so a fixed cadence could meet it on every pass.
 YIELD_MINUTES = (5, 15)
+# A tick works for at most this long, over as many actions as fit (plan S2),
+# so it never covers the next minute's host fire. Each action stops at the
+# deadline itself; an action starts only when its recent average fits.
+TICK_BUDGET_SECONDS = 45
+ACTION_AVERAGE_RUNS = 10
 # AudioMuse's main jobs and side jobs: its cron gate refuses every start
 # while one is live. A host with task_types adds BATCH_GATE_TASK_TYPES.
 HOST_BLOCKING_TASK_TYPES = (
@@ -885,6 +890,8 @@ class TickReport:
             body = ", ".join(phrases) + f" in {round(time.monotonic() - self.started)} s"
             if status == "failed":
                 body += ", then an action failed"
+            elif self.yielded_to:
+                body += f", then yielded to {self.yielded_to}"
         elif status == "failed":
             body = "an action failed"
         else:
@@ -1010,3 +1017,49 @@ class HostYield:
         )
         row = cur.fetchone()
         return str(row[0]) if row else None
+
+
+def action_averages(db):
+    """Average milliseconds of each action's last ACTION_AVERAGE_RUNS finished runs."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT action, avg(duration_ms) FROM (
+            SELECT action, duration_ms,
+                   row_number() OVER (PARTITION BY action ORDER BY event_id DESC) AS position
+              FROM {events_table()}
+             WHERE status IN ('success', 'deferred') AND duration_ms IS NOT NULL
+        ) recent
+         WHERE position <= %s
+         GROUP BY action
+        """,
+        (ACTION_AVERAGE_RUNS,),
+    )
+    averages = {str(action): float(value) for action, value in cur.fetchall() if value is not None}
+    cur.close()
+    db.commit()
+    return averages
+
+
+class TickBudget:
+    """The tick's deadline (plan S2), on the monotonic clock."""
+
+    def __init__(self, seconds=None, averages=None):
+        self.deadline = time.monotonic() + (TICK_BUDGET_SECONDS if seconds is None else seconds)
+        self.averages = dict(averages or {})
+        self.started = 0
+
+    def remaining(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+    def fits(self, action):
+        """Whether ``action`` may start: the tick's first action always may,
+        a later one only when its recent average fits in what is left."""
+        if not self.started:
+            return True
+        remaining = self.remaining()
+        average = self.averages.get(action)
+        return remaining > 0 and (average is None or average / 1000.0 <= remaining)
+
+    def start(self):
+        self.started += 1

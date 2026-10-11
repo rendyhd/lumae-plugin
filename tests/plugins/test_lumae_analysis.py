@@ -5,6 +5,7 @@ import pathlib
 import struct
 import sys
 import math
+import time
 import types
 import uuid
 
@@ -5024,39 +5025,52 @@ def test_reconcile_watchdog_is_a_noop_for_current_attested_catalogues(monkeypatc
     }
 
 
-def test_reconcile_watchdog_processes_only_the_highest_priority_action(monkeypatch):
+def test_reconcile_watchdog_runs_due_actions_in_priority_order(monkeypatch):
+    """Plan S2: one tick runs several actions, highest priority first, and
+    starts the order again after each."""
     mod = load_plugin()
     db = object()
     calls = []
+    runs = [{"server_id": "server-a", "catalog_instance_id": "catalog-a", "run_id": "run-a"}]
+    batches = [("server-a", "catalog-a", 0)] * 2
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(
-        mod,
-        "next_settled_analysis_run",
-        lambda db=None, server_id=None: {
-            "server_id": "server-a",
-            "catalog_instance_id": "catalog-a",
-            "run_id": "run-a",
-        },
+        mod, "next_settled_analysis_run",
+        lambda db=None, server_id=None: runs.pop(0) if runs else None,
     )
     monkeypatch.setattr(
-        mod,
-        "finalize_analysis_run_task",
+        mod, "finalize_analysis_run_task",
         lambda *args: calls.append(("analysis", args)) or {"status": "complete"},
     )
+    monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
+    for name in ("next_preparation_run", "next_relationship_run"):
+        monkeypatch.setattr(mod, name, lambda db=None, server_id=None: None)
     monkeypatch.setattr(
-        mod,
-        "enqueue_required_catalog_preparations",
-        lambda **_kwargs: (_ for _ in ()).throw(
-            AssertionError("a watchdog tick must stop after one action")
-        ),
+        mod, "next_profile_backfill_run",
+        lambda db=None, server_id=None: batches.pop(0) if batches else None,
     )
+    monkeypatch.setattr(
+        mod, "profile_backfill_task",
+        lambda server_id, catalog_id, deadline=None: calls.append(("waveforms", deadline))
+        or {"status": "queued", "ready": 3},
+    )
+    monkeypatch.setattr(mod, "_safe_credits_reconcile", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "_safe_metadata_reconcile", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "_safe_reconcile_schedule", lambda *_args, **_kwargs: None)
+    _stub_edge_reconcile(monkeypatch, mod)
+    monkeypatch.setattr(mod, "_run_reconcile_action",
+                        lambda _db, _action, *args: args[4](*args[5:]))
 
     result = mod.catalog_reconcile_task()
+
     assert result["status"] == "processed"
-    assert [(entry["action"], entry["status"], entry["count"]) for entry in result["actions"]] == [
-        ("analysis_run", "complete", 1)]
-    assert result["message"].startswith("Lumae: 1 analysis run in ")
-    assert calls == [("analysis", ("server-a", "catalog-a", "run-a"))]
+    assert [(entry["action"], entry["runs"], entry["count"]) for entry in result["actions"]] == [
+        ("analysis_run", 1, 1), ("profile_backfill", 2, 6)]
+    assert result["message"].startswith("Lumae: 6 waveforms, 1 analysis run in ")
+    assert calls[0] == ("analysis", ("server-a", "catalog-a", "run-a"))
+    # Each batch gets the tick's deadline.
+    assert [name for name, _ in calls[1:]] == ["waveforms", "waveforms"]
+    assert calls[1][1] == calls[2][1] and calls[1][1] > time.monotonic()
 
 
 @pytest.mark.parametrize(
@@ -5095,19 +5109,23 @@ def test_reconcile_schedule_adapts_to_durable_work(summary, expected_mode, expec
 
 
 @pytest.mark.parametrize(
-    ("background", "metadata_results", "expected_action", "expected_turns"),
+    ("background", "metadata_results", "expected_actions", "expected_turns"),
     [
-        # A due lookup whose turn has come runs before the library backfill.
-        (True, {True: {"status": "verified", "job_id": "job-a"}}, "music_metadata", [True]),
-        # A lookup that ran recently waits; the backfill takes this tick.
-        (True, {}, "profile_backfill", [True]),
-        # With no background work left, a due lookup runs on every tick.
-        (False, {False: {"status": "verified", "job_id": "job-a"}}, "music_metadata", [True, False]),
-        (False, {}, None, [True, False]),
+        # A due lookup whose turn has come runs before the library backfill,
+        # and the backfill runs after it in the same tick.
+        (True, {True: [{"status": "verified", "job_id": "job-a"}]},
+         ["music_metadata", "profile_backfill"], [True, False]),
+        # A lookup that ran recently waits; the backfill takes the tick.
+        (True, {}, ["profile_backfill"], [True, False]),
+        # With no background work left, due lookups run one after another.
+        (False, {False: [{"status": "verified", "job_id": "job-a"},
+                         {"status": "verified", "job_id": "job-b"}]},
+         ["music_metadata"], [True, False, False, False]),
+        (False, {}, [], [True, False]),
     ],
 )
 def test_reconcile_serves_metadata_lookups_taking_turns_with_background_work(
-    monkeypatch, background, metadata_results, expected_action, expected_turns
+    monkeypatch, background, metadata_results, expected_actions, expected_turns
 ):
     mod = load_plugin()
     turns = []
@@ -5115,10 +5133,11 @@ def test_reconcile_serves_metadata_lookups_taking_turns_with_background_work(
     monkeypatch.setattr(mod, "get_db", lambda: object())
     for name in ("next_settled_analysis_run", "next_preparation_run", "next_relationship_run"):
         monkeypatch.setattr(mod, name, lambda db=None, server_id=None: None)
+    batches = [("server-a", "catalog-a", 0)] if background else []
     monkeypatch.setattr(
         mod,
         "next_profile_backfill_run",
-        lambda db=None, server_id=None: ("server-a", "catalog-a", 0) if background else None,
+        lambda db=None, server_id=None: batches.pop(0) if batches else None,
     )
     monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
     monkeypatch.setattr(mod, "_safe_credits_reconcile", lambda *_args, **_kwargs: None)
@@ -5130,22 +5149,25 @@ def test_reconcile_serves_metadata_lookups_taking_turns_with_background_work(
     )
     _stub_edge_reconcile(monkeypatch, mod)
 
-    def metadata(_db, before_background=False):
+    def metadata(_db, before_background=False, deadline=None):
         turns.append(before_background)
-        return metadata_results.get(before_background)
+        assert deadline is not None and deadline > time.monotonic()
+        queued = metadata_results.get(before_background) or []
+        return queued.pop(0) if queued else None
 
     monkeypatch.setattr(mod.music_metadata, "reconcile", metadata)
 
     result = mod.catalog_reconcile_task()
 
-    assert [entry["action"] for entry in result["actions"]] == (
-        [expected_action] if expected_action else [])
+    assert [entry["action"] for entry in result["actions"]] == expected_actions
     assert turns == expected_turns
-    assert actions == (["profile_backfill"] if expected_action == "profile_backfill" else [])
-    if expected_action == "music_metadata":
-        assert result["actions"][0]["status"] == "verified"
-        assert result["message"].startswith("Lumae: 1 MusicBrainz lookup in ")
-    if expected_action is None:
+    assert actions == (["profile_backfill"] if "profile_backfill" in expected_actions else [])
+    if expected_actions[:1] == ["music_metadata"]:
+        lookups = result["actions"][0]
+        assert lookups["status"] == "verified"
+        assert result["message"].startswith(
+            f"Lumae: {lookups['count']} MusicBrainz lookup{'s' if lookups['count'] > 1 else ''}")
+    if not expected_actions:
         assert result["status"] == "current"
 
 
@@ -5270,6 +5292,7 @@ def test_reconcile_profile_batch_reports_track_outcomes_without_batch_retry(
         "ready": 2 - failed_count,
         "failed": failed_count,
         "skipped": 0,
+        "deferred": 0,
         "already_ready": 0,
         "promoted": 0,
         "queued_next": False,

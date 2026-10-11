@@ -314,7 +314,10 @@ def test_library_pass_walks_in_ticks_completes_and_resweeps(edge_publication_db,
 
     first = mod.edge_backfill_task("server-a", "catalog-a")
     assert first["status"] == "queued" and first["processed"] == 1
-    assert runs == [(["track-a"], "background", None)]
+    # The track gets what is left of the pass's time (plan S2), never None.
+    [(tracks, priority, budget)] = runs
+    assert (tracks, priority) == (["track-a"], "background")
+    assert 0 < budget <= mod.EDGE_BACKFILL_TICK_SECONDS
     assert _q(db, f"SELECT status, cursor, processed FROM {STATE}") == [("queued", "track-a", 1)]
 
     second = mod.edge_backfill_task("server-a", "catalog-a")

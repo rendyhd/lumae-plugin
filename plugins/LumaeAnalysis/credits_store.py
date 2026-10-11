@@ -208,8 +208,6 @@ def claim(db, catalog_id):
         FROM candidate c WHERE j.catalog_instance_id=c.catalog_instance_id AND j.album_id=c.album_id
         RETURNING j.album_id,j.input_fp,j.attempts""", (catalog_id, token))
     row = cur.fetchone()
-    if row:
-        cur.execute(f"UPDATE {table('credits_stream')} SET last_work_at=now() WHERE catalog_instance_id=%s", (catalog_id,))
     cur.close()
     db.commit()
     return {"catalog_id": catalog_id, "album_id": row[0], "input_fp": row[1], "attempt": row[2], "token": token} if row else None
@@ -238,6 +236,10 @@ def finish(db, job, payload=None, error=None, retry_seconds=60):
         cur.close()
         db.rollback()
         return False
+    # The before-background share is measured from the end of a turn (AUD-16):
+    # from the claim, a long album was due again at once.
+    cur.execute(f"UPDATE {table('credits_stream')} SET last_work_at=now() WHERE catalog_instance_id=%s",
+                (job["catalog_id"],))
     if error:
         cur.execute(f"""UPDATE {table('credits_jobs')} SET status='failed',lease_token=NULL,lease_until=NULL,
             last_error=%s,not_before=now()+(%s*interval '1 second')

@@ -299,19 +299,25 @@ def test_a_waveform_batch_reports_its_tracks_and_matches_its_event(tick, monkeyp
 
     result = mod.catalog_reconcile_task()
 
-    [(action, status, phase, summary)] = _events(db)
-    assert (action, status, phase) == ("profile_backfill", "success", "completed with warnings")
-    assert result["tracks_analyzed"] == summary["ready"] == 1
+    # Batches of two and one in one tick (plan S2), each journaled; each
+    # batch's stub fails one track.
+    events = _events(db)
+    assert [(action, status) for action, status, _phase, _summary in events] == [
+        ("profile_backfill", "success")] * 2
     [entry] = result["actions"]
-    assert (entry["action"], entry["count"], entry["failed"]) == ("profile_backfill", 1, 1)
+    assert (entry["action"], entry["runs"]) == ("profile_backfill", 2)
+    assert result["tracks_analyzed"] == entry["count"] == sum(
+        summary["ready"] for *_rest, summary in events) == 1
+    assert entry["failed"] == sum(summary["failed"] for *_rest, summary in events) == 2
     assert result["remaining"]["waveforms"] == 3
     assert result["message"] == result["status_message"]
-    assert result["message"].startswith("Lumae: 1 waveform (1 failed) in ")
+    assert result["message"].startswith("Lumae: 1 waveform (2 failed) in ")
     assert result["message"].endswith("; 3 tracks left")
     assert result["cadence"] == EVERY_MINUTE
     [line] = lines
     assert line.startswith("lumae_analysis watchdog: " + result["message"])
-    assert "profile_backfill queued 1/1 failed" in line and f"cadence {EVERY_MINUTE}" in line
+    assert "actions profile_backfill " in line and " 1/2 failed in 2 runs " in line
+    assert f"cadence {EVERY_MINUTE}" in line
 
 
 @pytest.mark.parametrize(
@@ -331,7 +337,9 @@ def test_credits_lookups_and_on_demand_turns_are_journaled(
     tick, monkeypatch, stub, value, action, message, tracks,
 ):
     mod, db = tick
-    monkeypatch.setattr(mod, stub, lambda *args, **kwargs: value)
+    queued = [value]
+    monkeypatch.setattr(mod, stub, lambda *args, **kwargs: queued.pop() if queued else (
+        0 if stub == "serve_deferred_interactive" else None))
 
     result = mod.catalog_reconcile_task()
 
