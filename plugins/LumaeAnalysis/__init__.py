@@ -30,7 +30,7 @@ from .edge_profile_store import (
     UNSUPPORTED as EDGE_UNSUPPORTED, mark_edge_jobs_deferred, claim_deferred_edge_jobs,
     edge_queue_counts, next_edge_backfill, update_edge_backfill, arm_edge_backfill,
     park_edge_backfill, edge_backfill_row, edge_statuses, EDGE_BACKFILL_RESWEEP_HOURS,
-    ensure_edge_backfill_sources,
+    ensure_edge_backfill_sources, rewind_edge_backfill,
 )
 from . import analysis_isolation
 from . import migrations
@@ -3738,6 +3738,28 @@ def _schedule_edge_upgrade(track_id, catalog_instance_id, server_id, priority="b
         logger.warning("lumae_analysis optional edge upgrade could not be scheduled")
 
 
+def _leave_edge_to_pass(track_id, catalog_instance_id):
+    """AudioMuse song hook: the library pass, not a task per song, makes the edge.
+
+    The host admits a plugin root task from inside its own analysis, so a task
+    per song put hundreds on the queue, and the host's analysis page shows the
+    newest root task and kept switching to them. The pass is made due to reach
+    the track instead and runs once the reconcile watchdog ticks again (the
+    host skips plugin crons while its own analysis runs).
+    """
+    if not catalog_instance_id or not edge_profiles_enabled() or not edge_scheduling_allowed():
+        return
+    db = None
+    try:
+        db = get_db()
+        if rewind_edge_backfill(db, catalog_instance_id, track_id):
+            arm_reconcile(db, "edge_backfill_ready", commit=True)
+    except Exception:
+        if db is not None:
+            _rollback_if_possible(db)
+        logger.warning("lumae_analysis optional edge upgrade could not be scheduled")
+
+
 @bp.post("/api/profiles/edges/analyze")
 def edge_analyze_api():
     try:
@@ -4332,7 +4354,7 @@ def _analyze_song_hook(song):
         get_db(), catalog_instance_id, track_id, ANALYZER_VERSION, SCHEMA_VERSION
     ):
         # Still heal a missing edge; a current edge makes this a no-op.
-        _schedule_edge_upgrade(track_id, catalog_instance_id, source_server_id)
+        _leave_edge_to_pass(track_id, catalog_instance_id)
         return {"track_id": track_id, "status": "current"}
     tokens = mark_pending([track_id], catalog_instance_id, priority="interactive")
     token = tokens.get(track_id)
@@ -4364,7 +4386,7 @@ def _analyze_song_hook(song):
         result = run_file_analysis(analyze_file, audio_path)
         outcome = complete(result, "ready")
         if outcome["status"] == "ready":
-            _schedule_edge_upgrade(track_id, catalog_instance_id, source_server_id)
+            _leave_edge_to_pass(track_id, catalog_instance_id)
         return outcome
     except Exception as exc:
         code = analysis_failure_code(track_id, exc, "hook failed")

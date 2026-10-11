@@ -7,6 +7,19 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased
+
+- During an AudioMuse analysis run, the per-song hook no longer queues one
+  edge task per analysed song. The host admits those tasks from inside its
+  own run, so a 2,300-album pass put hundreds on the queue, and AudioMuse's
+  analysis page, which shows the newest top-level task, kept switching from
+  the run to a queued "Plugin task queued." edge task. The hook now makes the
+  library pass due and, when the pass is already past the song, sends it back
+  to the start. The pass makes the edge once the reconcile watchdog runs
+  again; the host holds plugin crons until its own run ends. Nothing on the
+  wire changes. On-demand (`/api/profiles/edges/analyze`) and the plugin's
+  own analysis tasks still queue edge work as before.
+
 ## 1.6.1 (2026-10-07)
 
 Storage. On a 36k-track production library the plugin held 3.0 GB of a
