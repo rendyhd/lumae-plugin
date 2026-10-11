@@ -31,6 +31,7 @@ from .edge_profile_store import (
     edge_queue_counts, next_edge_backfill, update_edge_backfill, arm_edge_backfill,
     park_edge_backfill, edge_backfill_row, edge_statuses, EDGE_BACKFILL_RESWEEP_HOURS,
     ensure_edge_backfill_sources, rewind_edge_backfill,
+    edge_payload_sql, edge_schema_v3_ready, upgrade_stored_edges,
 )
 from . import analysis_isolation
 from . import migrations
@@ -965,6 +966,21 @@ def _run_reconcile_action(
         raise
 
 
+def _safe_edge_v3_upgrade(db):
+    """One bounded batch of the stored-edge v3 upgrade (SF.3) while any edge
+    lacks its v3 digest: ``(upgraded, flagged)``, or None when there is nothing
+    to do or it failed (logged; the next tick tries again)."""
+    try:
+        if edge_schema_v3_ready(db):
+            return None
+        upgraded, flagged = upgrade_stored_edges(db, budget_seconds=EDGE_V3_UPGRADE_BUDGET_SECONDS)
+        return (upgraded, flagged) if upgraded else None
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis stored edge v3 upgrade unavailable")
+        return None
+
+
 def _safe_credits_reconcile(db, server_id, before_background):
     try:
         return credits_service.reconcile(db, server_id, before_background=before_background)
@@ -1011,6 +1027,11 @@ def catalog_reconcile_task():
         served = serve_deferred_interactive()
         if served:
             return {"status": "processed", "action": "interactive", "served": served}
+        # SF.3: stored edges still without a v3 digest, a bounded batch per tick.
+        upgrade = _safe_edge_v3_upgrade(db)
+        if upgrade:
+            return {"status": "processed", "action": "edge_schema_v3",
+                    "upgraded": upgrade[0], "flagged": upgrade[1]}
         run = next_settled_analysis_run(db=db, server_id=server_id)
         if run:
             result = _run_reconcile_action(
@@ -1726,6 +1747,9 @@ def migrate(db):
     # that pre-K6 journal rows still embed.
     credits_store.purge_http_cache_fully(db)
     externalize_journal_edges(db)
+    # SF.3: v3 digests (and music-end recheck flags) for the stored edges,
+    # within a budget here; reconcile ticks finish the rest.
+    _safe_edge_v3_upgrade(db)
 
 
 def parse_ids(value):
@@ -1774,16 +1798,18 @@ def fetch_profile_rows(ids, catalog_instance_id=None):
     return rows
 
 
-def fetch_published_profile_rows(ids, catalog_instance_id):
+def fetch_published_profile_rows(ids, catalog_instance_id, edge_schema=2):
     if not ids:
         return []
     db = get_db()
     cur = db.cursor()
+    # SF.3: ``edge_schema`` 3 serves each edge's v3 projection (contract §4.5).
+    edge_columns = edge_payload_sql("e", edge_schema) + " AS payload"
     cur.execute(
         f"""SELECT p.track_id, p.sample_rate, p.duration_ms, p.ref_lufs,
                   p.start_ramp, p.end_ramp, p.analyzer_ver, p.analyzed_at,
                   p.media_signature, edge.payload AS edge_profile
-             FROM {table('published_source_profiles')} p {edge_join()}
+             FROM {table('published_source_profiles')} p {edge_join(columns=edge_columns)}
             WHERE p.catalog_instance_id=%s AND p.track_id=ANY(%s)""",
         (catalog_instance_id, ids),
     )
@@ -2388,7 +2414,23 @@ def edge_profiles_capability():
             "analyzable": analyzable, "worker_runtime": worker,
             "served": True, "stored": edge_profiles_stored(),
             "server_backfill": True, "edge_status": True, "deferred_requests": True,
-            "queue": queue}
+            "queue": queue, "schema_versions": edge_schema_versions()}
+
+
+def edge_schema_versions(db=None):
+    """Health ``edge_profiles.schema_versions`` (SF.3, contract §4.5): ``[2, 3]``
+    once every stored edge has its v3 digest (``upgrade_stored_edges``), so a
+    client that converts its own edges never meets a missing one; ``[2]``
+    before then or when unknown.
+    """
+    try:
+        return [2, 3] if edge_schema_v3_ready(db or get_db()) else [2]
+    except Exception:
+        try:
+            _rollback_if_possible(db or get_db())
+        except Exception:
+            pass
+        return [2]
 
 
 def integrity_status(db=None):
@@ -3247,8 +3289,29 @@ def analysis_vectors_api():
         return _catalog_error("invalid_batch", str(exc), 400)
 
 
+def _edge_schema_requested():
+    """SF.3 (contract §4.5): ``edge_schema=3`` serves every edge in schema v3;
+    ``2`` or none, v2 as in 1.6.1. Any other value raises ValueError, which the
+    profile routes answer with 400 ``invalid_edge_schema``.
+    """
+    value = request.args.get("edge_schema")
+    if value in (None, "", "2"):
+        return 2
+    if value == "3":
+        return 3
+    raise ValueError("edge_schema must be 2 or 3")
+
+
+def _invalid_edge_schema(exc):
+    return _catalog_error("invalid_edge_schema", str(exc), 400)
+
+
 @bp.get("/api/profiles")
 def profiles():
+    try:
+        edge_schema = _edge_schema_requested()
+    except ValueError as exc:
+        return _invalid_edge_schema(exc)
     try:
         source = resolve_profile_source(
             catalog_instance_id=request.args.get("catalog_instance_id")
@@ -3259,7 +3322,7 @@ def profiles():
     source_id = source["catalog_instance_id"]
     published = {
         row["track_id"]: row
-        for row in fetch_published_profile_rows(ids, source_id)
+        for row in fetch_published_profile_rows(ids, source_id, edge_schema)
     }
     attempts = {
         row["track_id"]: row
@@ -3300,6 +3363,10 @@ def profiles():
 @bp.get("/api/profiles/bootstrap")
 def profiles_bootstrap_api():
     try:
+        edge_schema = _edge_schema_requested()
+    except ValueError as exc:
+        return _invalid_edge_schema(exc)
+    try:
         catalog_instance_id = str(request.args.get("catalog_instance_id") or "")
         if not catalog_instance_id:
             raise ValueError("catalog_instance_id is required")
@@ -3309,6 +3376,7 @@ def profiles_bootstrap_api():
                 catalog_instance_id,
                 page_token=request.args.get("page_token"),
                 limit=request.args.get("limit", 250),
+                edge_schema=edge_schema,
             ),
             no_store=False,
         )
@@ -3330,6 +3398,10 @@ def _edge_refs_requested():
 
 @bp.get("/api/profiles/changes")
 def profile_changes_api():
+    try:
+        edge_schema = _edge_schema_requested()
+    except ValueError as exc:
+        return _invalid_edge_schema(exc)
     cursor = request.args.get("cursor")
     if not cursor:
         return _catalog_error("cursor_required", "Profile cursor is required.", 400)
@@ -3341,6 +3413,7 @@ def profile_changes_api():
                 catalog_instance_id=request.args.get("catalog_instance_id"),
                 limit=request.args.get("limit", 250),
                 edge_refs=_edge_refs_requested(),
+                edge_schema=edge_schema,
             ),
             no_store=False,
         )
@@ -3679,6 +3752,8 @@ DEFERRED = "deferred"
 # A queued background edge batch yields its slot after this long; its
 # unstarted jobs are released and due again at once.
 EDGE_BACKGROUND_BUDGET_SECONDS = 60
+# SF.3: the stored-edge v3 upgrade's time per install or reconcile tick.
+EDGE_V3_UPGRADE_BUDGET_SECONDS = 20
 # One library-pass tick analyses edges for about this long, one track at a
 # time, serving on-demand work between tracks.
 EDGE_BACKFILL_TICK_SECONDS = 30

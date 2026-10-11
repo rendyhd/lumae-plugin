@@ -9,6 +9,22 @@ still matters. Exact, code-verified wire behaviour for every version lives in
 
 ## Unreleased
 
+- Edge profile schema v3 (SF.3). A client that asks for it (`edge_schema=3`
+  on `/api/profiles`, bootstrap and changes, or `edge_schema: 3` when it
+  creates a profile session; health lists `edge_profiles.schema_versions:
+  [2, 3]`) gets the stored edge without the windows' sample peak and spectral
+  flux, with its own digest. When a song's music ends before the last 30
+  seconds (a hidden track after a long silence, or a long silent run-out),
+  the v3 edge also says where (`landmarks.music_end_frame`) and carries an
+  `ending` window measured over the 30 seconds before it, so Lumae and Lumae
+  Radio end the song there and fade on its real ending. The analyzer keeps
+  the whole file's level series and decodes a second time only for those
+  songs (about 0.1% of a library). v2 transfers, v2 digests and the stored
+  payload are unchanged, so 1.6.1 still reads the database after a
+  downgrade. The upgrade gives every stored edge its v3 digest in short
+  batches and flags tails that open on silence for the library pass to
+  measure again; schema 3 is offered once every edge has its digest. Details
+  in `plugins/LumaeAnalysis/EDGE_PROFILES.md` and the contract's §4.5.
 - During an AudioMuse analysis run, the per-song hook no longer queues one
   edge task per analysed song. The host admits those tasks from inside its
   own run, so a 2,300-album pass put hundreds on the queue, and AudioMuse's

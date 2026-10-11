@@ -27,8 +27,8 @@ from plugin.api import get_db, table
 
 from . import migrations
 from .reconcile import arm_reconcile
-from .edge_profiles import opaque_revision
-from .edge_profile_store import edge_join
+from .edge_profiles import edge_profile_v3, opaque_revision
+from .edge_profile_store import edge_join, edge_payload_sql, edge_v3_digest_sql
 
 from .catalog import (
     JOURNAL_WRITER_GENERATION,
@@ -552,6 +552,11 @@ def migrate_enrichment(db):
         lambda cur: migrations.ensure_columns(
             cur, t('profile_bootstrap_sessions'), "edge_refs BOOLEAN NOT NULL DEFAULT FALSE",
         ),
+        # SF.3: a session created with edge_schema: 3 serves its snapshot pages
+        # and catch-up in edge schema v3 (contract §4.5). Default v2.
+        lambda cur: migrations.ensure_columns(
+            cur, t('profile_bootstrap_sessions'), "edge_schema SMALLINT NOT NULL DEFAULT 2",
+        ),
         lambda cur: migrations.ensure_index(cur, f"""
         CREATE INDEX IF NOT EXISTS {t('profile_bootstrap_sessions_request_idx')}
         ON {t('profile_bootstrap_sessions')} (source_scope, client_request_id)
@@ -878,12 +883,13 @@ def record_profile_deletions(cur, catalog_instance_id, track_ids):
     return seq
 
 
-def _profile_rows(cur, catalog_instance_id, after_track_id, limit):
+def _profile_rows(cur, catalog_instance_id, after_track_id, limit, edge_schema=2):
+    edge_columns = edge_payload_sql("e", edge_schema) + " AS payload"
     cur.execute(
         f"""
         SELECT p.track_id, p.sample_rate, p.duration_ms, p.ref_lufs, p.start_ramp, p.end_ramp,
                p.analyzer_ver, p.analyzed_at, p.media_signature, edge.payload
-          FROM {t("published_source_profiles")} p {edge_join()}
+          FROM {t("published_source_profiles")} p {edge_join(columns=edge_columns)}
          WHERE p.catalog_instance_id=%s AND p.track_id > %s
          ORDER BY p.track_id LIMIT %s
         """,
@@ -912,7 +918,7 @@ def _decode_page_token(value):
     return result
 
 
-def profile_bootstrap_page(db, catalog_instance_id, page_token=None, limit=250):
+def profile_bootstrap_page(db, catalog_instance_id, page_token=None, limit=250, edge_schema=2):
     sources = resolve_catalog_source(db, catalog_instance_id=catalog_instance_id)
     if len(sources) != 1:
         raise ValueError("An explicit catalogue source is required")
@@ -932,7 +938,7 @@ def profile_bootstrap_page(db, catalog_instance_id, page_token=None, limit=250):
     else:
         pinned_head = head_seq
         after = ""
-    rows = _profile_rows(cur, catalog_instance_id, after, limit + 1)
+    rows = _profile_rows(cur, catalog_instance_id, after, limit + 1, edge_schema)
     cur.close()
     has_more = len(rows) > limit
     rows = rows[:limit]
@@ -961,14 +967,31 @@ def profile_bootstrap_page(db, catalog_instance_id, page_token=None, limit=250):
 EDGE_REF_KEPT = """{alias}.edge_ref @> '{{"kept": true}}'::jsonb"""
 
 
-def edge_profile_ref_sql(alias, payload):
+def edge_profile_ref_sql(alias, payload, edge_schema=2, catalog=None):
     """SQL: the wire ``edge_profile_ref`` of a kept journal row whose waveform
-    payload is at the SQL path ``payload``."""
+    payload is at the SQL path ``payload``. In schema v3 (SF.3) the digest is
+    the referenced edge's v3 digest; ``catalog`` is the SQL for its source."""
+    if edge_schema != 3:
+        return (f"jsonb_build_object('media_revision', {payload}->'media_revision', "
+                f"'profile_digest', {alias}.edge_ref->'profile_digest')")
+    digest = edge_v3_digest_sql(f"{payload}->>'track_id'", f"{payload}->>'media_revision'",
+                                f"{alias}.edge_ref->>'profile_digest'", catalog)
     return (f"jsonb_build_object('media_revision', {payload}->'media_revision', "
-            f"'profile_digest', {alias}.edge_ref->'profile_digest')")
+            f"'profile_digest', {digest})")
 
 
-def _changes_page_sql(edge_refs):
+def edge_v3_embedded(payload, edge_schema):
+    """A pre-K6 journal row's own copy of its edge, in schema v3 when asked."""
+    edge = payload.get("edge_profile") if isinstance(payload, dict) else None
+    if edge_schema == 3 and isinstance(edge, dict) and edge.get("schema_version") == 2:
+        try:
+            return dict(payload, edge_profile=edge_profile_v3(edge))
+        except (KeyError, TypeError, ValueError):
+            return {key: value for key, value in payload.items() if key != "edge_profile"}
+    return payload
+
+
+def _changes_page_sql(edge_refs, edge_schema=2):
     """(select, join) that serve a /changes page's journal rows (alias ``c``).
 
     A row journalled with an edge reference is joined back to its edge: the
@@ -991,33 +1014,52 @@ def _changes_page_sql(edge_refs):
     kept = EDGE_REF_KEPT.format(alias="c")
     payload = "c.payload"
     lookup = "c.edge_ref IS NOT NULL"
+    references = ""
+    sources = 1
     if edge_refs:
+        reference = edge_profile_ref_sql("c", "c.payload")
+        if edge_schema == 3:
+            # SF.3: a kept row's reference names its edge's v3 digest, looked
+            # up after the page (``ref``); the journalled digest when the edge
+            # is gone, as the client then fetches it anyway.
+            reference = ("jsonb_build_object('media_revision', c.payload->'media_revision', "
+                         "'profile_digest', COALESCE(ref.digest, c.edge_ref->>'profile_digest'))")
+            references = f"""
+    LEFT JOIN LATERAL (
+        SELECT NULLIF(e.profile_digest_v3, '') AS digest FROM {t('edge_profiles')} e
+         WHERE {kept} AND e.catalog_instance_id=%s AND e.track_id=c.track_id
+           AND e.media_revision=c.payload->>'media_revision'
+           AND e.profile_digest=c.edge_ref->>'profile_digest'
+         LIMIT 1
+    ) ref ON TRUE"""
+            sources = 2
         payload = (f"CASE WHEN {kept} THEN c.payload || jsonb_build_object("
-                   f"'edge_profile_ref', {edge_profile_ref_sql('c', 'c.payload')}) "
+                   f"'edge_profile_ref', {reference}) "
                    f"ELSE c.payload END")
         lookup += f" AND NOT {kept}"
     select = f"c.seq, c.track_id, c.operation, {payload}, c.created_at, edge.payload"
     join = f"""LEFT JOIN LATERAL (
-        SELECT e.payload FROM {t('edge_profiles')} e
+        SELECT {edge_payload_sql('e', edge_schema)} AS payload FROM {t('edge_profiles')} e
          WHERE {lookup}
            AND e.catalog_instance_id=%s AND e.track_id=c.track_id
            AND e.media_revision=c.payload->>'media_revision'
          ORDER BY e.profile_digest=c.edge_ref->>'profile_digest' DESC,
                   e.updated_at DESC, e.profile_digest
          LIMIT 1
-    ) edge ON TRUE"""
-    return select, join
+    ) edge ON TRUE{references}"""
+    return select, join, sources
 
 
 def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250, *,
-                         edge_refs=False):
-    """One /profiles/changes page. ``edge_refs`` is the K6 opt-in (P3-2)."""
+                         edge_refs=False, edge_schema=2):
+    """One /profiles/changes page. ``edge_refs`` is the K6 opt-in (P3-2);
+    ``edge_schema`` 3 serves edges and references in schema v3 (SF.3)."""
     cursor = parse_opaque_cursor(cursor_value)
     expected_id = catalog_instance_id or cursor["catalog_instance_id"]
     sources = resolve_catalog_source(db, catalog_instance_id=expected_id)
     if len(sources) != 1 or sources[0]["catalog_instance_id"] != cursor["catalog_instance_id"]:
         raise ValueError("Cursor belongs to another profile source")
-    page_select, page_join = _changes_page_sql(bool(edge_refs))
+    page_select, page_join, sources = _changes_page_sql(bool(edge_refs), edge_schema)
     cur = db.cursor()
     try:
         # State and events from one snapshot, checked for density (P1-7);
@@ -1036,7 +1078,7 @@ def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250, 
             ahead_message="Cursor is ahead of the profile head",
             page_select=page_select,
             page_join=page_join,
-            page_params=(expected_id,),
+            page_params=(expected_id,) * sources,
         )
     finally:
         cur.close()
@@ -1050,6 +1092,8 @@ def read_profile_changes(db, cursor_value, catalog_instance_id=None, limit=250, 
         # SQL ``||`` used to do, just in Python instead of in Postgres.
         if edge_profile is not None and isinstance(payload, dict):
             payload = dict(payload, edge_profile=edge_profile)
+        else:
+            payload = edge_v3_embedded(payload, edge_schema)
         changes.append({
             "seq": int(row[0]),
             "track_id": str(row[1]),

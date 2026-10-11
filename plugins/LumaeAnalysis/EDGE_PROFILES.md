@@ -68,6 +68,30 @@ there and plan its fade on `ending`. v2 transfers and v2 digests are unchanged.
 The exact rule and the negotiation are in `docs/contracts/LUMAE_SYNC_CONTRACT.md`
 §4.5.
 
+How it is built:
+
+- **Measurement.** While it streams, the analyzer also keeps the whole file's
+  100 ms level series (from frame 0, measured like `level_cdb`; a few bytes per
+  second). At the end it applies the contract's rule. Only when the rule holds
+  does it decode the file a second time, through the same path, up to a second
+  past the music end, and measure `ending` there like `tail`; the second decode
+  reproduces the first exactly. Other songs cost only the level series. A
+  second pass that fails or runs out of time leaves the v2 edge without the
+  music end. Timed on a Mac against 1.6.1's analyzer: the qualification corpus
+  within ±1%, a 240 s song +4.2% (the level series), a 240 s song whose music
+  ends at 150 s +70% (its second decode).
+- **Storage.** `edge_profiles.payload` stays the v2 edge, byte for byte (1.6.1
+  can read it after a downgrade). Beside it: `profile_digest_v3` (the v3
+  projection's digest), `v3_ending` (`{"music_end_frame", "ending"}`, or NULL)
+  and `v3_recheck`. Every transfer builds v3 from these in SQL
+  (`edge_payload_sql`); an edge reference in v3 names the v3 digest.
+- **Upgrade.** Edges stored before 1.7.0 get their v3 digest after the
+  migration and on reconcile ticks, in short batches. Health lists schema 3 only
+  once none is missing. The same pass flags an edge whose tail window opens
+  under the excerpt floor (`v3_recheck`); the library pass measures those again
+  (about 0.1% of a library), so their music end is found, and the new edge
+  reaches clients as an edge publication.
+
 ## Measurement contract
 
 The analyzer retains only the first and last 30 seconds, including partial

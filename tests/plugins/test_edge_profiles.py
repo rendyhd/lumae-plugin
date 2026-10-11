@@ -395,3 +395,124 @@ def test_crashing_runtime_is_a_qualification_error(fresh_status, monkeypatch):
     status = edge.edge_runtime_status()
     assert status['available'] is False and status['reason'] == 'qualification_error'
     assert 'decoder exploded' in status['detail']
+
+
+# --- Schema v3 and the whole-file music end (SF.3, contract §4.5) ----------
+
+def _song(rate, seconds, music, quiet=()):
+    """Stereo PCM: a 220/330 Hz chord at about -14 dB over ``music`` (start, end)
+    spans, a -40 dB 440 Hz tone over ``quiet`` spans, digital zero elsewhere."""
+    t = np.arange(int(rate * seconds), dtype=np.float64) / rate
+    left, right = np.zeros_like(t), np.zeros_like(t)
+    for start, end in music:
+        span = (t >= start) & (t < end)
+        left[span] = .25 * np.sin(2 * np.pi * 220 * t[span])
+        right[span] = .2 * np.sin(2 * np.pi * 330 * t[span])
+    for start, end in quiet:
+        span = (t >= start) & (t < end)
+        left[span] = right[span] = .01 * np.sin(2 * np.pi * 440 * t[span])
+    return np.asarray([left, right], dtype=np.float32)
+
+
+def measure_rewindable(pcm, rate, block=7919, rewindable=True):
+    blocks = [pcm[:, i:i + block] for i in range(0, pcm.shape[1], block)]
+    return edge.analyze_edge_blocks(
+        blocks if rewindable else iter(blocks), rate, catalog_instance_id="catalog-a", track_id="track-a",
+        media_revision="sha256:" + "a" * 64, content_sha256="b" * 64, timeline_verified=True,
+    )
+
+
+def test_v3_projection_drops_two_series_and_has_its_own_digest():
+    golden = json.loads((Path(__file__).parent / 'edge_profile_v2_golden.json').read_text(encoding='utf-8'))
+    v3 = edge.edge_profile_v3(golden)
+    assert v3["schema_version"] == 3
+    for name in ("head", "tail"):
+        assert set(golden[name]) - set(v3[name]) == {"peak_cdb", "spectral_flux_q15"}
+        assert v3[name]["level_cdb"] == golden[name]["level_cdb"]
+    assert "ending" not in v3 and "music_end_frame" not in v3["landmarks"]
+    assert v3["profile_digest"] == edge.profile_digest(v3) != golden["profile_digest"]
+    rest = lambda p: {k: v for k, v in p.items() if k not in ("schema_version", "profile_digest", "head", "tail")}
+    assert rest(v3) == rest(golden)
+    # The stored edge is unchanged.
+    assert golden["head"]["peak_cdb"] and golden["schema_version"] == 2
+
+
+def test_hidden_outro_measures_the_music_end_over_the_whole_file():
+    # "Keep on Singin' My Song": music to 40 s, a silence from before the
+    # 30 s tail window, a quiet hidden outro at 80-90 s, silence to 100 s.
+    rate = 48000
+    pcm = _song(rate, 100, music=[(0, 40)], quiet=[(80, 90)])
+    result = measure_rewindable(pcm, rate)
+    extension = result.pop(edge.V3_ENDING_KEY)
+    # The v2 edge and its digest are untouched by the music end.
+    assert result == measure_rewindable(pcm, rate, rewindable=False)
+    assert edge.profile_digest(result) == result["profile_digest"]
+    music_end = extension["music_end_frame"]
+    assert 40 * rate <= music_end <= 40.2 * rate and music_end % (rate // 10) == 0
+    ending = extension["ending"]
+    assert set(ending) == {"origin_frame", "covered_frames", "bin_count", "boundaries", "valid", "level_cdb",
+                           "true_peak_cdb", "low_power_cdb", "mid_power_cdb", "high_power_cdb", "onset_density_q15"}
+    assert ending["origin_frame"] == music_end - 30 * rate
+    assert ending["covered_frames"] == 30 * rate and ending["bin_count"] == 300
+    assert ending["boundaries"][-1] == music_end
+    levels = values({"ending": ending}, "ending")
+    floor = edge.excerpt_floor_cdb(result["head"], result["tail"])
+    assert levels[-1] >= floor and levels[0] > floor
+    v3 = edge.edge_profile_v3(result, extension)
+    assert v3["landmarks"]["music_end_frame"] == music_end and v3["ending"] == ending
+    assert v3["profile_digest"] == edge.profile_digest(v3)
+
+
+def test_a_silent_run_out_has_a_music_end_and_an_ordinary_ending_none():
+    rate = 44100
+    run_out = measure_rewindable(_song(rate, 90, music=[(0, 45)]), rate)
+    assert 45 * rate <= run_out[edge.V3_ENDING_KEY]["music_end_frame"] <= 45.2 * rate
+    # Music into the tail window, or a silence that starts inside it, is the
+    # client's own trim: no music end.
+    assert edge.V3_ENDING_KEY not in measure_rewindable(_song(rate, 90, music=[(0, 88)]), rate)
+    assert edge.V3_ENDING_KEY not in measure_rewindable(_song(rate, 90, music=[(0, 70)], quiet=[(80, 85)]), rate)
+    # Without a way to read the source again there is no second pass.
+    assert edge.V3_ENDING_KEY not in measure_rewindable(_song(rate, 90, music=[(0, 45)]), rate, rewindable=False)
+
+
+def test_the_ending_window_is_measured_exactly_like_a_tail_window():
+    # A second decode reproduces the first: the window that ends at 50 s of an
+    # 80 s song equals the tail window of the same song's first 50 s, but for
+    # that song's last bin (the end of a file flushes the resampler).
+    rate = 48000
+    pcm = _song(rate, 80, music=[(0, 30), (35, 50)])
+    import av
+    window = edge._ending_window(av, lambda: iter([pcm[:, i:i + 7919] for i in range(0, pcm.shape[1], 7919)]),
+                                 rate, "stereo", 50 * rate, None)
+    tail = edge.edge_window_v3(measure(pcm[:, :50 * rate], rate)["tail"])
+    assert window["boundaries"] == tail["boundaries"] and window["bin_count"] == tail["bin_count"]
+    for series in ("level_cdb", "true_peak_cdb", "low_power_cdb", "mid_power_cdb", "high_power_cdb",
+                   "onset_density_q15"):
+        dtype = "<u2" if series.endswith("_q15") else "<i2"
+        got = np.frombuffer(base64.b64decode(window[series]), dtype=dtype)
+        want = np.frombuffer(base64.b64decode(tail[series]), dtype=dtype)
+        assert np.array_equal(got[:-1], want[:-1]), series
+
+
+V3_GOLDEN = Path(__file__).parent / 'edge_profile_v3_golden.json'
+
+
+def v3_golden_edge():
+    """The cross-language v3 golden: the hidden-outro song's v3 projection.
+
+    The app (``src/lib/__fixtures__/edge-profile-v3-hidden-outro.json``) and the
+    radio parse this file and end the song at its music end."""
+    rate = 48000
+    result = measure_rewindable(_song(rate, 100, music=[(0, 40)], quiet=[(80, 90)]), rate)
+    return edge.edge_profile_v3(result, result.pop(edge.V3_ENDING_KEY))
+
+
+def test_v3_cross_language_golden():
+    golden = json.loads(V3_GOLDEN.read_text(encoding='utf-8'))
+    result = v3_golden_edge()
+    if result['measurement']['resampler'] == golden['measurement']['resampler']:
+        assert result == golden
+    else:
+        assert edge.compare_to_reference(result, golden) == []
+    assert golden['profile_digest'] == edge.profile_digest(golden)
+    assert golden['landmarks']['music_end_frame'] == golden['ending']['boundaries'][-1]

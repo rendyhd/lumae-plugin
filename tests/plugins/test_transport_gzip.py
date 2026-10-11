@@ -79,7 +79,7 @@ def _stub_profiles(mod, monkeypatch, count):
         mod, "resolve_profile_source",
         lambda **_kw: {"catalog_instance_id": SOURCE, "server_id": SERVER},
     )
-    monkeypatch.setattr(mod, "fetch_published_profile_rows", lambda ids, _source: rows)
+    monkeypatch.setattr(mod, "fetch_published_profile_rows", lambda ids, _source, _schema=2: rows)
     monkeypatch.setattr(mod, "fetch_profile_rows", lambda ids, catalog_instance_id=None: [])
     monkeypatch.setattr(
         mod, "serialize_ready_profile",

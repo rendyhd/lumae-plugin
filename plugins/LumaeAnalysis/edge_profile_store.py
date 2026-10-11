@@ -3,13 +3,24 @@
 Never changes the legacy profile's readiness. The legacy row is locked before
 publishing a measurement, so a completed old job cannot attach to a new source.
 """
+import json
+import time
 import uuid
 from datetime import timedelta, timezone
 
 from plugin.api import table
 
 from . import migrations
-from .edge_profiles import METHOD, SCHEMA_VERSION, canonical_json, opaque_revision, profile_digest
+from .edge_profiles import (
+    METHOD,
+    SCHEMA_VERSION,
+    V3_ENDING_KEY,
+    canonical_json,
+    edge_profile_v3,
+    opaque_revision,
+    profile_digest,
+    tail_opens_below_floor,
+)
 
 
 def migrate_edge_profiles(db):
@@ -83,7 +94,69 @@ def migrate_edge_profiles(db):
         f"CREATE INDEX IF NOT EXISTS {table('edge_profile_jobs')}_active_idx "
         f"ON {table('edge_profile_jobs')} (status) WHERE status IN ('pending', 'running')",
     )
+    # Schema v3 (1.7.0, SF.3): ``payload`` stays the v2 edge exactly. Beside it,
+    # the v3 digest (``edge_profile_v3``; NULL until computed, see
+    # upgrade_stored_edges), the whole-file music end when there is one (D9:
+    # ``{"music_end_frame", "ending"}``), and ``v3_recheck``: an edge measured
+    # before 1.7.0 whose tail window opens below the excerpt floor, analysed
+    # again so its music end can be found. Additive; 1.6.1 ignores them.
+    migrations.ensure_columns(
+        cur, table('edge_profiles'),
+        "profile_digest_v3 TEXT",
+        "v3_ending JSONB",
+        "v3_recheck BOOLEAN NOT NULL DEFAULT FALSE",
+    )
+    migrations.ensure_index(
+        cur,
+        f"CREATE INDEX IF NOT EXISTS {table('edge_profiles')}_v3_pending_idx "
+        f"ON {table('edge_profiles')} (catalog_instance_id, track_id) WHERE profile_digest_v3 IS NULL",
+    )
     cur.close()
+
+
+def edge_payload_sql(alias='e', edge_schema=2):
+    """SQL: the served edge of the ``edge_profiles`` row ``alias``.
+
+    Schema 2 is the stored payload. Schema 3 (contract §4.5) is its projection:
+    the windows without ``peak_cdb`` and ``spectral_flux_q15``, the D9 music end
+    when stored, and the v3 digest; NULL while the v3 digest is not computed
+    (health lists schema 3 only once every edge has one) and for a stored edge
+    that is not a measurable v2 edge (an empty v3 digest).
+    """
+    if edge_schema != 3:
+        return f"{alias}.payload"
+    return f"""(CASE WHEN COALESCE({alias}.profile_digest_v3, '') = '' THEN NULL ELSE
+        ({alias}.payload #- '{{head,peak_cdb}}' #- '{{head,spectral_flux_q15}}'
+                         #- '{{tail,peak_cdb}}' #- '{{tail,spectral_flux_q15}}')
+        || jsonb_build_object('schema_version', 3, 'profile_digest', {alias}.profile_digest_v3)
+        || CASE WHEN {alias}.v3_ending IS NULL THEN '{{}}'::jsonb ELSE jsonb_build_object(
+               'ending', {alias}.v3_ending->'ending',
+               'landmarks', ({alias}.payload->'landmarks')
+                   || jsonb_build_object('music_end_frame', {alias}.v3_ending->'music_end_frame'))
+           END
+    END)"""
+
+
+def edge_v3_digest_sql(track, media_revision, digest, catalog):
+    """SQL: the v3 digest of the edge a K6 reference names by its v2 digest,
+    or that v2 digest when the edge is gone or has none yet (the client then
+    fetches it, as for any reference it does not hold)."""
+    return f"""COALESCE((SELECT NULLIF(e.profile_digest_v3, '') FROM {table('edge_profiles')} e
+         WHERE e.catalog_instance_id={catalog} AND e.track_id={track}
+           AND e.media_revision={media_revision} AND e.profile_digest={digest}
+         LIMIT 1), {digest})"""
+
+
+def _v3_ending(value):
+    """The analyzer's D9 result, checked, or None."""
+    if value is None:
+        return None
+    if (not isinstance(value, dict) or set(value) != {'music_end_frame', 'ending'}
+            or type(value['music_end_frame']) is not int or value['music_end_frame'] <= 0
+            or not isinstance(value['ending'], dict)
+            or value['ending'].get('boundaries', [None])[-1] != value['music_end_frame']):
+        raise ValueError('edge publication music end is malformed')
+    return value
 
 
 EDGE_RUNTIME_FRESH_HOURS = 6
@@ -180,17 +253,19 @@ def claim_edge_requests(db, catalog_id, ids, priority='background'):
     """
     priority = 'interactive' if priority == 'interactive' else 'background'
     cur = db.cursor()
-    cur.execute(f"""SELECT p.track_id, p.media_signature, edge.payload
-        FROM {table('published_source_profiles')} p {edge_join()}
+    cur.execute(f"""SELECT p.track_id, p.media_signature, edge.payload, edge.v3_recheck
+        FROM {table('published_source_profiles')} p {edge_join(columns='e.payload, e.v3_recheck')}
         WHERE p.catalog_instance_id=%s AND p.track_id=ANY(%s)
         ORDER BY p.track_id""", (catalog_id, list(dict.fromkeys(ids))[:100]))
     rows = cur.fetchall()
     accepted, ready, pending, unsupported = [], [], [], []
-    for track_id, signature, payload in rows:
+    for track_id, signature, payload, recheck in rows:
         revision = opaque_revision(signature)
         if not revision:
             continue
-        if payload and payload.get('schema_version') == SCHEMA_VERSION and payload.get('measurement', {}).get('method') == METHOD:
+        # An edge to measure again for its music end (v3_recheck) is not ready.
+        if (payload and not recheck and payload.get('schema_version') == SCHEMA_VERSION
+                and payload.get('measurement', {}).get('method') == METHOD):
             ready.append(track_id)
             continue
         token = str(uuid.uuid4())
@@ -296,6 +371,8 @@ def update_edge_job(db, catalog_id, job, status, reason=None):
 def publish_edge_profile(db, catalog_id, job, payload, signature):
     from .catalog_enrichment import journal_edge_ref, record_profile_change, serialize_profile
 
+    payload = dict(payload)
+    ending = _v3_ending(payload.pop(V3_ENDING_KEY, None))
     if (payload.get('schema_version') != SCHEMA_VERSION or payload.get('catalog_instance_id') != catalog_id or
             payload.get('track_id') != job['track_id'] or payload.get('media_revision') != job['media_revision'] or
             opaque_revision(signature) != job['media_revision'] or profile_digest(payload) != payload.get('profile_digest')):
@@ -344,10 +421,13 @@ def publish_edge_profile(db, catalog_id, job, payload, signature):
     cur.execute(f"DELETE FROM {table('edge_profiles')} WHERE catalog_instance_id=%s AND track_id=%s",
                 (catalog_id, job['track_id']))
     cur.execute(f"""INSERT INTO {table('edge_profiles')}
-        (catalog_instance_id, track_id, media_revision, representation_id, media_signature, profile_digest, payload)
-        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb)""",
+        (catalog_instance_id, track_id, media_revision, representation_id, media_signature, profile_digest, payload,
+         profile_digest_v3, v3_ending)
+        VALUES (%s, %s, %s, %s, %s, %s, %s::jsonb, %s, %s::jsonb)""",
                 (catalog_id, job['track_id'], job['media_revision'], payload['representation_id'],
-                 signature, payload['profile_digest'], canonical_json(payload)))
+                 signature, payload['profile_digest'], canonical_json(payload),
+                 edge_profile_v3(payload, ending)['profile_digest'],
+                 canonical_json(ending) if ending else None))
     # The event journals the waveform part and a reference to the edge just
     # stored (K6); an edge publication is served in full to every client.
     record_profile_change(cur, catalog_id, job['track_id'], 'ready', serialize_profile(*legacy),
@@ -398,9 +478,11 @@ def _edge_due_sql():
     # Published waveform rows without an edge for their media (P3-7): an edge
     # is published only for, and read only through, such a row. An attempt
     # row may be unpublished or describe other media than what is published.
-    return f"""{table('published_source_profiles')} p {edge_join()}
+    # An edge flagged for a music-end recheck (SF.3) is due like a missing one.
+    return f"""{table('published_source_profiles')} p {edge_join(columns='e.payload, e.v3_recheck')}
         LEFT JOIN {table('edge_profile_jobs')} j ON j.catalog_instance_id=p.catalog_instance_id AND j.track_id=p.track_id
-        WHERE p.catalog_instance_id=%s AND p.media_signature IS NOT NULL AND edge.payload IS NULL
+        WHERE p.catalog_instance_id=%s AND p.media_signature IS NOT NULL
+          AND (edge.payload IS NULL OR edge.v3_recheck)
           AND (j.track_id IS NULL OR j.updated_at < now()-interval '6 hours'
                OR (j.status='failed' AND j.last_error='edge-enqueue-failed'))"""
 
@@ -573,3 +655,69 @@ def edge_statuses(db, catalog_id, ids):
         else:
             result[track_id] = {'status': 'absent'}
     return result
+
+
+# ------------------------------------------------------------ schema v3 upgrade
+# Edges stored before 1.7.0 get their v3 digest in short batches after the
+# migration and on reconcile ticks; health lists schema 3 only when none is
+# missing. The same pass flags edges whose tail window opens below the excerpt
+# floor for a music-end recheck (D9, about 0.1% of a library).
+EDGE_V3_BATCH = 200
+
+
+def edge_schema_v3_ready(db):
+    """Whether every stored edge has its v3 digest (one partial-index probe)."""
+    cur = db.cursor()
+    try:
+        cur.execute(f"SELECT 1 FROM {table('edge_profiles')} WHERE profile_digest_v3 IS NULL LIMIT 1")
+        return cur.fetchone() is None
+    finally:
+        cur.close()
+
+
+def upgrade_stored_edges(db, batch_size=EDGE_V3_BATCH, budget_seconds=None):
+    """Computes missing v3 digests and recheck flags; returns ``(upgraded, flagged)``.
+
+    One short transaction per batch; a row is updated only while it is still
+    the edge that was read (same v2 digest). Stops after ``budget_seconds``
+    (None: when done) and resumes where it stopped. Flagged sources' library
+    passes are made due.
+    """
+    deadline = None if budget_seconds is None else time.monotonic() + budget_seconds
+    upgraded = flagged = 0
+    sources = set()
+    cur = db.cursor()
+    try:
+        while deadline is None or time.monotonic() < deadline:
+            cur.execute(f"""SELECT catalog_instance_id, track_id, media_revision, representation_id,
+                                   profile_digest, payload::text
+                              FROM {table('edge_profiles')} WHERE profile_digest_v3 IS NULL
+                             ORDER BY catalog_instance_id, track_id LIMIT %s""", (batch_size,))
+            rows = cur.fetchall()
+            for catalog_id, track_id, revision, representation, digest, text in rows:
+                payload = json.loads(text)
+                try:
+                    v3_digest = edge_profile_v3(payload)['profile_digest']
+                    recheck = tail_opens_below_floor(payload['head'], payload['tail'])
+                except (KeyError, TypeError, ValueError):
+                    # Not a measurable v2 edge: serve no v3 edge for it, and
+                    # never flag it again.
+                    v3_digest, recheck = '', False
+                cur.execute(f"""UPDATE {table('edge_profiles')} SET profile_digest_v3=%s, v3_recheck=%s
+                    WHERE catalog_instance_id=%s AND track_id=%s AND media_revision=%s
+                      AND representation_id=%s AND profile_digest=%s AND profile_digest_v3 IS NULL""",
+                            (v3_digest, recheck, catalog_id, track_id, revision, representation, digest))
+                if cur.rowcount:
+                    upgraded += 1
+                    if recheck:
+                        flagged += 1
+                        sources.add(catalog_id)
+            if rows:
+                db.commit()
+            if len(rows) < batch_size:
+                break
+    finally:
+        cur.close()
+    for catalog_id in sources:
+        arm_edge_backfill(db, catalog_id)
+    return upgraded, flagged

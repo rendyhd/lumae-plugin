@@ -251,6 +251,8 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "edge_status": True,
                 "deferred_requests": True,
                 "queue": None,
+                # No database: v3 is not offered (SF.3).
+                "schema_versions": [2],
             },
             "transport": {"gzip": True},
             "profile_stream": {"edge_refs": True},
@@ -2440,7 +2442,7 @@ def test_profiles_endpoint_splits_ready_missing_and_failed(monkeypatch):
     )
     monkeypatch.setattr(
         mod, "fetch_published_profile_rows",
-        lambda ids, catalog_instance_id: [row for row in rows if row["status"] == "ready"],
+        lambda ids, catalog_instance_id, edge_schema=2: [row for row in rows if row["status"] == "ready"],
     )
     client = plugin_client(mod)
 

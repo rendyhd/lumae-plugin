@@ -4,6 +4,11 @@ The decoder, resampler and all recursive filters remain continuous for the whole
 source. Only the first and last 30 seconds of measurements and canonical PCM are
 retained. Exact digital zero is reported separately from adaptive quiet regions;
 only the former can ever authorize padding trim.
+
+Schema v3 (1.7.0, contract §4.5) is served as a projection of the stored v2
+edge (``edge_profile_v3``). Its whole-file music end (D9) is measured here: a
+100 ms level series over the whole file, and, only when the tail window opens
+on a silence that began before it, a second pass for the ``ending`` window.
 """
 
 import base64
@@ -22,6 +27,15 @@ import numpy as np
 from scipy.signal import butter, lfilter, resample_poly
 
 SCHEMA_VERSION = 2
+# Schema v3 (SF.3): a projection of v2 without these window series (D3), plus
+# the optional whole-file music end (D9).
+SCHEMA_VERSION_V3 = 3
+V3_DROPPED_SERIES = ("peak_cdb", "spectral_flux_q15")
+# The analyzer's D9 result rides on its v2 payload under this key, outside the
+# v2 digest; publication stores it beside the v2 edge (edge_profile_store).
+V3_ENDING_KEY = "v3_ending"
+# The clients' excerpt floor: 45 dB under the loudest head or tail level.
+EXCERPT_FLOOR_CDB = 4500
 ANALYZER_VERSION = "lumae-edge-v2.0.0"
 METHOD = "lumae-edge-kweighted-bands-48k-k4-v2"
 QUANTIZATION = "s16le-centidb-u16le-q15-v2"
@@ -71,6 +85,77 @@ def opaque_revision(media_signature):
 
 def profile_digest(payload):
     return hashlib.sha256(canonical_json({k: v for k, v in payload.items() if k != "profile_digest"}).encode("utf-8")).hexdigest()
+
+
+def edge_window_v3(window):
+    """A v3 window: the v2 window without sample peak and spectral flux."""
+    return {key: value for key, value in window.items() if key not in V3_DROPPED_SERIES}
+
+
+def edge_profile_v3(payload, ending=None):
+    """The v3 projection of a v2 edge (contract §4.5), with its own digest.
+
+    ``ending`` is the stored D9 result (``{"music_end_frame", "ending"}``) or
+    None. Without it the projection is exactly what a client gets by dropping
+    the two series from its stored v2 edge and recomputing the digest.
+    """
+    projected = {key: value for key, value in payload.items()
+                 if key not in ("profile_digest", V3_ENDING_KEY)}
+    projected["schema_version"] = SCHEMA_VERSION_V3
+    projected["head"] = edge_window_v3(payload["head"])
+    projected["tail"] = edge_window_v3(payload["tail"])
+    if ending:
+        projected["landmarks"] = dict(payload["landmarks"], music_end_frame=int(ending["music_end_frame"]))
+        projected["ending"] = edge_window_v3(ending["ending"])
+    projected["profile_digest"] = profile_digest(projected)
+    return projected
+
+
+def _series(window, name="level_cdb"):
+    return [int(value) for value in np.frombuffer(base64.b64decode(window[name]), dtype="<i2")]
+
+
+def excerpt_floor_cdb(head, tail):
+    """The clients' excerpt floor (centi-dB), or None when no level is above zero."""
+    levels = [value for value in _series(head) + _series(tail) if value != ZERO_CDB]
+    return max(levels) - EXCERPT_FLOOR_CDB if levels else None
+
+
+def tail_opens_below_floor(head, tail):
+    """Whether the tail window's first 100 ms is under the excerpt floor (or digital zero).
+
+    A client ends such a song at the tail window's start at the latest; when
+    the silence began earlier, only the whole-file music end (D9) can say where.
+    """
+    floor = excerpt_floor_cdb(head, tail)
+    if floor is None:
+        return False
+    first = _series(tail)[0]
+    return first == ZERO_CDB or first < floor
+
+
+def music_end_frame(whole_levels, sample_rate, total, head, tail):
+    """D9: where the music ends when the tail window opens on a silence that
+    began before it, else None (contract §4.5).
+
+    ``whole_levels`` are the file's 100 ms levels from frame 0 (boundaries
+    ``floor(i * rate / 10)``), measured like ``level_cdb``.
+    """
+    tail_origin = max(0, total - EDGE_SECONDS * sample_rate)
+    floor = excerpt_floor_cdb(head, tail)
+    if tail_origin <= 0 or floor is None or not tail_opens_below_floor(head, tail):
+        return None
+    holding = (10 * tail_origin + sample_rate - 1) // sample_rate - 1
+    if holding >= len(whole_levels):
+        return None
+    if whole_levels[holding] != ZERO_CDB and whole_levels[holding] >= floor:
+        return None
+    for index in range(holding, -1, -1):
+        level = whole_levels[index]
+        if level != ZERO_CDB and level >= floor:
+            end = (index + 1) * sample_rate // 10
+            return end if 0 < end <= tail_origin else None
+    return None
 
 
 def quantize_db(value, *, peak=False):
@@ -519,26 +604,20 @@ def _landmarks(head, head_levels, tail, tail_levels, total, leading_zeros, trail
     }
 
 
-def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
-                        media_revision, content_sha256, channel_layout="stereo",
-                        decoder="pcm-input-v1", timeline_verified=False, deadline=None):
-    """Measure channel-first float PCM. Identity must be verified by the caller."""
-    av = _av()
-    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or not 10 <= sample_rate <= MAX_SOURCE_RATE:
-        raise EdgeProfileError("unsupported source sample rate")
-    if channel_layout not in ("mono", "stereo"):
-        raise EdgeProfileError("unqualified channel layout")
-    for token in (catalog_instance_id, track_id, media_revision):
-        if not isinstance(token, str) or not 0 < len(token) <= 512:
-            raise EdgeProfileError("invalid source identity")
-    if not media_revision.startswith("sha256:") or len(media_revision) != 71 or any(c not in "0123456789abcdef" for c in media_revision[7:]):
-        raise EdgeProfileError("invalid media revision")
-    if not isinstance(content_sha256, str) or len(content_sha256) != 64 or any(c not in "0123456789abcdef" for c in content_sha256):
-        raise EdgeProfileError("invalid content hash")
+def _stream(av, blocks, sample_rate, channel_layout, deadline, *, capacity_seconds=EDGE_SECONDS,
+            stop_frame=None, whole=None):
+    """Decode-side measurements of ``blocks``: the shared path of both passes.
+
+    Keeps the first and last ``capacity_seconds`` (canonical: one more second).
+    ``stop_frame`` ends the stream once a second past it has been measured,
+    without flushing the resampler (the second pass, D9); otherwise the whole
+    source is consumed and flushed. ``whole``, a list, receives the 100 ms
+    levels from frame 0 as soon as each is complete (D9).
+    """
     channels = 1 if channel_layout == "mono" else 2
     resampler = av.AudioResampler(format="fltp", layout=channel_layout, rate=CANONICAL_RATE)
-    peaks = _EdgeSamples(EDGE_SECONDS * sample_rate, np.float32)
-    canonical_capacity = (EDGE_SECONDS + 1) * CANONICAL_RATE
+    peaks = _EdgeSamples(capacity_seconds * sample_rate, np.float32)
+    canonical_capacity = (capacity_seconds + 1) * CANONICAL_RATE
     powers = _EdgeSamples(canonical_capacity, np.float64)
     true_pcm = [_EdgeSamples(canonical_capacity, np.float32) for _ in range(channels)]
     band_powers = [_EdgeSamples(canonical_capacity, np.float64) for _ in range(3)]
@@ -567,6 +646,21 @@ def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
             for channel in range(channels):
                 true_pcm[channel].push(pcm[channel].astype(np.float32))
 
+    def measure_whole():
+        # Each 100 ms bin from frame 0 once its canonical span is in; the
+        # same mean K-weighted power as level_cdb (_edge) for any bin that
+        # does not end the file.
+        while True:
+            index = len(whole)
+            begin, finish = index * sample_rate // 10, (index + 1) * sample_rate // 10
+            canonical_begin = begin * CANONICAL_RATE // sample_rate
+            canonical_end = finish * CANONICAL_RATE // sample_rate
+            if finish > peaks.total or canonical_end > powers.total:
+                return
+            power = float(np.mean(powers.window(canonical_begin, canonical_end)))
+            whole.append(quantize_db(0.0 if power < 1e-30 else power))
+
+    stopped = False
     for raw in blocks:
         _check_deadline(deadline)
         block = np.asarray(raw, dtype=np.float32)
@@ -590,8 +684,67 @@ def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
             frame.pts = peaks.total
             peaks.push(peak)
             consume_canonical(frame)
-    consume_canonical(None)
+            if whole is not None:
+                measure_whole()
+            if stop_frame is not None and peaks.total >= stop_frame + sample_rate and (
+                    powers.total >= (stop_frame + sample_rate // 2) * CANONICAL_RATE // sample_rate):
+                stopped = True
+                break
+        if stopped:
+            break
+    if not stopped:
+        if stop_frame is not None:
+            raise EdgeProfileError("edge source ended before the music end")
+        consume_canonical(None)
     _check_deadline(deadline)
+    return peaks, powers, true_pcm, band_powers, leading_zero_frames, trailing_zero_frames
+
+
+def _ending_window(av, rewind, sample_rate, channel_layout, music_end, deadline):
+    """D9's ``ending``: the window that ends at ``music_end``, measured like the
+    tail on a second decode of the same source (v3 fields only)."""
+    source = rewind()
+    try:
+        peaks, powers, true_pcm, band_powers, _lead, _trail = _stream(
+            av, source, sample_rate, channel_layout, deadline,
+            capacity_seconds=EDGE_SECONDS + 2, stop_frame=music_end)
+    finally:
+        close = getattr(source, "close", None)
+        if close is not None:
+            close()
+    window, _levels = _edge(peaks, powers, true_pcm, band_powers, sample_rate,
+                            max(0, music_end - EDGE_SECONDS * sample_rate), music_end)
+    return edge_window_v3(window)
+
+
+def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
+                        media_revision, content_sha256, channel_layout="stereo",
+                        decoder="pcm-input-v1", timeline_verified=False, deadline=None,
+                        rewind=None):
+    """Measure channel-first float PCM. Identity must be verified by the caller.
+
+    ``rewind`` returns the same blocks again from the start: the second pass
+    that measures the ``ending`` window when the music ends before the tail
+    window (D9). A list or tuple of blocks rewinds itself. The D9 result rides
+    on the v2 payload under ``V3_ENDING_KEY``, outside its digest.
+    """
+    av = _av()
+    if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or not 10 <= sample_rate <= MAX_SOURCE_RATE:
+        raise EdgeProfileError("unsupported source sample rate")
+    if channel_layout not in ("mono", "stereo"):
+        raise EdgeProfileError("unqualified channel layout")
+    for token in (catalog_instance_id, track_id, media_revision):
+        if not isinstance(token, str) or not 0 < len(token) <= 512:
+            raise EdgeProfileError("invalid source identity")
+    if not media_revision.startswith("sha256:") or len(media_revision) != 71 or any(c not in "0123456789abcdef" for c in media_revision[7:]):
+        raise EdgeProfileError("invalid media revision")
+    if not isinstance(content_sha256, str) or len(content_sha256) != 64 or any(c not in "0123456789abcdef" for c in content_sha256):
+        raise EdgeProfileError("invalid content hash")
+    if rewind is None and isinstance(blocks, (list, tuple)):
+        rewind = lambda: iter(blocks)  # noqa: E731
+    whole = []
+    peaks, powers, true_pcm, band_powers, leading_zero_frames, trailing_zero_frames = _stream(
+        av, blocks, sample_rate, channel_layout, deadline, whole=whole)
     if peaks.total == 0 or abs(powers.total - peaks.total * CANONICAL_RATE / sample_rate) > 1:
         raise EdgeProfileError("invalid decoded/resampled timeline")
     head, head_levels = _edge(peaks, powers, true_pcm, band_powers, sample_rate, 0, min(peaks.total, EDGE_SECONDS * sample_rate))
@@ -615,6 +768,17 @@ def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
         "tail": tail,
     }
     payload["profile_digest"] = profile_digest(payload)
+    music_end = music_end_frame(whole, sample_rate, peaks.total, head, tail)
+    if music_end is not None and rewind is not None:
+        del peaks, powers, true_pcm, band_powers
+        try:
+            ending = _ending_window(av, rewind, sample_rate, channel_layout, music_end, deadline)
+        except EdgeProfileError:
+            # Past the deadline or a source that reads differently: the v2
+            # edge stands without the music end.
+            ending = None
+        if ending is not None:
+            payload[V3_ENDING_KEY] = {"music_end_frame": music_end, "ending": ending}
     return payload
 
 
@@ -660,7 +824,24 @@ def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, de
                 for converted in converter.resample(None):
                     yield converted.to_ndarray()
 
-            result = analyze_edge_blocks(blocks(), rate, catalog_instance_id=catalog_instance_id, track_id=track_id, media_revision=media_revision or "sha256:" + content_hash, content_sha256=content_hash, channel_layout=layout, decoder="pyav-" + av.__version__ + ":" + codec, timeline_verified=codec in ("flac", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le"), deadline=deadline)
+            def reread():
+                # D9's second pass decodes the same file again from the start,
+                # through its own handle and the same conversion.
+                with open(path, "rb") as again:
+                    current = os.fstat(again.fileno())
+                    if (current.st_size, current.st_mtime_ns) != (before.st_size, before.st_mtime_ns):
+                        raise EdgeProfileError("source changed during analysis")
+                    with av.open(again) as replay:
+                        audio = replay.streams.audio[0]
+                        again_converter = av.AudioResampler(format="fltp", layout=layout, rate=rate)
+                        for frame in replay.decode(audio):
+                            _check_deadline(deadline)
+                            for converted in again_converter.resample(frame):
+                                yield converted.to_ndarray()
+                        for converted in again_converter.resample(None):
+                            yield converted.to_ndarray()
+
+            result = analyze_edge_blocks(blocks(), rate, catalog_instance_id=catalog_instance_id, track_id=track_id, media_revision=media_revision or "sha256:" + content_hash, content_sha256=content_hash, channel_layout=layout, decoder="pyav-" + av.__version__ + ":" + codec, timeline_verified=codec in ("flac", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le"), deadline=deadline, rewind=reread)
         after = os.fstat(source.fileno())
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or hash_source() != content_hash:
             raise EdgeProfileError("source changed during analysis")
