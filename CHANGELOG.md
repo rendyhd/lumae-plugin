@@ -7,6 +7,36 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.6.1 (2026-10-07)
+
+Storage. On a 36k-track production library the plugin held 3.0 GB of a
+3.7 GB AudioMuse backup, a third of it MusicBrainz responses kept for later.
+After the 1.6.1 upgrade the same database backs up to 2.5 GB (plugin
+1.8 GB) and is 350 MB smaller on disk. Nothing on the wire changes.
+
+- MusicBrainz responses (full releases with every credit relationship, tens
+  of KB to megabytes each) are cached for 3 days instead of 30, enough for
+  one album's deferrals and retries; the credits themselves are published
+  and kept as before. Expired responses are deleted at once (up to 1.6.0, a
+  week after expiry) by the credits watchdog even while every album is
+  current, and the upgrade deletes those an older version cached for longer
+  (on that library 13,624 of 14,722 rows: 1.1 GB less in the backup,
+  319 → 24 MB on disk).
+- Profile journal rows written before 1.3.0's edge references still carried
+  their own copy of the edge, about 20 KB each, until compaction reached them,
+  which a stable library may not do for months. The upgrade rewrites each one
+  whose edge is still stored to the reference form, which every reader serves
+  byte-identically (contract §3.7). On that library: 4,105 rows, 176 → 104 MB
+  on disk, and every one of its 71,429 events read the same before and after.
+  A row whose edge was replaced since keeps its copy.
+- Credits versions are compacted to two snapshots of the catalogue's albums,
+  as the catalogue, analysis and profile journals are, instead of only past
+  50,000 versions. A monthly rematch republishes every album, so the old
+  limit let them grow for years (about 12 KB each, about 600 MB at the old
+  limit). A client further behind (about two months; less when many albums
+  are unresolved, which rematch weekly) bootstraps credits again (410
+  `bootstrap_required`).
+
 ## 1.6.0 (2026-10-06)
 
 Jellyfin. The plugin mirrors a Jellyfin 12.0+ library next to Navidrome,

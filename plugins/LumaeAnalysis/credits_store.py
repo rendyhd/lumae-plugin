@@ -9,12 +9,19 @@ import uuid
 
 from plugin.api import table
 from . import migrations
-from .catalog import canonical_json, opaque_cursor, parse_opaque_cursor, resolve_catalog_source, _external_ids
+from .catalog import (
+    canonical_json, change_journal_retention_limit, opaque_cursor, parse_opaque_cursor,
+    resolve_catalog_source, _external_ids,
+)
 from .credits_matching import MATCHING_VERSION
 
 SCHEMA_VERSION = 1
 MAX_PAGE = 20
 MAX_RECORD_BYTES = 2 * 1024 * 1024
+# A cached MusicBrainz response outlives one album's deferrals and retries,
+# not the month between rematches: full releases are tens of KB to megabytes.
+HTTP_CACHE_TTL_DAYS = 3
+HTTP_CACHE_PURGE_BATCH = 500
 
 
 def migrate(db):
@@ -45,6 +52,7 @@ def migrate(db):
         lambda cur: migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS {table('credits_versions_subject')} ON {table('credits_versions')}(catalog_instance_id,album_id,seq DESC)"),
         f"""CREATE TABLE IF NOT EXISTS {table('credits_http_cache')} (
             request_key TEXT PRIMARY KEY,payload JSONB NOT NULL,expires_at TIMESTAMPTZ NOT NULL)""",
+        lambda cur: migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS {table('credits_http_cache_expiry')} ON {table('credits_http_cache')}(expires_at)"),
         f"""CREATE TABLE IF NOT EXISTS {table('credits_http_control')} (
             singleton INTEGER PRIMARY KEY CHECK(singleton=1),next_request_at TIMESTAMPTZ NOT NULL DEFAULT now())""",
         f"INSERT INTO {table('credits_http_control')}(singleton) VALUES(1) ON CONFLICT DO NOTHING",
@@ -330,8 +338,40 @@ def changes(db, catalog_id, cursor_value, limit=250):
             "cursor": opaque_cursor(catalog_id, head["epoch"], next_seq), "has_more": next_seq < head["seq"]}
 
 
-def compact(db, catalog_id, retention=50000):
+def purge_http_cache(cur, batch=HTTP_CACHE_PURGE_BATCH):
+    """Delete up to ``batch`` cached MusicBrainz responses that expired, or that
+    an older version cached for longer than HTTP_CACHE_TTL_DAYS (30 days up to
+    1.6.0). Returns the number deleted; a response deleted early is refetched."""
+    # clock_timestamp: a row a concurrent request cached after this
+    # transaction began never looks longer-lived than the TTL.
+    cur.execute(f"""DELETE FROM {table('credits_http_cache')} WHERE request_key IN(
+        SELECT request_key FROM {table('credits_http_cache')}
+        WHERE expires_at<now() OR expires_at>clock_timestamp()+(%s*interval '1 day')
+        LIMIT %s FOR UPDATE SKIP LOCKED)""", (HTTP_CACHE_TTL_DAYS, max(1, int(batch))))
+    return cur.rowcount
+
+
+def purge_http_cache_fully(db, batch=HTTP_CACHE_PURGE_BATCH):
+    """purge_http_cache until nothing is left, one committed batch at a time."""
     cur = db.cursor()
+    try:
+        while True:
+            deleted = purge_http_cache(cur, batch)
+            db.commit()
+            if deleted < batch:
+                return
+    finally:
+        cur.close()
+
+
+def compact(db, catalog_id, retention=None):
+    cur = db.cursor()
+    if retention is None:
+        # Two logical snapshots of the catalogue's albums, as the other journals keep.
+        cur.execute(f"""SELECT COALESCE((entity_counts->>'album')::bigint,0) FROM {table('catalog_state')}
+            WHERE catalog_instance_id=%s""", (catalog_id,))
+        row = cur.fetchone()
+        retention = change_journal_retention_limit(row[0] if row else 0)
     cur.execute(f"""UPDATE {table('credits_stream')} SET floor_seq=GREATEST(floor_seq,head_seq-%s)
         WHERE catalog_instance_id=%s RETURNING floor_seq""", (max(1000, int(retention)), catalog_id))
     row = cur.fetchone()
@@ -340,6 +380,6 @@ def compact(db, catalog_id, retention=50000):
         cur.execute(f"""DELETE FROM {table('credits_versions')} v WHERE catalog_instance_id=%s AND seq<%s
             AND (payload IS NULL OR seq NOT IN(SELECT MAX(seq) FROM {table('credits_versions')}
               WHERE catalog_instance_id=%s AND seq<=%s GROUP BY album_id))""", (catalog_id, row[0], catalog_id, row[0]))
-    cur.execute(f"DELETE FROM {table('credits_http_cache')} WHERE expires_at<now()-interval '7 days'")
+    purge_http_cache(cur)
     cur.close()
     db.commit()

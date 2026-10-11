@@ -353,6 +353,81 @@ def compact_enrichment_storage(db, catalog_instance_id=None, cursor=None,
         cur.close()
 
 
+# Journal rows rewritten per transaction by externalize_journal_edges, and the
+# stored payload size below which an upsert cannot embed an edge (a waveform
+# payload is under 1 KB, an embedded edge alone several KB even compressed).
+JOURNAL_EDGE_BATCH = 200
+EMBEDDED_EDGE_MIN_BYTES = 1024
+
+
+def externalize_journal_edges(db, batch_size=JOURNAL_EDGE_BATCH):
+    """Store pre-K6 journal upserts that embed their edge in the K6 form.
+
+    A row journalled before K6 (P3-2) keeps its own copy of its edge, about
+    19 KB, until compaction removes the row, which a stable library may not do
+    for months. Such a row is rewritten to its waveform payload plus an edge
+    reference when the edge it embeds is still stored for the row's track and
+    media revision. /changes then joins back that same edge (same digest, so
+    the same content), and a catch-up capture copies the reference it would
+    have split off, so every reader serves the row exactly as before. From
+    then on it behaves as every K6 row: an edge replaced or removed later is
+    served as the current edge, or none, and the event that replaced or
+    removed it follows in the journal (contract §3.7). A row whose edge is
+    gone, or names another revision, keeps its copy.
+
+    Runs after the migration commits, one short transaction per batch and
+    without stream locks: a reader sees either form. Idempotent; returns the
+    number of rows rewritten.
+    """
+    rewritten = 0
+    after = None
+    cur = db.cursor()
+    try:
+        while True:
+            keyset = "" if after is None else "AND (catalog_instance_id, epoch, seq) > (%s, %s, %s)"
+            cur.execute(
+                f"""
+                SELECT catalog_instance_id, epoch, seq
+                  FROM {t('profile_changes')}
+                 WHERE edge_ref IS NULL AND operation='upsert'
+                   AND pg_column_size(payload) > %s {keyset}
+                 ORDER BY catalog_instance_id, epoch, seq
+                 LIMIT %s
+                """,
+                (EMBEDDED_EDGE_MIN_BYTES, *(after or ()), batch_size),
+            )
+            keys = cur.fetchall()
+            if keys:
+                cur.execute(
+                    f"""
+                    UPDATE {t('profile_changes')} c
+                       SET payload = c.payload - 'edge_profile',
+                           edge_ref = jsonb_build_object(
+                               'profile_digest', c.payload#>'{{edge_profile,profile_digest}}')
+                      FROM unnest(%s::text[], %s::text[], %s::bigint[]) AS k(source, epoch, seq)
+                     WHERE c.catalog_instance_id=k.source AND c.epoch=k.epoch AND c.seq=k.seq
+                       AND c.edge_ref IS NULL AND c.operation='upsert'
+                       AND jsonb_typeof(c.payload#>'{{edge_profile,profile_digest}}')='string'
+                       AND c.payload#>>'{{edge_profile,media_revision}}'=c.payload->>'media_revision'
+                       AND EXISTS (
+                           SELECT 1 FROM {t('edge_profiles')} e
+                            WHERE e.catalog_instance_id=c.catalog_instance_id
+                              AND e.track_id=c.track_id
+                              AND e.media_revision=c.payload->>'media_revision'
+                              AND e.profile_digest=c.payload#>>'{{edge_profile,profile_digest}}')
+                    """,
+                    ([key[0] for key in keys], [key[1] for key in keys],
+                     [key[2] for key in keys]),
+                )
+                rewritten += cur.rowcount
+            db.commit()
+            if len(keys) < batch_size:
+                return rewritten
+            after = keys[-1]
+    finally:
+        cur.close()
+
+
 def migrate_enrichment(db):
     """Create source-scoped, independently cursorable enrichment storage."""
     cur = db.cursor()

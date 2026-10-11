@@ -81,6 +81,7 @@ from .catalog_enrichment import (
     RELATIONSHIP_SCHEMA_VERSION,
     claim_relationship_preparation,
     compact_enrichment_storage,
+    externalize_journal_edges,
     migrate_enrichment,
     prepare_relationships,
     profile_bootstrap_page,
@@ -161,7 +162,7 @@ from .reconcile import (
 
 SCHEMA_VERSION = 1
 ANALYZER_VERSION = 1
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.6.1"
 CATALOG_SCHEMA_VERSION = 3
 ANALYSIS_SCHEMA_VERSION = 2
 CATALOG_FEATURES = (
@@ -1720,6 +1721,11 @@ def migrate(db):
     _safe_reconcile_schedule(db)
     # Provider and catalogue watchdogs consume the durable requests above.
     # Install hooks remain schema-only and never queue root work.
+    # Storage reclaimed after the migration commits, in short transactions:
+    # MusicBrainz responses an older version cached for 30 days, and edges
+    # that pre-K6 journal rows still embed.
+    credits_store.purge_http_cache_fully(db)
+    externalize_journal_edges(db)
 
 
 def parse_ids(value):
