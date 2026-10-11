@@ -53,6 +53,21 @@ failed jobs back off for six hours. Source revision changes may retry
 immediately. Each file has a 15 minute deadline and a 6,553.6 second decoded
 duration ceiling.
 
+## Schema v3 (1.7.0, unreleased)
+
+Clients that ask for it (`edge_schema=3`; capability
+`edge_profiles.schema_versions: [2, 3]`) get schema v3, a deterministic
+projection of the stored edge: the same fields without the windows'
+`peak_cdb` and `spectral_flux_q15` (no client planner reads them), with its own
+`profile_digest`. When a song's music ends before the last 30 seconds (the tail
+window opens on a silence that began before it: a hidden track after a long
+silence, or a long silent run-out; about 0.1% of a library), v3 adds
+`landmarks.music_end_frame`, where that silence begins, and an `ending` window
+measured like `tail` over the 30 seconds that end there. Clients end the song
+there and plan its fade on `ending`. v2 transfers and v2 digests are unchanged.
+The exact rule and the negotiation are in `docs/contracts/LUMAE_SYNC_CONTRACT.md`
+§4.5.
+
 ## Measurement contract
 
 The analyzer retains only the first and last 30 seconds, including partial
