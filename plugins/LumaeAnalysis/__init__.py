@@ -806,13 +806,15 @@ def _rollback_if_possible(db):
         rollback()
 
 
-def _safe_reconcile_schedule(db, paused=None, yield_to=None, host_retries=True):
+def _safe_reconcile_schedule(db, paused=None, yield_to=None, host_retries=True,
+                             keep_yield=False):
     try:
         return reconcile_schedule_from_state(
             db,
             paused=maintenance_paused() if paused is None else bool(paused),
             yield_to=yield_to,
             host_retries=host_retries,
+            keep_yield=keep_yield,
         )
     except Exception:
         _rollback_if_possible(db)
@@ -1579,7 +1581,8 @@ def observe_provider_identities_on_start():
                 server["server_id"],
             )
     enqueue_required_catalog_preparations(db=db)
-    _safe_reconcile_schedule(db)
+    # A restart leaves a yield to AudioMuse in place (plan S1).
+    _safe_reconcile_schedule(db, keep_yield=True)
     # The scheduled provider-identity recheck consumes durable transition
     # state. Startup never reaches into queue internals or creates root work.
 
@@ -1910,7 +1913,7 @@ def migrate(db):
     # is admitted here; ordinary analysis hooks and explicit prepare requests
     # own later enrichment.
     enqueue_required_catalog_preparations(db=db)
-    _safe_reconcile_schedule(db)
+    _safe_reconcile_schedule(db, keep_yield=True)
     # Provider and catalogue watchdogs consume the durable requests above.
     # Install hooks remain schema-only and never queue root work.
     # Storage reclaimed after the migration commits, in short transactions:

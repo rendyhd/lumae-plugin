@@ -152,10 +152,15 @@ def migrate_reconcile(db):
 
 def _lock_control(cur):
     cur.execute(
-        f"SELECT mode, cron_expr FROM {control_table()} "
+        f"SELECT mode, cron_expr, reason FROM {control_table()} "
         "WHERE name='catalog_reconcile' FOR UPDATE"
     )
     return cur.fetchone()
+
+
+def _yielding(control):
+    """Whether the locked control row waits on a yield (plan S1)."""
+    return bool(control) and control[0] == "waiting" and str(control[2] or "").startswith("yield:")
 
 
 def cron_minutes(expr):
@@ -283,10 +288,15 @@ def _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at=None, *, av
 
 
 def arm_reconcile(db, reason="work_admitted", commit=False):
-    """Switch to minute cadence inside the caller's work-admission transaction."""
+    """Switch to minute cadence inside the caller's work-admission transaction.
+
+    A yield (plan S1) holds: the work is durable, and the tick that finds
+    nothing to yield to takes it. Minute cadence here put a fire back on every
+    minute, ahead of the host's retry pass, whenever a song was analysed or
+    the app asked for work."""
     cur = db.cursor()
-    _lock_control(cur)
-    _set_schedule_locked(cur, "active", ACTIVE_CRON, reason)
+    if not _yielding(_lock_control(cur)):
+        _set_schedule_locked(cur, "active", ACTIVE_CRON, reason)
     cur.close()
     if commit:
         db.commit()
@@ -436,16 +446,23 @@ def _recover_interrupted_events(cur):
 
 
 def reconcile_schedule_from_state(db, paused=False, commit=True, yield_to=None,
-                                  host_retries=True):
+                                  host_retries=True, keep_yield=False):
     """Choose cadence from durable state while excluding concurrent lost wakes.
 
     ``yield_to``: the tick left the queue to that host work (plan S1); the
     watchdog waits on the yield cadence until a tick finds nothing to yield to.
     ``host_retries``: the host retries a refused fire (``cron_retry``).
+    ``keep_yield``: a caller outside a tick (startup, the install) leaves a
+    yield as it is; only a tick ends one.
     """
     cur = db.cursor()
-    _lock_control(cur)
+    control = _lock_control(cur)
     _recover_interrupted_events(cur)
+    if keep_yield and not paused and _yielding(control):
+        cur.close()
+        if commit:
+            db.commit()
+        return {"mode": control[0], "cron_expr": control[1], "next_retry_at": None}
     avoid = True
     if paused:
         mode, cron_expr, reason, next_retry_at = (

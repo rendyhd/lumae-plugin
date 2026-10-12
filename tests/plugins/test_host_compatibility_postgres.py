@@ -192,7 +192,9 @@ class HostLoop:
                 cur.execute("UPDATE task_status SET status='SUCCESS' WHERE task_id=%s", (task_id,))
             self.db.commit()
 
-    def run(self, minutes):
+    def run(self, minutes, each_minute=None):
+        """``each_minute``: called after each minute's ticks (work admitted
+        meanwhile)."""
         heartbeat = None
         if self.shape["heartbeat"]:
             # 3.5.2+: a heartbeat thread runs beside the plugin call.
@@ -208,6 +210,8 @@ class HostLoop:
                 if not self.shape["retry_first"]:
                     self._retry_pass()
                 self._run()
+                if each_minute is not None:
+                    each_minute()
         finally:
             if heartbeat is not None:
                 stop.set()
@@ -233,6 +237,29 @@ def test_host_schedules_start_and_lumae_resumes_on_every_host(tick, monkeypatch,
     # Lumae works again within about one retry interval of it ending, or
     # within five minutes where the host does not retry (3.2.x: */5 while
     # yielding, a refused yield minute would wait an hour).
+    resumed = [minute for minute, status, _live in loop.lumae_ticks
+               if status == "processed" and minute >= loop.main_until]
+    assert resumed and resumed[0] - loop.main_until <= (
+        RETRY_EVERY + 1 if shape["cron_retry"] else 5), loop.lumae_ticks
+
+
+@pytest.mark.parametrize("name", list(SHAPES))
+def test_work_admitted_every_minute_leaves_the_yield_in_place(tick, monkeypatch, name):
+    """Seen on the test instance after the 1.7.0 install: every analysed song,
+    on-demand request or credits lookup admits work. Arming minute cadence on
+    each one ended the yield, a fire was queued ahead of every retry pass, and
+    the refused schedule never started."""
+    mod, db = tick
+    shape = SHAPES[name]
+    _host(db, monkeypatch, shape)
+    _always_working(mod, monkeypatch)
+    reconcile.arm_reconcile(db, "work_admitted", commit=True)
+    loop = HostLoop(mod, db, shape, monkeypatch, time.mktime((2026, 10, 11, 2, 0, 0, 0, 0, -1)))
+
+    loop.run(45, each_minute=lambda: reconcile.arm_reconcile(db, "analysis_hook", commit=True))
+
+    assert loop.main_started == (0 if not shape["gate_counts_plugins"] else 5), loop.lumae_ticks
+    assert not [tick for tick in loop.lumae_ticks if tick[2] and tick[1] == "processed"]
     resumed = [minute for minute, status, _live in loop.lumae_ticks
                if status == "processed" and minute >= loop.main_until]
     assert resumed and resumed[0] - loop.main_until <= (

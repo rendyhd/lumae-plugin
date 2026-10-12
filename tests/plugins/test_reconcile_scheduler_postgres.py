@@ -19,6 +19,7 @@ Plan: docs/plan/LUMAE_SCHEDULER_PLAN_2026-10-11.md (1.6.2: S1-S6).
 import importlib
 import random
 import time
+from types import SimpleNamespace
 
 import pytest
 
@@ -535,6 +536,39 @@ def test_the_tick_resumes_and_returns_to_minute_cadence_once_the_retry_clears(ti
     assert _reconcile().reconcile_schedule_from_state(db)["cron_expr"] == EVERY_MINUTE
     assert _rows(db, f"SELECT mode, reason FROM {P}reconcile_control")[0] == (
         "active", "runnable_work")
+
+
+@pytest.mark.parametrize("caller", ["work_admitted", "startup", "install"])
+def test_only_a_tick_ends_a_yield(tick, monkeypatch, caller):
+    """Work admitted during a yield (an analysed song, an on-demand request, a
+    credits lookup) waits for the tick that finds nothing to yield to, and so
+    do the startup and install recomputes; minute cadence from any of them put
+    a fire back ahead of the host's retry pass."""
+    mod, db = tick
+    ran = _ready_work(mod, db, monkeypatch)
+    _cron_retry(db, COLLECTION_RETENTION)
+    assert mod.catalog_reconcile_task()["status"] == "yielded"
+    held = _rows(db, f"SELECT mode, cron_expr, reason FROM {P}reconcile_control")[0]
+
+    if caller == "work_admitted":
+        _reconcile().arm_reconcile(db, "deferred_on_demand", commit=True)
+    elif caller == "startup":
+        monkeypatch.setattr(mod, "ProviderCatalogBridge", lambda: SimpleNamespace(
+            list_servers=lambda: []))
+        mod.observe_provider_identities_on_start()
+    else:
+        mod.migrate(db)
+
+    assert _rows(db, f"SELECT mode, cron_expr, reason FROM {P}reconcile_control")[0] == held
+    assert _cron(db) == held[1]
+    with db.cursor() as cur:
+        cur.execute("DELETE FROM cron_retry")
+    db.commit()
+    assert mod.catalog_reconcile_task()["status"] == "processed" and ran == [["track-a"]]
+    # Outside a yield, admitted work arms minute cadence as before.
+    _reconcile().arm_reconcile(db, "deferred_on_demand", commit=True)
+    assert _rows(db, f"SELECT mode, cron_expr, reason FROM {P}reconcile_control")[0] == (
+        "active", EVERY_MINUTE, "deferred_on_demand")
 
 
 @pytest.mark.parametrize(("task_type", "status", "yields"), [
