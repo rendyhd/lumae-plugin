@@ -5414,7 +5414,12 @@ def test_reconcile_status_panel_reports_real_work_and_escapes_errors(monkeypatch
     assert "7.5 s" in body
     assert "processed: 2" in body
     assert "&lt;boom&gt;" in body
-    assert "Songs analyzed: 0" in body
+    # Since 1.7.0 the note is a real count on older hosts and Lumae's own
+    # sentence on newer ones, never a fixed "Songs analyzed: 0" (LA-2).
+    assert "Songs analyzed: 0" not in body
+    text = " ".join(body.split())
+    assert "older AudioMuse hosts note these tasks with a “Songs analyzed” count" in text
+    assert "newer hosts show the sentence Lumae returns" in text
     assert f'data-lumae-active="{str(running).lower()}"' in body
     assert "<script>" not in body
 
