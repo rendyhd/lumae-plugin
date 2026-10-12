@@ -612,27 +612,29 @@ def _revision_lookup(cur, source, generation, changed):
 
     Returns ``(track_ids, gone, media_fps)``: ``gone`` when the change is a
     deletion or the track is missing from or unavailable in the generation.
+
+    The generation is usually the publisher's own, still uncommitted, so
+    PostgreSQL has no statistics for it. One read of its changed rows keeps
+    that a single pass; a probe per changed track (1.7.0) let the planner
+    filter the whole generation for each one, 41-58 s for 5,471 changes in
+    a 36k-track catalogue (LA-1).
     """
     track_ids = list(changed)
     cur.execute(
-        f"""SELECT c.track_id,
-                   c.deleted OR t.track_id IS NULL OR NOT t.available,
-                   t.media_fp
-              FROM unnest(%s::text[], %s::boolean[]) WITH ORDINALITY
-                   AS c(track_id, deleted, ordinality)
-              LEFT JOIN LATERAL (
-                  SELECT track_id, available, media_fp
-                    FROM {table('catalog_tracks')}
-                   WHERE catalog_instance_id=%s AND published_generation=%s
-                     AND track_id=c.track_id
-                   LIMIT 1
-              ) t ON TRUE
-             ORDER BY c.ordinality""",
-        (track_ids, [changed[track_id] == "delete" for track_id in track_ids],
-         source, generation),
+        f"""SELECT track_id, available, media_fp
+              FROM {table('catalog_tracks')}
+             WHERE catalog_instance_id=%s AND published_generation=%s
+               AND track_id = ANY(%s::text[])""",
+        (source, generation, track_ids),
     )
-    rows = cur.fetchall()
-    return [row[0] for row in rows], [bool(row[1]) for row in rows], [row[2] for row in rows]
+    rows = {str(row[0]): (row[1], row[2]) for row in cur.fetchall()}
+    gone = []
+    media_fps = []
+    for track_id in track_ids:
+        row = rows.get(track_id)
+        gone.append(changed[track_id] == "delete" or row is None or not row[0])
+        media_fps.append(row[1] if row else None)
+    return track_ids, gone, media_fps
 
 
 def plan_catalog_invalidation(cur, source, generation, track_changes, *, full_reconcile=False):

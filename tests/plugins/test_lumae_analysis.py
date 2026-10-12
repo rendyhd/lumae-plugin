@@ -3316,12 +3316,29 @@ def test_streaming_loudness_caps_channels_and_sample_rate():
 
 
 class FakeCursor:
+    # psycopg2.extras.execute_values reads the encoding, mogrifies each row
+    # and runs one statement; _unbatch turns that back into (sql, rows), as
+    # executemany records it.
+    connection = types.SimpleNamespace(encoding="UTF8")
+
     def __init__(self, rows=None):
         self.rows = rows or []
         self.description = [("item_id",), ("file_path",)]
         self.executed = []
+        self.pending_rows = []
+
+    def mogrify(self, _template, args):
+        self.pending_rows.append(tuple(args))
+        return b"(?)"
+
+    def _unbatch(self, sql, params):
+        if isinstance(sql, bytes):
+            rows, self.pending_rows = self.pending_rows, []
+            return sql.decode(), rows
+        return sql, params
 
     def execute(self, sql, params=None):
+        sql, params = self._unbatch(sql, params)
         self.executed.append((sql, params))
 
     def fetchone(self):
@@ -7073,6 +7090,7 @@ class RefreshCursor(FakeCursor):
         self.db = db
 
     def execute(self, sql, params=None):
+        sql, params = self._unbatch(sql, params)
         super().execute(sql, params)
         self.db.executed.append((sql, params))
         if "SELECT catalog_instance_id, current_core_server_id" in sql:
@@ -7163,16 +7181,16 @@ class RefreshDb:
 def test_catalog_generation_parameters_are_materialized_one_batch_at_a_time():
     import plugins.LumaeAnalysis.catalog as catalog
 
-    class Cursor:
+    class Cursor(FakeCursor):
         def __init__(self):
+            super().__init__()
             self.batch_sizes = []
 
-        def executemany(self, _sql, params):
-            self.batch_sizes.append(len(params))
-
         # LUM-016: the track insert reads unaccent and the album names first.
-        def execute(self, _sql, _params=None):
-            pass
+        def execute(self, sql, params=None):
+            sql, params = self._unbatch(sql, params)
+            if sql.lstrip().startswith("INSERT"):
+                self.batch_sizes.append(len(params))
 
         def fetchone(self):
             return (True,)
@@ -10712,6 +10730,7 @@ class PublisherCursor(FakeCursor):
         self.db = db
 
     def execute(self, sql, params=None):
+        sql, params = self._unbatch(sql, params)
         super().execute(sql, params)
         self.db.executed.append((sql, params))
         normalized = " ".join(sql.split())
