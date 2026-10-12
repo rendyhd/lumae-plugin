@@ -3988,13 +3988,17 @@ def _schedule_edge_upgrade(track_id, catalog_instance_id, server_id, priority="b
 
 
 def _leave_edge_to_pass(track_id, catalog_instance_id):
-    """AudioMuse song hook: the library pass, not a task per song, makes the edge.
+    """AudioMuse song hook and background waveforms: the library pass, not a
+    task per song, makes the edge.
 
     The host admits a plugin root task from inside its own analysis, so a task
     per song put hundreds on the queue, and the host's analysis page shows the
     newest root task and kept switching to them. The pass is made due to reach
     the track instead and runs once the reconcile watchdog ticks again (the
-    host skips plugin crons while its own analysis runs).
+    host skips plugin crons while its own analysis runs). The waveform
+    backfill's tick runs several batches (plan S2), so its task per track kept
+    a Lumae root task on the host's queue for most of every minute, and the
+    host refused its schedules meanwhile.
     """
     if not catalog_instance_id or not edge_profiles_enabled() or not edge_scheduling_allowed():
         return
@@ -4290,8 +4294,11 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
         result = run_file_analysis(analyze_file, info["file_path"])
         outcome = complete(result, "ready", media_sig=info["media_signature"])
         if outcome["status"] == "ready":
-            # An on-demand track's edge follows at on-demand priority.
-            _schedule_edge_upgrade(track_id, catalog_instance_id, server_id, priority)
+            if priority == "interactive":
+                # An on-demand track's edge follows at on-demand priority.
+                _schedule_edge_upgrade(track_id, catalog_instance_id, server_id, priority)
+            else:
+                _leave_edge_to_pass(track_id, catalog_instance_id)
         return outcome
     except Exception as exc:
         code = analysis_failure_code(track_id, exc)

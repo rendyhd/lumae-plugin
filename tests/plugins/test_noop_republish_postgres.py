@@ -491,6 +491,57 @@ def test_song_hook_does_not_rewind_for_a_track_in_back_off(source_db, monkeypatc
     assert reasons == []
 
 
+def _analyse_one(mod, monkeypatch, tmp_path, priority):
+    """The plugin's own analysis of one track, through analyze_one_track."""
+    audio = tmp_path / "track.flac"
+    audio.write_bytes(b"audio")
+    batches = []
+    monkeypatch.setattr(mod, "load_track_file", lambda *a, **k: {
+        "file_path": str(audio), "media_signature": "catalog-media:rev-a", "cleanup_path": None,
+    })
+    monkeypatch.setattr(mod, "analyze_file", lambda _path: _result())
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "arm_profile_claim_recovery", lambda *a, **k: False)
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
+    monkeypatch.setattr(mod, "enqueue_bounded", lambda _task, jobs, *args, **kwargs: batches.append(
+        ([job["track_id"] for job in jobs], args[2])))
+    token = mod.mark_pending(["track-a"], SOURCE, priority=priority)["track-a"]
+    outcome = mod.analyze_one_track("track-a", SOURCE, SERVER, token, priority=priority)
+    return outcome, batches
+
+
+def test_a_background_waveform_leaves_its_edge_to_the_pass(source_db, monkeypatch, tmp_path):
+    """The waveform backfill queues no root task per track (as the song hook):
+    1.7.0's ticks run several batches, and a task per track kept a Lumae root
+    task on the host's queue for most of every minute (seen on the test
+    instance), so the host refused its schedules meanwhile."""
+    mod = load_plugin()
+    db = source_db
+    _edge_pass(db, "complete", next_retry_hours=6)
+    reasons = _record_reconcile_arms(mod, monkeypatch)
+
+    outcome, batches = _analyse_one(mod, monkeypatch, tmp_path, "background")
+
+    assert outcome == {"track_id": "track-a", "status": "ready"}
+    assert batches == [] and _snapshot(db, "track-a")["jobs"] == []
+    assert _pass_row(db) == ("queued", "", True)
+    assert reasons == ["edge_backfill_ready"]
+    assert store.edge_backfill_candidates(db, SOURCE) == ["track-a"]
+
+
+def test_an_on_demand_waveform_queues_its_edge_at_once(source_db, monkeypatch, tmp_path):
+    mod = load_plugin()
+    db = source_db
+    _edge_pass(db, "complete", next_retry_hours=6)
+
+    outcome, batches = _analyse_one(mod, monkeypatch, tmp_path, "interactive")
+
+    assert outcome == {"track_id": "track-a", "status": "ready"}
+    assert batches == [(["track-a"], "interactive")]
+    assert [job[2] for job in _snapshot(db, "track-a")["jobs"]] == ["pending"]
+    assert _pass_row(db) == ("complete", "", False)
+
+
 def test_song_hook_on_current_row_with_current_edge_requests_no_job(
     source_db, monkeypatch, tmp_path,
 ):
