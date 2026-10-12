@@ -50,7 +50,11 @@ def playback_pending(db):
     return result
 
 
-def run_one(catalog_id, *, db=None, client_factory=Client, critical=playback_pending):
+def run_one(catalog_id, *, db=None, client_factory=Client, critical=playback_pending,
+            deadline=None):
+    """One album's turn. ``deadline`` bounds its uncached MusicBrainz requests
+    (a watchdog tick's); the final allowed() check never uses it, so a
+    finished album is published."""
     db = db or get_db()
     store.source(db, catalog_id)
     if paused() or critical(db):
@@ -64,7 +68,9 @@ def run_one(catalog_id, *, db=None, client_factory=Client, critical=playback_pen
             store.request_album(db, catalog_id, job["album_id"])
             return {"status": "superseded"}
         allowed = lambda: not paused() and store.lease_current(db, job) and not critical(db)
-        match = resolve(album, client_factory(db, allowed=allowed))
+        client = (client_factory(db, allowed=allowed) if deadline is None
+                  else client_factory(db, allowed=allowed, deadline=deadline))
+        match = resolve(album, client)
         credits = extract_credits(match)
         payload = {"schema_version": 1, "catalog_instance_id": catalog_id, "album_id": album["id"],
             "input_fingerprint": album["input_fp"], "match_status": match["status"],
@@ -88,8 +94,12 @@ def run_one(catalog_id, *, db=None, client_factory=Client, critical=playback_pen
                 "album_id": job["album_id"], "retry_seconds": delay}
 
 
-def reconcile(db, server_id=None, before_background=False):
-    """One credits album per turn, with time sharing alongside existing background work."""
+def reconcile(db, server_id=None, before_background=False, deadline=None):
+    """One credits album per turn, with time sharing alongside existing background work.
+
+    Before background work a turn waits 300 s (120 s for a requested album)
+    after the last one ended.
+    """
     if paused():
         return None
     # Expired responses go even while every album is current (one bounded batch).
@@ -114,7 +124,9 @@ def reconcile(db, server_id=None, before_background=False):
         cur.close()
         db.commit()
         if row and row[0] and (not before_background or float(row[1]) >= (120 if row[2] else 300)):
-            return run_one(catalog_id, db=db)
+            if deadline is None:
+                return run_one(catalog_id, db=db)
+            return run_one(catalog_id, db=db, deadline=deadline)
     return None
 
 

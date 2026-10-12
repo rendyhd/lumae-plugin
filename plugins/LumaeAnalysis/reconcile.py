@@ -2,14 +2,19 @@
 
 from contextvars import ContextVar
 from datetime import datetime, timezone
+import importlib
 import json
+import random
+import time
 
-from plugin.api import get_db, table
+from plugin.api import get_db, logger, table
 
 from . import migrations
 
 
+LUMAE_TASK_TYPE_PREFIX = "plugin.lumae_analysis."
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
+PROVIDER_IDENTITY_RECHECK_TASK_TYPE = "plugin.lumae_analysis.provider_identity_recheck"
 ACTIVE_CRON = "* * * * *"
 # On-demand work AudioMuse refused to queue (``last_error`` of a pending
 # interactive attempt or edge job). It is runnable work for the watchdog.
@@ -25,7 +30,33 @@ BACKOFF_LADDER = (
     (BACKOFF_15_CRON, 15 * 60),
     (IDLE_CRON, 60 * 60),
 )
-EVENT_RETENTION_PER_SOURCE = 25
+# While it yields (plan S1), the watchdog ticks once, at a random minute this
+# many minutes ahead, re-picked on every yielding tick. AudioMuse's retry pass
+# runs about every 11 minutes (CRON_RETRY_INTERVAL_MINUTES, stamped after the
+# pass), so a fixed cadence could meet it on every pass.
+YIELD_MINUTES = (5, 15)
+# A tick works for at most this long, over as many actions as fit (plan S2),
+# so it never covers the next minute's host fire. Each action stops at the
+# deadline itself; an action starts only when its recent average fits.
+TICK_BUDGET_SECONDS = 45
+ACTION_AVERAGE_RUNS = 10
+# AudioMuse's main jobs and side jobs: its cron gate refuses every start
+# while one is live. A host with task_types adds BATCH_GATE_TASK_TYPES.
+HOST_BLOCKING_TASK_TYPES = (
+    "main_analysis", "main_clustering", "cleaning", "provider_migration",
+    "server_sweep", "naming_preview",
+)
+# The journal keeps a day of events per source, at least the latest
+# EVENT_RETENTION_MIN and at most EVENT_RETENTION_MAX; the settings page shows
+# the latest EVENT_JOURNAL_LIMIT. 25 events were about 25 minutes at minute
+# cadence, which rotated a long tick out before anyone looked (AUD-18).
+EVENT_RETENTION_HOURS = 24
+EVENT_RETENTION_MIN = 25
+EVENT_RETENTION_MAX = 1000
+EVENT_JOURNAL_LIMIT = 25
+# AudioMuse shows the tick's message as its task message, and with AM-2 as
+# its Recent tasks note.
+TICK_MESSAGE_MAX = 100
 
 _current_event_id = ContextVar("lumae_reconcile_event_id", default=None)
 
@@ -127,7 +158,92 @@ def _lock_control(cur):
     return cur.fetchone()
 
 
-def _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at=None):
+def cron_minutes(expr):
+    """The minutes a cron expression's minute field names, as AudioMuse's
+    matcher reads it (``*``, numbers, lists, ``a-b``, ``*/n``, ``a-b/n``,
+    ``a/n``); None when the field is unparseable."""
+    try:
+        field = str(expr).split()[0]
+        minutes = set()
+        for part in field.split(","):
+            base, slash, step = part.strip().partition("/")
+            step = int(step) if slash else 1
+            if base == "*":
+                start, end = 0, 59
+            elif "-" in base:
+                start, end = (int(value) for value in base.split("-", 1))
+            else:
+                start = int(base)
+                end = 59 if slash else start
+            if step < 1 or not 0 <= start <= end <= 59:
+                return None
+            minutes.update(range(start, end + 1, step))
+        return minutes
+    except (ValueError, IndexError):
+        return None
+
+
+def _minute_field(minutes):
+    """``0,1,3-31,33-59`` for a set of minutes: runs of three or more as ranges."""
+    parts, ordered, index = [], sorted(minutes), 0
+    while index < len(ordered):
+        end = index
+        while end + 1 < len(ordered) and ordered[end + 1] == ordered[end] + 1:
+            end += 1
+        if end - index >= 2:
+            parts.append(f"{ordered[index]}-{ordered[end]}")
+        else:
+            parts.extend(str(value) for value in ordered[index:end + 1])
+        index = end + 1
+    return ",".join(parts)
+
+
+def lumae_row_minutes(cur):
+    """The minutes at which Lumae's other enabled cron rows are due.
+
+    AudioMuse's minute pass dispatches due rows in cron.id order, and the
+    watchdog's row comes first, so a watchdog due in the same minute was
+    queued first and the other row refused (the reporter's 06:02). Minutes
+    only: a daily row costs the watchdog one minute an hour. A row due every
+    minute, or with an unparseable minute field, excludes nothing.
+    """
+    cur.execute(
+        "SELECT cron_expr FROM cron WHERE starts_with(task_type, %s) AND task_type <> %s "
+        "AND enabled",
+        (LUMAE_TASK_TYPE_PREFIX, CATALOG_RECONCILE_TASK_TYPE),
+    )
+    excluded = set()
+    for (expr,) in cur.fetchall() or ():
+        minutes = cron_minutes(expr)
+        if minutes and len(minutes) < 60:
+            excluded |= minutes
+    return excluded
+
+
+def avoid_minutes(cron_expr, excluded):
+    """``cron_expr`` without the ``excluded`` minutes; unchanged when it
+    would have none left or its minute field is unparseable."""
+    minutes = cron_minutes(cron_expr)
+    if not minutes or not excluded or not minutes & excluded or not minutes - excluded:
+        return cron_expr
+    return " ".join([_minute_field(minutes - excluded)] + str(cron_expr).split()[1:])
+
+
+def yield_cron(excluded=(), now=None, rng=None):
+    """One random minute YIELD_MINUTES ahead (local time, as the host's cron
+    matcher reads it), off Lumae's other rows' minutes when it can be."""
+    rng = rng or random
+    current = time.localtime(now).tm_min
+    ahead = [(current + offset) % 60 for offset in range(YIELD_MINUTES[0], YIELD_MINUTES[1] + 1)]
+    minute = rng.choice([value for value in ahead if value not in excluded] or ahead)
+    return f"{minute} * * * *"
+
+
+def _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at=None, *, avoid=True):
+    """Store the cadence; returns the cron expression written. ``avoid``
+    takes Lumae's other rows' minutes out of it (plan S1)."""
+    if avoid:
+        cron_expr = avoid_minutes(cron_expr, lumae_row_minutes(cur))
     cur.execute(
         f"""
         UPDATE {control_table()}
@@ -149,10 +265,12 @@ def _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at=None):
             next_retry_at,
         ),
     )
+    # The cadence only: an administrator's disable on AudioMuse's Scheduled
+    # Tasks page stays (1.6.1 re-enabled the row on every change, AUD-18).
     cur.execute(
-        "UPDATE cron SET name=%s, cron_expr=%s, enabled=TRUE "
+        "UPDATE cron SET name=%s, cron_expr=%s "
         "WHERE task_type=%s AND (name IS DISTINCT FROM %s "
-        "OR cron_expr IS DISTINCT FROM %s OR enabled IS DISTINCT FROM TRUE)",
+        "OR cron_expr IS DISTINCT FROM %s)",
         (
             CATALOG_RECONCILE_TASK_TYPE,
             cron_expr,
@@ -161,6 +279,7 @@ def _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at=None):
             cron_expr,
         ),
     )
+    return cron_expr
 
 
 def arm_reconcile(db, reason="work_admitted", commit=False):
@@ -178,11 +297,11 @@ def set_paused(db, paused, commit=True):
         return reconcile_schedule_from_state(db, paused=False, commit=commit)
     cur = db.cursor()
     _lock_control(cur)
-    _set_schedule_locked(cur, "paused", IDLE_CRON, "maintenance_paused")
+    cron_expr = _set_schedule_locked(cur, "paused", IDLE_CRON, "maintenance_paused")
     cur.close()
     if commit:
         db.commit()
-    return {"mode": "paused", "cron_expr": IDLE_CRON, "next_retry_at": None}
+    return {"mode": "paused", "cron_expr": cron_expr, "next_retry_at": None}
 
 
 def _work_summary(cur):
@@ -316,11 +435,18 @@ def _recover_interrupted_events(cur):
     )
 
 
-def reconcile_schedule_from_state(db, paused=False, commit=True):
-    """Choose cadence from durable state while excluding concurrent lost wakes."""
+def reconcile_schedule_from_state(db, paused=False, commit=True, yield_to=None,
+                                  host_retries=True):
+    """Choose cadence from durable state while excluding concurrent lost wakes.
+
+    ``yield_to``: the tick left the queue to that host work (plan S1); the
+    watchdog waits on the yield cadence until a tick finds nothing to yield to.
+    ``host_retries``: the host retries a refused fire (``cron_retry``).
+    """
     cur = db.cursor()
     _lock_control(cur)
     _recover_interrupted_events(cur)
+    avoid = True
     if paused:
         mode, cron_expr, reason, next_retry_at = (
             "paused",
@@ -328,6 +454,15 @@ def reconcile_schedule_from_state(db, paused=False, commit=True):
             "maintenance_paused",
             None,
         )
+    elif yield_to:
+        mode, reason, next_retry_at = "waiting", f"yield:{yield_to}", None
+        if host_retries:
+            cron_expr, avoid = yield_cron(lumae_row_minutes(cur)), False
+        else:
+            # Before cron_retry (AudioMuse 3.2.x) a fire refused while the
+            # host's job runs is not retried: a yield minute would wait an
+            # hour after the job, and there is no retry pass to meet.
+            cron_expr = WAITING_CRON
     else:
         state = _work_summary(cur)
         next_retry_at = state["next_retry_at"]
@@ -342,7 +477,7 @@ def reconcile_schedule_from_state(db, paused=False, commit=True):
             mode, reason = "backoff", "retry_backoff"
         else:
             mode, cron_expr, reason = "idle", IDLE_CRON, "catalog_current"
-    _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at)
+    cron_expr = _set_schedule_locked(cur, mode, cron_expr, reason, next_retry_at, avoid=avoid)
     cur.execute(
         f"UPDATE {control_table()} SET last_sweep_at=now() "
         "WHERE name='catalog_reconcile'"
@@ -367,7 +502,9 @@ def _retry_target(action):
     raise ValueError(f"Unknown reconciliation action: {action}")
 
 
-def update_work_retry(db, action, catalog_instance_id, work_key=None, *, failed=True):
+def update_work_retry(db, action, catalog_instance_id, work_key=None, *, failed=True,
+                      keep_next_retry=False):
+    """``keep_next_retry``: a success that stored its own ``next_retry_at``."""
     table_name = _retry_target(action)
     cur = db.cursor()
     if failed:
@@ -398,9 +535,9 @@ def update_work_retry(db, action, catalog_instance_id, work_key=None, *, failed=
         if action == "analysis_run":
             where += " AND run_id=%s"
             params.append(work_key)
+        reset = "retry_count=0" if keep_next_retry else "retry_count=0, next_retry_at=NULL"
         cur.execute(
-            f"UPDATE {_work_table(table_name)} "
-            f"SET retry_count=0, next_retry_at=NULL WHERE {where}",
+            f"UPDATE {_work_table(table_name)} SET {reset} WHERE {where}",
             tuple(params),
         )
         cur.close()
@@ -489,12 +626,49 @@ def finish_event(db, event_id, status, *, phase, summary=None, error=None, next_
             event_id,
         ),
     )
+    _trim_events(cur)
+    cur.close()
+    db.commit()
+    _current_event_id.set(None)
+
+
+def record_event(db, action, server_id, catalog_instance_id, status, *, phase,
+                 duration_ms, summary=None, error=None):
+    """A finished event in one statement, for work that knows it ran only
+    once it has (credits, MusicBrainz lookups, on-demand work)."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        INSERT INTO {events_table()}
+            (server_id, catalog_instance_id, action, status, phase, started_at,
+             heartbeat_at, completed_at, duration_ms, summary, last_error)
+        VALUES (%s, %s, %s, %s, %s, now() - make_interval(secs => %s / 1000.0),
+                now(), now(), %s, %s::jsonb, %s)
+        """,
+        (
+            server_id,
+            catalog_instance_id,
+            action,
+            status,
+            str(phase)[:200],
+            int(duration_ms),
+            int(duration_ms),
+            json.dumps(summary or {}, default=str),
+            str(error)[:2000] if error else None,
+        ),
+    )
+    _trim_events(cur)
+    cur.close()
+    db.commit()
+
+
+def _trim_events(cur):
     cur.execute(
         f"""
         DELETE FROM {events_table()} e
          USING (
              SELECT event_id FROM (
-                 SELECT event_id,
+                 SELECT event_id, COALESCE(completed_at, started_at) AS finished_at,
                         row_number() OVER (
                             PARTITION BY COALESCE(catalog_instance_id, '')
                             ORDER BY event_id DESC
@@ -503,14 +677,12 @@ def finish_event(db, event_id, status, *, phase, summary=None, error=None, next_
                   WHERE status <> 'running'
              ) ranked
              WHERE position > %s
+                OR (position > %s AND finished_at < now() - make_interval(hours => %s))
          ) expired
          WHERE e.event_id=expired.event_id
         """,
-        (EVENT_RETENTION_PER_SOURCE,),
+        (EVENT_RETENTION_MAX, EVENT_RETENTION_MIN, EVENT_RETENTION_HOURS),
     )
-    cur.close()
-    db.commit()
-    _current_event_id.set(None)
 
 
 def discard_event(db, event_id):
@@ -565,9 +737,14 @@ def read_reconcile_status(db):
          ORDER BY (status='running') DESC, event_id DESC
          LIMIT %s
         """,
-        (EVENT_RETENTION_PER_SOURCE,),
+        (EVENT_JOURNAL_LIMIT,),
     )
     rows = cur.fetchall()
+    cur.execute(
+        "SELECT task_type, enabled FROM cron WHERE starts_with(task_type, %s)",
+        (LUMAE_TASK_TYPE_PREFIX,),
+    )
+    schedules = {str(task_type): enabled for task_type, enabled in cur.fetchall()}
     cur.close()
     keys = (
         "event_id", "server_id", "catalog_instance_id", "action", "status", "phase",
@@ -586,6 +763,8 @@ def read_reconcile_status(db):
         },
         "pending": pending,
         "events": events,
+        # task_type -> enabled for every Lumae cron row.
+        "schedules": schedules,
     }
 
 
@@ -598,3 +777,300 @@ def iso(value):
             current = current.replace(tzinfo=timezone.utc)
         return current.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
     return str(value)
+
+
+def remaining_work(db):
+    """Per-queue counts for the tick report: waveform tracks left on active
+    sources (from the settings snapshot), unfinished edge passes and
+    relationship builds, and due credits albums and MusicBrainz lookups."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT
+            (SELECT COALESCE(sum(GREATEST(0, ss.profile_total_count - ss.profile_ready_count
+                                             - ss.profile_failed_count - ss.profile_skipped_count)), 0)
+               FROM {table('status_summary')} ss
+               JOIN {table('catalog_sources')} s USING (catalog_instance_id)
+              WHERE s.rebind_status='active'),
+            (SELECT count(*) FROM {_work_table('edge_backfill_state')}
+              WHERE status IN ('queued', 'running', 'failed')),
+            (SELECT count(*) FROM {_work_table('relationship_state')}
+              WHERE status IN ('queued', 'failed', 'waiting_for_index', 'running')),
+            (SELECT count(*) FROM {_work_table('credits_jobs')}
+              WHERE status IN ('pending', 'failed', 'running') AND not_before <= now()),
+            (SELECT count(*) FROM {_work_table('metadata_jobs')}
+              WHERE status IN ('pending', 'deferred', 'running') AND not_before <= now())
+        """
+    )
+    row = cur.fetchone()
+    cur.close()
+    db.commit()
+    keys = ("waveforms", "edge_passes", "relationships", "credits_albums", "lookups")
+    return {key: int(value or 0) for key, value in zip(keys, row or ())}
+
+
+# (singular, plural) of what one unit of each action is, in report order:
+# tracks first.
+ACTION_UNITS = {
+    "profile_backfill": ("waveform", "waveforms"),
+    "edge_backfill": ("edge", "edges"),
+    "edge_schema_v3": ("edge upgraded to v3", "edges upgraded to v3"),
+    "interactive": ("on-demand track", "on-demand tracks"),
+    "credits": ("credits album", "credits albums"),
+    "music_metadata": ("MusicBrainz lookup", "MusicBrainz lookups"),
+    "relationships": ("relationship step", "relationship steps"),
+    "analysis_run": ("analysis run", "analysis runs"),
+    "catalog_preparation": ("catalogue preparation", "catalogue preparations"),
+}
+# Their counts are tracks analysed: the host's "Songs analyzed" note.
+TRACK_ACTIONS = ("interactive", "profile_backfill", "edge_backfill")
+
+
+def action_counts(action, result):
+    """``(done, failed)`` units of one action's result."""
+    result = result if isinstance(result, dict) else {}
+    if action == "interactive":
+        return int(result.get("served") or 0), 0
+    if action in ("profile_backfill", "edge_backfill"):
+        return int(result.get("ready") or 0), int(result.get("failed") or 0)
+    if action == "edge_schema_v3":
+        return int(result.get("upgraded") or 0), 0
+    status = str(result.get("status") or "")
+    if status in ("failed", "failure", "error"):
+        return 0, 1
+    if status in ("current", "coalesced", "paused"):
+        return 0, 0
+    return 1, 0
+
+
+def _units(count, action):
+    singular, plural = ACTION_UNITS.get(action, (action, action))
+    return f"{count:,} {singular if count == 1 else plural}"
+
+
+class TickReport:
+    """What one watchdog tick did, returned as the host's task details.
+
+    AudioMuse takes ``status_message``, then ``message``, as the task's
+    message, and labels a type containing "analysis" with ``tracks_analyzed``
+    ("Songs analyzed: N") unless AM-2 shows the message instead.
+    """
+
+    def __init__(self):
+        self.started = time.monotonic()
+        self.actions = []
+        self.requested = 0
+        self.yielded_to = None
+        self.remaining = None
+        self.cadence = None
+
+    def add(self, action, result, duration_ms):
+        """One run of ``action``; runs of the same action share one entry, so
+        the details stay small however many runs a tick has."""
+        done, failed = action_counts(action, result)
+        status = (str((result or {}).get("status") or "complete")
+                  if isinstance(result, dict) or result is None else str(result))
+        entry = next((entry for entry in self.actions if entry["action"] == action), None)
+        if entry is None:
+            entry = {"action": action, "status": "", "runs": 0, "count": 0, "failed": 0, "ms": 0}
+            self.actions.append(entry)
+        entry["status"] = status[:40]
+        entry["runs"] += 1
+        entry["count"] += done
+        entry["failed"] += failed
+        entry["ms"] += int(duration_ms)
+
+    def tracks_analyzed(self):
+        return sum(entry["count"] for entry in self.actions if entry["action"] in TRACK_ACTIONS)
+
+    def message(self, status):
+        if status == "paused":
+            return "Lumae: paused"
+        if status == "yielded":
+            return f"Lumae: yielded to {self.yielded_to}"[:TICK_MESSAGE_MAX]
+        if status == "same_dispatch":
+            return "Lumae: ran earlier in this task"
+        phrases = []
+        totals = {entry["action"]: (entry["count"], entry["failed"]) for entry in self.actions}
+        for action in ACTION_UNITS:
+            done, failed = totals.get(action, (0, 0))
+            if done or failed:
+                phrases.append(_units(done, action) + (f" ({failed:,} failed)" if failed else ""))
+        left = (self.remaining or {}).get("waveforms") or 0
+        if phrases:
+            body = ", ".join(phrases) + f" in {round(time.monotonic() - self.started)} s"
+            if status == "failed":
+                body += ", then an action failed"
+            elif self.yielded_to:
+                body += f", then yielded to {self.yielded_to}"
+        elif status == "failed":
+            body = "an action failed"
+        else:
+            body = "nothing ready" if left else "up to date"
+        tail = f"; {left:,} tracks left" if left else ""
+        for message in (f"Lumae: {body}{tail}", f"Lumae: {body}"):
+            if len(message) <= TICK_MESSAGE_MAX:
+                return message
+        return f"Lumae: {body}"[:TICK_MESSAGE_MAX - 1] + "…"
+
+    def result(self, status, **extra):
+        message = self.message(status)
+        return {
+            "status": status,
+            "message": message,
+            "status_message": message,
+            "tracks_analyzed": self.tracks_analyzed(),
+            "actions": list(self.actions),
+            "requested": int(self.requested or 0),
+            "remaining": self.remaining,
+            "yielded_to": self.yielded_to,
+            "cadence": self.cadence,
+            **extra,
+        }
+
+    def log(self, status):
+        """The tick's one INFO line."""
+        actions = ", ".join(
+            f"{entry['action']} {entry['status']} {entry['count']}"
+            + (f"/{entry['failed']} failed" if entry["failed"] else "")
+            + (f" in {entry['runs']} runs" if entry["runs"] > 1 else "") + f" {entry['ms']} ms"
+            for entry in self.actions
+        ) or "none"
+        remaining = ", ".join(f"{key} {value:,}" for key, value in (self.remaining or {}).items())
+        logger.info(
+            "lumae_analysis watchdog: %s [status %s; actions %s; remaining %s; cadence %s%s]",
+            self.message(status), status, actions, remaining or "unknown",
+            self.cadence or "unchanged",
+            f"; yielded to {self.yielded_to}" if self.yielded_to else "",
+        )
+
+
+def host_blocking_task_types():
+    """The root task types AudioMuse's cron gate waits for, besides plugins."""
+    types = set(HOST_BLOCKING_TASK_TYPES)
+    try:
+        host = importlib.import_module("task_types")
+        types.update(str(name) for name in getattr(host, "BATCH_GATE_TASK_TYPES", ())
+                     if not str(name).startswith("plugin."))
+    except Exception:
+        pass
+    return sorted(types)
+
+
+class HostYield:
+    """What a tick leaves AudioMuse's queue to (plan S1, AUD-13).
+
+    - A ``cron_retry`` row other than the watchdog's own: a schedule the host
+      refused while a plugin task was live (its own, another plugin's, or one
+      of Lumae's other rows). At minute cadence its retry always lost to the
+      next watchdog fire until it expired. ``cron_retry`` exists from
+      AudioMuse 3.3.0; before, the host's gate ignores plugin tasks.
+    - A live AudioMuse main job or side job: the host's gate refuses every
+      start behind it.
+    Each check fails open: a missing table or a raising query turns only that
+    check off for the rest of the tick, logged once at DEBUG.
+    """
+
+    def __init__(self):
+        self.cron_retry = None  # None: not checked yet this tick
+        self.live_tasks = True
+
+    def check(self, db):
+        target = None
+        if self.cron_retry is not False:
+            target = self._safely(db, "cron_retry", self._retry_row)
+        if target is None and self.live_tasks:
+            target = self._safely(db, "live_tasks", self._live_root)
+        return target
+
+    def _safely(self, db, check, query):
+        cur = None
+        try:
+            cur = db.cursor()
+            target = query(cur)
+            cur.close()
+            db.commit()
+            return target
+        except Exception:
+            rollback = getattr(db, "rollback", None)
+            if callable(rollback):
+                try:
+                    rollback()
+                except Exception:
+                    pass
+            setattr(self, check, False)
+            logger.debug("lumae_analysis turned off the %s yield check for this tick", check,
+                         exc_info=True)
+            return None
+
+    def _retry_row(self, cur):
+        if self.cron_retry is None:
+            cur.execute("SELECT to_regclass('cron_retry') IS NOT NULL")
+            self.cron_retry = bool(cur.fetchone()[0])
+            if not self.cron_retry:
+                return None
+        cur.execute(
+            "SELECT task_type FROM cron_retry WHERE task_type <> %s ORDER BY task_type LIMIT 1",
+            (CATALOG_RECONCILE_TASK_TYPE,),
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+
+    def _live_root(self, cur):
+        cur.execute(
+            """
+            SELECT task_type FROM task_status
+             WHERE parent_task_id IS NULL AND task_type = ANY(%s)
+               AND status IN ('NEW', 'QUEUED', 'PENDING', 'STARTED', 'RUNNING', 'PROGRESS')
+             ORDER BY task_type LIMIT 1
+            """,
+            (host_blocking_task_types(),),
+        )
+        row = cur.fetchone()
+        return str(row[0]) if row else None
+
+
+def action_averages(db):
+    """Average milliseconds of each action's last ACTION_AVERAGE_RUNS finished runs."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT action, avg(duration_ms) FROM (
+            SELECT action, duration_ms,
+                   row_number() OVER (PARTITION BY action ORDER BY event_id DESC) AS position
+              FROM {events_table()}
+             WHERE status IN ('success', 'deferred') AND duration_ms IS NOT NULL
+        ) recent
+         WHERE position <= %s
+         GROUP BY action
+        """,
+        (ACTION_AVERAGE_RUNS,),
+    )
+    averages = {str(action): float(value) for action, value in cur.fetchall() if value is not None}
+    cur.close()
+    db.commit()
+    return averages
+
+
+class TickBudget:
+    """The tick's deadline (plan S2), on the monotonic clock."""
+
+    def __init__(self, seconds=None, averages=None):
+        self.deadline = time.monotonic() + (TICK_BUDGET_SECONDS if seconds is None else seconds)
+        self.averages = dict(averages or {})
+        self.started = 0
+
+    def remaining(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+    def fits(self, action):
+        """Whether ``action`` may start: the tick's first action always may,
+        a later one only when its recent average fits in what is left."""
+        if not self.started:
+            return True
+        remaining = self.remaining()
+        average = self.averages.get(action)
+        return remaining > 0 and (average is None or average / 1000.0 <= remaining)
+
+    def start(self):
+        self.started += 1

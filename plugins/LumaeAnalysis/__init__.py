@@ -147,6 +147,11 @@ from .collection_manager import (
 )
 from .reconcile import (
     DEFERRED_MARKER,
+    IDLE_CRON as RECONCILE_IDLE_CRON,
+    HostYield,
+    TickBudget,
+    TickReport,
+    action_averages,
     arm_reconcile,
     begin_event,
     defer_work,
@@ -157,6 +162,8 @@ from .reconcile import (
     progress_event,
     read_reconcile_status,
     reconcile_schedule_from_state,
+    record_event,
+    remaining_work,
     set_paused as set_reconcile_paused,
     update_work_retry,
 )
@@ -545,11 +552,12 @@ def ensure_catalog_reconcile_schedule(db):
 
 
 def ensure_provider_identity_recheck_schedule(db):
+    """Enabled on install; an administrator's later change to the row is kept
+    (1.6.1 re-enabled it on every install, AUD-18)."""
     cur = db.cursor()
     cur.execute(
         "INSERT INTO cron (name, task_type, cron_expr, enabled) "
-        "VALUES (%s, %s, %s, TRUE) ON CONFLICT (task_type) DO UPDATE SET "
-        "cron_expr=EXCLUDED.cron_expr, enabled=TRUE",
+        "VALUES (%s, %s, %s, TRUE) ON CONFLICT (task_type) DO NOTHING",
         (
             PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
             PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
@@ -798,11 +806,13 @@ def _rollback_if_possible(db):
         rollback()
 
 
-def _safe_reconcile_schedule(db, paused=None):
+def _safe_reconcile_schedule(db, paused=None, yield_to=None, host_retries=True):
     try:
         return reconcile_schedule_from_state(
             db,
             paused=maintenance_paused() if paused is None else bool(paused),
+            yield_to=yield_to,
+            host_retries=host_retries,
         )
     except Exception:
         _rollback_if_possible(db)
@@ -830,6 +840,7 @@ def _reconcile_result_summary(result):
         "ready",
         "failed",
         "skipped",
+        "deferred",
         "already_ready",
         "promoted",
         "queued_next",
@@ -839,6 +850,12 @@ def _reconcile_result_summary(result):
         "album_count",
         "artist_count",
         "track_count",
+        "served",
+        "match_status",
+        "credits",
+        "retry_seconds",
+        "upgraded",
+        "flagged",
     )
     return {key: result[key] for key in allowed if key in result}
 
@@ -925,6 +942,13 @@ def _run_reconcile_action(
                 catalog_instance_id,
                 work_key=work_key,
                 failed=False,
+                # A finished backfill stored its soonest track retry (or
+                # none); clearing it made the row due at once and held
+                # minute cadence after the backfill (AUD-15).
+                keep_next_retry=(
+                    action == "profile_backfill"
+                    and result_status in ("waiting_retry", "complete")
+                ),
             )
             finish_event(
                 db,
@@ -966,14 +990,17 @@ def _run_reconcile_action(
         raise
 
 
-def _safe_edge_v3_upgrade(db):
+def _safe_edge_v3_upgrade(db, budget_seconds=None):
     """One bounded batch of the stored-edge v3 upgrade (SF.3) while any edge
     lacks its v3 digest: ``(upgraded, flagged)``, or None when there is nothing
-    to do or it failed (logged; the next tick tries again)."""
+    to do or it failed (logged; the next tick tries again). It works for
+    ``budget_seconds``, EDGE_V3_UPGRADE_BUDGET_SECONDS by default."""
     try:
         if edge_schema_v3_ready(db):
             return None
-        upgraded, flagged = upgrade_stored_edges(db, budget_seconds=EDGE_V3_UPGRADE_BUDGET_SECONDS)
+        if budget_seconds is None:
+            budget_seconds = EDGE_V3_UPGRADE_BUDGET_SECONDS
+        upgraded, flagged = upgrade_stored_edges(db, budget_seconds=budget_seconds)
         return (upgraded, flagged) if upgraded else None
     except Exception:
         _rollback_if_possible(db)
@@ -981,26 +1008,115 @@ def _safe_edge_v3_upgrade(db):
         return None
 
 
-def _safe_credits_reconcile(db, server_id, before_background):
+def _safe_credits_reconcile(db, server_id, before_background, deadline=None):
     try:
-        return credits_service.reconcile(db, server_id, before_background=before_background)
+        return credits_service.reconcile(db, server_id, before_background=before_background,
+                                         deadline=deadline)
     except Exception:
         _rollback_if_possible(db)
         logger.exception("lumae_analysis credits reconciliation unavailable")
         return None
 
 
-def _safe_metadata_reconcile(db, before_background):
+def _safe_metadata_reconcile(db, before_background, deadline=None):
     try:
-        return music_metadata.reconcile(db, before_background=before_background)
+        return music_metadata.reconcile(db, before_background=before_background,
+                                        deadline=deadline)
     except Exception:
         _rollback_if_possible(db)
         logger.exception("lumae_analysis MusicBrainz lookups unavailable")
         return None
 
 
+def _elapsed_ms(started):
+    return int((time.monotonic() - started) * 1000)
+
+
+def _record_turn(db, report, action, server_id, catalog_instance_id, result, started):
+    """Report and journal a credits, MusicBrainz or on-demand turn (AUD-18)."""
+    duration_ms = _elapsed_ms(started)
+    report.add(action, result, duration_ms)
+    status = str((result or {}).get("status") or "complete")
+    event_status = (
+        "failed" if status in ("failed", "failure", "error")
+        else "deferred" if status == "deferred" else "success"
+    )
+    try:
+        record_event(db, action, server_id, catalog_instance_id, event_status,
+                     phase=status, duration_ms=duration_ms,
+                     summary=_reconcile_result_summary(result))
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not record the reconcile event")
+
+
+def _reconcile_step(db, report, action, *args):
+    started = time.monotonic()
+    try:
+        result = _run_reconcile_action(db, action, *args)
+    except Exception:
+        report.add(action, {"status": "failed"}, _elapsed_ms(started))
+        raise
+    report.add(action, result, _elapsed_ms(started))
+    return result
+
+
+def _safe_remaining_work(db):
+    try:
+        return remaining_work(db)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.debug("lumae_analysis could not count the remaining work", exc_info=True)
+        return None
+
+
+def _safe_action_averages(db):
+    try:
+        return action_averages(db)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.debug("lumae_analysis could not read the action averages", exc_info=True)
+        return {}
+
+
+_reconcile_dispatch_id = None
+
+
+def _reconcile_dispatch():
+    """``(first, task_id)`` for this host dispatch (plan S2, AUD-19).
+
+    With several media servers AudioMuse calls the tick once per server in
+    one task (``server_scope='all'``). The first call works for every source
+    within the budget; later calls in the same task return at once. Without
+    a task id (``taskqueue.current_task_id``, AudioMuse 3.2.0, or a raising
+    call) each call is a tick for the active server, as before.
+    """
+    global _reconcile_dispatch_id
+    try:
+        import taskqueue
+
+        task_id = taskqueue.current_task_id()
+    except Exception:
+        task_id = None
+    if not task_id:
+        return True, None
+    if task_id == _reconcile_dispatch_id:
+        return False, task_id
+    _reconcile_dispatch_id = task_id
+    return True, task_id
+
+
 def catalog_reconcile_task():
-    """Execute at most one durable action for the active source, then retune cadence."""
+    """Work through due actions for up to TICK_BUDGET_SECONDS, retune cadence
+    and report what the tick did."""
+    report = TickReport()
+    versions = {
+        "plugin_version": PLUGIN_VERSION,
+        "catalog_builder_version": CATALOG_BUILDER_VERSION,
+    }
+    first, task_id = _reconcile_dispatch()
+    if not first:
+        return report.result("same_dispatch", **versions)
     db = get_db()
     if maintenance_paused():
         try:
@@ -1008,138 +1124,193 @@ def catalog_reconcile_task():
         except Exception:
             _rollback_if_possible(db)
             logger.exception("lumae_analysis could not pause the reconcile schedule")
-        return {
-            "status": "paused",
-            "requested": 0,
-            "plugin_version": PLUGIN_VERSION,
-            "catalog_builder_version": CATALOG_BUILDER_VERSION,
-        }
-
+        report.cadence = RECONCILE_IDLE_CRON
+        report.log("paused")
+        return report.result("paused", **versions)
+    status = "failed"
+    host_yield = HostYield()
     try:
-        server_id = str(get_core_adapter().active_server_id() or "") or None
-    except Exception:
-        server_id = None
+        # While AudioMuse has a refused schedule to retry or a main job
+        # running, the tick does no work (plan S1, AUD-13).
+        report.yielded_to = host_yield.check(db)
+        status = "yielded" if report.yielded_to else _reconcile_tick(
+            db, report, host_yield, every_source=bool(task_id))
+    finally:
+        schedule = _safe_reconcile_schedule(db, yield_to=report.yielded_to,
+                                            host_retries=host_yield.cron_retry is True)
+        if status != "yielded":
+            # The waveform counts that /settings/status reads follow the
+            # tick's work, and a publication left without a summary gets
+            # one (P2-1).
+            refresh_status_snapshot(db, publications=True)
+            report.remaining = _safe_remaining_work(db)
+        report.cadence = (schedule or {}).get("cron_expr")
+        report.log(status)
+    return report.result(status, **versions)
 
-    requested = 0
-    try:
-        report_edge_runtime()
-        # On-demand work the host refused to queue goes before everything.
+
+# A result in one of these says the action has nothing more to do now: it is
+# not run again in the same tick.
+_SETTLED_STATUSES = frozenset((
+    "current", "coalesced", "paused", "deferred", "failed", "failure", "error",
+    "waiting_retry", "waiting_for_index", "already_finalized", "superseded",
+))
+# Actions whose "complete" ends their work for now (an analysis run's
+# "complete" is one run of several).
+_COMPLETE_SETTLES = frozenset(("catalog_preparation", "relationships", "profile_backfill",
+                               "edge_backfill"))
+# A guard against an action that stays due without progress.
+MAX_TICK_ACTIONS = 100
+
+
+def _reconcile_tick(db, report, host_yield, every_source=False):
+    """Due actions in priority order until the budget is used (plan S2).
+
+    The order is unchanged: on-demand work AudioMuse refused to queue, a batch
+    of the stored-edge v3 upgrade (SF.3), analysis runs, catalogue
+    preparation, a credits and a MusicBrainz turn when their share has come,
+    relationships, the waveform backfill, the edge pass, then credits and
+    MusicBrainz lookups. After each action the order starts
+    again, so higher-priority work that became due goes first, and before
+    each action the tick yields as at its start. Returns the tick's status.
+    """
+    server_id = None
+    if not every_source:
+        try:
+            server_id = str(get_core_adapter().active_server_id() or "") or None
+        except Exception:
+            server_id = None
+    budget = TickBudget(averages=_safe_action_averages(db))
+    report_edge_runtime()
+    report.requested = enqueue_required_catalog_preparations(db=db, server_id=server_id)
+    done = set()
+    status = "current"
+    for _ in range(MAX_TICK_ACTIONS):
+        action, result = _next_reconcile_action(db, report, budget, server_id, done)
+        if action is None:
+            break
+        status = "processed"
+        result_status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
+        if result_status in _SETTLED_STATUSES or (
+            result_status == "complete" and action in _COMPLETE_SETTLES
+        ):
+            done.add(action)
+        if not budget.remaining():
+            break
+        report.yielded_to = host_yield.check(db)
+        if report.yielded_to:
+            break
+    return status
+
+
+def _next_reconcile_action(db, report, budget, server_id, done):
+    """Run the first due action the budget fits; ``(action, result)`` or
+    ``(None, None)`` when none ran. ``done`` collects actions with nothing
+    more to do this tick."""
+
+    def due(action):
+        return action not in done and budget.fits(action)
+
+    if due("interactive"):
+        start = time.monotonic()
         served = serve_deferred_interactive()
         if served:
-            return {"status": "processed", "action": "interactive", "served": served}
-        # SF.3: stored edges still without a v3 digest, a bounded batch per tick.
-        upgrade = _safe_edge_v3_upgrade(db)
+            budget.start()
+            result = {"status": "served", "served": served}
+            _record_turn(db, report, "interactive", server_id, None, result, start)
+            return "interactive", result
+        done.add("interactive")
+    # SF.3: stored edges still without a v3 digest, one bounded batch a tick.
+    if due("edge_schema_v3"):
+        done.add("edge_schema_v3")
+        start = time.monotonic()
+        upgrade = _safe_edge_v3_upgrade(
+            db, min(EDGE_V3_UPGRADE_BUDGET_SECONDS, budget.remaining()))
         if upgrade:
-            return {"status": "processed", "action": "edge_schema_v3",
-                    "upgraded": upgrade[0], "flagged": upgrade[1]}
+            budget.start()
+            result = {"status": "processed", "upgraded": upgrade[0], "flagged": upgrade[1]}
+            _record_turn(db, report, "edge_schema_v3", None, None, result, start)
+            return "edge_schema_v3", result
+    if due("analysis_run"):
         run = next_settled_analysis_run(db=db, server_id=server_id)
         if run:
-            result = _run_reconcile_action(
-                db,
-                "analysis_run",
-                run["server_id"],
-                run["catalog_instance_id"],
-                run["run_id"],
-                run.get("retry_count", 0),
-                finalize_analysis_run_task,
-                run["server_id"],
-                run["catalog_instance_id"],
-                run["run_id"],
+            budget.start()
+            return "analysis_run", _reconcile_step(
+                db, report, "analysis_run", run["server_id"], run["catalog_instance_id"],
+                run["run_id"], run.get("retry_count", 0), finalize_analysis_run_task,
+                run["server_id"], run["catalog_instance_id"], run["run_id"],
             )
-            return {"status": "processed", "action": "analysis_run", "result": result}
-
-        requested = enqueue_required_catalog_preparations(db=db, server_id=server_id)
+        done.add("analysis_run")
+    if due("catalog_preparation"):
         preparation = next_preparation_run(db=db, server_id=server_id)
         if preparation:
-            result = _run_reconcile_action(
-                db,
-                "catalog_preparation",
-                preparation[0],
-                preparation[1],
-                preparation[1],
-                preparation[2] if len(preparation) > 2 else 0,
-                prepare_lumae_task,
-                *preparation[:2],
+            budget.start()
+            return "catalog_preparation", _reconcile_step(
+                db, report, "catalog_preparation", preparation[0], preparation[1],
+                preparation[1], preparation[2] if len(preparation) > 2 else 0,
+                prepare_lumae_task, *preparation[:2],
             )
-            return {
-                "status": "processed",
-                "action": "catalog_preparation",
-                "requested": int(requested),
-                "result": result,
-            }
-
-        credits_result = _safe_credits_reconcile(db, server_id, before_background=True)
-        if credits_result:
-            return {"status": "processed", "action": "credits", "result": credits_result}
-
-        metadata_result = _safe_metadata_reconcile(db, before_background=True)
-        if metadata_result:
-            return {"status": "processed", "action": "music_metadata", "result": metadata_result}
-
+        done.add("catalog_preparation")
+    # A share-gated turn each, checked once a tick: the check sweeps.
+    for action, call in (("credits", _safe_credits_reconcile),
+                         ("music_metadata", _safe_metadata_reconcile)):
+        slot = f"{action}:before_background"
+        if slot in done or action in done or not budget.fits(action):
+            continue
+        done.add(slot)
+        start = time.monotonic()
+        result = (call(db, server_id, before_background=True, deadline=budget.deadline)
+                  if action == "credits"
+                  else call(db, before_background=True, deadline=budget.deadline))
+        if result:
+            budget.start()
+            _record_turn(db, report, action, server_id,
+                         result.get("catalog_instance_id"), result, start)
+            return action, result
+    if due("relationships"):
         relationship = next_relationship_run(db=db, server_id=server_id)
         if relationship:
-            result = _run_reconcile_action(
-                db,
-                "relationships",
-                relationship[0],
-                relationship[1],
-                relationship[1],
-                relationship[2] if len(relationship) > 2 else 0,
-                relationship_preparation_task,
-                *relationship[:2],
+            budget.start()
+            return "relationships", _reconcile_step(
+                db, report, "relationships", relationship[0], relationship[1],
+                relationship[1], relationship[2] if len(relationship) > 2 else 0,
+                relationship_preparation_task, *relationship[:2], budget.remaining(),
             )
-            return {"status": "processed", "action": "relationships", "result": result}
-
+        done.add("relationships")
+    if due("profile_backfill"):
         profile = next_profile_backfill_run(db=db, server_id=server_id)
         if profile:
-            result = _run_reconcile_action(
-                db,
-                "profile_backfill",
-                profile[0],
-                profile[1],
-                profile[1],
-                profile[2] if len(profile) > 2 else 0,
-                profile_backfill_task,
-                *profile[:2],
+            budget.start()
+            return "profile_backfill", _reconcile_step(
+                db, report, "profile_backfill", profile[0], profile[1], profile[1],
+                profile[2] if len(profile) > 2 else 0, profile_backfill_task, *profile[:2],
+                budget.deadline,
             )
-            return {"status": "processed", "action": "profile_backfill", "result": result}
-
+        done.add("profile_backfill")
+    if due("edge_backfill"):
         edge = next_edge_backfill(db, server_id=server_id) if edge_profiles_enabled() else None
         if edge:
-            result = _run_reconcile_action(
-                db,
-                "edge_backfill",
-                edge[0],
-                edge[1],
-                edge[1],
-                0,
-                edge_backfill_task,
-                edge[0],
-                edge[1],
+            budget.start()
+            return "edge_backfill", _reconcile_step(
+                db, report, "edge_backfill", edge[0], edge[1], edge[1], 0,
+                edge_backfill_task, edge[0], edge[1], budget.deadline,
             )
-            return {"status": "processed", "action": "edge_backfill", "result": result}
-
-        credits_result = _safe_credits_reconcile(db, server_id, before_background=False)
-        if credits_result:
-            return {"status": "processed", "action": "credits", "result": credits_result}
-
-        metadata_result = _safe_metadata_reconcile(db, before_background=False)
-        if metadata_result:
-            return {"status": "processed", "action": "music_metadata", "result": metadata_result}
-
-        return {
-            "status": "current",
-            "requested": int(requested),
-            "plugin_version": PLUGIN_VERSION,
-            "catalog_builder_version": CATALOG_BUILDER_VERSION,
-        }
-    finally:
-        _safe_reconcile_schedule(db)
-        # The tick ran at most one action (a profile batch, a finalization, a
-        # catalogue publication); the waveform counts that /settings/status
-        # reads follow it, and a publication left without a summary gets one
-        # (P2-1).
-        refresh_status_snapshot(db, publications=True)
+        done.add("edge_backfill")
+    for action, call in (("credits", _safe_credits_reconcile),
+                         ("music_metadata", _safe_metadata_reconcile)):
+        if not due(action):
+            continue
+        start = time.monotonic()
+        result = (call(db, server_id, before_background=False, deadline=budget.deadline)
+                  if action == "credits"
+                  else call(db, before_background=False, deadline=budget.deadline))
+        if result:
+            budget.start()
+            _record_turn(db, report, action, server_id,
+                         result.get("catalog_instance_id"), result, start)
+            return action, result
+        done.add(action)
+    return None, None
 
 
 def analysis_projection_task(server_id=None):
@@ -3924,12 +4095,13 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="backgroun
     return outcomes
 
 
-def edge_backfill_task(server_id, catalog_instance_id):
+def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
     """One library-pass tick: edges for a few published tracks, then yield.
 
     Runs inside the reconcile tick after the waveform backfill. Analyses one
-    track at a time for about EDGE_BACKFILL_TICK_SECONDS, serving on-demand
-    work between tracks, and keeps its cursor at the last track it reached.
+    track at a time for about EDGE_BACKFILL_TICK_SECONDS, and not past the
+    tick's ``deadline``, serving on-demand work between tracks, and keeps its
+    cursor at the last track it reached.
     """
     if maintenance_paused():
         return {"status": "paused", "processed": 0}
@@ -3947,14 +4119,19 @@ def edge_backfill_task(server_id, catalog_instance_id):
                                  next_retry_hours=EDGE_BACKFILL_RESWEEP_HOURS, completed=True)
             return {"status": "complete", "processed": 0}
         update_edge_backfill(db, catalog_instance_id, "running", started=started)
-        deadline = time.monotonic() + EDGE_BACKFILL_TICK_SECONDS
+        pass_deadline = time.monotonic() + EDGE_BACKFILL_TICK_SECONDS
+        if deadline is not None:
+            pass_deadline = min(pass_deadline, deadline)
         reached, counts = cursor, {}
         for track_id in ids:
-            if reached != cursor and time.monotonic() > deadline:
+            # Before the first track too: production's pass ran 81 s on
+            # average against its 30 s (AUD-20).
+            remaining = pass_deadline - time.monotonic()
+            if remaining <= 0:
                 break
             jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
             for outcome in analyze_edges_task(jobs, catalog_instance_id, server_id,
-                                              budget_seconds=None):
+                                              budget_seconds=remaining):
                 counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
             reached = track_id
         processed = sum(counts.values())
@@ -4493,7 +4670,10 @@ def analyze_tracks_task(
     server_id=None,
     priority="background",
     attempt_tokens=None,
+    deadline=None,
 ):
+    """``deadline``: a watchdog tick's (``time.monotonic()``); no track starts
+    after it, and the unstarted ones are released uncounted (plan S2)."""
     ids = parse_ids(",".join(ids or []))
     if maintenance_paused():
         release_pending(
@@ -4554,6 +4734,20 @@ def analyze_tracks_task(
     attempted = 0
     for index, track_id in enumerate(ids):
         _safe_progress("analyzing volume and ramps", current=index, total=len(ids))
+        if deadline is not None and time.monotonic() >= deadline:
+            remaining = ids[index:]
+            release_pending(
+                remaining,
+                catalog_instance_id=catalog_instance_id,
+                reason="The Lumae watchdog tick's time was used",
+                tokens=attempt_tokens,
+                count_failure=False,
+            )
+            results.extend(
+                {"track_id": item_id, "status": "deferred_tick_deadline"}
+                for item_id in remaining
+            )
+            break
         if priority == "background":
             serve_deferred_interactive()
         if priority == "background" and catalog_instance_id:
@@ -4606,7 +4800,7 @@ def analyze_tracks_task(
         "promoted": sum(1 for result in results if result["status"] == "promoted"),
         "failed": sum(1 for result in results if result["status"] == "failed"),
         "skipped": sum(1 for result in results if result["status"].startswith("skipped")),
-        "deferred": 0,
+        "deferred": sum(1 for result in results if result["status"] == "deferred_tick_deadline"),
     }
     if catalog_instance_id:
         finalize_preparation_if_settled(catalog_instance_id)
@@ -5272,8 +5466,12 @@ def next_profile_retry_at(catalog_instance_id, db=None):
     return row[0] if row else None
 
 
-def profile_backfill_task(server_id, catalog_instance_id):
-    """Process one small batch; the watchdog resumes a queued next batch."""
+def profile_backfill_task(server_id, catalog_instance_id, deadline=None):
+    """Process one small batch; the watchdog resumes a queued next batch.
+
+    ``deadline``: the watchdog tick's; tracks not started by then are due
+    again at once.
+    """
     if maintenance_paused():
         update_profile_backfill_state(
             catalog_instance_id,
@@ -5323,7 +5521,9 @@ def profile_backfill_task(server_id, catalog_instance_id):
             server_id=server_id,
             priority="background",
             attempt_tokens=claim_tokens,
+            deadline=deadline,
         )
+        analysed = len(ids) - int((result or {}).get("deferred") or 0)
         next_ids = find_backfill_ids(
             1,
             catalog_instance_id=catalog_instance_id,
@@ -5335,21 +5535,21 @@ def profile_backfill_task(server_id, catalog_instance_id):
             update_profile_backfill_state(
                 catalog_instance_id, server_id,
                 "queued" if next_retry else "complete",
-                processed_increment=len(ids), next_retry_at=next_retry,
+                processed_increment=analysed, next_retry_at=next_retry,
                 completed=not bool(next_retry),
             )
             return {"status": "waiting_retry" if next_retry else "complete",
-                    "processed": len(ids), "queued_next": False, **result}
+                    "processed": analysed, "queued_next": False, **result}
         update_profile_backfill_state(
             catalog_instance_id,
             server_id,
             "queued",
-            processed_increment=len(ids),
+            processed_increment=analysed,
             queued_profiles=len(next_ids),
         )
         return {
             "status": "queued",
-            "processed": len(ids),
+            "processed": analysed,
             "queued_next": False,
             "deferred": True,
             **result,
@@ -5418,7 +5618,8 @@ def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=No
     return analyze_tracks_task(ids)
 
 
-def relationship_preparation_task(server_id, catalog_instance_id):
+def relationship_preparation_task(server_id, catalog_instance_id, time_budget_seconds=20):
+    """One build step; a watchdog tick passes what is left of its budget."""
     if maintenance_paused():
         return {"status": "paused", "reason": "maintenance_paused"}
     source = resolve_profile_source(
@@ -5427,7 +5628,8 @@ def relationship_preparation_task(server_id, catalog_instance_id):
     if source["catalog_instance_id"] != catalog_instance_id:
         raise CatalogScanError("Catalogue identity changed before relationship preparation")
     # The builder owns a session advisory lock across its checkpoint commits.
-    return prepare_relationships(catalog_instance_id, progress=_safe_progress)
+    return prepare_relationships(catalog_instance_id, progress=_safe_progress,
+                                 time_budget_seconds=max(1.0, float(time_budget_seconds)))
 
 
 def start_relationship_preparation(

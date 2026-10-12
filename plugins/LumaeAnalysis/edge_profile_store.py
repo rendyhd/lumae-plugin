@@ -478,13 +478,24 @@ def _edge_due_sql():
     # Published waveform rows without an edge for their media (P3-7): an edge
     # is published only for, and read only through, such a row. An attempt
     # row may be unpublished or describe other media than what is published.
-    # An edge flagged for a music-end recheck (SF.3) is due like a missing one.
-    return f"""{table('published_source_profiles')} p {edge_join(columns='e.payload, e.v3_recheck')}
-        LEFT JOIN {table('edge_profile_jobs')} j ON j.catalog_instance_id=p.catalog_instance_id AND j.track_id=p.track_id
+    # Anti-joins let the pass walk the primary key from its cursor and stop at
+    # its batch; a left join with an "edge is NULL" filter was estimated at
+    # one row and seq-scanned the jobs per track (AUD-14). The payload is NOT
+    # NULL and a track has at most one job and one edge, so the meaning is
+    # unchanged. An edge flagged for a music-end recheck (SF.3) is due like a
+    # missing one.
+    return f"""{table('published_source_profiles')} p
         WHERE p.catalog_instance_id=%s AND p.media_signature IS NOT NULL
-          AND (edge.payload IS NULL OR edge.v3_recheck)
-          AND (j.track_id IS NULL OR j.updated_at < now()-interval '6 hours'
-               OR (j.status='failed' AND j.last_error='edge-enqueue-failed'))"""
+          AND NOT EXISTS (SELECT 1 FROM {table('edge_profiles')} e
+                           WHERE e.catalog_instance_id=p.catalog_instance_id
+                             AND e.track_id=p.track_id AND e.media_signature=p.media_signature
+                             AND NOT e.v3_recheck)
+          AND NOT EXISTS (SELECT 1 FROM {table('edge_profile_jobs')} j
+                           WHERE j.catalog_instance_id=p.catalog_instance_id
+                             AND j.track_id=p.track_id
+                             AND j.updated_at >= now()-interval '6 hours'
+                             AND NOT (j.status='failed'
+                                      AND j.last_error IS NOT DISTINCT FROM 'edge-enqueue-failed'))"""
 
 
 def edge_backfill_candidates(db, catalog_id, after='', limit=100):

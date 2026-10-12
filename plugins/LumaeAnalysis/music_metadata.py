@@ -191,7 +191,8 @@ def resolve(entity, client):
             "recognition": "unknown", "relatedEntities": "not_resolved"}
 
 
-def run_one(*, db=None, client_factory=Client, critical=playback_pending):
+def run_one(*, db=None, client_factory=Client, critical=playback_pending, deadline=None):
+    """One lookup; ``deadline`` (a watchdog tick's) bounds its uncached requests."""
     db = db or get_db()
     if paused() or critical(db):
         return {"status": "deferred"}
@@ -216,7 +217,10 @@ def run_one(*, db=None, client_factory=Client, critical=playback_pending):
         db.commit()
         return current and not paused() and not critical(db)
     try:
-        result = resolve(entity, client_factory(db, allowed=allowed, reserve_request=lambda: reserve(db, user)))
+        options = {"allowed": allowed, "reserve_request": lambda: reserve(db, user)}
+        if deadline is not None:
+            options["deadline"] = deadline
+        result = resolve(entity, client_factory(db, **options))
         status, error, delay = result["status"], None, 0
     except MusicBrainzDeferred as exc:
         result, status, error, delay = None, "deferred", str(exc), exc.retry_seconds
@@ -233,7 +237,7 @@ def run_one(*, db=None, client_factory=Client, critical=playback_pending):
     return {"status": status if applied else "superseded", "job_id": job_id}
 
 
-def reconcile(db, before_background=False):
+def reconcile(db, before_background=False, deadline=None):
     """Run one due job on a watchdog tick, taking turns with background work."""
     if paused():
         return None
@@ -246,7 +250,7 @@ def reconcile(db, before_background=False):
     db.commit()
     if not due or (before_background and float(idle_seconds) < SHARE_SECONDS):
         return None
-    result = run_one(db=db)
+    result = run_one(db=db) if deadline is None else run_one(db=db, deadline=deadline)
     # Nothing claimed (playback first, or another worker won): the tick goes on.
     return result if result.get("job_id") else None
 
