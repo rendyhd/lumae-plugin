@@ -53,7 +53,7 @@ failed jobs back off for six hours. Source revision changes may retry
 immediately. Each file has a 15 minute deadline and a 6,553.6 second decoded
 duration ceiling.
 
-## Schema v3 (1.7.0, unreleased)
+## Schema v3 (1.7.0)
 
 Clients that ask for it (`edge_schema=3`; capability
 `edge_profiles.schema_versions: [2, 3]`) get schema v3, a deterministic

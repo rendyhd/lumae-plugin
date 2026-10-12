@@ -305,7 +305,7 @@ This is the K6 miss fetch (§3.7, C-10). Each profile in `profiles` carries the 
 
 This route is read-only: it never schedules analysis. Use `POST /api/analyze` (below) for that.
 
-**New in 1.7.0 (unreleased, SF.3):** `edge_schema=3` serves every `edge_profile` in schema v3 (§4.5); `edge_schema=2` or none is today's v2; any other value is 400 `invalid_edge_schema`. The same parameter applies to §3.3 and §3.4, and `edge_schema: 3` in a v2 session's create body to its pages and catch-up (§3.5).
+**New in 1.7.0 (SF.3):** `edge_schema=3` serves every `edge_profile` in schema v3 (§4.5); `edge_schema=2` or none is today's v2; any other value is 400 `invalid_edge_schema`. The same parameter applies to §3.3 and §3.4, and `edge_schema: 3` in a v2 session's create body to its pages and catch-up (§3.5).
 
 **New in 1.3.0 (unreleased):** with `edge_status=1` (or `true`) the body adds `edge_status: {track_id: {status, retry_at?}}` for every requested id that has a published waveform row. `status` is `ready` (an edge for the current media is served), `pending` (queued or running), `failed` (with `retry_at`, UTC `Z`: when a request can queue it again), `unsupported` (the analyzer can never measure this media, for example more than two channels; terminal until the media changes, never re-request it) or `absent`. Without the parameter the response is unchanged. Advertised by `capabilities.edge_profiles.edge_status`.
 
@@ -446,9 +446,9 @@ Release is idempotent for tokens the server does not know: it returns 200 `relea
   - 202: the analyze body plus `next_after`.
   - Candidates are taken in track-ID order after `after`: tracks without an edge for their media and without a job attempted in the last 6 hours; `next_after` is the last candidate. From P3-7 (unreleased, ships in 1.3.0) they are published waveform rows, as for analyze. Before, they were analysis-attempt rows, so a page could name tracks without a published row (which analyze then skipped) and miss published ones whose attempt was on other media.
 
-A successful waveform analysis also schedules an edge upgrade automatically (`_schedule_edge_upgrade`, `__init__.py:2785-2794`). From 1.3.0 it inherits the waveform attempt's priority.
+A successful waveform analysis also schedules an edge upgrade automatically (`_schedule_edge_upgrade`, `__init__.py:2785-2794`). From 1.3.0 it inherits the waveform attempt's priority. From 1.7.0 only an on-demand waveform does; a background one (the waveform backfill) leaves its edge to the server library pass below, as AudioMuse's per-song hook does.
 
-**Server library pass (1.3.0, unreleased).** The reconcile watchdog walks each active source's published waveform rows by track ID (`edge_backfill_state`), after the waveform backfill and at the same low priority: one tick per minute, about 30 s of work (at most 25 tracks), one track at a time, serving refused on-demand work between tracks. A finished pass sweeps again after 6 hours (failed jobs past their back-off, new publications) and a catalogue refresh with changes starts one at once. Without a qualified worker the pass is parked (`waiting_runtime`) and resumes when one reports. Measured on the AudioMuse worker (20 cores): about 1.8 s of edge analysis per 4-minute 44.1 kHz stereo FLAC, plus the download.
+**Server library pass (1.3.0, unreleased).** The reconcile watchdog walks each active source's published waveform rows by track ID (`edge_backfill_state`), after the waveform backfill and at the same low priority: about 30 s of work (at most 25 tracks) at a time, one track at a time, serving refused on-demand work between tracks. From 1.7.0 the pass starts no track after the watchdog tick's 45 s budget, and the tick (every minute while work is due) skips while AudioMuse has a refused schedule to retry or a main job running, then comes 5–15 minutes later. A finished pass sweeps again after 6 hours (failed jobs past their back-off, new publications) and a catalogue refresh with changes starts one at once. Without a qualified worker the pass is parked (`waiting_runtime`) and resumes when one reports. Measured on the AudioMuse worker (20 cores): about 1.8 s of edge analysis per 4-minute 44.1 kHz stereo FLAC, plus the download.
 
 ### 3.7 Edge references (K6; 1.3.0, unreleased, P3-2)
 
@@ -582,7 +582,7 @@ len(boundaries) = bin_count + 1;  boundaries[0] = origin;  boundaries[bin_count]
 - The equivalent form in the plan's K7 derives each window's `origin`/`end` from `source.decoded_frames` and the 30-second rule in §4.1. It gives identical results.
 - This was checked against the code for rates 10 Hz–384 kHz and window lengths from 1 frame to 61 s, and against the golden fixture (48 kHz, 10,003 frames, 4 boundaries per window). The fixture's digest also verifies with the §4.2 rule.
 
-### 4.5 Schema v3 (1.7.0, unreleased; SF.3)
+### 4.5 Schema v3 (1.7.0; SF.3)
 
 Gate: `capabilities.edge_profiles.schema_versions` includes `3` (§2). Decisions D3 and D9 of the SmoothFade review (Auralscape `docs/smoothfade-handoff-2026-10-11.md`).
 

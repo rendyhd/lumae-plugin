@@ -112,6 +112,14 @@
   },
   "versions": [
     {
+      "version": "1.7.0",
+      "min_core_version": "3.2.0",
+      "changelog": "SmoothFade: edge profiles in schema v3 on request (edge_schema=3; health edge_profiles.schema_versions lists 3 once every stored edge has its v3 digest), without the windows' sample peak and spectral flux and with their own digest. When a song's music ends before its last 30 seconds (a hidden track after a long silence, a long silent run-out), the v3 edge says where and carries an ending window measured before it, so Lumae fades on the real ending. v2 transfers and stored edges are unchanged. Scheduler: the catalogue watchdog steps aside while AudioMuse has a refused schedule to retry or one of its main jobs running and comes back 5-15 minutes later, so AudioMuse's nightly analysis and clustering and Lumae's other schedules no longer fail after 240 minutes blocked; minute cadence skips Lumae's other schedules; a tick works for at most 45 s over several actions; the edge pass finds its tracks by key (639 to 125 ms on a 36k-track library); disabling Lumae's schedules on the Scheduled Tasks page lasts; each tick says what it did. Neither the per-song hook during an AudioMuse analysis run nor the waveform backfill queues an edge task per song any more; the library pass makes those edges, and on-demand requests still get theirs at once. AudioMuse 3.2.0 is still the minimum.",
+      "imageUrl": "",
+      "checksum": "ad771a0376e805cf45ab2a7c6c7afb1b",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.7.0.zip"
+    },
+    {
       "version": "1.6.1",
       "min_core_version": "3.2.0",
       "changelog": "Storage: MusicBrainz responses for credits are cached for 3 days instead of 30 and deleted as soon as they expire, and the upgrade deletes those cached longer by earlier versions (on a 36k-track library about 1.1 GB of a 3.7 GB AudioMuse backup). Profile journal events written before 1.3.0's edge references drop their copy of the edge when that edge is still stored; every reader serves them exactly as before. Credits versions are compacted to two snapshots of the catalogue's albums instead of 50,000 versions. Nothing on the wire changes; that library's backup went from 3.7 to 2.5 GB.",

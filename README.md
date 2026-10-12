@@ -36,8 +36,8 @@ a running 1.2.5 installation — no 1.2.5 process may keep running once the
 * **Waveform and edge profiles.** Per-track loudness/MixRamp profiles reuse
   AudioMuse's own analysis audio; edge (SmoothFade) profiles are a separate,
   source-bound analysis. One durable background-enrichment workflow per
-  source uses small batches and a one-action watchdog instead of flooding
-  the queue, with high-priority idempotent promotion for the current
+  source uses small batches and a time-boxed watchdog that steps aside for
+  AudioMuse's own jobs instead of flooding the queue, with high-priority idempotent promotion for the current
   playback window so a requested track is never trapped behind a library
   backfill. Both profile kinds are delivered as a cursor stream, so a phone
   installs only newly ready or removed profiles after its first bootstrap,

@@ -7,7 +7,15 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased
+## 1.7.0 (2026-10-12)
+
+SmoothFade and the scheduler. A client can ask for edge profiles in schema
+v3, which drops fields Lumae never used and says where a song's music
+really ends. The catalogue watchdog now steps aside for AudioMuse, which it
+used to starve of its own schedules, holds each tick to about 45 s of work
+and says what each tick did. AudioMuse 3.2.0 is still the minimum. Schema v3 is
+opt-in: v2 transfers are unchanged, and the scheduler changes nothing on
+the wire.
 
 - Edge profile schema v3 (SF.3). A client that asks for it (`edge_schema=3`
   on `/api/profiles`, bootstrap and changes, or `edge_schema: 3` when it
@@ -25,6 +33,52 @@ still matters. Exact, code-verified wire behaviour for every version lives in
   batches and flags tails that open on silence for the library pass to
   measure again; schema 3 is offered once every edge has its digest. Details
   in `plugins/LumaeAnalysis/EDGE_PROFILES.md` and the contract's §4.5.
+- The watchdog yields to AudioMuse. While Lumae had background work it
+  ticked every minute, and AudioMuse queued it milliseconds before its own
+  retry pass, so a schedule AudioMuse refused while a Lumae task ran (its
+  nightly analysis, clustering, Lumae's own identity recheck and retention)
+  never got another chance and failed after 240 minutes ("Blocked for over
+  240 minutes; not run"). Now, while AudioMuse has a refused schedule
+  waiting to be retried or one of its main jobs is running, the tick does
+  nothing, and the next one comes at a random minute 5–15 minutes later
+  (every 5 minutes on AudioMuse before 3.3.0, which does not retry), so it
+  never meets AudioMuse's retry pass systematically. Lumae resumes once
+  AudioMuse's work has started or finished. Work that arrives meanwhile (an
+  analysed song, a request from the app) and a restart wait for that tick
+  too.
+- Minute cadence leaves out the minutes at which Lumae's other schedules are
+  due (with the defaults :02, :23 and :32), so the watchdog no longer blocks
+  its own identity recheck and retention.
+- A tick works for at most 45 s, over as many actions as fit, instead of one
+  action of any length. The waveform batch, the edge pass, the relationship
+  build and credits and MusicBrainz lookups each stop at the tick's end; a
+  credits album resumes from the response cache at the next tick. The edge
+  pass no longer runs past its 30 s (production averaged 81 s), a
+  relationship step gets about 40 s instead of 20 s per checkpoint reload,
+  and the stored-edge v3 upgrade takes one turn of at most 20 s a tick,
+  right after on-demand work.
+- The edge pass finds its next tracks by walking the library's key instead
+  of scanning every job per track: 639 → 125 ms on a 36k-track library
+  (this query was behind ticks that lasted up to eight minutes).
+- A finished waveform backfill whose remaining tracks wait for a retry keeps
+  that retry time. Before, the watchdog stayed on minute cadence after the
+  backfill was done and the edge pass behind it never ran.
+- Credits take their turn 300 s after the previous turn ended, not after it
+  started.
+- With several media servers, AudioMuse calls the watchdog once per server;
+  the first call now does the work for every source and the others return
+  at once.
+- AudioMuse shows what each tick did: its message is one sentence ("Lumae: 7
+  waveforms, 2 credits albums in 44 s; 41,200 tracks left", "Lumae: yielded
+  to analysis", "Lumae: up to date"), and the "Songs analyzed" note counts
+  waveforms, edges and on-demand tracks instead of always 0. Each tick also
+  writes one INFO line, credits, MusicBrainz lookups, on-demand work and the
+  v3 upgrade are journaled, and the journal keeps a day of events (25 to
+  1,000 per source) instead of the last 25.
+- Disabling `plugin.lumae_analysis.catalog_reconcile` or
+  `plugin.lumae_analysis.provider_identity_recheck` on AudioMuse's Scheduled
+  Tasks page now lasts; before, Lumae re-enabled both. The settings page says
+  when either is disabled and what waits while it is.
 - During an AudioMuse analysis run, the per-song hook no longer queues one
   edge task per analysed song. The host admits those tasks from inside its
   own run, so a 2,300-album pass put hundreds on the queue, and AudioMuse's
@@ -33,8 +87,15 @@ still matters. Exact, code-verified wire behaviour for every version lives in
   library pass due and, when the pass is already past the song, sends it back
   to the start. The pass makes the edge once the reconcile watchdog runs
   again; the host holds plugin crons until its own run ends. Nothing on the
-  wire changes. On-demand (`/api/profiles/edges/analyze`) and the plugin's
-  own analysis tasks still queue edge work as before.
+  wire changes.
+- The plugin's own waveform backfill no longer queues one edge task per
+  track either: those edges come from the library pass too. With several
+  waveform batches per tick, a task per track kept a Lumae task on
+  AudioMuse's queue about 85% of the time on a library mid-backfill (about
+  10% on 1.6), and AudioMuse refused its schedules meanwhile. On such a
+  library background edges now follow once its waveforms are done. An
+  on-demand request (`/api/profiles/edges/analyze`, or an on-demand
+  waveform) still queues its edge at once.
 
 ## 1.6.1 (2026-10-07)
 
