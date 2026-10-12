@@ -962,6 +962,59 @@ class TickReport:
         )
 
 
+def _plural(count, singular, plural=None):
+    return f"{count:,} {singular if count == 1 else (plural or singular + 's')}"
+
+
+def task_message(result, sentence):
+    """``result`` with ``sentence`` as AudioMuse's task message.
+
+    Lumae's other schedules say what they did, like the tick (LA-3); without
+    a message AudioMuse shows "Plugin task completed successfully.". They set
+    no ``tracks_analyzed``, so a host that notes "Songs analyzed" still does.
+    """
+    if len(sentence) > TICK_MESSAGE_MAX:
+        sentence = sentence[:TICK_MESSAGE_MAX - 1] + "…"
+    return {**result, "message": sentence, "status_message": sentence}
+
+
+def catalog_refresh_sentence(result):
+    reason = result.get("change_reason")
+    if reason == "provider_identity_wait":
+        return "Lumae: catalogue held for a second scan of the media server ID change"
+    tracks = int((result.get("counts") or {}).get("track") or 0)
+    if reason == "no_change":
+        return f"Lumae: catalogue unchanged, {_plural(tracks, 'track')}"
+    changes = int(result.get("changes") or 0)
+    return (f"Lumae: catalogue refreshed, {_plural(changes, 'change')}, "
+            f"{_plural(tracks, 'track')}")
+
+
+def analysis_projection_sentence(result):
+    ready = f"{int(result.get('ready_count') or 0):,} tracks ready"
+    if result.get("unchanged"):
+        return f"Lumae: analysis projection unchanged, {ready}"
+    return f"Lumae: analysis projected, {_plural(int(result.get('changes') or 0), 'change')}, {ready}"
+
+
+def identity_recheck_sentence(result):
+    checked = int(result.get("checked") or 0)
+    if not checked:
+        return "Lumae: no media server ID change to recheck"
+    failed = sum(1 for entry in result.get("results") or () if (entry or {}).get("error"))
+    return (f"Lumae: rechecked {_plural(checked, 'media server ID change')}"
+            + (f", {failed:,} failed" if failed else ""))
+
+
+def collection_retention_sentence(result):
+    if result.get("status") == "error":
+        return "Lumae: collection cleanup failed; see the worker log"
+    removed = sum(int(value or 0) for key, value in result.items() if key.endswith("_deleted"))
+    if not removed:
+        return "Lumae: no expired collection entries"
+    return f"Lumae: removed {_plural(removed, 'expired collection entry', 'expired collection entries')}"
+
+
 def host_blocking_task_types():
     """The root task types AudioMuse's cron gate waits for, besides plugins."""
     types = set(HOST_BLOCKING_TASK_TYPES)

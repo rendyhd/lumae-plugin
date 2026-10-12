@@ -380,7 +380,11 @@ def test_no_change_refresh_rechecks_stranded_repair(monkeypatch):
                         lambda value: seen.append(value))
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod.optional_storage, "prune", lambda value: None)
-    assert mod.catalog_refresh_task("server-a") == result
+    assert mod.catalog_refresh_task("server-a") == {
+        **result,
+        "message": "Lumae: catalogue unchanged, 0 tracks",
+        "status_message": "Lumae: catalogue unchanged, 0 tracks",
+    }
     assert seen == [result]
 
 def test_recovery_arm_failure_rolls_back_token_admission(edge_publication_db, monkeypatch):

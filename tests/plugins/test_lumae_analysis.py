@@ -6510,8 +6510,8 @@ def test_stale_v2_worker_task_uses_only_the_proven_rebound_server(monkeypatch):
         or {"status": "complete"},
     )
 
-    assert mod.catalog_refresh_task("legacy-default") == {"status": "complete"}
-    assert mod.analysis_projection_task("legacy-default") == {"status": "complete"}
+    assert mod.catalog_refresh_task("legacy-default")["status"] == "complete"
+    assert mod.analysis_projection_task("legacy-default")["status"] == "complete"
     assert calls == [
         ("catalog", "server-a"),
         ("analysis", "server-a", adapter),
@@ -6527,6 +6527,8 @@ def test_stale_v2_worker_task_uses_only_the_proven_rebound_server(monkeypatch):
     assert mod.catalog_refresh_task("legacy-default") == {
         "status": "skipped",
         "reason": "source_rebind_required",
+        "message": "Lumae: catalogue refresh skipped; the source awaits rebinding",
+        "status_message": "Lumae: catalogue refresh skipped; the source awaits rebinding",
     }
     assert len(calls) == 2
 
@@ -6628,7 +6630,8 @@ def test_analysis_projection_task_reports_a_by_design_hold_as_deferred(monkeypat
         "status": "deferred",
         "reason": reason,
         "server_id": "server-a",
-        "message": "Analysis projection deferred: Navidrome did not answer",
+        "message": "Lumae: analysis projection deferred: Navidrome did not answer",
+        "status_message": "Lumae: analysis projection deferred: Navidrome did not answer",
     }
     # The read transaction the projection opened is ended, not left idle.
     assert db.rollbacks == 1
@@ -10515,7 +10518,12 @@ def test_identity_recheck_schedule_skips_normal_sources(monkeypatch):
             "refresh_catalog",
             lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not scan")),
         )
-        assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
+        assert mod.provider_identity_recheck_task() == {
+            "checked": 0,
+            "results": [],
+            "message": "Lumae: no media server ID change to recheck",
+            "status_message": "Lumae: no media server ID change to recheck",
+        }
     finally:
         refresh.undo()
 
@@ -10581,6 +10589,8 @@ def test_identity_recheck_releases_completed_migration_and_projects_inline(monke
                 },
             }
         ],
+        "message": "Lumae: rechecked 1 media server ID change",
+        "status_message": "Lumae: rechecked 1 media server ID change",
     }
     assert projected == ["server-a"]
     assert db.commits == 1
@@ -10683,7 +10693,12 @@ def test_identity_recheck_durable_request_projects_when_startup_was_already_read
         or {"status": "complete", "catalog_instance_id": "catalog-a"},
     )
 
-    assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
+    assert mod.provider_identity_recheck_task() == {
+        "checked": 0,
+        "results": [],
+        "message": "Lumae: no media server ID change to recheck",
+        "status_message": "Lumae: no media server ID change to recheck",
+    }
     reconcile["required"] = True
     result = mod.provider_identity_recheck_task()
 
