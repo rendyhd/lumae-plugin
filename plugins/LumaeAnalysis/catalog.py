@@ -13,6 +13,7 @@ import unicodedata
 import uuid
 
 from plugin.api import logger, table
+from psycopg2.extras import execute_values
 
 from . import catalog_search, migrations
 from .catalog_providers import (
@@ -1478,6 +1479,15 @@ def _json_param(value):
     return canonical_json(value)
 
 
+def _insert_rows(cur, sql, template, rows):
+    """Insert ``rows`` a page per statement; ``sql`` ends in ``VALUES %s``.
+
+    One statement per row was about 18 s of a 36k-track refresh (LA-1).
+    """
+    for batch in _chunks(rows):
+        execute_values(cur, sql, batch, template=template, page_size=len(batch))
+
+
 def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, rows, now):
     """Insert one entity type's rows of a new generation. For tracks, also
     their search text (LUM-016); returns whether it was folded with unaccent
@@ -1544,7 +1554,7 @@ def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, r
         album_names = dict(cur.fetchall())
         columns.append("search_text")
         placeholders.append(catalog_search.search_text_placeholder(folded))
-    sql = f"INSERT INTO {t(table_name)} ({', '.join(columns)}) VALUES ({', '.join(placeholders)})"
+    sql = f"INSERT INTO {t(table_name)} ({', '.join(columns)}) VALUES %s"
     def parameters():
         for row in rows:
             values = [catalog_instance_id, generation, row[id_column]]
@@ -1558,9 +1568,7 @@ def _insert_generation_rows(cur, entity_type, catalog_instance_id, generation, r
                     row.get("album_artist_display"), album_names.get(row.get("album_id"))))
             yield tuple(values)
 
-    params = parameters()
-    for batch in _chunks(params):
-        cur.executemany(sql, batch)
+    _insert_rows(cur, sql, f"({', '.join(placeholders)})", parameters())
     # How the search text was folded (tracks only): the caller records it
     # with the generation in catalog_state, under its publication lock.
     return folded
@@ -1589,7 +1597,7 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
             INSERT INTO {t(table_name)}
                 (catalog_instance_id, published_generation, {entity_id}, position,
                  artist_id, display_name, role, identity_provenance, payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)
+            VALUES %s
         """
         params = (
             (
@@ -1605,14 +1613,13 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
             )
             for row in rows
         )
-        for batch in _chunks(params):
-            cur.executemany(sql, batch)
+        _insert_rows(cur, sql, "(%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb)", params)
     membership = normalized["entity_libraries"]
     if membership:
         sql = f"""
             INSERT INTO {t("catalog_entity_libraries")}
                 (catalog_instance_id, published_generation, entity_type, entity_id, library_id)
-            VALUES (%s, %s, %s, %s, %s)
+            VALUES %s
         """
         params = (
             (
@@ -1624,8 +1631,7 @@ def _insert_relationship_rows(cur, catalog_instance_id, generation, normalized):
             )
             for row in membership
         )
-        for batch in _chunks(params):
-            cur.executemany(sql, batch)
+        _insert_rows(cur, sql, "(%s, %s, %s, %s, %s)", params)
 
 
 def _published_fingerprints(cur, entity_type, catalog_instance_id, generation):

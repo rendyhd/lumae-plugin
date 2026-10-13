@@ -3316,12 +3316,29 @@ def test_streaming_loudness_caps_channels_and_sample_rate():
 
 
 class FakeCursor:
+    # psycopg2.extras.execute_values reads the encoding, mogrifies each row
+    # and runs one statement; _unbatch turns that back into (sql, rows), as
+    # executemany records it.
+    connection = types.SimpleNamespace(encoding="UTF8")
+
     def __init__(self, rows=None):
         self.rows = rows or []
         self.description = [("item_id",), ("file_path",)]
         self.executed = []
+        self.pending_rows = []
+
+    def mogrify(self, _template, args):
+        self.pending_rows.append(tuple(args))
+        return b"(?)"
+
+    def _unbatch(self, sql, params):
+        if isinstance(sql, bytes):
+            rows, self.pending_rows = self.pending_rows, []
+            return sql.decode(), rows
+        return sql, params
 
     def execute(self, sql, params=None):
+        sql, params = self._unbatch(sql, params)
         self.executed.append((sql, params))
 
     def fetchone(self):
@@ -5414,7 +5431,12 @@ def test_reconcile_status_panel_reports_real_work_and_escapes_errors(monkeypatch
     assert "7.5 s" in body
     assert "processed: 2" in body
     assert "&lt;boom&gt;" in body
-    assert "Songs analyzed: 0" in body
+    # Since 1.7.0 the note is a real count on older hosts and Lumae's own
+    # sentence on newer ones, never a fixed "Songs analyzed: 0" (LA-2).
+    assert "Songs analyzed: 0" not in body
+    text = " ".join(body.split())
+    assert "older AudioMuse hosts note these tasks with a “Songs analyzed” count" in text
+    assert "newer hosts show the sentence Lumae returns" in text
     assert f'data-lumae-active="{str(running).lower()}"' in body
     assert "<script>" not in body
 
@@ -6510,8 +6532,8 @@ def test_stale_v2_worker_task_uses_only_the_proven_rebound_server(monkeypatch):
         or {"status": "complete"},
     )
 
-    assert mod.catalog_refresh_task("legacy-default") == {"status": "complete"}
-    assert mod.analysis_projection_task("legacy-default") == {"status": "complete"}
+    assert mod.catalog_refresh_task("legacy-default")["status"] == "complete"
+    assert mod.analysis_projection_task("legacy-default")["status"] == "complete"
     assert calls == [
         ("catalog", "server-a"),
         ("analysis", "server-a", adapter),
@@ -6527,6 +6549,8 @@ def test_stale_v2_worker_task_uses_only_the_proven_rebound_server(monkeypatch):
     assert mod.catalog_refresh_task("legacy-default") == {
         "status": "skipped",
         "reason": "source_rebind_required",
+        "message": "Lumae: catalogue refresh skipped; the source awaits rebinding",
+        "status_message": "Lumae: catalogue refresh skipped; the source awaits rebinding",
     }
     assert len(calls) == 2
 
@@ -6628,7 +6652,8 @@ def test_analysis_projection_task_reports_a_by_design_hold_as_deferred(monkeypat
         "status": "deferred",
         "reason": reason,
         "server_id": "server-a",
-        "message": "Analysis projection deferred: Navidrome did not answer",
+        "message": "Lumae: analysis projection deferred: Navidrome did not answer",
+        "status_message": "Lumae: analysis projection deferred: Navidrome did not answer",
     }
     # The read transaction the projection opened is ended, not left idle.
     assert db.rollbacks == 1
@@ -7073,6 +7098,7 @@ class RefreshCursor(FakeCursor):
         self.db = db
 
     def execute(self, sql, params=None):
+        sql, params = self._unbatch(sql, params)
         super().execute(sql, params)
         self.db.executed.append((sql, params))
         if "SELECT catalog_instance_id, current_core_server_id" in sql:
@@ -7163,16 +7189,16 @@ class RefreshDb:
 def test_catalog_generation_parameters_are_materialized_one_batch_at_a_time():
     import plugins.LumaeAnalysis.catalog as catalog
 
-    class Cursor:
+    class Cursor(FakeCursor):
         def __init__(self):
+            super().__init__()
             self.batch_sizes = []
 
-        def executemany(self, _sql, params):
-            self.batch_sizes.append(len(params))
-
         # LUM-016: the track insert reads unaccent and the album names first.
-        def execute(self, _sql, _params=None):
-            pass
+        def execute(self, sql, params=None):
+            sql, params = self._unbatch(sql, params)
+            if sql.lstrip().startswith("INSERT"):
+                self.batch_sizes.append(len(params))
 
         def fetchone(self):
             return (True,)
@@ -10515,7 +10541,12 @@ def test_identity_recheck_schedule_skips_normal_sources(monkeypatch):
             "refresh_catalog",
             lambda **_kwargs: (_ for _ in ()).throw(AssertionError("must not scan")),
         )
-        assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
+        assert mod.provider_identity_recheck_task() == {
+            "checked": 0,
+            "results": [],
+            "message": "Lumae: no media server ID change to recheck",
+            "status_message": "Lumae: no media server ID change to recheck",
+        }
     finally:
         refresh.undo()
 
@@ -10581,6 +10612,8 @@ def test_identity_recheck_releases_completed_migration_and_projects_inline(monke
                 },
             }
         ],
+        "message": "Lumae: rechecked 1 media server ID change",
+        "status_message": "Lumae: rechecked 1 media server ID change",
     }
     assert projected == ["server-a"]
     assert db.commits == 1
@@ -10683,7 +10716,12 @@ def test_identity_recheck_durable_request_projects_when_startup_was_already_read
         or {"status": "complete", "catalog_instance_id": "catalog-a"},
     )
 
-    assert mod.provider_identity_recheck_task() == {"checked": 0, "results": []}
+    assert mod.provider_identity_recheck_task() == {
+        "checked": 0,
+        "results": [],
+        "message": "Lumae: no media server ID change to recheck",
+        "status_message": "Lumae: no media server ID change to recheck",
+    }
     reconcile["required"] = True
     result = mod.provider_identity_recheck_task()
 
@@ -10712,6 +10750,7 @@ class PublisherCursor(FakeCursor):
         self.db = db
 
     def execute(self, sql, params=None):
+        sql, params = self._unbatch(sql, params)
         super().execute(sql, params)
         self.db.executed.append((sql, params))
         normalized = " ".join(sql.split())

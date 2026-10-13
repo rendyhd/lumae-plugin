@@ -152,11 +152,15 @@ from .reconcile import (
     TickBudget,
     TickReport,
     action_averages,
+    analysis_projection_sentence,
     arm_reconcile,
     begin_event,
+    catalog_refresh_sentence,
+    collection_retention_sentence,
     defer_work,
     discard_event,
     finish_event,
+    identity_recheck_sentence,
     iso as reconcile_iso,
     migrate_reconcile,
     progress_event,
@@ -165,6 +169,7 @@ from .reconcile import (
     record_event,
     remaining_work,
     set_paused as set_reconcile_paused,
+    task_message,
     update_work_retry,
 )
 
@@ -648,11 +653,13 @@ def wake_profile_backfill_after_catalog_refresh(result, db=None):
 
 def catalog_refresh_task(server_id=None):
     if maintenance_paused():
-        return {"status": "paused", "reason": "maintenance_paused"}
+        return task_message({"status": "paused", "reason": "maintenance_paused"},
+                            "Lumae: paused")
     adapter = get_core_adapter()
     resolved_server_id = _resolve_task_server_id(adapter, server_id)
     if not resolved_server_id:
-        return {"status": "skipped", "reason": "source_rebind_required"}
+        return task_message({"status": "skipped", "reason": "source_rebind_required"},
+                            "Lumae: catalogue refresh skipped; the source awaits rebinding")
     result = refresh_catalog(server_id=resolved_server_id)
     try:
         source = result["catalog_instance_id"]
@@ -678,7 +685,7 @@ def catalog_refresh_task(server_id=None):
     # The publication may have withdrawn profiles; /settings/status reads
     # these counts (P2-1).
     refresh_status_snapshot(get_db(), result.get("catalog_instance_id"))
-    return result
+    return task_message(result, catalog_refresh_sentence(result))
 
 
 def next_settled_analysis_run(db=None, server_id=None):
@@ -1317,11 +1324,13 @@ def _next_reconcile_action(db, report, budget, server_id, done):
 
 def analysis_projection_task(server_id=None):
     if maintenance_paused():
-        return {"status": "paused", "reason": "maintenance_paused"}
+        return task_message({"status": "paused", "reason": "maintenance_paused"},
+                            "Lumae: paused")
     adapter = get_core_adapter()
     resolved_server_id = _resolve_task_server_id(adapter, server_id)
     if not resolved_server_id:
-        return {"status": "skipped", "reason": "source_rebind_required"}
+        return task_message({"status": "skipped", "reason": "source_rebind_required"},
+                            "Lumae: analysis projection skipped; the source awaits rebinding")
     try:
         result = project_analysis(server_id=resolved_server_id, adapter=adapter)
     except AnalysisProjectionDeferred as exc:
@@ -1340,12 +1349,11 @@ def analysis_projection_task(server_id=None):
                 exc.reason,
                 exc,
             )
-        return {
+        return task_message({
             "status": "deferred",
             "reason": exc.reason,
             "server_id": resolved_server_id,
-            "message": f"Analysis projection deferred: {exc}",
-        }
+        }, f"Lumae: analysis projection deferred: {exc}")
     if not result.get("catalog_instance_id"):
         return result
     complete_projection_reconcile(get_db(), result["catalog_instance_id"])
@@ -1364,7 +1372,7 @@ def analysis_projection_task(server_id=None):
             "coalesced": False,
             "error": str(exc),
         }
-    return result
+    return task_message(result, analysis_projection_sentence(result))
 
 
 def enqueue_required_catalog_preparations(db=None, server_id=None):
@@ -1487,7 +1495,8 @@ def provider_identity_recheck_task(server_id=None):
             )
             result["error"] = str(exc)
         results.append(result)
-    return {"checked": len(results), "results": results}
+    summary = {"checked": len(results), "results": results}
+    return task_message(summary, identity_recheck_sentence(summary))
 
 
 def collection_retention_task():
@@ -1497,7 +1506,8 @@ def collection_retention_task():
     periodic maintenance tasks; see collection_manager and shelves for
     the retention windows, batch limits and lock order."""
     if maintenance_paused():
-        return {"status": "paused", "reason": "maintenance_paused"}
+        return task_message({"status": "paused", "reason": "maintenance_paused"},
+                            "Lumae: paused")
     db = get_db()
     try:
         mutations_deleted = purge_expired_collection_mutations(db)
@@ -1509,8 +1519,8 @@ def collection_retention_task():
     except Exception:
         _rollback_if_possible(db)
         logger.exception("lumae_analysis collection retention cleanup failed")
-        return {"status": "error"}
-    return {
+        return task_message({"status": "error"}, collection_retention_sentence({"status": "error"}))
+    result = {
         "status": "ok",
         "collection_mutations_deleted": mutations_deleted,
         "collection_restores_deleted": restores_deleted,
@@ -1519,6 +1529,7 @@ def collection_retention_task():
         "cover_mutations_deleted": cover_deleted,
         "cover_images_deleted": cover_images_deleted,
     }
+    return task_message(result, collection_retention_sentence(result))
 
 
 def observe_provider_identities_on_start():

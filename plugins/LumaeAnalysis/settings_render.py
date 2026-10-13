@@ -1217,8 +1217,9 @@ def render_reconcile_status_panel():
         data-lumae-active="{str(bool(running)).lower()}">
         <span class="lumae-section-priority lumae-section-advanced">Scheduler</span>
         <h3>Background reconcile is {_pkg.escape(str(mode).replace('_', ' '))}</h3>
-        <p class="lumae-action-copy">{_pkg.escape(cadence)}. AudioMuse may label these tasks
-          “Songs analyzed: 0”; the action and phase below are Lumae’s authoritative status.</p>
+        <p class="lumae-action-copy">{_pkg.escape(cadence)}. In Recent tasks, older AudioMuse
+          hosts note these tasks with a “Songs analyzed” count and newer hosts show the
+          sentence Lumae returns; the action and phase below are Lumae’s authoritative status.</p>
         {disabled_html}
         {running_html}
         <ul class="lumae-help">{pending_html}</ul>
