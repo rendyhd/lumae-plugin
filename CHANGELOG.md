@@ -7,6 +7,32 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.7.1 (2026-10-13)
+
+Follow-ups from testing 1.7.0 against AudioMuse's scheduler changes
+(NeptuneHub/AudioMuse-AI#944). Nothing changes on the wire, and AudioMuse
+3.2.0 is still the minimum.
+
+- The catalogue refresh that finalizes an AudioMuse analysis run took 109 s
+  on a 35k-song test library, more than twice the watchdog's 45 s tick, and
+  AudioMuse refuses to start its own schedules while a plugin task runs.
+  Most of that was Lumae's own database work. The check of which profiles a
+  publication withdraws looked up each changed track in the new catalogue
+  generation separately; that generation is not committed yet, so
+  PostgreSQL had no statistics for it and scanned the whole generation for
+  every changed track (41-58 s for 5,500 changes). It now reads them in one
+  pass. The generation is also written up to 1,000 rows per statement
+  instead of one row per statement (about 150,000 statements for a 36k-track
+  library). In local tests such a refresh went from 86-103 s to 34 s. A very
+  large library (100k+ tracks) still runs over the tick while it refreshes.
+- Lumae's other schedules (`catalog_refresh`, `analysis_projection`,
+  `provider_identity_recheck`, `collection_retention`) say what they did in
+  AudioMuse's task message, like the watchdog, instead of "Plugin task
+  completed successfully." They still set no `tracks_analyzed`.
+- The scheduler panel on the settings page no longer says AudioMuse labels
+  Lumae's tasks "Songs analyzed: 0": older AudioMuse versions show a real
+  count, newer ones Lumae's own sentence.
+
 ## 1.7.0 (2026-10-12)
 
 SmoothFade and the scheduler. A client can ask for edge profiles in schema

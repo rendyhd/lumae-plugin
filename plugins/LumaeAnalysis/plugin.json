@@ -112,6 +112,14 @@
   },
   "versions": [
     {
+      "version": "1.7.1",
+      "min_core_version": "3.2.0",
+      "changelog": "The analysis-run finalization's catalogue refresh does far less database work: it reads the changed tracks of the generation it is writing in one pass (the per-track lookup filtered the whole generation for each one) and writes the generation a page of rows per statement instead of one row per statement. A 36k-track refresh with about 5,500 changed tracks went from 86-103 s to 34 s in local tests, so the watchdog tick that finalizes an AudioMuse analysis run holds AudioMuse's schedules back far less. Lumae's other schedules (catalogue refresh, analysis projection, provider identity recheck, collection retention) now say what they did in AudioMuse's task message instead of \"Plugin task completed successfully.\"; the settings page no longer says AudioMuse labels these tasks \"Songs analyzed: 0\". AudioMuse 3.2.0 is still the minimum.",
+      "imageUrl": "",
+      "checksum": "cc9b4c40e1f2e99cb01ed4aa693b6819",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.7.1.zip"
+    },
+    {
       "version": "1.7.0",
       "min_core_version": "3.2.0",
       "changelog": "SmoothFade: edge profiles in schema v3 on request (edge_schema=3; health edge_profiles.schema_versions lists 3 once every stored edge has its v3 digest), without the windows' sample peak and spectral flux and with their own digest. When a song's music ends before its last 30 seconds (a hidden track after a long silence, a long silent run-out), the v3 edge says where and carries an ending window measured before it, so Lumae fades on the real ending. v2 transfers and stored edges are unchanged. Scheduler: the catalogue watchdog steps aside while AudioMuse has a refused schedule to retry or one of its main jobs running and comes back 5-15 minutes later, so AudioMuse's nightly analysis and clustering and Lumae's other schedules no longer fail after 240 minutes blocked; minute cadence skips Lumae's other schedules; a tick works for at most 45 s over several actions; the edge pass finds its tracks by key (639 to 125 ms on a 36k-track library); disabling Lumae's schedules on the Scheduled Tasks page lasts; each tick says what it did. Neither the per-song hook during an AudioMuse analysis run nor the waveform backfill queues an edge task per song any more; the library pass makes those edges, and on-demand requests still get theirs at once. AudioMuse 3.2.0 is still the minimum.",
