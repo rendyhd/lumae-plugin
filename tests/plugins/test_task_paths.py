@@ -78,6 +78,7 @@ EXPECTED_DOTTED_PATHS = {
     "task:analysis_projection": "plugins.LumaeAnalysis.analysis_projection_task",
     "task:credits": "plugins.LumaeAnalysis.credits_service.run_one",
     "task:edge_backfill": "plugins.LumaeAnalysis.edge_backfill_task",
+    "task:loudness_backfill": "plugins.LumaeAnalysis.loudness_backfill_task",
     "task:prepare": "plugins.LumaeAnalysis.prepare_lumae_task",
     "task:profile_backfill": "plugins.LumaeAnalysis.profile_backfill_task",
     "task:provider_identity_recheck": "plugins.LumaeAnalysis.provider_identity_recheck_task",

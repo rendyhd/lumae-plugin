@@ -369,6 +369,12 @@ def _work_summary(cur):
              WHERE status IN ('queued', 'failed')
                 OR (status='running' AND updated_at < now() - interval '30 minutes')
             UNION ALL
+            SELECT CASE WHEN next_retry_at > now() THEN 'retry' ELSE 'ready' END,
+                   retry_count, next_retry_at
+              FROM {_work_table('loudness_backfill_state')}
+             WHERE status IN ('queued', 'failed')
+                OR (status='running' AND updated_at < now() - interval '30 minutes')
+            UNION ALL
             SELECT 'ready', 0, NULL::timestamp
              WHERE EXISTS (SELECT 1 FROM {_work_table('source_profiles')}
                             WHERE status='pending_interactive' AND last_error='{DEFERRED_MARKER}')
@@ -516,6 +522,8 @@ def _retry_target(action):
         return "profile_backfill_state"
     if action == "edge_backfill":
         return "edge_backfill_state"
+    if action == "loudness_backfill":
+        return "loudness_backfill_state"
     raise ValueError(f"Unknown reconciliation action: {action}")
 
 
@@ -831,6 +839,7 @@ def remaining_work(db):
 ACTION_UNITS = {
     "profile_backfill": ("waveform", "waveforms"),
     "edge_backfill": ("edge", "edges"),
+    "loudness_backfill": ("loudness measurement", "loudness measurements"),
     "edge_schema_v3": ("edge upgraded to v3", "edges upgraded to v3"),
     "interactive": ("on-demand track", "on-demand tracks"),
     "credits": ("credits album", "credits albums"),
@@ -848,7 +857,7 @@ def action_counts(action, result):
     result = result if isinstance(result, dict) else {}
     if action == "interactive":
         return int(result.get("served") or 0), 0
-    if action in ("profile_backfill", "edge_backfill"):
+    if action in ("profile_backfill", "edge_backfill", "loudness_backfill"):
         return int(result.get("ready") or 0), int(result.get("failed") or 0)
     if action == "edge_schema_v3":
         return int(result.get("upgraded") or 0), 0

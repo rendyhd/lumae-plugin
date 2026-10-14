@@ -85,6 +85,7 @@ def tick(migrated_db, monkeypatch):
     monkeypatch.setattr(mod, "_safe_credits_reconcile", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(mod, "_safe_metadata_reconcile", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: False)
+    monkeypatch.setattr(mod, "next_loudness_backfill", lambda db=None, server_id=None: None)
     monkeypatch.setattr(
         mod, "resolve_profile_source",
         lambda **_kwargs: {"catalog_instance_id": SOURCE, "server_id": SERVER},
@@ -370,6 +371,40 @@ def test_idle_and_paused_ticks_say_so(tick, monkeypatch):
         "paused", "Lumae: paused", "11 * * * *")
     assert len(lines) == 2 and lines[1].startswith("lumae_analysis watchdog: Lumae: paused")
     assert _events(db) == []
+
+
+def _loudness_on(mod, monkeypatch):
+    monkeypatch.setattr(mod, "next_loudness_backfill", lambda db=None, server_id=None: (
+        mod.loudness_backfill.next_due(db, server_id=server_id)))
+
+
+def test_the_loudness_turn_comes_after_the_waveform_batch(tick, monkeypatch):
+    """LN.4c: last of the track work. A measurement that fails backs off, and the pass finishes."""
+    mod, db = tick
+    _loudness_on(mod, monkeypatch)
+    _track(db, "track-a")
+    _queued_backfill(db)
+    monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: {
+        "processed": len(ids), "attempted": len(ids), "ready": len(ids), "failed": 0, "skipped": 0})
+    downloads = []
+    monkeypatch.setattr(mod, "load_track_file", lambda track_id, **_: downloads.append(track_id))
+
+    result = mod.catalog_reconcile_task()
+
+    actions = [(action, status) for action, status, _phase, _summary in _events(db)]
+    assert actions.index(("loudness_backfill", "success")) > actions.index(("profile_backfill", "success"))
+    entry = next(entry for entry in result["actions"] if entry["action"] == "loudness_backfill")
+    assert (entry["count"], entry["failed"]) == (0, 1) and downloads == ["track-a"]
+    assert mod.loudness_backfill.state(db, SOURCE)["status"] == "complete"
+
+
+def test_a_finished_loudness_pass_rests_until_its_resweep(tick, monkeypatch):
+    mod, db = tick
+    _loudness_on(mod, monkeypatch)
+    first = mod.catalog_reconcile_task()  # follows the catalogue; nothing to measure
+    assert [entry["action"] for entry in first["actions"]] == ["loudness_backfill"]
+    idle = mod.catalog_reconcile_task()
+    assert (idle["status"], idle["actions"]) == ("current", [])
 
 
 def test_a_failed_action_still_logs_its_tick(tick, monkeypatch):

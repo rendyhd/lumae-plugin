@@ -58,6 +58,8 @@ PRODUCTION_TABLES = (
     "loudness_tracks",
     "loudness_albums",
     "loudness_changes",
+    "loudness_backfill_state",
+    "loudness_attempts",
 )
 
 

@@ -45,7 +45,7 @@ from .shelves import (
 )
 from . import covers, vibes
 from . import file_tags
-from . import loudness_stream, loudness_v1
+from . import loudness_backfill, loudness_stream, loudness_v1
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -673,6 +673,11 @@ def catalog_refresh_task(server_id=None):
             wake_profile_backfill_after_catalog_refresh(result)
         if changed and arm_edge_backfill(get_db(), source):
             arm_reconcile(get_db(), "edge_backfill_ready", commit=True)
+        if changed:
+            # LN.4c: new tracks to measure, and loudness records to follow the catalogue.
+            loudness_backfill.ensure_sources(get_db())
+            loudness_backfill.arm(get_db(), source)
+            arm_reconcile(get_db(), "loudness_backfill_ready", commit=True)
     except Exception:
         _rollback_if_possible(get_db())
         logger.exception("Could not arm source profile repair after catalogue publication")
@@ -934,7 +939,7 @@ def _run_reconcile_action(
             return result
         if result_status in ("failed", "failure", "error"):
             raise RuntimeError(str((result or {}).get("error") or result_status))
-        if action == "edge_backfill":
+        if action in ("edge_backfill", "loudness_backfill"):
             # The pass keeps its own next_retry_at (the re-sweep after a
             # finished pass); resetting it here would make it due at once.
             finish_event(db, event_id, "success", phase=result_status,
@@ -1168,7 +1173,7 @@ _SETTLED_STATUSES = frozenset((
 # Actions whose "complete" ends their work for now (an analysis run's
 # "complete" is one run of several).
 _COMPLETE_SETTLES = frozenset(("catalog_preparation", "relationships", "profile_backfill",
-                               "edge_backfill"))
+                               "edge_backfill", "loudness_backfill"))
 # A guard against an action that stays due without progress.
 MAX_TICK_ACTIONS = 100
 
@@ -1179,8 +1184,8 @@ def _reconcile_tick(db, report, host_yield, every_source=False):
     The order is unchanged: on-demand work AudioMuse refused to queue, a batch
     of the stored-edge v3 upgrade (SF.3), analysis runs, catalogue
     preparation, a credits and a MusicBrainz turn when their share has come,
-    relationships, the waveform backfill, the edge pass, then credits and
-    MusicBrainz lookups. After each action the order starts
+    relationships, the waveform backfill, the edge pass, the loudness pass
+    (LN.4c), then credits and MusicBrainz lookups. After each action the order starts
     again, so higher-priority work that became due goes first, and before
     each action the tick yields as at its start. Returns the tick's status.
     """
@@ -1306,6 +1311,16 @@ def _next_reconcile_action(db, report, budget, server_id, done):
                 edge_backfill_task, edge[0], edge[1], budget.deadline,
             )
         done.add("edge_backfill")
+    # LN.4c: last of the track work, so it measures only when nothing else waits.
+    if due("loudness_backfill"):
+        loudness = next_loudness_backfill(db, server_id=server_id)
+        if loudness:
+            budget.start()
+            return "loudness_backfill", _reconcile_step(
+                db, report, "loudness_backfill", loudness[0], loudness[1], loudness[1], 0,
+                loudness_backfill_task, loudness[0], loudness[1], budget.deadline,
+            )
+        done.add("loudness_backfill")
     for action, call in (("credits", _safe_credits_reconcile),
                          ("music_metadata", _safe_metadata_reconcile)):
         if not due(action):
@@ -1897,6 +1912,7 @@ def migrate(db):
     cur.close()
     migrate_enrichment(db)
     loudness_stream.migrate_loudness(db)
+    loudness_backfill.migrate_backfill(db)
     credits_store.migrate(db)
     prune_catalog_storage(db)
     # Must run after the published-profile seed above (marker
@@ -3966,6 +3982,9 @@ def report_edge_runtime(force=False):
                 arm_reconcile(db, "edge_backfill_ready", commit=True)
         else:
             park_edge_backfill(db)
+        # A worker with PyAV reports: loudness passes parked for want of it resume (LN.4c).
+        if status.get("pyav") and loudness_backfill.arm(db, include_complete=False):
+            arm_reconcile(db, "loudness_backfill_ready", commit=True)
         _edge_runtime_reported_at = now
     except Exception:
         if db is not None:
@@ -4213,6 +4232,119 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
         _rollback_if_possible(db)
         update_edge_backfill(db, catalog_instance_id, "failed", error=exc)
         raise
+
+
+def next_loudness_backfill(db, server_id=None):
+    """``(server_id, catalog_instance_id)`` of the next loudness turn, or None (LN.4c)."""
+    return loudness_backfill.next_due(db, server_id=server_id)
+
+
+def loudness_backfill_task(server_id, catalog_instance_id, deadline=None):
+    """One loudness turn (LN.4c): follow the published catalogue when its generation moved, then
+    measure a few due tracks on the standalone path and yield.
+
+    Measures one track at a time for about ``loudness_backfill.TICK_SECONDS`` and at most the admin
+    batch size, not past the tick's ``deadline``, serving on-demand work between tracks, publishes
+    the turn's measurements together and keeps its cursor at the last track it reached. A worker
+    without PyAV parks the pass before downloading.
+    """
+    if maintenance_paused():
+        return {"status": "paused", "processed": 0}
+    db = get_db()
+    row = loudness_backfill.state(db, catalog_instance_id) or {}
+    result = {"status": "current", "processed": 0, "ready": 0, "failed": 0, "reconciled": 0}
+    try:
+        generation = row.get("published_generation")
+        if generation is not None and generation != row.get("reconciled_generation"):
+            result["reconciled"] = loudness_backfill.follow_catalogue(db, catalog_instance_id, generation)
+        if not row.get("pass_due"):
+            return result
+        if not loudness_backfill.runtime_available():
+            # No decoder here: park before downloading anything (a PyAV worker's report resumes it).
+            loudness_backfill.park(db, catalog_instance_id)
+            return {**result, "status": "paused", "reason": "loudness_runtime_unavailable"}
+        cursor = "" if row.get("status") == "complete" else (row.get("cursor") or "")
+        due = loudness_backfill.candidates(db, catalog_instance_id, cursor, configured_backfill_limit(),
+                                           edges_enabled=edge_profiles_enabled())
+        if not due:
+            loudness_backfill.update(db, catalog_instance_id, "complete", cursor="",
+                                     next_retry_hours=loudness_backfill.RESWEEP_HOURS, completed=True)
+            return {**result, "status": "complete"}
+        loudness_backfill.update(db, catalog_instance_id, "running", started=not cursor)
+        pass_deadline = time.monotonic() + loudness_backfill.TICK_SECONDS
+        if deadline is not None:
+            pass_deadline = min(pass_deadline, deadline)
+        reached, measured = cursor, []
+        for track_id, media_revision in due:
+            serve_deferred_interactive()
+            if time.monotonic() >= pass_deadline:
+                break
+            outcome = _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured)
+            result[outcome] += 1
+            reached = track_id
+        failed = _publish_loudness(db, catalog_instance_id, measured)
+        result["ready"] -= failed
+        result["failed"] += failed
+        result["processed"] = result["ready"] + result["failed"]
+        loudness_backfill.update(db, catalog_instance_id, "queued", cursor=reached, processed=result["processed"])
+        return {**result, "status": "queued"}
+    except Exception as exc:
+        _rollback_if_possible(db)
+        loudness_backfill.update(db, catalog_instance_id, "failed", error=exc)
+        raise
+
+
+def _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured):
+    """``ready`` (its measurement appended to ``measured``) or ``failed`` for one track: one
+    download, one decode."""
+    info = None
+    try:
+        info = load_track_file(track_id, catalog_instance_id=catalog_instance_id, server_id=server_id)
+        # Nothing written yet: end the read transaction rather than hold it through the decode.
+        db.commit()
+        if not info or opaque_revision(info.get("media_signature")) != media_revision:
+            raise ValueError("loudness-source-replaced")
+        record = run_file_analysis(loudness_v1.measure_file, info["file_path"])
+        measured.append({"track_id": track_id, "media_revision": media_revision, "record": record})
+        return "ready"
+    except Exception as exc:
+        _rollback_if_possible(db)
+        loudness_backfill.record_failure(db, catalog_instance_id, track_id, media_revision,
+                                         analysis_isolation.edge_failure_reason(exc))
+        return "failed"
+    finally:
+        if info:
+            remove_downloaded_file(info.get("cleanup_path"))
+
+
+def _publish_loudness(db, catalog_instance_id, measured):
+    """Publish a turn's measurements in one transaction; returns how many failed. Should the batch
+    fail, each is published alone, and one that still fails backs off like a failed measurement."""
+    if not measured:
+        return 0
+    cur = db.cursor()
+    try:
+        loudness_stream.publish_tracks(cur, catalog_instance_id, measured)
+        loudness_backfill.clear_failures(cur, catalog_instance_id, [item["track_id"] for item in measured])
+        db.commit()
+        return 0
+    except Exception:  # noqa: BLE001 - fall back to one publication per track
+        logger.exception("lumae_analysis loudness batch publication failed; publishing one at a time")
+        _rollback_if_possible(db)
+    finally:
+        cur.close()
+    failed = 0
+    for item in measured:
+        if loudness_stream.store_measurement(db, catalog_instance_id, item["track_id"], item["media_revision"],
+                                             item["record"]):
+            with db.cursor() as cleared:
+                loudness_backfill.clear_failures(cleared, catalog_instance_id, [item["track_id"]])
+            db.commit()
+        else:
+            failed += 1
+            loudness_backfill.record_failure(db, catalog_instance_id, item["track_id"], item["media_revision"],
+                                             "loudness-publication-failed")
+    return failed
 
 
 def serve_deferred_interactive(limit=None):
@@ -6393,6 +6525,7 @@ def register(ctx):
     ctx.add_task("prepare", prepare_lumae_task, queue="default")
     ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
     ctx.add_task("edge_backfill", edge_backfill_task, queue="default")
+    ctx.add_task("loudness_backfill", loudness_backfill_task, queue="default")
     ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
     ctx.add_task("credits", credits_service.run_one, queue="default")
     ctx.add_task(

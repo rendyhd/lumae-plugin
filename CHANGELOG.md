@@ -16,6 +16,14 @@ Auralscape LN.3/LN.4). Clients that don't know the new stream never read it.
   BS.1770-4: integrated loudness, true peak, EBU Tech 3342 loudness range,
   largest short-term and momentary loudness) in the same decode, from its
   48 kHz series. The edge payload is byte-identical with or without it.
+- Files the edge pass refuses (more than two channels, unnamed WAV layouts,
+  DSF above 384 kHz) and songs whose edge was computed before this release
+  are measured by a low-priority backfill: at their own sample rate up to
+  48 kHz, and through a 48 kHz conversion above it, so ultrasonic content
+  doesn't count (DSD's shaped noise read 4.7-5.7 LU loud on two DSD256
+  files). It runs after the reconcile tick's other track work, at most the
+  background batch size per turn, one download and one decode per song,
+  each turn's songs published together, backing off after a failure.
 - Album loudness is pooled from the members' measurements (the album played
   whole) once every music track of the album is measured.
 - A new stream carries it: `GET /api/catalog/loudness/bootstrap` and

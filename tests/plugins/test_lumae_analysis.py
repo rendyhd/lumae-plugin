@@ -4500,10 +4500,11 @@ def test_track_batch_counts_attempts_separately_from_reused_and_promoted_tracks(
 
 
 def _stub_edge_reconcile(monkeypatch, mod):
-    """Reconcile ticks without the edge runtime report, deferred work or pass."""
+    """Reconcile ticks without the edge runtime report, deferred work, edge or loudness pass."""
     monkeypatch.setattr(mod, "report_edge_runtime", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(mod, "serve_deferred_interactive", lambda *_args, **_kwargs: 0)
     monkeypatch.setattr(mod, "next_edge_backfill", lambda db=None, server_id=None: None)
+    monkeypatch.setattr(mod, "next_loudness_backfill", lambda db=None, server_id=None: None)
 
 
 def test_track_batch_does_not_count_tracks_paused_before_dispatch_as_attempted(monkeypatch):
@@ -8588,6 +8589,7 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
         ("prepare", mod.prepare_lumae_task, "default"),
         ("profile_backfill", mod.profile_backfill_task, "default"),
         ("edge_backfill", mod.edge_backfill_task, "default"),
+        ("loudness_backfill", mod.loudness_backfill_task, "default"),
         ("analysis_projection", mod.analysis_projection_task, "default"),
         ("credits", mod.credits_service.run_one, "default"),
         ("relationship_preparation", mod.relationship_preparation_task, "default"),
