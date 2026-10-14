@@ -7,10 +7,12 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased
+## 1.8.0 (2026-10-14)
 
 Whole-track loudness for Lumae's volume normalization (contract §3.9, K13;
-Auralscape LN.3/LN.4). Clients that don't know the new stream never read it.
+Auralscape LN.3/LN.4). Clients that don't know the new stream never read it, and
+AudioMuse 3.2.0 is still the minimum. Installing it starts the backfill: every
+song is downloaded and decoded once more, at low priority, over some days.
 
 - The edge pass now measures each song's loudness the industry's way (ITU-R
   BS.1770-4: integrated loudness, true peak, EBU Tech 3342 loudness range,

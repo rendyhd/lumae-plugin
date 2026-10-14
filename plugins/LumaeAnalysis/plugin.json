@@ -112,6 +112,14 @@
   },
   "versions": [
     {
+      "version": "1.8.0",
+      "min_core_version": "3.2.0",
+      "changelog": "Whole-track loudness for Lumae's volume normalization: each song is measured the industry's way (ITU-R BS.1770-4: integrated loudness, true peak, EBU Tech 3342 loudness range, largest short-term and momentary loudness), inside the edge pass's own decode, or by a low-priority backfill for files the edge pass refuses and songs analyzed before this release (one download and one decode per song; sources above 48 kHz through a 48 kHz conversion, so DSD's ultrasonic noise doesn't count). Albums are pooled once every music track is measured. A new loudness stream (/api/catalog/loudness/bootstrap and /changes, sync_contract.streams.loudness, capabilities.loudness) carries the records; measuring never publishes a profile, edge or catalogue event, the edge payload is unchanged, and a loudness error never fails an edge. A provider-identity rekey keeps the measurements. After installing, the backfill measures the whole library over some days, after Lumae's other track work and yielding to AudioMuse's own jobs. AudioMuse 3.2.0 is still the minimum.",
+      "imageUrl": "",
+      "checksum": "353304ed2c9f20423569dca738cf5c40",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/loudness-1.8.0/dist/lumae_analysis/lumae_analysis_1.8.0.zip"
+    },
+    {
       "version": "1.7.1",
       "min_core_version": "3.2.0",
       "changelog": "The analysis-run finalization's catalogue refresh does far less database work: it reads the changed tracks of the generation it is writing in one pass (the per-track lookup filtered the whole generation for each one) and writes the generation a page of rows per statement instead of one row per statement. A 36k-track refresh with about 5,500 changed tracks went from 86-103 s to 34 s in local tests, so the watchdog tick that finalizes an AudioMuse analysis run holds AudioMuse's schedules back far less. Lumae's other schedules (catalogue refresh, analysis projection, provider identity recheck, collection retention) now say what they did in AudioMuse's task message instead of \"Plugin task completed successfully.\"; the settings page no longer says AudioMuse labels these tasks \"Songs analyzed: 0\". AudioMuse 3.2.0 is still the minimum.",

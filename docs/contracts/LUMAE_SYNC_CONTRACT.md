@@ -110,7 +110,7 @@ This route always answers 200 (unless an exception occurs, or the request carrie
 | `plugin` | `"lumae_analysis"` | 1828 |
 | `plugin_version` | `"1.2.5"`; `"1.3.0"` from 1.3.0 (unreleased, P1-3) | 1829 |
 | `core_version`, `core_adapter`, `supported_core_range` | host detection; the range is `">=2.6.0,<4.0.0"` | 1830-1832 |
-| `sync_contract` | `{revision, producer, core_api_contract, streams:{catalog, analysis, profiles:{schema_version:1, analyzer_version:1, semantic_contracts:["lumae_playback_profile_v1"]}, credits, relationships}}`. **1.8.0 (unreleased, K13) adds** `streams.loudness: {schema_version: 1}`, the loudness stream's gate (§3.9) | `sync_contract()`, 1765-1801 |
+| `sync_contract` | `{revision, producer, core_api_contract, streams:{catalog, analysis, profiles:{schema_version:1, analyzer_version:1, semantic_contracts:["lumae_playback_profile_v1"]}, credits, relationships}}`. **1.8.0 (K13) adds** `streams.loudness: {schema_version: 1}`, the loudness stream's gate (§3.9) | `sync_contract()`, 1765-1801 |
 | `schema_version` | `1` (profile schema) | 1834 |
 | `analyzer_version` | `1` (waveform analyzer) | 1835 |
 | `status` | `"ok"` when the core is supported, otherwise the core compatibility status | 1862 |
@@ -134,7 +134,7 @@ This route always answers 200 (unless an exception occurs, or the request carrie
 | `transport` | `gzip: true` | **New in 1.3.0 (unreleased, K1).** Informational: gzip is negotiated per request through `Accept-Encoding` (§1.5). Absent in 1.2.5. |
 | `profile_stream` | `edge_refs: true` | **New in 1.3.0 (unreleased, K6, P3-2).** The server accepts the edge-reference opt-in on `/profiles/changes` and on v2 create (§3.7). Absent in 1.2.5. |
 | `analysis_vectors` | `generation_fallback: true`, `missing: true`, `strict_generation: true` | **New in 1.3.0 (unreleased, F9, Phase C).** `POST /api/catalog/analysis/vectors` serves a pruned generation from the current one, lists absent ids in `missing`, and accepts `strict_generation` (§3.8). Absent in 1.2.5. |
-| `loudness` | absent in 1.7.x and earlier. **1.8.0 (unreleased, K13):** `version: 1`, `methods: ["bs1770-4-48k", "bs1770-4-native"]`, `album: true` | Describes the loudness stream (§3.9); a client gates on `sync_contract.streams.loudness`. |
+| `loudness` | absent in 1.7.x and earlier. **1.8.0 (K13):** `version: 1`, `methods: ["bs1770-4-48k", "bs1770-4-native"]`, `album: true` | Describes the loudness stream (§3.9); a client gates on `sync_contract.streams.loudness`. |
 
 **Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream` (added in 1.3.0, K6), `analysis_vectors` (added in 1.3.0, F9), `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `edge_profiles.served`, `edge_profiles.stored` (both added in 1.3.0), `edge_profiles.analyzable`, `edge_profiles.worker_runtime`, `edge_profiles.server_backfill`, `edge_profiles.edge_status`, `edge_profiles.deferred_requests`, `edge_profiles.queue` (all added in 1.3.0), `collections.feed_epoch` (added in 1.3.0, P3-4a), `collections.contract` (added in 1.3.0, P3-4b), `collections.source_scoped_items`, `vibes` (added in 1.4.0, §5.5), `covers` (added in 1.5.0, §5.6), `servers[].provider_server_id` and `servers[].provider_version` (added in 1.6.0, §2.1), `edge_profiles.schema_versions` (added in 1.7.0, §4.5), `loudness` and `sync_contract.streams.loudness` (added in 1.8.0, §3.9), `servers[].provider_identity_transition.rekey_contract`, `.last_applied_transition_id`, `.last_applied_contract`, `.last_applied_first_seq`, `.last_applied_last_seq`, `.last_applied_manifest_sha256` and `.retained_transitions` (added in 1.6.0, §2.2), the manifest's `previous_transition_id` (v2 manifests only, 1.6.0, §2.2), and `lumae_analysis_profiles`.
 
@@ -507,7 +507,7 @@ Errors: 400 `invalid_batch` for a missing `catalog_instance_id` or `analysis_ids
 
 **Client rule.** When `capabilities.analysis_vectors.generation_fallback` is true, compare `generation` with the generation you asked for: vectors served from a newer generation are current and can be stored for it; re-check `missing` ids against the analysis stream rather than retrying them. Without the capability (1.2.5), treat an empty page for an older generation as possibly pruned and refetch at the current generation.
 
-### 3.9 Loudness stream (K13; 1.8.0, unreleased; Lumae LN.3)
+### 3.9 Loudness stream (K13; 1.8.0; Lumae LN.3, LN.4)
 
 Whole-track and album loudness, measured the industry's way, so clients can level songs (Auralscape's volume-normalization plan, `docs/volume-normalization-handoff-2026-10-13.md` N1–N4 and decision D11). It travels in its own stream, beside the catalogue and the profiles, never inside them:
 - **Not in catalogue entities.** A loudness change never moves the catalogue cursor, so it never builds a new catalogue generation on a client (on Lumae Radio a new generation stales every station's preparation).
