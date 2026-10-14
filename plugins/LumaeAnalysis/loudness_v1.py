@@ -4,13 +4,18 @@ ITU-R BS.1770-4/5 integrated loudness, true peak, EBU Tech 3342 loudness range a
 short-term and momentary loudness, from one derivation over 100 ms bins of channel-weighted
 K-filtered energy:
 
-- ``bs1770-4-48k``: inside the edge pass (``edge_profiles._stream``), from its canonical 48 kHz
-  K-weighted series. ``SeriesMeter`` receives each canonical block (sample peak, true peak 4x) and
-  each 100 ms bin's mean power. Mono and stereo only (the edge pass refuses the rest).
-- ``bs1770-4-native``: ``measure_file``, the standalone path for files the edge pass refuses (more
-  than two channels, unnamed WAV layouts, DSF above 384 kHz, an unqualified runtime): K-weighting
-  designed per sample rate from libebur128's analog prototype, true peak 4x below 96 kHz and 2x
-  from 96 kHz.
+- ``bs1770-4-48k``, a 48 kHz series: inside the edge pass (``edge_profiles._stream``), from its
+  canonical 48 kHz K-weighted series (mono and stereo; the edge pass refuses the rest).
+  ``SeriesMeter`` receives each canonical block (sample peak, true peak 4x) and each 100 ms bin's
+  mean power. And ``measure_file``, the standalone path, on any source above 48 kHz, converted to
+  48 kHz first (``NativeMeter`` at 48 kHz, any channel count): ultrasonic content then doesn't
+  count. DSD shapes its noise above 20 kHz, which read 4.7-5.7 LU loud at the decoded rate on two
+  DSD256 files (Auralscape LN.1), DSD-derived PCM keeps that noise, and every Lumae player hears a
+  hi-res source converted; hi-res PCM loses at most 0.03 LU (LN.1, 23 files).
+- ``bs1770-4-native``: ``measure_file`` on a source at 48 kHz or below, at its own rate (files the
+  edge pass refuses: more than two channels, unnamed WAV layouts, an unqualified runtime; and the
+  backfill's tracks): K-weighting designed per sample rate from libebur128's analog prototype, true
+  peak 4x.
 
 Rules (contract §3.9): 400 ms blocks with 75 % overlap (four bins), the -70 LUFS absolute and
 -10 LU relative gates; channel weights L/R/C 1.0, back, side and top-back 1.41, LFE 0 (as ffmpeg's
@@ -23,6 +28,7 @@ A record also carries ``histogram``: the 0.1 dB counts of its gated 400 ms block
 keeping every block (within 0.03 LU of gating every block).
 """
 
+import logging
 import math
 import time
 import zlib
@@ -31,6 +37,8 @@ import numpy as np
 from scipy.signal import firwin, sosfilt, upfirdn
 
 from .loudness import ProfileAnalysisTimeout, ProfileResourceLimitError
+
+logger = logging.getLogger(__name__)
 
 VERSION = 1
 METHOD_48K = "bs1770-4-48k"
@@ -50,6 +58,8 @@ SHORT_TERM_BINS = 30
 MAX_CHANNELS = 8
 # DSF decodes at a 1/8 of its DSD rate: DSD512 is 2,822,400 Hz.
 MAX_SAMPLE_RATE = 2_822_400
+# The standalone path meters a source above this rate through a conversion to it.
+CONVERTED_RATE = 48_000
 MAX_SECONDS = 6553.6
 DEFAULT_DEADLINE_SECONDS = 900
 # The 0.1 dB histogram of libebur128: bin i covers [-70 + i/10, -70 + (i+1)/10) LUFS.
@@ -223,6 +233,9 @@ class SeriesMeter:
 
     The edge pass's power is the K-weighted mean over its one or two channels; the BS.1770 sum is
     twice that for stereo (L + R) and for mono as dual-mono (2 x mono).
+
+    It never fails the edge pass: an error stops the measurement, ``result`` is then None, and the
+    backfill measures the track on the standalone path.
     """
 
     def __init__(self, canonical_rate=48_000):
@@ -230,27 +243,47 @@ class SeriesMeter:
         self.bins = []
         self.sample_peak = 0.0
         self._true_peak = None
+        self.failed = None
 
     def canonical(self, pcm):
-        pcm = np.asarray(pcm, dtype=np.float64)
-        if pcm.size == 0:
+        if self.failed is not None:
             return
-        if self._true_peak is None:
-            self._true_peak = _TruePeak(true_peak_factor(self.canonical_rate), pcm.shape[0])
-        self.sample_peak = max(self.sample_peak, float(np.max(np.abs(pcm))))
-        self._true_peak.add(pcm)
+        try:
+            pcm = np.asarray(pcm, dtype=np.float64)
+            if pcm.size == 0:
+                return
+            if self._true_peak is None:
+                self._true_peak = _TruePeak(true_peak_factor(self.canonical_rate), pcm.shape[0])
+            self.sample_peak = max(self.sample_peak, float(np.max(np.abs(pcm))))
+            self._true_peak.add(pcm)
+        except Exception as exc:  # noqa: BLE001 - loudness never fails the edge pass
+            self.failed = exc
 
     def bin(self, mean_power):
-        self.bins.append(2.0 * float(mean_power))
+        if self.failed is not None:
+            return
+        try:
+            self.bins.append(2.0 * float(mean_power))
+        except Exception as exc:  # noqa: BLE001
+            self.failed = exc
 
     def result(self, *, channels, sample_rate):
-        true_peak = self._true_peak.finish() if self._true_peak is not None else 0.0
-        return derive(self.bins, self.sample_peak, true_peak, method=METHOD_48K, channels=channels,
-                      sample_rate=sample_rate)
+        """The record, or None when the measurement failed."""
+        if self.failed is None:
+            try:
+                true_peak = self._true_peak.finish() if self._true_peak is not None else 0.0
+                return derive(self.bins, self.sample_peak, true_peak, method=METHOD_48K, channels=channels,
+                              sample_rate=sample_rate)
+            except Exception as exc:  # noqa: BLE001
+                self.failed = exc
+        logger.warning("lumae_analysis loudness in the edge pass failed; the backfill measures the track",
+                       exc_info=self.failed)
+        return None
 
 
 class NativeMeter:
-    """``bs1770-4-native``: channel-first float blocks at the source's own rate."""
+    """Channel-first float blocks at one rate: the source's own (``bs1770-4-native``) or the
+    standalone path's 48 kHz conversion (``bs1770-4-48k``). True peak 4x below 96 kHz, 2x from it."""
 
     def __init__(self, sample_rate, weights):
         self.sample_rate = int(sample_rate)
@@ -298,9 +331,14 @@ class NativeMeter:
             self.partial += float(np.sum(energy[offset:]))
             self.filled += count - offset
 
-    def result(self):
-        return derive(self.bins, self.sample_peak, self._true_peak.finish(), method=METHOD_NATIVE,
-                      channels=self.weights.size, sample_rate=self.sample_rate)
+    def result(self, *, method=METHOD_NATIVE, sample_rate=None):
+        return derive(self.bins, self.sample_peak, self._true_peak.finish(), method=method,
+                      channels=self.weights.size, sample_rate=sample_rate or self.sample_rate)
+
+
+def measured_rate(sample_rate):
+    """The rate ``measure_file`` meters at: the source's own up to 48 kHz, 48 kHz above it."""
+    return CONVERTED_RATE if int(sample_rate) > CONVERTED_RATE else int(sample_rate)
 
 
 def _check_deadline(deadline):
@@ -309,7 +347,8 @@ def _check_deadline(deadline):
 
 
 def measure_file(path, *, deadline_seconds=DEFAULT_DEADLINE_SECONDS, observer=None):
-    """``bs1770-4-native`` for one media file: PyAV, its own rate and layout, bounded memory.
+    """``bs1770-4-native`` for one media file: PyAV, its own rate and layout, bounded memory; a DSD
+    source above 48 kHz (DSD among them) is converted to 48 kHz first (``bs1770-4-48k``, ``measured_rate``).
 
     ``observer`` (``analysis_isolation.DecodeProbe``) records the stream and the decode position
     for failure diagnostics, as ``loudness.analyze_file``.
@@ -337,10 +376,11 @@ def measure_file(path, *, deadline_seconds=DEFAULT_DEADLINE_SECONDS, observer=No
             raise ProfileResourceLimitError(f"channel count {len(names)} exceeds the loudness range")
         if sample_rate <= 0 or sample_rate > MAX_SAMPLE_RATE:
             raise ProfileResourceLimitError(f"sample rate {sample_rate} exceeds the loudness range")
-        meter = NativeMeter(sample_rate, channel_weights(names))
+        rate = measured_rate(sample_rate)
+        meter = NativeMeter(rate, channel_weights(names))
         resampler = av.audio.resampler.AudioResampler(
-            format=_decode_sample_format(len(names)), layout=layout_name, rate=sample_rate)
-        limit = int(MAX_SECONDS * sample_rate)
+            format=_decode_sample_format(len(names)), layout=layout_name, rate=rate)
+        limit = int(MAX_SECONDS * rate)
         for frame in container.decode(stream):
             _check_deadline(deadline)
             if observer is not None:
@@ -352,6 +392,8 @@ def measure_file(path, *, deadline_seconds=DEFAULT_DEADLINE_SECONDS, observer=No
         for block in _frame_blocks(resampler, None, len(names)):
             meter.add(block)
         _check_deadline(deadline)
+    if rate != sample_rate:
+        return meter.result(method=METHOD_48K, sample_rate=sample_rate)
     return meter.result()
 
 
@@ -369,8 +411,9 @@ def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, de
         path, catalog_instance_id=catalog_instance_id, track_id=track_id, media_revision=media_revision,
         deadline_seconds=deadline_seconds, observer=observer, loudness=meter)
     source = payload["source"]
-    payload[LOUDNESS_KEY] = meter.result(
-        channels=1 if source["channel_layout"] == "mono" else 2, sample_rate=source["sample_rate"])
+    record = meter.result(channels=1 if source["channel_layout"] == "mono" else 2, sample_rate=source["sample_rate"])
+    if record is not None:
+        payload[LOUDNESS_KEY] = record
     return payload
 
 

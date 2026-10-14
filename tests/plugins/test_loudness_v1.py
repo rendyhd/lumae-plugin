@@ -132,6 +132,61 @@ def test_measure_file_weights_each_layout(tmp_path, mask, levels, weights):
     assert abs(record["integrated_lufs"] - analytic(levels, weights)) <= 0.05
 
 
+def dsf_bytes(tone, dsd_rate):
+    """A stereo DSF (first-order delta-sigma, LSB first) carrying ``tone`` on both channels."""
+    bits = np.diff(np.floor(np.cumsum((tone + 1) / 2)), prepend=0).astype(np.uint8)
+    count = bits.size - bits.size % (8 * 4096)
+    packed = np.packbits(bits[:count], bitorder="little").reshape(-1, 4096)
+    data = np.stack([packed, packed], axis=1).tobytes()  # 4096-byte blocks, channel after channel
+    fmt = b"fmt " + struct.pack("<QIIIIIIQII", 52, 1, 0, 2, 2, dsd_rate, 1, count, 4096, 0)
+    body = fmt + b"data" + struct.pack("<Q", 12 + len(data)) + data
+    return b"DSD " + struct.pack("<QQQ", 28, 28 + len(body), 0) + body
+
+
+def test_sources_above_48k_are_measured_through_48k(tmp_path):
+    """Ultrasonic content never counts on the standalone path: DSD shapes its noise above 20 kHz
+    (Auralscape LN.1: two DSD256 files read 4.7-5.7 LU loud at their decoded rate), and DSD-derived
+    PCM keeps it."""
+    pytest.importorskip("av")
+    assert [lv1.measured_rate(rate) for rate in (32000, 44100, 48000, 88200, 352800)] == [
+        32000, 44100, 48000, 48000, 48000]
+    # A DSD64 DSF decodes at 352.8 kHz with its modulator's noise above the audio band.
+    dsd_rate = 2_822_400
+    tone = 0.5 * np.sin(2 * np.pi * 997 * np.arange(2 * dsd_rate) / dsd_rate)
+    path = tmp_path / "tone.dsf"
+    path.write_bytes(dsf_bytes(tone, dsd_rate))
+    record = lv1.measure_file(str(path))
+    assert (record["method"], record["sample_rate"], record["channels"]) == ("bs1770-4-48k", 352800, 2)
+    assert abs(record["integrated_lufs"] - analytic([-6.0206, -6.0206], [1, 1])) <= 0.05
+    # 96 kHz PCM with a loud 30 kHz tone (DSD-derived noise below the 48 kHz Nyquist) reads as its
+    # audible part. The tone fades in and out: an abrupt start would put a real transient in band.
+    rate = 96000
+    t = np.arange(4 * rate) / rate
+    audible = 10 ** (-23 / 20) * np.sin(2 * np.pi * 997 * t)
+    fade = np.minimum(1.0, np.minimum(t, t[-1] - t) / 0.1)
+    pcm = np.stack([audible + fade * 10 ** (-12 / 20) * np.sin(2 * np.pi * 30000 * t)] * 2)
+    path = tmp_path / "shaped.wav"
+    path.write_bytes(wav_bytes(pcm, rate, 0x3))
+    record = lv1.measure_file(str(path))
+    assert (record["method"], record["sample_rate"]) == ("bs1770-4-48k", rate)
+    assert abs(record["integrated_lufs"] - analytic([-23, -23], [1, 1])) <= 0.05
+    assert abs(record["true_peak_dbtp"] - -23) <= 0.1
+    assert native([pcm], rate)["integrated_lufs"] > record["integrated_lufs"] + 3  # what it would read
+    # 48 kHz and below stay native.
+    path = tmp_path / "plain.wav"
+    path.write_bytes(wav_bytes(sines([-23, -23], 44100, seconds=4.0), 44100, 0x3))
+    assert lv1.measure_file(str(path))["method"] == "bs1770-4-native"
+
+
+def test_the_duration_limit_counts_metered_frames(tmp_path, monkeypatch):
+    pytest.importorskip("av")
+    monkeypatch.setattr(lv1, "MAX_SECONDS", 1.0)
+    path = tmp_path / "long.wav"
+    path.write_bytes(wav_bytes(sines([-23, -23], 96000, seconds=1.5), 96000, 0x3))
+    with pytest.raises(lv1.ProfileResourceLimitError):
+        lv1.measure_file(str(path))
+
+
 def test_unmeasurable_values_are_null():
     rate = 48000
     short = native(sine_levels([(-20, 0.3)], rate), rate)
@@ -225,6 +280,36 @@ def test_the_edge_file_wrapper_rides_beside_the_payload(tmp_path):
     assert abs(record["integrated_lufs"] - lv1.measure_file(str(path))["integrated_lufs"]) <= 0.05
     assert isinstance(record["histogram"], bytes)
     assert "histogram" not in lv1.track_record_fields(record)
+
+
+def _raise(*_args, **_kwargs):
+    raise FloatingPointError("meter bug")
+
+
+@pytest.mark.parametrize("target", ["true_peak", "derive"])
+def test_a_loudness_error_never_fails_the_edge(tmp_path, monkeypatch, target):
+    """The edge (SmoothFade's data) comes first: a meter that raises leaves the payload as it is and
+    no record beside it, and the backfill measures the track later."""
+    pytest.importorskip("av")
+    path = tmp_path / "song.wav"
+    path.write_bytes(wav_bytes(music(44100, seconds=8.0).astype(np.float64), 44100, 0x3))
+    identity = dict(catalog_instance_id="catalog-a", track_id="track-a", media_revision="sha256:" + "a" * 64)
+    plain = edge.canonical_json(edge.analyze_edge_file(str(path), **identity))
+    if target == "true_peak":
+        monkeypatch.setattr(lv1._TruePeak, "add", _raise)
+    else:
+        monkeypatch.setattr(lv1, "derive", _raise)
+    measured = lv1.analyze_edge_file(str(path), **identity)
+    assert lv1.LOUDNESS_KEY not in measured and edge.canonical_json(measured) == plain
+
+
+def test_a_series_meter_bin_error_means_no_record():
+    meter = lv1.SeriesMeter()
+    meter.canonical(0.1 * np.ones((2, 4800)))
+    meter.bins = None  # a bin can't be kept
+    meter.bin(1e-3)
+    meter.canonical(0.1 * np.ones((2, 4800)))  # and the meter stays stopped
+    assert meter.result(channels=2, sample_rate=48000) is None
 
 
 def test_album_pooling_matches_the_album_played_whole():
