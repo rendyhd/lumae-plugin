@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import logging
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
@@ -356,6 +357,18 @@ def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings, legacy_profile
     )
     from .profile_publication import rekey_published_profiles
     rekey_published_profiles(cur, catalog_instance_id, tracks)
+    # Loudness keeps its measurements under the new ids and rotates its epoch (contract §3.9). It
+    # never blocks the rekey: should that fail, its records are dropped and measured again.
+    from .loudness_stream import forget as forget_loudness, rekey as rekey_loudness
+    cur.execute("SAVEPOINT lumae_loudness_rekey")
+    try:
+        rekey_loudness(cur, catalog_instance_id, tracks)
+    except Exception:  # noqa: BLE001 - the identity rekey is the data-safety path
+        cur.execute("ROLLBACK TO SAVEPOINT lumae_loudness_rekey")
+        logging.getLogger(__name__).exception(
+            "lumae_analysis loudness rekey failed; its records are dropped and measured again")
+        forget_loudness(cur, catalog_instance_id)
+    cur.execute("RELEASE SAVEPOINT lumae_loudness_rekey")
     if tracks:
         cur.execute(
             f"""UPDATE {t('source_profiles')} SET attempt_token=NULL, status='stale',

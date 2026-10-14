@@ -239,6 +239,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
             },
             "catalog_mirror": mod.catalog_capability(),
             "credits": mod.credits_service.capability(),
+            "loudness": {"version": 1, "methods": ["bs1770-4-48k", "bs1770-4-native"], "album": True},
             "edge_profiles": {
                 "schema_version": 2,
                 "method": mod.EDGE_METHOD,

@@ -550,8 +550,8 @@ A track record is about 250 bytes. Every number is finite or `null`: a value the
  "members": 12, "exact": true}
 ```
 
-- Published when every member of the album (its tracks in the source's published catalogue generation) has a track record of the current `version` for its current media, and their pooled integrated loudness is not `null`; withdrawn (a deletion) when that stops being true.
-- `integrated_lufs` pools the members' 400 ms block energies and gates them once, which is the loudness of the album played whole (exact; within 0.017 LU of ffmpeg on the concatenated album). `lra_lu` pools their 3 s windows the same way (a window never spans two tracks). `true_peak_dbtp` is the members' maximum, skipping digitally silent members (`null` if any other member's is `null`), `loudest_track_lufs` the largest of the members' non-null integrated loudness, `members` their count. `lra_lu` is `null` when no pooled window passes the gates.
+- Published when every member of the album (its music tracks, `analysis_eligible`, in the source's published catalogue generation) has a track record of the current `version` for its current media, and their pooled integrated loudness is not `null`; withdrawn (a deletion) when that stops being true.
+- `integrated_lufs` pools the members' gated 400 ms blocks and gates them once, which is the loudness of the album played whole. The plugin keeps each member's blocks as a 0.1 dB histogram (internal, never published), which is within 0.03 LU of gating every block and within 0.05 LU of ffmpeg on the concatenated album. `lra_lu` pools their 3 s windows the same way (a window never spans two tracks). `true_peak_dbtp` is the largest of the members' true peaks (a member without one is digitally silent or under −60 dBTP, so it never holds the maximum; `null` when no member has one), `loudest_track_lufs` the largest of the members' non-null integrated loudness, `members` their count. `lra_lu` is `null` when no pooled window passes the gates.
 - `track_set_hash` = `"sha256:" + sha256_hex(utf8(json.dumps(pairs, separators=(",", ":"), ensure_ascii=False)))`, where `pairs` is `[[track_id, media_revision], …]` sorted by `track_id` in code-point order (no Unicode normalization or trimming). It changes when membership or any member's media changes, and the album is then pooled again.
 - `exact` is `true` for every plugin record. (Clients mark their own energy-mean approximation `false`; the plugin never publishes one.)
 
@@ -606,7 +606,7 @@ Response 200: `{schema_version: 1, catalog_instance_id, changes: [{seq, created_
 2. Bootstrap when the stream first appears: page to the end, then replay `/loudness/changes` from the pinned `cursor`. Never read changes before the bootstrap is complete.
 3. On a 410, bootstrap again; replace what the old epoch delivered (records it doesn't deliver again are gone).
 4. Use a track record only when its `media_revision` matches the current media's.
-5. Use an album record only when its `track_set_hash` equals the hash of the album's members in the client's own catalogue (the formula above); otherwise treat the album as unmeasured.
+5. Use an album record only when its `track_set_hash` equals the hash of the album's members (its `analysis_eligible` tracks) in the client's own catalogue (the formula above); otherwise treat the album as unmeasured.
 6. A loudness change never changes a catalogue binding or generation on the client.
 
 ---

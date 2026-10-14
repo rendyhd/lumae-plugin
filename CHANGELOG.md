@@ -7,6 +7,24 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased
+
+Whole-track loudness for Lumae's volume normalization (contract §3.9, K13;
+Auralscape LN.3/LN.4). Clients that don't know the new stream never read it.
+
+- The edge pass now measures each song's loudness the industry's way (ITU-R
+  BS.1770-4: integrated loudness, true peak, EBU Tech 3342 loudness range,
+  largest short-term and momentary loudness) in the same decode, from its
+  48 kHz series. The edge payload is byte-identical with or without it.
+- Album loudness is pooled from the members' measurements (the album played
+  whole) once every music track of the album is measured.
+- A new stream carries it: `GET /api/catalog/loudness/bootstrap` and
+  `/api/catalog/loudness/changes`, announced as
+  `sync_contract.streams.loudness` and `capabilities.loudness`. Measuring
+  never publishes a profile, edge or catalogue event, so it never moves those
+  cursors. A provider-identity rekey keeps the measurements under the new ids
+  and rotates the stream's epoch.
+
 ## 1.7.1 (2026-10-13)
 
 Follow-ups from testing 1.7.0 against AudioMuse's scheduler changes

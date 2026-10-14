@@ -16,7 +16,7 @@ import pytest
 psycopg2 = pytest.importorskip("psycopg2")
 
 from test_lumae_analysis import plugin_api_module  # noqa: F401  (host stub)
-from plugins.LumaeAnalysis import catalog, catalog_analysis, catalog_enrichment
+from plugins.LumaeAnalysis import catalog, catalog_analysis, catalog_enrichment, loudness_stream
 
 
 SOURCE = "catalog-a"
@@ -120,6 +120,7 @@ def _source(db):
             (SOURCE, catalog_enrichment.RELATIONSHIP_SCHEMA_VERSION),
         )
         catalog_enrichment._profile_stream_state(cur, SOURCE, for_update=True)
+        loudness_stream._state(cur, SOURCE, for_update=True)
     db.commit()
 
 
@@ -144,6 +145,11 @@ STREAMS = {
         "relationship_changes", "generation, entity_type, entity_id, operation",
         "1, 'album', 'album-' || n, 'delete'",
         "relationship_state", "epoch", "head_seq", "floor_seq",
+    ),
+    "loudness": (
+        "loudness_changes", "kind, entity_id, operation, payload",
+        "'track', 'track-' || n, 'delete', jsonb_build_object('kind', 'track', 'id', 'track-' || n, 'op', 'delete')",
+        "loudness_stream_state", "epoch", "head_seq", "floor_seq",
     ),
 }
 
@@ -209,6 +215,8 @@ def _read(stream, db, cursor, limit=5):
         return catalog_analysis.read_analysis_changes(
             db, cursor, catalog_instance_id=SOURCE, limit=limit
         )
+    if stream == "loudness":
+        return loudness_stream.read_changes(db, cursor, catalog_instance_id=SOURCE, limit=limit)
     return catalog_enrichment.read_relationship_changes(db, cursor, SOURCE, limit=limit)
 
 
@@ -298,7 +306,7 @@ def test_profile_reader_sees_compaction_as_410_not_a_short_page(
 # Density, paging and cursor validation for every v1 journal reader.
 
 
-ALL_STREAMS = ["profile", "catalog", "analysis", "relationship"]
+ALL_STREAMS = ["profile", "catalog", "analysis", "relationship", "loudness"]
 
 
 @pytest.mark.parametrize("stream", ALL_STREAMS)

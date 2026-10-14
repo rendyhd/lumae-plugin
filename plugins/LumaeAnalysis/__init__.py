@@ -45,6 +45,7 @@ from .shelves import (
 )
 from . import covers, vibes
 from . import file_tags
+from . import loudness_stream, loudness_v1
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -1895,6 +1896,7 @@ def migrate(db):
     )
     cur.close()
     migrate_enrichment(db)
+    loudness_stream.migrate_loudness(db)
     credits_store.migrate(db)
     prune_catalog_storage(db)
     # Must run after the published-profile seed above (marker
@@ -2370,6 +2372,7 @@ def sync_contract(compatibility):
                 "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
                 "semantic_contracts": ["lumae_album_artist_relationships_v1"],
             },
+            "loudness": {"schema_version": loudness_stream.SCHEMA_VERSION},
         },
     }
 
@@ -2793,6 +2796,7 @@ def health():
                 },
                 "catalog_mirror": catalog_capability(),
                 "credits": credits_service.capability(),
+                "loudness": loudness_stream.capability(),
                 "transport": {"gzip": True},
                 "profile_stream": {"edge_refs": True},
                 "analysis_vectors": {"generation_fallback": True, "missing": True, "strict_generation": True},
@@ -3798,6 +3802,51 @@ def relationship_changes_api():
         return _catalog_error("invalid_cursor", str(exc), 400)
 
 
+@bp.get("/api/catalog/loudness/bootstrap")
+def loudness_bootstrap_api():
+    try:
+        return _private_json(
+            loudness_stream.bootstrap_page(
+                get_db(),
+                str(request.args.get("catalog_instance_id") or ""),
+                page_token=request.args.get("page_token"),
+                limit=request.args.get("limit"),
+            ),
+            no_store=False,
+        )
+    except KeyError:
+        return _catalog_error(
+            "bootstrap_required", "Loudness bootstrap token expired.", 410
+        )
+    except (CatalogScanError, ValueError) as exc:
+        return _catalog_error("invalid_loudness_bootstrap", str(exc), 400)
+
+
+@bp.get("/api/catalog/loudness/changes")
+def loudness_changes_api():
+    cursor = request.args.get("cursor")
+    if not cursor:
+        return _catalog_error("cursor_required", "Loudness cursor is required.", 400)
+    try:
+        return _private_json(
+            loudness_stream.read_changes(
+                get_db(),
+                cursor,
+                catalog_instance_id=request.args.get("catalog_instance_id"),
+                limit=request.args.get("limit"),
+            ),
+            no_store=False,
+        )
+    except KeyError:
+        return _catalog_error(
+            "bootstrap_required",
+            "Loudness cursor expired or belongs to an old epoch.",
+            410,
+        )
+    except (CatalogScanError, ValueError) as exc:
+        return _catalog_error("invalid_cursor", str(exc), 400)
+
+
 @bp.post("/api/analyze")
 def analyze():
     if maintenance_paused():
@@ -4087,12 +4136,17 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="backgroun
             info = load_track_file(job["track_id"], catalog_instance_id=catalog_instance_id, server_id=server_id)
             if not info or opaque_revision(info.get("media_signature")) != job["media_revision"]:
                 raise ValueError("edge-source-replaced")
-            payload = run_file_analysis(analyze_edge_file, info["file_path"],
+            # LN.4a: whole-track loudness from the same decode, beside the edge payload.
+            payload = run_file_analysis(loudness_v1.analyze_edge_file, info["file_path"],
                                         catalog_instance_id=catalog_instance_id,
                                         track_id=job["track_id"], media_revision=job["media_revision"])
+            measured = payload.pop(loudness_v1.LOUDNESS_KEY, None)
             applied = publish_edge_profile(get_db(), catalog_instance_id, job, payload, info["media_signature"])
             if not applied:
                 update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-source-replaced")
+            elif measured is not None:
+                loudness_stream.store_measurement(get_db(), catalog_instance_id, job["track_id"],
+                                                  job["media_revision"], measured)
             outcomes.append({"track_id": job["track_id"], "status": "ready" if applied else "superseded"})
         except Exception as exc:
             rollback = getattr(get_db(), "rollback", None)

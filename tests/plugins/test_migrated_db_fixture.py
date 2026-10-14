@@ -54,6 +54,10 @@ PRODUCTION_TABLES = (
     "collection_changes",
     "collection_mutations",
     "collection_feed_state",
+    "loudness_stream_state",
+    "loudness_tracks",
+    "loudness_albums",
+    "loudness_changes",
 )
 
 
