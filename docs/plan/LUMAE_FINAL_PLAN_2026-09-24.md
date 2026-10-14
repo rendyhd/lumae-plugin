@@ -130,13 +130,13 @@ Where different groups touch one file, keep each WP to the functions listed and 
 | K8 | **Collections feed:** the response adds `epoch`, `head_seq` and `has_more`. 410 `collections_resync_required` is returned **only** when the request echoes `epoch` and it mismatches, or when the cursor is past head. A new snapshot endpoint returns all of the principal's collections, items and head in one REPEATABLE READ transaction. | P3-4 | Echo the epoch; resync on 410; page by `has_more`/`next_cursor` (C-13) | `capabilities.collections.feed_epoch:true` | 3 |
 | K9 | **Collections conflicts:** with header `X-Lumae-Collections-Contract: 2`, `idempotency_key_conflict` includes `current`, and a duplicate membership returns 409 `membership_conflict {existing_item_id}` instead of a silent id remap. Create with an existing id returns 409. | P3-4 | Handle both; freeze reorder bodies at enqueue (C-13) | `capabilities.collections.contract:2` | 3 |
 | K10 | Collection items carry `catalog_instance_id` (LUM-013, additive); workbench routes take an explicit catalogue | P3-5 | Store and scope items (C-13) | `capabilities.collections.source_scoped_items:true` | 3 |
-| K11 | Profiles may carry `analyzer_ver:2` (BS.1770-4 `ref_lufs` and new ramps) | P3-1 | Accept v1 and v2; normalise by version (C-11) | `capabilities.lumae_analysis_profiles.analyzer_versions:[1,2]`, `loudness_method:"bs1770-4"` | 3 |
+| K11 | Profiles may carry `analyzer_ver:2` (BS.1770-4 `ref_lufs` and new ramps). **Superseded by K13** (contract §3.9, 2026-10-14) | P3-1 | Accept v1 and v2; normalise by version (C-11) | `capabilities.lumae_analysis_profiles.analyzer_versions:[1,2]`, `loudness_method:"bs1770-4"` | 3 |
 
 **Contract findings from P0-4 (2026-09-24), folded into the WPs below:**
 
 | # | Finding in 1.2.5 | Handled by |
 |---|---|---|
-| 1 | `lumae_analysis_profiles` is only in `plugin.json`, not in the health payload, so the K11 gate needs a new health key | P3-1 adds `capabilities.lumae_analysis_profiles` to health |
+| 1 | `lumae_analysis_profiles` is only in `plugin.json`, not in the health payload, so the K11 gate needs a new health key | P3-1 adds `capabilities.lumae_analysis_profiles` to health. **Superseded by K13 (2026-10-14; contract §3.9): no analyzer v2.** |
 | 2 | `capabilities.transport` and `capabilities.profile_stream` don't exist | P1-4 and P3-2 add them as new objects |
 | 3 | v2 never returns 404 or 409; 404 only means an older plugin without the route | Contract; client treats a v2 404 as "unavailable" |
 | 4 | v2 expiry is a hard-coded 60 minutes in SQL; `SESSION_MINUTES` is unused | P1-6 uses one constant for absolute and sliding expiry |
@@ -466,7 +466,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 
 ### Phase 3 — Semantics, product and structure
 
-**P3-1 — LUM-005 loudness analyzer v2 (AUD-10, K11).** Depends on P3-2 (K6) being released to clients before regeneration starts.
+**P3-1 — LUM-005 loudness analyzer v2 (AUD-10, K11).** Depends on P3-2 (K6) being released to clients before regeneration starts. **Superseded 2026-10-14 (K13, contract §3.9):** the Auralscape volume-normalization plan's decision D11 (`docs/volume-normalization-handoff-2026-10-13.md` in Auralscape) replaces analyzer v2 with a separate loudness stream. `ref_lufs`, the ramps and `analyzer_ver` keep their v1 meaning; loudness is measured in the edge pass (and a standalone path) and published in its own stream (Lumae LN.3/LN.4).
 - (a) **Mapping spike** (U3): run v1 and v2 on 200–500 real tracks and publish the distribution of v1−v2 deltas. It decides the client's interim v1 normalisation offset for C-11.
 - (b) **New module `loudness_v2.py`:**
   - measure on 48 kHz PCM, either resampled (`AudioResampler(rate=48000)`) or with coefficients derived per rate from the analog prototype;
@@ -665,7 +665,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 
 **P4-4 — Post-release.**
 - Watch health `integrity`, v2 429/503 rates (logged) and the journal retention floor.
-- Start analyzer v2 regeneration (P3-1) only after the Auralscape release that includes C-10 and C-11 is adopted.
+- Start analyzer v2 regeneration (P3-1) only after the Auralscape release that includes C-10 and C-11 is adopted. **Superseded by K13 (2026-10-14; contract §3.9): no analyzer v2.**
 
 ---
 
@@ -675,7 +675,7 @@ Plugin WPs are below. The client runs §H Phase 1 **in parallel**, because it ha
 P0-1 → P0-2 → (P0-3 ∥ P0-4 ∥ P0-5)
 Phase 1 plugin: (P1-1 ∥ P1-2) → (P1-7 ∥ P1-4) → P1-3 → P1-5 → P1-6        ∥  client §H Phase 1 (C-1…C-7)
 Phase 2: P2-1 ∥ P2-2 ; P2-3 ; P2-5 ; P2-6 (needs P1 + C-8) → P2-4 decision ; P2-7 any time
-Phase 3: P3-2 (+C-10) → P3-1 (+C-11; regeneration after client adoption) ; P3-4 (+C-13) ; P3-5 serial (LUM-014 after C-13 index fix) ;
+Phase 3: P3-2 (+C-10) → P3-1 (+C-11; regeneration after client adoption; superseded by K13) ; P3-4 (+C-13) ; P3-5 serial (LUM-014 after C-13 index fix) ;
          P3-6 ∥ P3-7 ∥ P3-8 ; P3-9 ; P3-10 ; P3-11 last ; P3-12 ; P3-13 any time
 Phase 4: P4-1 → P4-2 → P4-3 (user) → P4-4
 ```
@@ -790,7 +790,7 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
 | `collections.feed_epoch` | Echo `epoch`; handle 410 `collections_resync_required` through `GET /plugins/lumae_analysis/api/collections/snapshot`; use `has_more`/`next_cursor`. |
 | `collections.contract: 2` | Send `X-Lumae-Collections-Contract: 2`; handle 409 `membership_conflict {existing_item_id}` and `idempotency_key_conflict` with `current`. |
 | `collections.source_scoped_items` | Items carry `catalog_instance_id`. |
-| `lumae_analysis_profiles.analyzer_versions` includes 2 | Profiles may have `analyzer_ver:2` (BS.1770-4 `ref_lufs`). |
+| `lumae_analysis_profiles.analyzer_versions` includes 2 | Profiles may have `analyzer_ver:2` (BS.1770-4 `ref_lufs`). **Superseded by K13 (2026-10-14; contract §3.9): no analyzer v2.** Loudness comes from `sync_contract.streams.loudness` instead. |
 
 ### H.4 Work items
 
@@ -911,9 +911,9 @@ All live under `GET /plugins/lumae_analysis/api/.../health` → `capabilities`, 
   - keep the existing local edge (published or opportunistic) if the digest and `media_revision` match;
   - otherwise queue the track for fetch through `GET /api/profiles?ids=` (batches of up to 100; note the comma-joined ids), writing results through the C-4 path.
 - Without the capability, keep today's rule.
-- This is required before the plugin starts loudness v2 regeneration. Without it, every track would re-download its 19 KB edge.
+- This is required before the plugin starts loudness v2 regeneration. Without it, every track would re-download its 19 KB edge. (Loudness v2 regeneration is superseded by K13: the loudness stream republishes no profile or edge.)
 
-**C-11 — Loudness analyzer v2 (K11).**
+**C-11 — Loudness analyzer v2 (K11).** **Superseded 2026-10-14 (K13, contract §3.9):** the Auralscape volume-normalization plan's decision D11 (`docs/volume-normalization-handoff-2026-10-13.md` in Auralscape) replaces analyzer v2 with a separate loudness stream. `ref_lufs`, the ramps and `analyzer_ver` keep their v1 meaning; loudness is measured in the edge pass (and a standalone path) and published in its own stream (Lumae LN.3/LN.4).
 - Accept `analyzer_ver` 1 and 2 (`parseLumaeAnalysisProfile` currently requires ≥1).
 - Normalise v2 `ref_lufs` as true integrated loudness. For v1 rows, apply the interim offset from the plugin's P3-1a spike result.
 - SmoothFade uses the ramps of whichever version is stored.

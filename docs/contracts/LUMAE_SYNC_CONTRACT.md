@@ -2,18 +2,18 @@
 
 - **Status:** authoritative. Every contract work package edits this file in the same PR.
 - **Describes:** plugin `lumae_analysis` **1.2.5** (`PLUGIN_VERSION`, `plugins/LumaeAnalysis/__init__.py:117`), verified against `main` at 629089f.
-- **Planned changes:** §7 lists K1–K12. Each one is `planned` until its work package flips it to `shipped in <version>`.
+- **Planned changes:** §7 lists K1–K13. Each one is `planned` until its work package flips it to `shipped in <version>`; K11 is superseded by K13.
 - **Sources:** everything below was taken from the code, with file:line citations (paths are relative to `plugins/LumaeAnalysis/` unless shown otherwise). Where the plan (`docs/plan/LUMAE_FINAL_PLAN_2026-09-24.md`) or the hand-off says something different, **the code wins**. The difference is recorded in a "Note" and collected in §9.
 - **Auralscape copy:** the app agent copies this file to `docs/contracts/` in `rendyhd/Auralscape`. The copy in this repo is the master.
 
 Contents:
 1. Conventions
 2. Health and capabilities
-3. Profile endpoints
+3. Profile endpoints (and §3.9, the loudness stream)
 4. Edge profile payload
 5. Collections and shelves
 6. Client rules already relied on
-7. Planned changes (K1–K12)
+7. Planned changes (K1–K13)
 8. Compatibility rules
 9. Code-versus-plan notes
 
@@ -110,7 +110,7 @@ This route always answers 200 (unless an exception occurs, or the request carrie
 | `plugin` | `"lumae_analysis"` | 1828 |
 | `plugin_version` | `"1.2.5"`; `"1.3.0"` from 1.3.0 (unreleased, P1-3) | 1829 |
 | `core_version`, `core_adapter`, `supported_core_range` | host detection; the range is `">=2.6.0,<4.0.0"` | 1830-1832 |
-| `sync_contract` | `{revision, producer, core_api_contract, streams:{catalog, analysis, profiles:{schema_version:1, analyzer_version:1, semantic_contracts:["lumae_playback_profile_v1"]}, credits, relationships}}` | `sync_contract()`, 1765-1801 |
+| `sync_contract` | `{revision, producer, core_api_contract, streams:{catalog, analysis, profiles:{schema_version:1, analyzer_version:1, semantic_contracts:["lumae_playback_profile_v1"]}, credits, relationships}}`. **1.8.0 (unreleased, K13) adds** `streams.loudness: {schema_version: 1}`, the loudness stream's gate (§3.9) | `sync_contract()`, 1765-1801 |
 | `schema_version` | `1` (profile schema) | 1834 |
 | `analyzer_version` | `1` (waveform analyzer) | 1835 |
 | `status` | `"ok"` when the core is supported, otherwise the core compatibility status | 1862 |
@@ -134,8 +134,9 @@ This route always answers 200 (unless an exception occurs, or the request carrie
 | `transport` | `gzip: true` | **New in 1.3.0 (unreleased, K1).** Informational: gzip is negotiated per request through `Accept-Encoding` (§1.5). Absent in 1.2.5. |
 | `profile_stream` | `edge_refs: true` | **New in 1.3.0 (unreleased, K6, P3-2).** The server accepts the edge-reference opt-in on `/profiles/changes` and on v2 create (§3.7). Absent in 1.2.5. |
 | `analysis_vectors` | `generation_fallback: true`, `missing: true`, `strict_generation: true` | **New in 1.3.0 (unreleased, F9, Phase C).** `POST /api/catalog/analysis/vectors` serves a pruned generation from the current one, lists absent ids in `missing`, and accepts `strict_generation` (§3.8). Absent in 1.2.5. |
+| `loudness` | absent in 1.7.x and earlier. **1.8.0 (unreleased, K13):** `version: 1`, `methods: ["bs1770-4-48k", "bs1770-4-native"]`, `album: true` | Describes the loudness stream (§3.9); a client gates on `sync_contract.streams.loudness`. |
 
-**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream` (added in 1.3.0, K6), `analysis_vectors` (added in 1.3.0, F9), `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `edge_profiles.served`, `edge_profiles.stored` (both added in 1.3.0), `edge_profiles.analyzable`, `edge_profiles.worker_runtime`, `edge_profiles.server_backfill`, `edge_profiles.edge_status`, `edge_profiles.deferred_requests`, `edge_profiles.queue` (all added in 1.3.0), `collections.feed_epoch` (added in 1.3.0, P3-4a), `collections.contract` (added in 1.3.0, P3-4b), `collections.source_scoped_items`, `vibes` (added in 1.4.0, §5.5), `covers` (added in 1.5.0, §5.6), `servers[].provider_server_id` and `servers[].provider_version` (added in 1.6.0, §2.1), `edge_profiles.schema_versions` (added in 1.7.0, §4.5), `servers[].provider_identity_transition.rekey_contract`, `.last_applied_transition_id`, `.last_applied_contract`, `.last_applied_first_seq`, `.last_applied_last_seq`, `.last_applied_manifest_sha256` and `.retained_transitions` (added in 1.6.0, §2.2), the manifest's `previous_transition_id` (v2 manifests only, 1.6.0, §2.2), and `lumae_analysis_profiles`.
+**Keys that do not exist in 1.2.5.** A client must treat each of these as absent/false: `integrity` (top level, added in 1.3.0, P1-3), `transport` (added in 1.3.0, K1), `profile_stream` (added in 1.3.0, K6), `analysis_vectors` (added in 1.3.0, F9), `profile_bootstrap.sliding_expiry`, `profile_bootstrap.idempotent_create`, `profile_bootstrap.auth_enabled` (these three added in 1.3.0, P1-6), `edge_profiles.compact_transport`, `edge_profiles.served`, `edge_profiles.stored` (both added in 1.3.0), `edge_profiles.analyzable`, `edge_profiles.worker_runtime`, `edge_profiles.server_backfill`, `edge_profiles.edge_status`, `edge_profiles.deferred_requests`, `edge_profiles.queue` (all added in 1.3.0), `collections.feed_epoch` (added in 1.3.0, P3-4a), `collections.contract` (added in 1.3.0, P3-4b), `collections.source_scoped_items`, `vibes` (added in 1.4.0, §5.5), `covers` (added in 1.5.0, §5.6), `servers[].provider_server_id` and `servers[].provider_version` (added in 1.6.0, §2.1), `edge_profiles.schema_versions` (added in 1.7.0, §4.5), `loudness` and `sync_contract.streams.loudness` (added in 1.8.0, §3.9), `servers[].provider_identity_transition.rekey_contract`, `.last_applied_transition_id`, `.last_applied_contract`, `.last_applied_first_seq`, `.last_applied_last_seq`, `.last_applied_manifest_sha256` and `.retained_transitions` (added in 1.6.0, §2.2), the manifest's `previous_transition_id` (v2 manifests only, 1.6.0, §2.2), and `lumae_analysis_profiles`.
 
 > Note: `lumae_analysis_profiles` is a **manifest** capability in `plugin.json` (with `schema_version`, `analyzer_version`, `profile_source`, `features`). It is not part of the health payload. See §9 item 1.
 
@@ -224,7 +225,7 @@ Every manifest is retained and served by the manifest route, not only the latest
 
 **Manifest.** `GET /api/catalog/provider-identity/manifest?transition_id=<id>` returns the same fields as v1 with `contract: "provider_identity_rekey_v2"` (v1 manifests report `"provider_identity_rekey_v1"`): `transition_id`, `catalog_instance_id`, `baseline_catalog_generation`, `published_catalog_generation`, `baseline_analysis_generation`, `published_analysis_generation`, `provider_version_before`, `provider_version_after`, `target_fingerprint`, `first_seq`, `last_seq`, `counts`, `analysis_baseline`, `mappings`, `manifest_sha256`, `created_at`. `manifest_sha256` is, as for v1, the SHA-256 of `json.dumps(manifest, sort_keys=True, separators=(",", ":"))` over every field except `manifest_sha256` and `created_at`. `mappings` is `[{entity_type, old_id, new_id}]` sorted by entity type (artist, album, track) and `old_id`; every ID is 32 lowercase hex characters, the mapping is one-to-one per entity type, `old_id != new_id`, and no ID is both an old and a new ID anywhere in the manifest. `target_fingerprint` is the SHA-256 of the v1 stable-scan fingerprint of the target and the canonical mappings. A v2 manifest adds `previous_transition_id`: the catalogue's previous applied transition (any contract), `null` for the first; it is part of the hashed fields of a v2 manifest and absent from v1 manifests. As for v1, `published_catalog_generation` and `published_analysis_generation` are the baselines plus one, `last_seq − first_seq + 1 = counts.rekey + counts.addition + counts.confirmed_removal`, `counts.conflict` is 0 and `analysis_baseline.integrity` is `true`.
 
-**What moves with the rekey** (as v1): source and published profiles (a published profile is a `deleted` event for the old ID and a `ready` event for the new one; edge profiles are recomputed), Living Collections items (feed events, §5.2), shelves, Vibes, covers and the carried analysis links. Derived rows a target ID still held from an earlier publication (an ID that came back) are removed first. The legacy pre-registry profile table is never touched for Jellyfin. Personal discovery records are not rewritten, as for v1: a client applies the journal or the manifest to its own records.
+**What moves with the rekey** (as v1): source and published profiles (a published profile is a `deleted` event for the old ID and a `ready` event for the new one; edge profiles are recomputed), loudness records (from 1.8.0, K13: rekeyed in place, the loudness stream's epoch rotates, §3.9), Living Collections items (feed events, §5.2), shelves, Vibes, covers and the carried analysis links. Derived rows a target ID still held from an earlier publication (an ID that came back) are removed first. The legacy pre-registry profile table is never touched for Jellyfin. Personal discovery records are not rewritten, as for v1: a client applies the journal or the manifest to its own records.
 
 ### 2.3 Tags from Jellyfin files (1.6.0)
 
@@ -505,6 +506,108 @@ Errors: 400 `invalid_batch` for a missing `catalog_instance_id` or `analysis_ids
 - The header always carries `missing: [{analysis_id, reason}]`, in request order, for each requested id without a served vector: `not_in_generation` (no row in the served generation) or `no_vector` (a row with no vector of this family). `missing` is `[]` when every id was served. A page is never silently empty.
 
 **Client rule.** When `capabilities.analysis_vectors.generation_fallback` is true, compare `generation` with the generation you asked for: vectors served from a newer generation are current and can be stored for it; re-check `missing` ids against the analysis stream rather than retrying them. Without the capability (1.2.5), treat an empty page for an older generation as possibly pruned and refetch at the current generation.
+
+### 3.9 Loudness stream (K13; 1.8.0, unreleased; Lumae LN.3)
+
+Whole-track and album loudness, measured the industry's way, so clients can level songs (Auralscape's volume-normalization plan, `docs/volume-normalization-handoff-2026-10-13.md` N1–N4 and decision D11). It travels in its own stream, beside the catalogue and the profiles, never inside them:
+- **Not in catalogue entities.** A loudness change never moves the catalogue cursor, so it never builds a new catalogue generation on a client (on Lumae Radio a new generation stales every station's preparation).
+- **Not in profile rows or edge payloads.** `ref_lufs`, the MixRamp ramps and `analyzer_ver` keep their v1 meaning, and `analyzer_ver` stays 1. An edge payload never gains a key: `publish_edge_profile` refuses a changed digest (§4.2) and edge qualification (`edge_profiles.compare_to_reference`) fails on any extra key.
+- **No histograms.** The plugin pools albums itself and publishes their result.
+
+**Gate.** A client reads the stream only when `sync_contract.streams.loudness` is present (`{schema_version: 1}`). `capabilities.loudness` describes it: `{version: 1, methods: ["bs1770-4-48k", "bs1770-4-native"], album: true}`: `version` is the measurement version the plugin publishes, `methods` the methods its records may name, and `album: true` says the stream carries album records. A client that doesn't know the stream never reads it, so the plugin release and the clients can ship in either order.
+
+**Scope and identity.** Every route is scoped by `catalog_instance_id`, as the profile routes are. Track ids are the provider's (`provider_track_ids_v1`); `album_id` is the catalogue's (`catalog.py` album grouping). Any provider-identity rekey (v1 or v2, §2.2) rekeys the loudness tables, recomputes each album's `track_set_hash` over the new ids without measuring again, and **rotates the stream's epoch**, so a client gets a 410 and bootstraps again under the new ids.
+
+#### Items
+
+**Track:**
+
+```json
+{"kind": "track", "track_id": "…", "media_revision": "sha256:<64 hex>", "version": 1,
+ "method": "bs1770-4-48k", "integrated_lufs": -11.42, "true_peak_dbtp": -0.31, "sample_peak_dbfs": -0.42,
+ "lra_lu": 8.4, "max_short_term_lufs": -7.9, "max_momentary_lufs": -6.2, "channels": 2, "sample_rate": 44100}
+```
+
+| Field | Meaning |
+|---|---|
+| `media_revision` | the file it was measured on, in the profile rows' form: `opaque_revision(signature)` = `"sha256:" + sha256_hex(utf8(signature))` (§3.1, §4.3). A client compares it with the revision it derives for the current media (Auralscape `catalogMediaRevision(media_fp)`, Lumae Radio `catalogMediaRevision`) and **skips a record that doesn't match**. A record for older media stays published until the new measurement replaces it. |
+| `version` | the measurement version, `1`. A later change to the measurement bumps it, and the plugin measures every track again in its backfill; a record of an older `version` stays published until its new measurement replaces it. **A client skips an item whose `version` it doesn't know, without deleting what it holds for that id.** |
+| `method` | `bs1770-4-48k`: measured in the edge pass, from its canonical 48 kHz K-weighted series (any source of one or two channels). `bs1770-4-native`: the standalone path, with K-weighting designed per sample rate (files the edge pass refuses: more than two channels, some WAV layouts, DSF above 384 kHz, unqualified runtimes). They agree within 0.005 LU at 44.1/48 kHz and 0.04 LU at 96/192 kHz. |
+| `integrated_lufs` | ITU-R BS.1770-4/5 integrated loudness: 400 ms blocks with 75 % overlap, the −70 LUFS absolute and −10 LU relative gates; channel weights L/R/C 1.0, surrounds 1.41, LFE 0; **mono measured as dual-mono** (it plays on two speakers). `null` for an item under 0.4 s, or when no block passes the gates (digital silence). Files with more than 8 channels get no record. |
+| `true_peak_dbtp` | the whole file's true peak: 4× oversampling below 96 kHz, 2× at 96 kHz and above (`bs1770-4-48k`: 4× over the 48 kHz series). Never an edge-window peak. `null` for digital silence. |
+| `sample_peak_dbfs` | the largest absolute sample (`bs1770-4-48k`: of the 48 kHz series). `null` for digital silence. |
+| `lra_lu` | EBU Tech 3342 loudness range: 3 s windows at a 10 Hz hop, the −70 absolute and −20 LU relative gates, p95 − p10 (ffmpeg's convention; libebur128's 1 Hz hop differs by up to 0.28 LU). `null` under 3 s or when no window passes the gates. |
+| `max_short_term_lufs`, `max_momentary_lufs` | the largest 3 s and 400 ms loudness. `null` under 3 s and under 0.4 s, and for digital silence. |
+| `channels`, `sample_rate` | the measured file's channel count (1–8) and rate. |
+
+A track record is about 250 bytes. Every number is finite or `null`: a value the measurement can't give (under the durations above, digital silence, `-inf`, NaN) is published as `null`, never as a stand-in number such as ffmpeg's "−70.0".
+
+**Album:**
+
+```json
+{"kind": "album", "album_id": "…", "track_set_hash": "sha256:<64 hex>", "version": 1,
+ "integrated_lufs": -12.8, "true_peak_dbtp": -0.2, "loudest_track_lufs": -10.9, "lra_lu": 9.1,
+ "members": 12, "exact": true}
+```
+
+- Published when every member of the album (its tracks in the source's published catalogue generation) has a track record of the current `version` for its current media, and their pooled integrated loudness is not `null`; withdrawn (a deletion) when that stops being true.
+- `integrated_lufs` pools the members' 400 ms block energies and gates them once, which is the loudness of the album played whole (exact; within 0.017 LU of ffmpeg on the concatenated album). `lra_lu` pools their 3 s windows the same way (a window never spans two tracks). `true_peak_dbtp` is the members' maximum, skipping digitally silent members (`null` if any other member's is `null`), `loudest_track_lufs` the largest of the members' non-null integrated loudness, `members` their count. `lra_lu` is `null` when no pooled window passes the gates.
+- `track_set_hash` = `"sha256:" + sha256_hex(utf8(json.dumps(pairs, separators=(",", ":"), ensure_ascii=False)))`, where `pairs` is `[[track_id, media_revision], …]` sorted by `track_id` in code-point order (no Unicode normalization or trimming). It changes when membership or any member's media changes, and the album is then pooled again.
+- `exact` is `true` for every plugin record. (Clients mark their own energy-mean approximation `false`; the plugin never publishes one.)
+
+**Deletion:** `{"kind": "track" | "album", "id": "…", "op": "delete"}`: the track left the catalogue, or the album record was withdrawn. An item with `op: "delete"` is a deletion; a record never carries `op`.
+
+#### `GET /api/catalog/loudness/bootstrap`
+
+A lease-less keyset bootstrap, in the shape of the legacy profile bootstrap (§3.3). Not the catalogue/analysis bootstrap sessions, which `create_bootstrap_session` limits to those two streams.
+
+| Parameter | Rule |
+|---|---|
+| `catalog_instance_id` | **required**. Missing, unknown or ambiguous: 400 `invalid_loudness_bootstrap`. |
+| `page_token` | omitted on the first page; afterwards the `next_page_token` from the previous page. Opaque. |
+| `limit` | default 500, clamped to **1–1000**. Not an integer: 400 `invalid_loudness_bootstrap`. |
+
+Response 200: `{schema_version: 1, catalog_instance_id, items: […], cursor, next_page_token | null, has_more}`.
+- The first page **pins the stream head**: `cursor` is `opaque_cursor(source, epoch, pinned_head)` and every page returns the same one.
+- Pages walk the **live** published tables: track records in `track_id` order, then album records in `album_id` order. Clients must not rely on the order. A page token stays valid until the epoch rotates, so a client may store it and resume. This is not a snapshot: a record published during paging may or may not appear. **Replaying `/loudness/changes` from `cursor` after the last page makes the result consistent.** Pages carry records only, never deletions.
+- **410** `bootstrap_required`: the token's source or epoch no longer matches. **400** `invalid_loudness_bootstrap`: a malformed token.
+
+#### `GET /api/catalog/loudness/changes`
+
+The loudness journal, with §3.4's rules.
+
+| Parameter | Rule |
+|---|---|
+| `cursor` | **required**. Missing: 400 `cursor_required`. Opaque: base64url (no padding) of canonical JSON `{"catalog_instance_id","epoch","seq"}`. Clients must not build or edit cursors. |
+| `catalog_instance_id` | optional. If given, it must match the cursor's source, otherwise 400 `invalid_cursor`. |
+| `limit` | default 500, clamped to **1–1000**. Not an integer: 400 `invalid_cursor`. |
+
+Response 200: `{schema_version: 1, catalog_instance_id, changes: [{seq, created_at, item}…], cursor, head_cursor, has_more}`.
+- `item` is a track record, an album record (both as they were when the event was recorded) or a deletion.
+- `cursor` is the last returned seq (or the input seq if nothing was returned); `has_more = next_seq < head_seq`.
+- The stream state (epoch, head, floor) and the page are read in **one statement** and the page is checked for density, as the other change readers do (P1-7).
+
+| Status | Code | When |
+|---|---|---|
+| 410 | `bootstrap_required` | the cursor's epoch is not the current epoch, `cursor.seq < floor_seq` (the journal was compacted past it), or the page is not dense |
+| 400 | `invalid_cursor` | a malformed cursor, a cursor of another source, or a cursor ahead of head |
+
+**Retention** follows the profile journal (§3.4, P1-2): a persisted limit of max(50,000, 2 × (catalogue tracks + albums)) events. A client further behind gets a 410 and bootstraps again.
+
+#### Publication
+
+- **Batches.** The backfill publishes in batches of many records, so clients see few large pages rather than many small ones, and journals one event per changed record.
+- **Loudness only.** Measuring loudness never republishes a profile, an edge or a catalogue entity: no `profile_changes` or `catalog_changes` events.
+- **Backfill (Auralscape D8).** Tracks without a record of the current `version` for their current media are measured at low priority, only when no interactive work is pending and under an admin rate cap: one download and one decode per track. New analyses measure inside the edge pass.
+
+#### Client rules
+
+1. Gate on `sync_contract.streams.loudness`. Ignore unknown keys. **Skip an item** whose `kind`, `version` or `method` is unknown (the methods in `capabilities.loudness.methods`), whose `channels` is not an integer from 1 to 8 (track records), or with a number that is neither `null` nor finite and in range: `integrated_lufs` and `loudest_track_lufs` −70…+6, `true_peak_dbtp` −60…+12, `lra_lu` 0…60, `max_short_term_lufs` and `max_momentary_lufs` −70…+12. A skipped item deletes nothing the client holds for that id. (Lumae Radio's LN.R2 applies exactly these rules; a gain policy treats an integrated loudness of −70 or below as no loudness.)
+2. Bootstrap when the stream first appears: page to the end, then replay `/loudness/changes` from the pinned `cursor`. Never read changes before the bootstrap is complete.
+3. On a 410, bootstrap again; replace what the old epoch delivered (records it doesn't deliver again are gone).
+4. Use a track record only when its `media_revision` matches the current media's.
+5. Use an album record only when its `track_set_hash` equals the hash of the album's members in the client's own catalogue (the formula above); otherwise treat the album as unmeasured.
+6. A loudness change never changes a catalogue binding or generation on the client.
 
 ---
 
@@ -895,9 +998,9 @@ These rules hold against 1.2.5 and **must keep holding** for clients that do not
 
 ---
 
-## 7. Planned changes (K1–K12)
+## 7. Planned changes (K1–K13)
 
-Copied from plan §2. **Every server change is additive or opt-in.** Each work package that ships one changes its **Status** to `shipped in <version>`, and updates §2–§6 in the same PR.
+Copied from plan §2 (K12 and K13 were added here later). **Every server change is additive or opt-in.** Each work package that ships one changes its **Status** to `shipped in <version>`, and updates §2–§6 in the same PR.
 
 | ID | Change | Server WP | Client | Gate | Phase | Status |
 |---|---|---|---|---|---|---|
@@ -912,7 +1015,8 @@ Copied from plan §2. **Every server change is additive or opt-in.** Each work p
 | K9 | **Collections conflicts:** with header `X-Lumae-Collections-Contract: 2`, `idempotency_key_conflict` includes `current`, and a duplicate membership returns 409 `membership_conflict {existing_item_id}` instead of a silent id remap. Create with an existing id returns 409. | P3-4 | Handle both; freeze reorder bodies at enqueue (C-13) | `capabilities.collections.contract:2` | 3 | shipped in 1.3.0 (unreleased, P3-4b): opt-in header `X-Lumae-Collections-Contract: 2`; `idempotency_key_conflict` adds `current` (the collection the key's receipt applied to, as it is now, or `null` for a restore, a pre-1.3.0 receipt or a missing collection); a duplicate membership on item PUT or batch upsert is 409 `membership_conflict` `{item_id, existing_item_id, conflicts, current}` and writes nothing; a create with an existing or deleted id is 409 `collection_exists` / `collection_deleted` with `current`; restores are unchanged; with the header, a shelf mutation `id` reused with another body is 409 `idempotency_key_conflict` (§5.3, §5.4) |
 | K10 | Collection items carry `catalog_instance_id` (LUM-013, additive); workbench routes take an explicit catalogue | P3-5 | Store and scope items (C-13) | `capabilities.collections.source_scoped_items:true` | 3 | shipped in 1.3.0 (unreleased, P3-5a): items carry `catalog_instance_id` (string or `null`) in routes, feed payloads, snapshot and backups; membership is unique per catalogue; workbench reads take `catalog_instance_id`, default to the only active source, and answer 400 `catalog_instance_required` with several (§5.1, §5.1a) |
 | K12 | **Create adoption:** a create with a known `client_request_id` adopts the ready, never-paged capture of its own earlier create (or waits up to 5 s for that capture, then 503) instead of capturing again | 1.3.4 | Retry an unanswered create once with the same id; keep the id on 429/503; otherwise fall back to legacy (PS.1) | `capabilities.profile_bootstrap.create_adoption:true` | 4 | shipped in 1.3.4 |
-| K11 | Profiles may carry `analyzer_ver:2` (BS.1770-4 `ref_lufs` and new ramps) | P3-1 | Accept v1 and v2; normalise by version (C-11) | `capabilities.lumae_analysis_profiles.analyzer_versions:[1,2]`, `loudness_method:"bs1770-4"` (**new health key**; see §9 item 1) | 3 | planned |
+| K11 | Profiles may carry `analyzer_ver:2` (BS.1770-4 `ref_lufs` and new ramps) | P3-1 | Accept v1 and v2; normalise by version (C-11) | `capabilities.lumae_analysis_profiles.analyzer_versions:[1,2]`, `loudness_method:"bs1770-4"` (**new health key**; see §9 item 1) | 3 | **superseded by K13** (Auralscape D11, 2026-10-14): no analyzer v2; `ref_lufs` and the ramps keep their v1 meaning and `analyzer_ver` stays 1 |
+| K13 | **Loudness stream:** BS.1770-4 track and album loudness (integrated, true peak, sample peak, loudness range, maximum short-term and momentary) in a new stream with a keyset bootstrap and a change journal; never in catalogue entities, profile rows or edge payloads | LN.4 | Auralscape LN.5 (phone), Lumae Radio LN.R2 | `sync_contract.streams.loudness`; `capabilities.loudness` | — | planned for 1.8.0 (unreleased): contract §3.9 |
 
 **Unchanged by design:**
 - v2 `page_size` stays client-chosen (1–500). Byte-sized pages are a client choice: use `page_size` about 50 when edges are present.
@@ -927,7 +1031,7 @@ Copied from plan §2. **Every server change is additive or opt-in.** Each work p
 3. **Opt-in signals are safe against old servers.** 1.2.5 ignores unknown query parameters (`edge_refs`, `edge_compact`, `epoch`, `edge_schema`), unknown body fields (`expiry_mode`, `client_request_id`, `edge_refs`, `edge_schema`) and unknown headers (`X-Lumae-Collections-Contract`) (§1.3). The one exception: **never send `page_size` on v2 page/catchup/release** (400). Even so, a client must not *assume* a behaviour because it sent the signal. It checks the capability first, and the response shape second.
 4. **Default output is frozen.** Without an opt-in, a newer server emits byte-for-byte the same shape as today, apart from additive keys. This includes full `edge_profile` expansion, `boundaries`, and the collection feed shape. The one content difference is K2/K6's: an event or snapshot row whose edge was replaced or removed after it was recorded carries the current edge of its revision (`/profiles/changes`) or none (v2), and the replacing event follows (§3.5, §3.7).
 5. **New keys and values.** Clients ignore unknown JSON keys, unknown capability keys and unknown `features` entries. Enum-like values (`operation`, `entity_kind`, error codes) may gain members only behind a gate.
-6. **Versions.** `schema_version` or `protocol_version` changes only for a breaking change, and a breaking change needs a new route or a new gated protocol, never an in-place change. `analyzer_ver` can take new values only behind K11.
+6. **Versions.** `schema_version` or `protocol_version` changes only for a breaking change, and a breaking change needs a new route or a new gated protocol, never an in-place change. `analyzer_ver` can take new values only behind K11, which K13 superseded: it stays 1. A change to the loudness measurement bumps the loudness items' `version` (§3.9), never `analyzer_ver`.
 7. **Every contract WP** updates this file (§2–§7 and the K status) in the same PR, with tests that pin the old default behaviour.
 
 ---
@@ -936,7 +1040,7 @@ Copied from plan §2. **Every server change is additive or opt-in.** Each work p
 
 The code wins. Each item names the WP expected to act on it.
 
-1. **K11 gate location.** `lumae_analysis_profiles` exists only in `plugin.json` (manifest capabilities). **Health has no such key.** P3-1 must add a new `capabilities.lumae_analysis_profiles` object to `/api/health` (additive) for the gate in plan §2/H.3 to work. Until then the analyzer version is visible only as top-level `analyzer_version` and `sync_contract.streams.profiles.analyzer_version`.
+1. **K11 gate location.** `lumae_analysis_profiles` exists only in `plugin.json` (manifest capabilities). **Health has no such key.** P3-1 must add a new `capabilities.lumae_analysis_profiles` object to `/api/health` (additive) for the gate in plan §2/H.3 to work. Until then the analyzer version is visible only as top-level `analyzer_version` and `sync_contract.streams.profiles.analyzer_version`. **Superseded (K13, 2026-10-14):** P3-1 will not ship, so no such key is added; loudness has its own stream and capability (§3.9).
 2. **New capability objects.** `capabilities.transport` (K1) and `capabilities.profile_stream` (K6) do not exist in 1.2.5. They are new objects, not new fields on existing ones. P1-4 added `capabilities.transport: {gzip: true}` in 1.3.0 (unreleased); P3-2 added `capabilities.profile_stream: {edge_refs: true}` in 1.3.0 (unreleased).
 3. **The v2 bootstrap has no 404 or 409.** The only statuses are 200/400/410/413/429/503 (§3.5). A 404 means the route is missing.
 4. **The v2 session is absolute (60 minutes)**, hard-coded in SQL (`profile_bootstrap.py:245`); `SESSION_MINUTES` is unused. Release of an expired or stale session answers 410 and **leaves the row in place**, so it holds one of the 4 per-source slots until it expires (audit AUD-11). K5 alone does not fix this; P1-6 should. **Fixed in 1.3.0 (P1-6):** `SESSION_MINUTES` is the one lifetime constant for absolute and sliding (K3) sessions; release deletes expired and stale rows and answers 200; stale rows never count toward the slots (§3.5).
