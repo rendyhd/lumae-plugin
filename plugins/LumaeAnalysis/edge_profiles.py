@@ -605,14 +605,18 @@ def _landmarks(head, head_levels, tail, tail_levels, total, leading_zeros, trail
 
 
 def _stream(av, blocks, sample_rate, channel_layout, deadline, *, capacity_seconds=EDGE_SECONDS,
-            stop_frame=None, whole=None):
+            stop_frame=None, whole=None, loudness=None):
     """Decode-side measurements of ``blocks``: the shared path of both passes.
 
     Keeps the first and last ``capacity_seconds`` (canonical: one more second).
     ``stop_frame`` ends the stream once a second past it has been measured,
     without flushing the resampler (the second pass, D9); otherwise the whole
     source is consumed and flushed. ``whole``, a list, receives the 100 ms
-    levels from frame 0 as soon as each is complete (D9).
+    levels from frame 0 as soon as each is complete (D9). ``loudness``
+    (``loudness_v1.SeriesMeter``, with ``whole``) receives each canonical block
+    and each 100 ms bin's mean power, including the bins the resampler's flush
+    completes, which ``whole`` never gets (LN.4a: the music end reads the same
+    series as before).
     """
     channels = 1 if channel_layout == "mono" else 2
     resampler = av.AudioResampler(format="fltp", layout=channel_layout, rate=CANONICAL_RATE)
@@ -640,25 +644,36 @@ def _stream(av, blocks, sample_rate, channel_layout, deadline, *, capacity_secon
             mid, mid_z = lfilter(_MID_B, _MID_A, upper, axis=1, zi=mid_z)
             high = upper - mid
             powers.push(np.mean(weighted * weighted, axis=0))
+            if loudness is not None:
+                loudness.canonical(pcm)
             band_powers[0].push(np.mean(low * low, axis=0))
             band_powers[1].push(np.mean(mid * mid, axis=0))
             band_powers[2].push(np.mean(high * high, axis=0))
             for channel in range(channels):
                 true_pcm[channel].push(pcm[channel].astype(np.float32))
 
-    def measure_whole():
+    flushed_bins = 0
+
+    def measure_whole(flushed=False):
         # Each 100 ms bin from frame 0 once its canonical span is in; the
         # same mean K-weighted power as level_cdb (_edge) for any bin that
-        # does not end the file.
+        # does not end the file. After the flush (``flushed``) the bins go to
+        # ``loudness`` only.
+        nonlocal flushed_bins
         while True:
-            index = len(whole)
+            index = len(whole) + flushed_bins
             begin, finish = index * sample_rate // 10, (index + 1) * sample_rate // 10
             canonical_begin = begin * CANONICAL_RATE // sample_rate
             canonical_end = finish * CANONICAL_RATE // sample_rate
             if finish > peaks.total or canonical_end > powers.total:
                 return
             power = float(np.mean(powers.window(canonical_begin, canonical_end)))
-            whole.append(quantize_db(0.0 if power < 1e-30 else power))
+            if flushed:
+                flushed_bins += 1
+            else:
+                whole.append(quantize_db(0.0 if power < 1e-30 else power))
+            if loudness is not None:
+                loudness.bin(power)
 
     stopped = False
     for raw in blocks:
@@ -696,6 +711,8 @@ def _stream(av, blocks, sample_rate, channel_layout, deadline, *, capacity_secon
         if stop_frame is not None:
             raise EdgeProfileError("edge source ended before the music end")
         consume_canonical(None)
+        if whole is not None and loudness is not None:
+            measure_whole(flushed=True)
     _check_deadline(deadline)
     return peaks, powers, true_pcm, band_powers, leading_zero_frames, trailing_zero_frames
 
@@ -720,13 +737,15 @@ def _ending_window(av, rewind, sample_rate, channel_layout, music_end, deadline)
 def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
                         media_revision, content_sha256, channel_layout="stereo",
                         decoder="pcm-input-v1", timeline_verified=False, deadline=None,
-                        rewind=None):
+                        rewind=None, loudness=None):
     """Measure channel-first float PCM. Identity must be verified by the caller.
 
     ``rewind`` returns the same blocks again from the start: the second pass
     that measures the ``ending`` window when the music ends before the tail
     window (D9). A list or tuple of blocks rewinds itself. The D9 result rides
     on the v2 payload under ``V3_ENDING_KEY``, outside its digest.
+    ``loudness`` (``loudness_v1.SeriesMeter``) measures the whole-track
+    loudness in the same decode; the payload is the same with or without it.
     """
     av = _av()
     if isinstance(sample_rate, bool) or not isinstance(sample_rate, int) or not 10 <= sample_rate <= MAX_SOURCE_RATE:
@@ -744,7 +763,7 @@ def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
         rewind = lambda: iter(blocks)  # noqa: E731
     whole = []
     peaks, powers, true_pcm, band_powers, leading_zero_frames, trailing_zero_frames = _stream(
-        av, blocks, sample_rate, channel_layout, deadline, whole=whole)
+        av, blocks, sample_rate, channel_layout, deadline, whole=whole, loudness=loudness)
     if peaks.total == 0 or abs(powers.total - peaks.total * CANONICAL_RATE / sample_rate) > 1:
         raise EdgeProfileError("invalid decoded/resampled timeline")
     head, head_levels = _edge(peaks, powers, true_pcm, band_powers, sample_rate, 0, min(peaks.total, EDGE_SECONDS * sample_rate))
@@ -783,8 +802,9 @@ def analyze_edge_blocks(blocks, sample_rate, *, catalog_instance_id, track_id,
 
 
 def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, deadline_seconds=900,
-                      observer=None):
+                      observer=None, loudness=None):
     # ``observer``: see ``loudness.analyze_file``; the hard limit is LUM-018's.
+    # ``loudness``: see ``analyze_edge_blocks`` (``loudness_v1.analyze_edge_file``).
     av = _av()
     deadline = time.monotonic() + max(1, deadline_seconds)
     with open(path, "rb") as source:
@@ -841,7 +861,7 @@ def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, de
                         for converted in again_converter.resample(None):
                             yield converted.to_ndarray()
 
-            result = analyze_edge_blocks(blocks(), rate, catalog_instance_id=catalog_instance_id, track_id=track_id, media_revision=media_revision or "sha256:" + content_hash, content_sha256=content_hash, channel_layout=layout, decoder="pyav-" + av.__version__ + ":" + codec, timeline_verified=codec in ("flac", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le"), deadline=deadline, rewind=reread)
+            result = analyze_edge_blocks(blocks(), rate, catalog_instance_id=catalog_instance_id, track_id=track_id, media_revision=media_revision or "sha256:" + content_hash, content_sha256=content_hash, channel_layout=layout, decoder="pyav-" + av.__version__ + ":" + codec, timeline_verified=codec in ("flac", "pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le"), deadline=deadline, rewind=reread, loudness=loudness)
         after = os.fstat(source.fileno())
         if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns) or hash_source() != content_hash:
             raise EdgeProfileError("source changed during analysis")
