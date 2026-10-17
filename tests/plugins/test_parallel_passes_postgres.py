@@ -6,8 +6,10 @@ and through real analysis children.
   downloaded once and published once.
 * Every database and host call stays on the tick's thread (``get_db`` and the
   download assert it); the threads run only the analysis.
-* At the deadline the files in flight get the drain window, then are killed
-  and their tracks released uncounted (no failure, due again at once).
+* A file in flight at the deadline runs to completion: a file slower than
+  the whole tick is downloaded and published once, and the pass that met it
+  reaches the end of the library (1.8.0's test build killed it 5 s after
+  every deadline, so it restarted every tick and its pass never finished).
 * K = 1 on a single-threaded process still takes the fork path.
 * Host shapes (the scheduler plan's matrix): on 3.3.0-3.5.1 (one-thread
   jobs) and 3.5.2+ (a heartbeat thread beside the plugin call) K > 1 analyses
@@ -98,6 +100,36 @@ def _edge_tracks(db, names):
     db.commit()
 
 
+def _slow(mod, monkeypatch, track_id, seconds):
+    """The analysis of ``track_id``'s download takes ``seconds`` longer
+    (analysis threads only); returns the calls' track ids."""
+    real, calls = mod.run_file_analysis, []
+
+    def analyse(analyzer, path, **kwargs):
+        assert threading.current_thread() is not MAIN
+        name = path.rsplit("/", 1)[-1]
+        calls.append(name.rsplit("-", 1)[0])
+        if name.startswith(f"{track_id}-"):
+            time.sleep(seconds)
+        return real(analyzer, path, **kwargs)
+
+    monkeypatch.setattr(mod, "run_file_analysis", analyse)
+    # 1.8.0's 5 s drain window, scaled to these ticks (gone since).
+    monkeypatch.setattr(par, "DRAIN_SECONDS", 0.5, raising=False)
+    return calls
+
+
+def _until_complete(task, ticks=6, tick_seconds=1.0):
+    """Turns of a library pass, each with a short tick, until one completes."""
+    results = []
+    for _ in range(ticks):
+        with par.tick_scope(3):
+            results.append(task(SERVER, SOURCE, deadline=time.monotonic() + tick_seconds))
+        if results[-1]["status"] == "complete":
+            break
+    return results
+
+
 def _tracks(db, count):
     names = [f"track-{index:02d}" for index in range(count)]
     for name in names:
@@ -121,26 +153,28 @@ def test_a_background_waveform_batch_runs_on_k_threads_once_per_track(parallel):
     assert not [thread for thread in threading.enumerate() if thread.name.startswith("lumae-analysis")]
 
 
-def test_files_in_flight_at_the_drain_window_are_killed_and_released_uncounted(parallel, monkeypatch):
-    mod, db, downloads, _served, _tmp = parallel
+def test_a_waveform_slower_than_the_tick_finishes_in_the_tick_that_started_it(parallel, monkeypatch):
+    mod, db, downloads, served, _tmp = parallel
     names = _tracks(db, 6)
     _queued_backfill(db)
-    monkeypatch.setattr(mod, "analyze_file", fakes.sleep_forever)
-    monkeypatch.setattr(par, "DRAIN_SECONDS", 0.5)
+    _slow(mod, monkeypatch, "track-01", 3.0)
+    monkeypatch.setattr(par, "WAIT_SERVE_SECONDS", 0.5)
 
     began = time.monotonic()
     with par.tick_scope(3):
-        result = mod.profile_backfill_task(SERVER, SOURCE, deadline=began + 2)
+        result = mod.profile_backfill_task(SERVER, SOURCE, deadline=began + 1)
     elapsed = time.monotonic() - began
 
-    assert elapsed < 2 + 0.5 + 6, elapsed
-    assert len(downloads) == 3  # three started, none after the deadline
-    assert result["deferred"] == 6 and result["processed"] == 0
-    # Released, not failed: no retry count, due again at once.
-    assert sorted(mod.find_backfill_ids(25, catalog_instance_id=SOURCE, server_id=SERVER,
-                                        include_failed=False)) == names
-    assert _rows(db, f"SELECT DISTINCT retry_count FROM {P}source_profiles") == [(0,)]
+    assert elapsed >= 3.0, elapsed  # it ran past the deadline to its end
+    assert downloads.count("track-01") == 1
+    assert _rows(db, f"SELECT status FROM {P}source_profiles WHERE track_id='track-01'") == [("ready",)]
+    assert result["failed"] == 0 and result["ready"] == len(downloads), result
+    # Tracks it never started are released, not failed: due again at once.
+    assert result["deferred"] == len(names) - len(downloads)
     assert not _rows(db, f"SELECT 1 FROM {P}source_profiles WHERE status='failed'")
+    assert _rows(db, f"SELECT DISTINCT retry_count FROM {P}source_profiles") == [(0,)]
+    # On-demand work was served while the tick waited for it.
+    assert [at for at in served if at > began + 1.5]
 
 
 def test_k_equal_one_on_a_single_threaded_process_takes_the_fork_path(parallel, monkeypatch):
@@ -178,30 +212,21 @@ def test_the_edge_pass_runs_on_k_threads_and_finishes_the_library(parallel, monk
     assert _rows(db, f"SELECT count(*) FROM {P}loudness_tracks")[0][0] == 7
 
 
-def test_the_edge_pass_keeps_its_cursor_before_a_cancelled_file(parallel, monkeypatch):
+def test_an_edge_slower_than_the_tick_completes_and_the_edge_pass_reaches_its_end(parallel, monkeypatch):
     mod, db, downloads, _served, _tmp = parallel
     names = [f"track-{index:02d}" for index in range(5)]
     _edge_tracks(db, names)
     mod.test_signature = lambda track_id: f"catalog-media:{track_id}"
     monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
-    monkeypatch.setattr(par, "DRAIN_SECONDS", 0.5)
-    real = mod.run_file_analysis
+    _slow(mod, monkeypatch, "track-01", 3.0)
 
-    def analyse(analyzer, path, **kwargs):
-        if kwargs.get("track_id") == "track-01":
-            return real(fakes.sleep_forever, path, limit_seconds=kwargs["limit_seconds"])
-        return real(analyzer, path, **kwargs)
+    results = _until_complete(mod.edge_backfill_task)
 
-    monkeypatch.setattr(mod, "run_file_analysis", analyse)
-    with par.tick_scope(3):
-        result = mod.edge_backfill_task(SERVER, SOURCE, deadline=time.monotonic() + 4)
-
-    assert result["status"] == "queued" and result["released"] == 1, result
-    assert _rows(db, f"SELECT cursor FROM {P}edge_backfill_state") == [("track-00",)]
-    assert ("track-01",) not in _rows(db, f"SELECT track_id FROM {P}edge_profiles")
-    # Released, due again at once; the next turn reaches it.
-    assert _rows(db, f"SELECT status, last_error FROM {P}edge_profile_jobs WHERE track_id='track-01'") == [
-        ("failed", "edge-enqueue-failed")]
+    assert results[-1]["status"] == "complete", results
+    assert not any(result.get("released") for result in results), results
+    assert downloads.count("track-01") == 1 and sorted(set(downloads)) == names
+    assert _rows(db, f"SELECT track_id FROM {P}edge_profiles ORDER BY track_id") == [(n,) for n in names]
+    assert _rows(db, f"SELECT status, cursor FROM {P}edge_backfill_state") == [("complete", "")]
 
 
 def test_the_loudness_pass_runs_on_k_threads_and_publishes_by_page(parallel, monkeypatch):
@@ -220,6 +245,25 @@ def test_the_loudness_pass_runs_on_k_threads_and_publishes_by_page(parallel, mon
     assert (result["status"], result["ready"], result["failed"]) == ("complete", 7, 0), result
     assert sorted(downloads) == names
     assert publications == [3, 3, 1]
+    page = loudness_stream.bootstrap_page(db, SOURCE)
+    assert sorted(i["track_id"] for i in page["items"] if i["kind"] == "track") == names
+    assert loudness_backfill.state(db, SOURCE)["cursor"] == ""
+
+
+def test_a_loudness_measurement_slower_than_the_tick_completes_and_the_pass_reaches_its_end(
+        parallel, monkeypatch):
+    mod, db, downloads, _served, _tmp = parallel
+    names = _tracks(db, 5)
+    loudness_backfill.ensure_sources(db)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 3)
+    _slow(mod, monkeypatch, "track-01", 3.0)
+
+    results = _until_complete(mod.loudness_backfill_task)
+
+    assert results[-1]["status"] == "complete", results
+    assert sum(result["ready"] for result in results) == 5
+    assert not any(result["failed"] for result in results), results
+    assert downloads.count("track-01") == 1 and sorted(set(downloads)) == names
     page = loudness_stream.bootstrap_page(db, SOURCE)
     assert sorted(i["track_id"] for i in page["items"] if i["kind"] == "track") == names
     assert loudness_backfill.state(db, SOURCE)["cursor"] == ""

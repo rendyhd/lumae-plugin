@@ -37,7 +37,10 @@ BACKOFF_LADDER = (
 YIELD_MINUTES = (5, 15)
 # A tick works for at most this long, over as many actions as fit (plan S2),
 # so it never covers the next minute's host fire. Each action stops at the
-# deadline itself; an action starts only when its recent average fits.
+# deadline itself; an action starts only when its recent average fits. The
+# exception is a file already being analysed: it finishes, within its
+# per-file limit (one at a time or K at once alike), so a file longer than
+# the budget delays the next fires instead of restarting every tick.
 TICK_BUDGET_SECONDS = 45
 ACTION_AVERAGE_RUNS = 10
 # Actions that take whatever is left of the tick and stop at the deadline

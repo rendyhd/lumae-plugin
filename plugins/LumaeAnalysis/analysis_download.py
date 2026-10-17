@@ -125,8 +125,8 @@ def resolve(stream_target, provider_type, item_id, directory):
 def fetch(target, cancelled=None, session=None):
     """Write the target's file to ``target.path``; returns the path.
 
-    ``cancelled()`` is checked between chunks (a drain cancel stops a long
-    download). Raises ``DownloadError``; a partial file is removed.
+    ``cancelled()`` is checked between chunks (a parallel pass that raises
+    stops a long download). Raises ``DownloadError``; a partial file is removed.
     """
     http = session or http_requests
     try:

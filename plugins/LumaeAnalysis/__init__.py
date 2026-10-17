@@ -4371,8 +4371,9 @@ def _finish_edge(state, payload, error):
 
 
 def _release_edge(state):
-    """An edge whose analysis never finished (WP1b's drain cancel): released,
-    due again at once, like a background batch's unstarted jobs."""
+    """An edge whose analysis never finished (its pass raised, or Lumae's own
+    download was refused): released, due again at once, like a background
+    batch's unstarted jobs."""
     try:
         update_edge_job(get_db(), state["catalog_instance_id"], state["job"], "failed", "edge-enqueue-failed")
     finally:
@@ -4459,9 +4460,10 @@ def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, d
 
     Each due track is claimed, started and downloaded here, analysed on a
     thread and published here as it completes, serving deferred on-demand
-    work whenever a thread frees. The cursor stays at the last track of the
-    unbroken run of finished tracks, so a file cancelled at the drain window
-    (released, due again at once) is reached again next turn.
+    work whenever a thread frees. A file in flight at the deadline runs to
+    completion, as on the serial path. The cursor stays at the last track of
+    the unbroken run of finished tracks, so a file cancelled because the pass
+    raised (released, due again at once) is reached again next turn.
     """
     counts, limit = {}, analysis_time_limit_seconds()
 
@@ -4637,8 +4639,9 @@ def _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, du
     """The loudness turn on the tick's K analysis threads (WP1b).
 
     Downloads and publication stay here; a page of measurements (the admin
-    batch size) is published together as it fills. A file cancelled at the
-    drain window is not counted and keeps the cursor before it.
+    batch size) is published together as it fills. A file in flight at the
+    deadline runs to completion, as on the serial path; one cancelled because
+    the pass raised is not counted and keeps the cursor before it.
     """
     measured, limit = [], analysis_time_limit_seconds()
 
@@ -4993,8 +4996,8 @@ def _publish_bundle_edge(track_id, catalog_instance_id, signature, answer):
 
 
 def _release_track(state, reason):
-    """A waveform whose analysis never finished (WP1b's drain cancel): released
-    uncounted, due again at once."""
+    """A waveform whose analysis never finished (its batch raised, or Lumae's
+    own download was refused): released uncounted, due again at once."""
     try:
         release_pending([state["track_id"]], catalog_instance_id=state["catalog_instance_id"], reason=reason,
                         tokens={state["track_id"]: state["attempt_token"]} if state["attempt_token"] else None,
@@ -5530,8 +5533,8 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
     and published here as it completes. Deferred on-demand work is served
     whenever a thread frees, before the next track. No track starts once the
     tick's deadline is nearer than the batch's average time per file; a file
-    still running after the drain window is killed and its track released
-    uncounted, like the tracks never started.
+    in flight at the deadline runs to completion, as on the serial path, and
+    the tracks never started are released uncounted.
     """
     results, attempted, paused = [], [0], [False]
     limit = analysis_time_limit_seconds()

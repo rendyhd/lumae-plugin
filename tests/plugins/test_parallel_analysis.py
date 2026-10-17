@@ -3,8 +3,9 @@
 ``parallel_analysis.run`` prepares and finishes every unit on the calling
 thread and runs only the work on the tick's analysis threads, each with its
 own exec worker. It starts no unit once the deadline is nearer than the
-pass's average, waits a drain window for the files in flight, then cancels
-the rest (their children killed). One worker runs everything on the calling
+pass's average and lets the files in flight finish, however long past the
+deadline, serving on-demand work meanwhile; only a pass that raises cancels
+them (their children killed). One worker runs everything on the calling
 thread, as before WP1b.
 """
 import os
@@ -198,53 +199,120 @@ def test_no_file_starts_once_the_deadline_is_nearer_than_the_average(pool):
     recorder = Recorder(work_for)
     began = time.monotonic()
     report = par.run(range(20), recorder.prepare, recorder.finish, pool=pool,
-                     deadline=began + 0.5, drain_seconds=2)
+                     deadline=began + 0.5)
     # Three at once, then three more after 0.3 s (0.2 s left < the 0.3 s average: none).
     assert len(recorder.prepared) == 3, recorder.prepared
     assert report.stopped == "deadline" and not report.cancelled
     assert [error for _u, _r, error in recorder.finished] == [None] * 3
 
 
-def test_files_in_flight_after_the_drain_window_are_killed_and_finished_cancelled(pool, tmp_path):
-    media = tmp_path / "a.flac"
-    media.write_bytes(b"\0")
-    pid_files = [tmp_path / f"pid-{index}" for index in range(3)]
+def test_files_in_flight_at_the_deadline_run_to_completion(pool, monkeypatch):
+    monkeypatch.setattr(par, "DRAIN_SECONDS", 0.2, raising=False)  # 1.8.0's window, scaled
 
     def work_for(unit):
+        def work():
+            time.sleep(1.0)  # several times the time left at the start
+            return unit
+        return work
+
+    recorder = Recorder(work_for)
+    began = time.monotonic()
+    report = par.run(range(5), recorder.prepare, recorder.finish, pool=pool, deadline=began + 0.3)
+    assert time.monotonic() - began >= 1.0
+    assert recorder.prepared == [0, 1, 2]  # none started after the deadline
+    assert sorted(recorder.finished) == [(0, 0, None), (1, 1, None), (2, 2, None)]
+    assert report.stopped == "deadline" and not report.cancelled and report.reached() == 2
+
+
+def test_on_demand_work_is_served_while_the_pass_waits_past_the_deadline(pool, monkeypatch):
+    monkeypatch.setattr(par, "WAIT_SERVE_SECONDS", 0.2)
+    served = []
+
+    def between():
+        assert threading.current_thread() is MAIN
+        served.append(time.monotonic())
+        return True
+
+    recorder = Recorder(lambda unit: (lambda: time.sleep(1.5) or unit))
+    began = time.monotonic()
+    report = par.run(range(3), recorder.prepare, recorder.finish, pool=pool,
+                     deadline=began + 0.3, between=between)
+    # Once before each of the three units, then every 0.2 s of the 1.5 s wait.
+    assert len(served) >= 3 + 4, served
+    assert not report.cancelled and report.reached() == 2
+
+
+def test_a_file_slower_than_the_tick_completes_and_the_pass_reaches_its_end(pool, monkeypatch, tmp_path):
+    """The 1.8.0 livelock: a pass that keeps its cursor before a file that
+    did not finish, run tick after tick, with one file longer than a tick.
+    Cancelled at every deadline, the file restarted every tick and the pass
+    never completed; now it finishes in the tick that started it."""
+    media = tmp_path / "a.flac"
+    media.write_bytes(b"\0")
+    units = list(range(8))
+    slow, tick_seconds = 2, 0.4
+    # 1.8.0's 5 s drain window, scaled to these ticks (gone since).
+    monkeypatch.setattr(par, "DRAIN_SECONDS", 0.2, raising=False)
+    started, cursor, ticks = [], -1, []
+
+    def work_for(unit):
+        def work():
+            started.append(unit)
+            if unit == slow:  # an analysis child that outlasts the tick
+                iso.run_isolated(fakes.stall, str(media), limit_seconds=60, stall_seconds=2.0)
+            else:
+                time.sleep(0.05)
+            return unit
+        return work
+
+    for _tick in range(6):
+        recorder = Recorder(work_for)
+        report = par.run([unit for unit in units if unit > cursor], recorder.prepare, recorder.finish,
+                         pool=pool, deadline=time.monotonic() + tick_seconds)
+        ticks.append(report)
+        if report.stopped is None and not report.cancelled:
+            break  # "complete"
+        reached = report.reached()
+        cursor = cursor if reached is None else reached
+
+    assert ticks[-1].stopped is None and not ticks[-1].cancelled, "the pass never completed"
+    assert not any(report.cancelled for report in ticks)
+    assert started.count(slow) == 1  # never restarted (nor downloaded again)
+    assert sorted(started) == units
+
+
+def test_reached_never_passes_a_unit_that_did_not_finish():
+    report = par.Report()
+    report.taken = [0, 1, 2]
+    report.done = {0, 2}
+    assert report.reached() == 0
+    report.done.add(1)
+    assert report.reached() == 2
+
+
+def test_a_failing_pass_kills_the_files_in_flight_and_finishes_them_cancelled(pool, tmp_path):
+    media = tmp_path / "a.flac"
+    media.write_bytes(b"\0")
+    pid_files = [tmp_path / f"pid-{index}" for index in range(2)]
+
+    def work_for(unit):
+        if unit == 2:
+            for path in pid_files:  # both children are running
+                for _ in range(200):
+                    if path.exists() and path.read_text():
+                        break
+                    time.sleep(0.05)
+            raise RuntimeError("claim failed")
         return lambda: iso.run_isolated(fakes.sleep_forever, str(media), limit_seconds=60,
                                         pid_file=str(pid_files[unit]))
 
     recorder = Recorder(work_for)
     began = time.monotonic()
-    report = par.run(range(5), recorder.prepare, recorder.finish, pool=pool,
-                     deadline=began + 2, drain_seconds=0.5)
-    elapsed = time.monotonic() - began
-    assert elapsed < 2 + 0.5 + 5, elapsed
-    assert recorder.prepared == [0, 1, 2]
-    assert sorted(recorder.finished) == [(0, None, "Cancelled"), (1, None, "Cancelled"),
-                                         (2, None, "Cancelled")]
-    assert sorted(report.cancelled) == [0, 1, 2] and report.reached() is None
+    with pytest.raises(RuntimeError, match="claim failed"):
+        par.run(range(5), recorder.prepare, recorder.finish, pool=pool)
+    assert time.monotonic() - began < 15  # not the children's 60 s limit
+    assert sorted(recorder.finished) == [(0, None, "Cancelled"), (1, None, "Cancelled")]
     assert all(_gone(int(path.read_text())) for path in pid_files)
-
-
-def test_reached_never_passes_a_unit_that_did_not_finish(pool):
-    gate = threading.Event()
-
-    def work_for(unit):
-        def work():
-            if unit == 1:
-                gate.wait(10)  # outlives the drain window
-                raise RuntimeError("late")
-            return unit
-        return work
-
-    recorder = Recorder(work_for)
-    report = par.run(range(3), recorder.prepare, recorder.finish, pool=pool,
-                     deadline=time.monotonic() + 0.3, drain_seconds=0.2)
-    gate.set()
-    assert report.cancelled == [1]
-    assert report.reached() == 0
-    assert (1, None, "Cancelled") in recorder.finished
 
 
 def test_a_failing_prepare_cancels_and_finishes_the_files_in_flight(pool):

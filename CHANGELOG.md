@@ -49,9 +49,13 @@ Faster background analysis (performance plan 2026-10-16, WP1a).
   CPU priority (nice 10), reused for the whole tick; claims, downloads,
   publication and on-demand work stay on the tick's thread. On-demand work
   is served whenever a thread frees. No file starts once the tick's deadline
-  is nearer than the pass's average time per file; files still running 5 s
-  after the deadline are stopped and their tracks released uncounted, due
-  again at once.
+  is nearer than the pass's average time per file. The files in flight at
+  the deadline run to completion (each within its per-file time limit), as
+  with one file at a time, while on-demand work is served every 5 s. The
+  first 1.8.0 test build stopped them 5 s after the deadline and started
+  them again next tick, so a file longer than a tick (a two-hour DJ set)
+  never completed, held its thread for good, and the edge pass never
+  finished, which kept the loudness backfill from starting.
 - K is the new setting "Files analyzed at once" (`background_workers`):
   `auto` (the default) takes the AudioMuse worker's cores minus two, a
   quarter of its (or its container's) memory at 512 MiB per file, and at

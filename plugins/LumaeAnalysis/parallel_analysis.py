@@ -13,11 +13,17 @@ binding may not be thread-local.
 calling thread (``prepare`` returns the work for a thread, or None when it
 handled the unit itself), and finishes each on the calling thread as its
 work completes (``finish``). It starts no unit once the deadline is closer
-than the pass's average time per file, waits ``DRAIN_SECONDS`` after the
-deadline for the files in flight, then cancels the rest: their children are
-killed and ``finish`` gets ``Cancelled`` (the caller releases the track
-uncounted). With one worker, or outside a tick, the work runs on the calling
-thread, exactly as before WP1b.
+than the pass's average time per file. The files in flight at the deadline
+run to completion, each bounded by its own per-file limit, as the serial path
+runs its file past the deadline; meanwhile ``between`` still serves on-demand
+work every ``WAIT_SERVE_SECONDS``. Up to 1.8.0's test build they were
+cancelled ``DRAIN_SECONDS`` (5 s) after the deadline and due again from the
+start: a file longer than the tick restarted every tick, never completed and
+held its thread for good, and a pass with one never reached its end. A file
+is cancelled only when the pass itself raises: its child is killed and
+``finish`` gets ``Cancelled`` (the caller releases the track uncounted).
+With one worker, or outside a tick, the work runs on the calling thread,
+exactly as before WP1b.
 
 K is the setting ``background_workers``: ``auto`` (the default) takes the
 cores this process may use minus ``CPU_RESERVE``, the memory a quarter of
@@ -48,15 +54,17 @@ CHILD_RAM_BYTES = 512 * 1024 * 1024
 RAM_SHARE = 0.25
 # The children compete with playback and transcoding on the media host.
 NICE = 10
-# After the tick's deadline the files in flight get this long to finish.
-DRAIN_SECONDS = 5
+# While a pass only waits for files in flight (past the deadline, or with no
+# unit left), it serves on-demand work this often: AudioMuse refuses
+# on-demand enqueues while the tick runs (E3).
+WAIT_SERVE_SECONDS = 5
 # How long a cancelled thread gets to hand its file back.
 CANCEL_JOIN_SECONDS = 10
 
 
 class Cancelled(Exception):
-    """The file was in flight at the end of the drain window (or the pass
-    stopped): nothing about it is counted."""
+    """The file was in flight when the pass raised (or its thread did not
+    hand it back): nothing about it is counted."""
 
 
 # ---------------------------------------------------------------- sizing
@@ -311,8 +319,7 @@ class Report:
         return last
 
 
-def run(units, prepare, finish, *, pool=None, deadline=None, between=None,
-        drain_seconds=None):
+def run(units, prepare, finish, *, pool=None, deadline=None, between=None):
     """Prepare, work and finish ``units`` in order until they run out or the deadline.
 
     ``prepare(unit)`` (calling thread) returns ``(work, context)``, where
@@ -320,10 +327,12 @@ def run(units, prepare, finish, *, pool=None, deadline=None, between=None,
     the unit itself. ``finish(unit, context, result, error)`` runs on the
     calling thread; ``error`` is the work's exception or ``Cancelled``.
     ``between()`` runs before each unit is prepared and returns False to stop
-    taking units (those in flight still finish). Returns a ``Report``.
+    taking units; the files in flight at a stop or the deadline still finish,
+    and while ``run`` only waits for them ``between()`` runs every
+    ``WAIT_SERVE_SECONDS`` (its answer then changes nothing). Returns a
+    ``Report``.
     """
     report = Report()
-    drain = DRAIN_SECONDS if drain_seconds is None else drain_seconds
     units = iter(units)
     if pool is None or not pool.parallel:
         for unit in units:
@@ -372,6 +381,7 @@ def run(units, prepare, finish, *, pool=None, deadline=None, between=None,
 
     try:
         exhausted = False
+        serve_at = None  # while only waiting for files in flight: the next between()
         while True:
             while not exhausted and report.stopped is None and len(in_flight) < pool.workers:
                 if not can_start():
@@ -400,12 +410,20 @@ def run(units, prepare, finish, *, pool=None, deadline=None, between=None,
                     job = pool.collect(0)
             if not in_flight:
                 break
-            wait = 1.0
-            if deadline is not None:
-                left = deadline + drain - time.monotonic()
-                if left <= 0:
-                    break
-                wait = min(wait, left)
+            wait, now = 1.0, time.monotonic()
+            if between is not None and (exhausted or report.stopped is not None
+                                        or (deadline is not None and now >= deadline)):
+                # No unit starts now: wait for the files in flight, however
+                # long past the deadline they run (each stops at its own
+                # per-file limit), serving on-demand work meanwhile.
+                if serve_at is None:
+                    serve_at = now + WAIT_SERVE_SECONDS
+                elif now >= serve_at:
+                    between()
+                    serve_at = time.monotonic() + WAIT_SERVE_SECONDS
+                wait = max(0.0, min(wait, serve_at - time.monotonic()))
+            elif between is not None and deadline is not None:
+                wait = min(wait, deadline - now)  # start serving at the deadline
             job = pool.collect(wait)
             if job is not None:
                 settle(job)
