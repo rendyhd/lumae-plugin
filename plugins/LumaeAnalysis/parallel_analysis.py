@@ -131,6 +131,36 @@ def resolve_workers(raw):
     return auto_workers() if setting == DEFAULT_SETTING else setting
 
 
+# Speed-up over one file at a time, measured with a CPU-bound analysis on
+# 8 cores (scripts/perf/parallel_bench.py, 2026-10-17). The settings page's
+# ETA at a higher K is an estimate from it, not a measurement of this host.
+MEASURED_SPEEDUP = {1: 1.0, 2: 1.86, 4: 3.38, 6: 4.32}
+
+
+def speedup(workers):
+    """The measured speed-up at ``workers``, interpolated between measurements;
+    None above the last one."""
+    points = sorted(MEASURED_SPEEDUP)
+    workers = max(1, int(workers))
+    if workers in MEASURED_SPEEDUP:
+        return MEASURED_SPEEDUP[workers]
+    if workers > points[-1]:
+        return None
+    low = max(point for point in points if point < workers)
+    high = min(point for point in points if point > workers)
+    share = (workers - low) / (high - low)
+    return MEASURED_SPEEDUP[low] + share * (MEASURED_SPEEDUP[high] - MEASURED_SPEEDUP[low])
+
+
+def next_workers(workers, cpus=None):
+    """The next measured K above ``workers`` that this host's cores allow
+    (with the reserve), or None."""
+    cpus = available_cpus() if cpus is None else cpus
+    higher = [point for point in sorted(MEASURED_SPEEDUP)
+              if point > workers and point <= max(1, cpus - CPU_RESERVE) and point <= MAX_WORKERS]
+    return higher[0] if higher else None
+
+
 # ------------------------------------------------------------------ pool
 
 

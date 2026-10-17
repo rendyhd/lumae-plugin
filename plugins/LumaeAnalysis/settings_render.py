@@ -1107,6 +1107,70 @@ def _reconcile_event_summary(event):
     return "; ".join(parts) or _pkg.escape(str(summary.get("status") or event.get("phase") or "complete"))
 
 
+def _eta_text(hours):
+    if hours is None:
+        return ""
+    if hours < 1:
+        return f"about {max(1, round(hours * 60))} minutes"
+    if hours < 24:
+        return f"about {hours:.1f} hours"
+    return f"about {hours / 24:.1f} days"
+
+
+def _age_text(seconds):
+    if seconds is None:
+        return "earlier"
+    minutes = max(0, int(seconds // 60))
+    if minutes < 60:
+        return f"{minutes} minute{'' if minutes == 1 else 's'} ago"
+    return f"{minutes / 60:.1f} hours ago"
+
+
+def _throughput_html():
+    """Per queue: done in the last hour and 24 hours, left, ETA; the ETA of the
+    analysis queues at a higher K; refused AudioMuse schedules (S12, WP5)."""
+    db = _pkg.get_db()
+    try:
+        queues = _pkg.reconcile_queue_throughput(db)
+        yielding = _pkg.reconcile_yield_status(db)
+    except Exception:
+        _pkg._rollback_if_possible(db)
+        _pkg.logger.exception("lumae_analysis could not read the queue throughput")
+        return ""
+    items = []
+    analysis_eta = 0.0
+    for queue in queues:
+        approximate = queue["action"] in ("edge_backfill", "loudness_backfill")
+        text = (f"{queue['last_hour']:,} in the last hour, {queue['last_day']:,} in 24 hours")
+        if queue["remaining"] is not None:
+            text += f"; {'about ' if approximate else ''}{queue['remaining']:,} left"
+            if queue["eta_hours"] is not None:
+                text += f", {_eta_text(queue['eta_hours'])} at this rate"
+                if queue["action"] in _pkg.RECONCILE_ANALYSIS_QUEUES:
+                    analysis_eta += queue["eta_hours"]
+        items.append(f"<li><strong>{_pkg.escape(queue['label'])}</strong>: {_pkg.escape(text)}.</li>")
+    workers = _pkg.background_workers()
+    setting = _pkg.configured_background_workers()
+    workers_text = f"Files analyzed at once: {workers}{' (auto)' if setting == 'auto' else ''}."
+    higher = _pkg.parallel_analysis.next_workers(workers)
+    if higher and analysis_eta:
+        now, then = _pkg.parallel_analysis.speedup(workers), _pkg.parallel_analysis.speedup(higher)
+        if now and then:
+            workers_text += (f" At {higher} at once: {_eta_text(analysis_eta * now / then)} for the"
+                             " analysis queues (estimated from a CPU-bound bench on 8 cores).")
+    refused = ""
+    if yielding.get("refused"):
+        refused = "; ".join(f"{task} (refused {_age_text(age)})" for task, age in yielding["refused"])
+        refused = (f'<p class="lumae-help">AudioMuse schedules waiting for their retry, which Lumae'
+                   f' yields to: {_pkg.escape(refused)}.</p>')
+    return f"""
+        <h4>Throughput</h4>
+        <ul class="lumae-help">{''.join(items)}</ul>
+        <p class="lumae-help">{_pkg.escape(workers_text)}</p>
+        {refused}
+    """
+
+
 def render_reconcile_status_panel():
     try:
         snapshot = _pkg.read_reconcile_status(_pkg.get_db())
@@ -1232,6 +1296,7 @@ def render_reconcile_status_panel():
         {disabled_html}
         {running_html}
         <ul class="lumae-help">{pending_html}</ul>
+        {_throughput_html()}
         {next_retry}
         <details>
           <summary>Recent meaningful background actions</summary>

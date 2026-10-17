@@ -843,6 +843,107 @@ def remaining_work(db):
     return {key: int(value or 0) for key, value in zip(keys, row or ())}
 
 
+# The queues the settings page reports throughput for (S12, AUD-18):
+# (action, label, how a journal event counts). "ready" counts the summary's
+# ready tracks, "published" the turns that published, "runs" every turn.
+THROUGHPUT_QUEUES = (
+    ("profile_backfill", "Volume and ramps", "ready"),
+    ("edge_backfill", "Edge profiles", "ready"),
+    ("loudness_backfill", "Loudness", "ready"),
+    ("relationships", "Relationship steps", "runs"),
+    ("credits", "MusicBrainz credits", "published"),
+)
+# The queues whose files K analysis threads analyse (performance plan WP1b).
+ANALYSIS_QUEUES = ("profile_backfill", "edge_backfill", "loudness_backfill")
+
+
+def queue_throughput(db):
+    """Per queue: units done in the last hour and the last 24 hours (from the
+    journal, which keeps a day), units left and the ETA at the last hour's
+    rate (S12). What is left is approximate for edges and loudness: published
+    waveforms without an edge, music tracks without a loudness record."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT action,
+               COALESCE(sum(units) FILTER (WHERE completed_at > now() - interval '1 hour'), 0),
+               COALESCE(sum(units), 0)
+          FROM (SELECT action, completed_at,
+                       CASE WHEN action IN ('profile_backfill', 'edge_backfill', 'loudness_backfill')
+                            THEN CASE WHEN jsonb_typeof(summary->'ready')='number'
+                                      THEN (summary->>'ready')::bigint ELSE 0 END
+                            WHEN action='credits'
+                            THEN CASE WHEN summary->>'status'='published' THEN 1 ELSE 0 END
+                            ELSE 1 END AS units
+                  FROM {events_table()}
+                 WHERE action = ANY(%s) AND status IN ('success', 'deferred')
+                   AND completed_at > now() - interval '24 hours') recent
+         GROUP BY action
+        """,
+        ([action for action, _label, _unit in THROUGHPUT_QUEUES],),
+    )
+    done = {str(row[0]): (int(row[1] or 0), int(row[2] or 0)) for row in cur.fetchall()}
+    cur.execute(
+        f"""
+        SELECT
+            (SELECT COALESCE(sum(GREATEST(0, ss.profile_total_count - ss.profile_ready_count
+                                             - ss.profile_failed_count - ss.profile_skipped_count)), 0)
+               FROM {table('status_summary')} ss
+               JOIN {table('catalog_sources')} s USING (catalog_instance_id)
+              WHERE s.rebind_status='active'),
+            (SELECT GREATEST(0, (SELECT count(*) FROM {_work_table('published_source_profiles')})
+                               - (SELECT count(*) FROM {_work_table('edge_profiles')}))),
+            (SELECT GREATEST(0,
+                (SELECT count(*) FROM {table('catalog_tracks')} t
+                   JOIN {table('catalog_state')} c USING (catalog_instance_id)
+                   JOIN {table('catalog_sources')} s USING (catalog_instance_id)
+                  WHERE t.published_generation=c.published_generation AND t.available
+                    AND t.analysis_eligible AND s.rebind_status='active')
+                - (SELECT count(*) FROM {_work_table('loudness_tracks')}))),
+            NULL,
+            (SELECT count(*) FROM {_work_table('credits_jobs')}
+              WHERE (status IN ('pending', 'failed') OR (status='running' AND lease_until<now()))
+                AND rechecks=0)
+        """
+    )
+    left = cur.fetchone() or ()
+    cur.close()
+    db.commit()
+    queues = []
+    for index, (action, label, _unit) in enumerate(THROUGHPUT_QUEUES):
+        last_hour, last_day = done.get(action, (0, 0))
+        remaining = int(left[index]) if index < len(left) and left[index] is not None else None
+        eta = remaining / last_hour if remaining is not None and last_hour > 0 else None
+        queues.append({"action": action, "label": label, "last_hour": last_hour, "last_day": last_day,
+                       "remaining": remaining, "eta_hours": eta})
+    return queues
+
+
+def yield_status(db):
+    """The watchdog's current yield (S12): what it waits for, and each
+    schedule AudioMuse refused and will retry with how long ago it was
+    refused (``cron_retry``, AudioMuse 3.3.0+; None without it)."""
+    cur = db.cursor()
+    cur.execute(f"SELECT mode, reason FROM {control_table()} WHERE name='catalog_reconcile'")
+    control = cur.fetchone()
+    waiting_for = None
+    if control and str(control[0]) == "waiting" and str(control[1] or "").startswith("yield:"):
+        waiting_for = str(control[1])[len("yield:"):]
+    refused = None
+    cur.execute("SELECT to_regclass('cron_retry') IS NOT NULL")
+    if cur.fetchone()[0]:
+        cur.execute(
+            """SELECT task_type, EXTRACT(EPOCH FROM now())
+                      - NULLIF(to_jsonb(r)->>'first_blocked_at', '')::double precision
+                 FROM cron_retry r ORDER BY task_type LIMIT 10"""
+        )
+        refused = [(str(task_type), float(age) if age is not None else None)
+                   for task_type, age in cur.fetchall()]
+    cur.close()
+    db.commit()
+    return {"waiting_for": waiting_for, "refused": refused}
+
+
 # (singular, plural) of what one unit of each action is, in report order:
 # tracks first.
 ACTION_UNITS = {

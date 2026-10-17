@@ -105,6 +105,18 @@ Less work while idle (WP4: the scheduler plan's S7 and S8).
   (every tick reported, as each AudioMuse job is a fresh process). An idle
   tick on a small test library went from 59 to 26 database statements.
 
+The scheduler panel shows throughput (WP5: the scheduler plan's S12).
+
+- For waveforms, edges, loudness, relationships and credits: what was done
+  in the last hour and the last 24 hours (from the reconcile journal), what
+  is left (about, for edges and loudness), and the time left at the last
+  hour's rate.
+- The number of files analyzed at once, and the analysis queues' time left
+  at the next higher number this host's cores allow, estimated from the
+  bench (an estimate, not a measurement of this host).
+- AudioMuse schedules waiting for their retry, which Lumae yields to, and
+  how long ago each was refused (AudioMuse 3.3.0 and later).
+
 ## 1.7.1 (2026-10-13)
 
 Follow-ups from testing 1.7.0 against AudioMuse's scheduler changes
