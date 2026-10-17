@@ -297,6 +297,142 @@ def test_one_off_worker_is_closed_after_its_file(tmp_path, exec_mode):
         iso._pool_lock.release()
 
 
+# ------------------------------------------- dedicated workers (plan WP1b)
+
+
+def _in_thread(run):
+    """``run()`` on a new thread; returns its result or raises its exception."""
+    box = {}
+
+    def target():
+        try:
+            box["value"] = run()
+        except BaseException as exc:  # noqa: BLE001 - re-raised below
+            box["error"] = exc
+
+    thread = threading.Thread(target=target)
+    thread.start()
+    thread.join(60)
+    assert not thread.is_alive()
+    if "error" in box:
+        raise box["error"]
+    return box["value"]
+
+
+def test_dedicated_worker_is_reused_by_its_thread_at_its_nice_level_and_stopped_on_leaving(tmp_path):
+    media = _media(tmp_path)
+    parent_nice = os.nice(0)
+
+    def run():
+        with iso.dedicated_worker(nice=5) as slot:
+            first = iso.run_isolated(fakes.niceness, media, limit_seconds=60)
+            second = iso.run_isolated(fakes.niceness, media, limit_seconds=60)
+            assert slot.worker is not None and slot.worker.pid == first["pid"]
+        return first, second
+
+    first, second = _in_thread(run)
+    assert first["pid"] == second["pid"] != os.getpid()
+    assert first["nice"] == min(19, parent_nice + 5)
+    assert _gone(first["pid"])
+    assert not iso._dedicated_slots
+
+
+def test_each_dedicated_thread_has_its_own_worker_at_once(tmp_path):
+    media = _media(tmp_path)
+    barrier, seen = threading.Barrier(3, timeout=60), []
+
+    def run():
+        with iso.dedicated_worker():
+            pid = iso.run_isolated(fakes.describe_process, media, limit_seconds=60)["pid"]
+            barrier.wait()  # all three workers are alive together
+            seen.append((pid, iso.run_isolated(fakes.describe_process, media, limit_seconds=60)["pid"]))
+
+    threads = [threading.Thread(target=run) for _ in range(3)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(60)
+    assert len(seen) == 3 and all(first == again for first, again in seen)
+    assert len({first for first, _ in seen}) == 3
+    assert all(_gone(first) for first, _ in seen)
+
+
+def test_a_dedicated_worker_takes_the_exec_path_even_on_a_lone_main_thread(tmp_path, fork_mode):
+    media = _media(tmp_path)
+    with iso.dedicated_worker():
+        seen = iso.run_isolated(fakes.describe_process, media, limit_seconds=60)
+    assert seen["exec_worker"]
+    assert _gone(seen["pid"])
+
+
+def test_cancel_kills_the_threads_file_and_the_next_file_gets_a_new_worker(tmp_path):
+    media = _media(tmp_path)
+    pid_file = tmp_path / "pid"
+    token, slots, outcome = object(), [], {}
+
+    def run():
+        with iso.dedicated_worker() as slot:
+            slots.append(slot)
+            slot.begin(token)
+            began = time.monotonic()
+            try:
+                iso.run_isolated(fakes.sleep_forever, media, limit_seconds=60, pid_file=str(pid_file))
+            except iso.AnalysisCancelled:
+                outcome["cancelled_after"] = time.monotonic() - began
+            finally:
+                slot.end()
+            outcome["next"] = iso.run_isolated(fakes.describe_process, media, limit_seconds=60)["pid"]
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    deadline = time.monotonic() + 30
+    while not (pid_file.exists() and pid_file.read_text()):
+        assert time.monotonic() < deadline
+        time.sleep(0.05)
+    hung = int(pid_file.read_text())
+    assert not slots[0].cancel(object())  # another file's token: nothing happens
+    assert slots[0].cancel(token)
+    thread.join(30)
+    assert outcome["cancelled_after"] < 10
+    assert outcome["next"] != hung and _gone(hung) and _gone(outcome["next"])
+
+
+def test_a_cancelled_file_that_has_not_started_raises_before_any_worker_starts(tmp_path):
+    media = _media(tmp_path)
+
+    def run():
+        with iso.dedicated_worker() as slot:
+            token = object()
+            slot.begin(token)
+            assert slot.cancel(token)
+            with pytest.raises(iso.AnalysisCancelled):
+                iso.run_isolated(fakes.describe_process, media, limit_seconds=60)
+            assert slot.worker is None
+            slot.end()
+            return iso.run_isolated(fakes.describe_process, media, limit_seconds=60)["pid"]
+
+    assert _gone(_in_thread(run))
+
+
+def test_shutdown_stops_the_dedicated_workers(tmp_path):
+    media = _media(tmp_path)
+    started, release, pids = threading.Event(), threading.Event(), []
+
+    def run():
+        with iso.dedicated_worker():
+            pids.append(iso.run_isolated(fakes.describe_process, media, limit_seconds=60)["pid"])
+            started.set()
+            release.wait(60)
+
+    thread = threading.Thread(target=run)
+    thread.start()
+    assert started.wait(60)
+    iso.shutdown()
+    assert _gone(pids[0])
+    release.set()
+    thread.join(30)
+
+
 # ------------------------------------------------------- fork path isolation
 
 

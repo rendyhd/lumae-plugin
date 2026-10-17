@@ -34,6 +34,7 @@ from .edge_profile_store import (
     edge_payload_sql, edge_schema_v3_ready, upgrade_stored_edges,
 )
 from . import analysis_isolation
+from . import parallel_analysis
 from . import migrations
 from . import optional_storage
 from . import credits_service, credits_store, personal_discovery, music_metadata
@@ -474,18 +475,54 @@ def analysis_time_limit_seconds():
     )
 
 
-def run_file_analysis(analyzer, path, **kwargs):
+def run_file_analysis(analyzer, path, limit_seconds=None, **kwargs):
     """Run one file analysis in a child process under the hard limit (LUM-018).
 
     The host puts no timeout on the task (see ``enqueue_bounded``), and the
     analyzer's soft deadline cannot interrupt a decoder hung in native code.
     The setting is the analyzer's soft deadline, passed with each file, and
     the child is killed 30 s after it, so a progressing analysis stops at the
-    soft deadline first. Failures raise with a LUM-007 category.
+    soft deadline first. Failures raise with a LUM-007 category. A parallel
+    analysis thread (WP1b) passes ``limit_seconds``, read on the tick's own
+    thread: it reads no setting itself.
     """
-    return analysis_isolation.run_isolated(
-        analyzer, path, limit_seconds=analysis_time_limit_seconds(), **kwargs
-    )
+    if limit_seconds is None:
+        limit_seconds = analysis_time_limit_seconds()
+    return analysis_isolation.run_isolated(analyzer, path, limit_seconds=limit_seconds, **kwargs)
+
+
+def configured_background_workers():
+    """The setting ``background_workers``: ``auto`` or 1-8 (performance plan WP1b)."""
+    return parallel_analysis.normalize_setting(
+        get_setting("background_workers", parallel_analysis.DEFAULT_SETTING))
+
+
+def save_background_workers(form):
+    """Store the settings form's ``background_workers`` when it sent one."""
+    raw = form.get("background_workers")
+    if raw is not None:
+        set_setting("background_workers", parallel_analysis.normalize_setting(raw))
+
+
+def background_workers():
+    """K, the parallel analysis threads of a reconcile tick (setting
+    ``background_workers``; ``auto`` sized from this process's cores and
+    memory). One when it cannot be read."""
+    try:
+        return parallel_analysis.resolve_workers(configured_background_workers())
+    except Exception:
+        logger.warning("lumae_analysis could not size the parallel analysis; analysing one file at a time")
+        return 1
+
+
+def background_batch_limit():
+    """Waveform tracks a background batch claims: the admin batch size, or with
+    K analysis threads (WP1b) K times MAX_BACKFILL_BATCH_SIZE, so a batch
+    keeps every thread busy for several files before it drains."""
+    pool = parallel_analysis.current()
+    if pool is not None and pool.parallel:
+        return max(configured_backfill_limit(), pool.workers * MAX_BACKFILL_BATCH_SIZE)
+    return configured_backfill_limit()
 
 
 def analysis_failure_code(track_id, exc, context="failed"):
@@ -1180,6 +1217,14 @@ MAX_TICK_ACTIONS = 100
 
 
 def _reconcile_tick(db, report, host_yield, every_source=False):
+    """The tick's actions (``_run_reconcile_actions``) with its K parallel
+    analysis threads (WP1b), started on first use and stopped, with their
+    analysis workers, when the tick ends."""
+    with parallel_analysis.tick_scope(background_workers()):
+        return _run_reconcile_actions(db, report, host_yield, every_source)
+
+
+def _run_reconcile_actions(db, report, host_yield, every_source=False):
     """Due actions in priority order until the budget is used (plan S2).
 
     The order is unchanged: on-demand work AudioMuse refused to queue, a batch
@@ -4152,44 +4197,85 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="backgroun
                     update_edge_job(get_db(), catalog_instance_id, rest, "failed", "edge-enqueue-failed")
                     outcomes.append({"track_id": rest["track_id"], "status": "released"})
                 break
-        if not update_edge_job(get_db(), catalog_instance_id, job, "running"):
-            continue
-        info = None
-        try:
-            if maintenance_paused() or not edge_profiles_enabled():
-                raise ValueError("edge-worker-unavailable")
-            info = load_track_file(job["track_id"], catalog_instance_id=catalog_instance_id, server_id=server_id)
-            if not info or opaque_revision(info.get("media_signature")) != job["media_revision"]:
-                raise ValueError("edge-source-replaced")
-            # LN.4a: whole-track loudness from the same decode, beside the edge payload.
-            payload = run_file_analysis(loudness_v1.analyze_edge_file, info["file_path"],
-                                        catalog_instance_id=catalog_instance_id,
-                                        track_id=job["track_id"], media_revision=job["media_revision"])
-            measured = payload.pop(loudness_v1.LOUDNESS_KEY, None)
-            applied = publish_edge_profile(get_db(), catalog_instance_id, job, payload, info["media_signature"])
-            if not applied:
-                update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-source-replaced")
-            elif measured is not None:
-                loudness_stream.store_measurement(get_db(), catalog_instance_id, job["track_id"],
-                                                  job["media_revision"], measured)
-            outcomes.append({"track_id": job["track_id"], "status": "ready" if applied else "superseded"})
-        except Exception as exc:
-            rollback = getattr(get_db(), "rollback", None)
-            if callable(rollback):
-                rollback()
-            if is_unsupported_failure(exc):
-                # Terminal for this media revision: never retried until it changes.
-                update_edge_job(get_db(), catalog_instance_id, job, EDGE_UNSUPPORTED,
-                                analysis_isolation.edge_failure_reason(exc))
-                outcomes.append({"track_id": job["track_id"], "status": EDGE_UNSUPPORTED})
-            else:
-                update_edge_job(get_db(), catalog_instance_id, job, "failed",
-                                analysis_isolation.edge_failure_reason(exc))
-                outcomes.append({"track_id": job["track_id"], "status": "failed"})
-        finally:
-            if info:
-                remove_downloaded_file(info.get("cleanup_path"))
+        outcome, state = _prepare_edge(job, catalog_instance_id, server_id)
+        if state is not None:
+            try:
+                payload, error = run_file_analysis(loudness_v1.analyze_edge_file, state["path"],
+                                                   **state["kwargs"]), None
+            except Exception as exc:
+                payload, error = None, exc
+            outcome = _finish_edge(state, payload, error)
+        if outcome is not None:
+            outcomes.append(outcome)
     return outcomes
+
+
+def _prepare_edge(job, catalog_instance_id, server_id):
+    """An edge job's start and download (WP1b's split of ``analyze_edges_task``).
+
+    ``(outcome, None)`` when it settled here (None: another worker has the
+    job), or ``(None, state)`` with the downloaded file for the analysis and
+    ``_finish_edge``. Database and host calls only: the tick's own thread.
+    """
+    if not update_edge_job(get_db(), catalog_instance_id, job, "running"):
+        return None, None
+    state = {"job": job, "catalog_instance_id": catalog_instance_id, "info": None}
+    try:
+        if maintenance_paused() or not edge_profiles_enabled():
+            raise ValueError("edge-worker-unavailable")
+        info = state["info"] = load_track_file(job["track_id"], catalog_instance_id=catalog_instance_id,
+                                               server_id=server_id)
+        if not info or opaque_revision(info.get("media_signature")) != job["media_revision"]:
+            raise ValueError("edge-source-replaced")
+    except Exception as exc:
+        return _finish_edge(state, None, exc), None
+    # LN.4a: whole-track loudness from the same decode, beside the edge payload.
+    state["path"] = info["file_path"]
+    state["kwargs"] = {"catalog_instance_id": catalog_instance_id, "track_id": job["track_id"],
+                       "media_revision": job["media_revision"]}
+    return None, state
+
+
+def _finish_edge(state, payload, error):
+    """Publish an edge (and its loudness) or record its failure, and remove the
+    download; the tick's own thread."""
+    job, catalog_instance_id, info = state["job"], state["catalog_instance_id"], state["info"]
+    try:
+        if error is not None:
+            raise error
+        measured = payload.pop(loudness_v1.LOUDNESS_KEY, None)
+        applied = publish_edge_profile(get_db(), catalog_instance_id, job, payload, info["media_signature"])
+        if not applied:
+            update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-source-replaced")
+        elif measured is not None:
+            loudness_stream.store_measurement(get_db(), catalog_instance_id, job["track_id"],
+                                              job["media_revision"], measured)
+        return {"track_id": job["track_id"], "status": "ready" if applied else "superseded"}
+    except Exception as exc:
+        rollback = getattr(get_db(), "rollback", None)
+        if callable(rollback):
+            rollback()
+        if is_unsupported_failure(exc):
+            # Terminal for this media revision: never retried until it changes.
+            update_edge_job(get_db(), catalog_instance_id, job, EDGE_UNSUPPORTED,
+                            analysis_isolation.edge_failure_reason(exc))
+            return {"track_id": job["track_id"], "status": EDGE_UNSUPPORTED}
+        update_edge_job(get_db(), catalog_instance_id, job, "failed",
+                        analysis_isolation.edge_failure_reason(exc))
+        return {"track_id": job["track_id"], "status": "failed"}
+    finally:
+        if info:
+            remove_downloaded_file(info.get("cleanup_path"))
+
+
+def _release_edge(state):
+    """An edge whose analysis never finished (WP1b's drain cancel): released,
+    due again at once, like a background batch's unstarted jobs."""
+    try:
+        update_edge_job(get_db(), state["catalog_instance_id"], state["job"], "failed", "edge-enqueue-failed")
+    finally:
+        if state["info"]:
+            remove_downloaded_file(state["info"].get("cleanup_path"))
 
 
 def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
@@ -4218,6 +4304,9 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
             return {"status": "complete", "processed": 0}
         update_edge_backfill(db, catalog_instance_id, "running", started=started)
         pass_deadline = _pass_deadline(deadline)
+        pool = parallel_analysis.current()
+        if pool is not None and pool.parallel:
+            return _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, pass_deadline)
         reached, counts = cursor, {}
         while ids:
             for track_id in ids:
@@ -4246,6 +4335,71 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
         _rollback_if_possible(db)
         update_edge_backfill(db, catalog_instance_id, "failed", error=exc)
         raise
+
+
+def _serve_between():
+    """A parallel pass serves deferred on-demand work whenever a thread frees (WP1b)."""
+    serve_deferred_interactive()
+    return True
+
+
+def _paged(first_page, next_page):
+    """The units of ``first_page`` then of each ``next_page(last unit)``, read
+    lazily on the calling thread until a page comes back empty."""
+    page = first_page
+    while page:
+        yield from page
+        page = next_page(page[-1])
+
+
+def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, deadline):
+    """The edge pass's turn on the tick's K analysis threads (WP1b).
+
+    Each due track is claimed, started and downloaded here, analysed on a
+    thread and published here as it completes, serving deferred on-demand
+    work whenever a thread frees. The cursor stays at the last track of the
+    unbroken run of finished tracks, so a file cancelled at the drain window
+    (released, due again at once) is reached again next turn.
+    """
+    counts, limit = {}, analysis_time_limit_seconds()
+
+    def prepare(track_id):
+        jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
+        if not jobs:
+            return None
+        outcome, state = _prepare_edge(jobs[0], catalog_instance_id, server_id)
+        if state is None:
+            if outcome is not None:
+                counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+            return None
+        path, kwargs = state["path"], state["kwargs"]
+        return (lambda: run_file_analysis(loudness_v1.analyze_edge_file, path, limit_seconds=limit,
+                                          **kwargs)), state
+
+    def finish(_track_id, state, payload, error):
+        if isinstance(error, parallel_analysis.Cancelled):
+            _release_edge(state)
+            counts["released"] = counts.get("released", 0) + 1
+            return
+        outcome = _finish_edge(state, payload, error)
+        counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+
+    report_edge_runtime()
+    report = parallel_analysis.run(
+        _paged(ids, lambda last: edge_backfill_candidates(get_db(), catalog_instance_id, last,
+                                                          EDGE_BACKFILL_PAGE_SIZE)),
+        prepare, finish, pool=pool, deadline=deadline,
+        between=_serve_between)
+    processed = sum(counts.values())
+    if report.stopped is None and not report.cancelled:
+        # The walk reached the end inside this turn.
+        update_edge_backfill(db, catalog_instance_id, "complete", cursor="", processed=processed,
+                             next_retry_hours=EDGE_BACKFILL_RESWEEP_HOURS, completed=True)
+        return {"status": "complete", "processed": processed, **counts}
+    reached = report.reached()
+    update_edge_backfill(db, catalog_instance_id, "queued", cursor=cursor if reached is None else reached,
+                         processed=processed)
+    return {"status": "queued", "processed": processed, **counts}
 
 
 def next_loudness_backfill(db, server_id=None):
@@ -4288,6 +4442,10 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None):
             return {**result, "status": "complete"}
         loudness_backfill.update(db, catalog_instance_id, "running", started=not cursor)
         pass_deadline = _pass_deadline(deadline)
+        pool = parallel_analysis.current()
+        if pool is not None and pool.parallel:
+            return _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, due, page_size,
+                                           edges_enabled, pass_deadline, result)
         reached = cursor
         while due:
             measured = []
@@ -4322,24 +4480,102 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None):
 def _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured):
     """``ready`` (its measurement appended to ``measured``) or ``failed`` for one track: one
     download, one decode."""
-    info = None
+    outcome, state = _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revision)
+    if outcome is not None:
+        return outcome
     try:
-        info = load_track_file(track_id, catalog_instance_id=catalog_instance_id, server_id=server_id)
+        record, error = run_file_analysis(loudness_v1.measure_file, state["info"]["file_path"]), None
+    except Exception as exc:
+        record, error = None, exc
+    return _finish_loudness(state, record, error, measured)
+
+
+def _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revision):
+    """A loudness measurement's download (WP1b's split of ``_measure_loudness``):
+    ``("failed", None)`` or ``(None, state)``; the tick's own thread."""
+    state = {"db": db, "catalog_instance_id": catalog_instance_id, "track_id": track_id,
+             "media_revision": media_revision, "info": None}
+    try:
+        info = state["info"] = load_track_file(track_id, catalog_instance_id=catalog_instance_id,
+                                               server_id=server_id)
         # Nothing written yet: end the read transaction rather than hold it through the decode.
         db.commit()
         if not info or opaque_revision(info.get("media_signature")) != media_revision:
             raise ValueError("loudness-source-replaced")
-        record = run_file_analysis(loudness_v1.measure_file, info["file_path"])
-        measured.append({"track_id": track_id, "media_revision": media_revision, "record": record})
+    except Exception as exc:
+        return _finish_loudness(state, None, exc, None), None
+    return None, state
+
+
+def _finish_loudness(state, record, error, measured):
+    """``ready`` (the measurement appended to ``measured``) or ``failed`` (backing off), and the
+    download removed; the tick's own thread."""
+    db, info = state["db"], state["info"]
+    try:
+        if error is not None:
+            raise error
+        measured.append({"track_id": state["track_id"], "media_revision": state["media_revision"],
+                         "record": record})
         return "ready"
     except Exception as exc:
         _rollback_if_possible(db)
-        loudness_backfill.record_failure(db, catalog_instance_id, track_id, media_revision,
-                                         analysis_isolation.edge_failure_reason(exc))
+        loudness_backfill.record_failure(db, state["catalog_instance_id"], state["track_id"],
+                                         state["media_revision"], analysis_isolation.edge_failure_reason(exc))
         return "failed"
     finally:
         if info:
             remove_downloaded_file(info.get("cleanup_path"))
+
+
+def _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, due, page_size,
+                            edges_enabled, deadline, result):
+    """The loudness turn on the tick's K analysis threads (WP1b).
+
+    Downloads and publication stay here; a page of measurements (the admin
+    batch size) is published together as it fills. A file cancelled at the
+    drain window is not counted and keeps the cursor before it.
+    """
+    measured, limit = [], analysis_time_limit_seconds()
+
+    def prepare(item):
+        track_id, media_revision = item
+        outcome, state = _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revision)
+        if state is None:
+            result[outcome] += 1
+            return None
+        path = state["info"]["file_path"]
+        return (lambda: run_file_analysis(loudness_v1.measure_file, path, limit_seconds=limit)), state
+
+    def publish():
+        failed = _publish_loudness(db, catalog_instance_id, measured)
+        result["ready"] -= failed
+        result["failed"] += failed
+        measured.clear()
+
+    def finish(_item, state, record, error):
+        if isinstance(error, parallel_analysis.Cancelled):
+            if state["info"]:
+                remove_downloaded_file(state["info"].get("cleanup_path"))
+            return
+        result[_finish_loudness(state, record, error, measured)] += 1
+        if len(measured) >= page_size:
+            publish()
+
+    report = parallel_analysis.run(
+        _paged(due, lambda last: loudness_backfill.candidates(db, catalog_instance_id, last[0], page_size,
+                                                              edges_enabled=edges_enabled)),
+        prepare, finish, pool=pool, deadline=deadline, between=_serve_between)
+    publish()
+    result["processed"] = result["ready"] + result["failed"]
+    if report.stopped is None and not report.cancelled:
+        # The walk reached the end inside this turn.
+        loudness_backfill.update(db, catalog_instance_id, "complete", cursor="", processed=result["processed"],
+                                 next_retry_hours=loudness_backfill.RESWEEP_HOURS, completed=True)
+        return {**result, "status": "complete"}
+    reached = report.reached()
+    loudness_backfill.update(db, catalog_instance_id, "queued", cursor=cursor if reached is None else reached[0],
+                             processed=result["processed"])
+    return {**result, "status": "queued"}
 
 
 def _publish_loudness(db, catalog_instance_id, measured):
@@ -4480,6 +4716,23 @@ def interactive_demand_pending(db):
 
 def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
                       attempt_token=None, priority="background"):
+    outcome, state = _prepare_track(track_id, catalog_instance_id, server_id, attempt_token, priority)
+    if outcome is not None:
+        return outcome
+    try:
+        result, error = run_file_analysis(analyze_file, state["info"]["file_path"]), None
+    except Exception as exc:
+        result, error = None, exc
+    return _finish_track(state, result, error)
+
+
+def _prepare_track(track_id, catalog_instance_id, server_id, attempt_token, priority):
+    """A waveform's claim and download (WP1b's split of ``analyze_one_track``).
+
+    ``(outcome, None)`` when it settled here, or ``(None, state)`` with the
+    downloaded file for the analysis and ``_finish_track``. Database and host
+    calls only: it runs on the tick's own thread.
+    """
     if maintenance_paused():
         release_pending(
             [track_id], catalog_instance_id=catalog_instance_id,
@@ -4487,9 +4740,9 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
             tokens={track_id: attempt_token} if attempt_token else None,
             count_failure=False,
         )
-        return {"track_id": track_id, "status": "skipped_maintenance_paused"}
+        return {"track_id": track_id, "status": "skipped_maintenance_paused"}, None
     if catalog_instance_id and not attempt_token:
-        return {"track_id": track_id, "status": "superseded"}
+        return {"track_id": track_id, "status": "superseded"}, None
 
     def complete(result, status, error=None, media_sig=None, failure_code=None,
                  diagnostics=None):
@@ -4507,18 +4760,32 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
             track_id, catalog_instance_id=catalog_instance_id, server_id=server_id,
         )
     except MediaDownloadError as exc:
-        return complete(object(), "failed", str(exc), failure_code="download_unavailable")
+        return complete(object(), "failed", str(exc), failure_code="download_unavailable"), None
     if info is None:
-        return complete(object(), "skipped_no_file", "missing file path", failure_code="media_unavailable")
+        return complete(object(), "skipped_no_file", "missing file path", failure_code="media_unavailable"), None
+    state = {"track_id": track_id, "catalog_instance_id": catalog_instance_id, "server_id": server_id,
+             "attempt_token": attempt_token, "priority": priority, "info": info, "complete": complete}
     try:
         # JF.10: a Jellyfin track's tags, read from the downloaded original.
         file_tags.capture(get_db(), catalog_instance_id, track_id, info["file_path"])
-        result = run_file_analysis(analyze_file, info["file_path"])
+    except Exception as exc:
+        return _finish_track(state, None, exc), None
+    return None, state
+
+
+def _finish_track(state, result, error):
+    """Publish a waveform analysis (or its failure) and remove the download;
+    the tick's own thread."""
+    track_id, info, complete = state["track_id"], state["info"], state["complete"]
+    catalog_instance_id, priority = state["catalog_instance_id"], state["priority"]
+    try:
+        if error is not None:
+            raise error
         outcome = complete(result, "ready", media_sig=info["media_signature"])
         if outcome["status"] == "ready":
             if priority == "interactive":
                 # An on-demand track's edge follows at on-demand priority.
-                _schedule_edge_upgrade(track_id, catalog_instance_id, server_id, priority)
+                _schedule_edge_upgrade(track_id, catalog_instance_id, state["server_id"], priority)
             else:
                 _leave_edge_to_pass(track_id, catalog_instance_id)
         return outcome
@@ -4528,6 +4795,17 @@ def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
                         analysis_isolation.failure_diagnostics(exc))
     finally:
         remove_downloaded_file(info.get("cleanup_path"))
+
+
+def _release_track(state, reason):
+    """A waveform whose analysis never finished (WP1b's drain cancel): released
+    uncounted, due again at once."""
+    try:
+        release_pending([state["track_id"]], catalog_instance_id=state["catalog_instance_id"], reason=reason,
+                        tokens={state["track_id"]: state["attempt_token"]} if state["attempt_token"] else None,
+                        count_failure=False)
+    finally:
+        remove_downloaded_file(state["info"].get("cleanup_path"))
 
 
 def hook_track_id(song):
@@ -4905,7 +5183,10 @@ def analyze_tracks_task(
     deadline=None,
 ):
     """``deadline``: a watchdog tick's (``time.monotonic()``); no track starts
-    after it, and the unstarted ones are released uncounted (plan S2)."""
+    after it, and the unstarted ones are released uncounted (plan S2).
+
+    Inside a tick with K analysis threads (WP1b) a background batch analyses
+    K files at once (``_analyze_tracks_parallel``)."""
     ids = parse_ids(",".join(ids or []))
     if maintenance_paused():
         release_pending(
@@ -4933,7 +5214,10 @@ def analyze_tracks_task(
             "deferred": len(ids), "superseded": len(ids),
         }
 
-    if priority == "background" and len(ids) > MAX_BACKFILL_BATCH_SIZE:
+    pool = parallel_analysis.current() if priority == "background" else None
+    if pool is not None and not pool.parallel:
+        pool = None
+    if priority == "background" and len(ids) > MAX_BACKFILL_BATCH_SIZE * (pool.workers if pool else 1):
         # Drain 0.8.0's already-persisted 250-track RQ jobs quickly after an
         # upgrade. Their rows become retryable and one bounded chain owns the
         # remaining durable work; interactive requests can promote any of them now.
@@ -4962,6 +5246,10 @@ def analyze_tracks_task(
             "skipped": 0,
             "deferred": len(ids),
         }
+    if pool is not None:
+        results, attempted = _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id,
+                                                      attempt_tokens, deadline)
+        return _tracks_summary(results, attempted, catalog_instance_id, priority)
     results = []
     attempted = 0
     for index, track_id in enumerate(ids):
@@ -5023,6 +5311,80 @@ def analyze_tracks_task(
         _safe_progress("analyzing volume and ramps", current=index + 1, total=len(ids))
         if priority == "background" and catalog_instance_id:
             heartbeat_profile_backfill(catalog_instance_id)
+    return _tracks_summary(results, attempted, catalog_instance_id, priority)
+
+
+def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_tokens, deadline):
+    """A background waveform batch on the tick's K analysis threads (WP1b):
+    ``(results, attempted)``.
+
+    Each track is claimed, checked and downloaded here, analysed on a thread,
+    and published here as it completes. Deferred on-demand work is served
+    whenever a thread frees, before the next track. No track starts once the
+    tick's deadline is nearer than the batch's average time per file; a file
+    still running after the drain window is killed and its track released
+    uncounted, like the tracks never started.
+    """
+    results, attempted, paused = [], [0], [False]
+    limit = analysis_time_limit_seconds()
+    tokens = attempt_tokens or {}
+
+    def between():
+        serve_deferred_interactive()
+        if catalog_instance_id:
+            heartbeat_profile_backfill(catalog_instance_id)
+        if maintenance_paused():
+            paused[0] = True
+            return False
+        return True
+
+    def prepare(track_id):
+        _safe_progress("analyzing volume and ramps", current=len(results), total=len(ids))
+        if catalog_instance_id and track_id not in tokens:
+            results.append({"track_id": track_id, "status": "superseded"})
+            return None
+        disposition = profile_task_disposition(
+            track_id, catalog_instance_id=catalog_instance_id, server_id=server_id, priority="background")
+        if disposition != "analyze":
+            results.append({"track_id": track_id, "status": disposition})
+            return None
+        attempted[0] += 1
+        outcome, state = _prepare_track(track_id, catalog_instance_id, server_id,
+                                        tokens.get(track_id) if catalog_instance_id else None, "background")
+        if outcome is not None:
+            results.append(outcome)
+            return None
+        path = state["info"]["file_path"]
+        return (lambda: run_file_analysis(analyze_file, path, limit_seconds=limit)), state
+
+    def finish(track_id, state, result, error):
+        if isinstance(error, parallel_analysis.Cancelled):
+            attempted[0] -= 1
+            _release_track(state, "The Lumae watchdog tick's time was used")
+            results.append({"track_id": track_id, "status": "deferred_tick_deadline"})
+        else:
+            results.append(_finish_track(state, result, error))
+        _safe_progress("analyzing volume and ramps", current=len(results), total=len(ids))
+        if catalog_instance_id:
+            heartbeat_profile_backfill(catalog_instance_id)
+
+    report = parallel_analysis.run(ids, prepare, finish, pool=pool, deadline=deadline, between=between)
+    remaining = ids[len(report.taken):]
+    if remaining:
+        status = "skipped_maintenance_paused" if paused[0] else "deferred_tick_deadline"
+        release_pending(
+            remaining,
+            catalog_instance_id=catalog_instance_id,
+            reason=("Lumae background maintenance was paused during the batch" if paused[0]
+                    else "The Lumae watchdog tick's time was used"),
+            tokens=attempt_tokens,
+            count_failure=False,
+        )
+        results.extend({"track_id": item_id, "status": status} for item_id in remaining)
+    return results, attempted[0]
+
+
+def _tracks_summary(results, attempted, catalog_instance_id, priority):
     summary = {
         "attempted": attempted,
         "ready": sum(1 for result in results if result["status"] == "ready"),
@@ -5728,7 +6090,7 @@ def profile_backfill_task(server_id, catalog_instance_id, deadline=None):
         )
         recover_stale_pending_profiles(catalog_instance_id)
         ids = find_backfill_ids(
-            configured_backfill_limit(),
+            background_batch_limit(),
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
             include_failed=False,
@@ -6392,6 +6754,7 @@ def settings():
                     request.form.get("backfill_batch_size") or DEFAULT_BACKFILL_BATCH_SIZE
                 )
                 set_setting("backfill_batch_size", batch_size)
+                save_background_workers(request.form)
                 source = resolve_profile_source(
                     catalog_instance_id=request.form.get("catalog_instance_id"),
                     server_id=request.form.get("server_id"),
@@ -6488,6 +6851,7 @@ def settings():
                     request.form.get("backfill_batch_size") or DEFAULT_BACKFILL_BATCH_SIZE
                 )
                 set_setting("backfill_batch_size", batch_size)
+                save_background_workers(request.form)
                 message = "Lumae analysis settings saved."
         except (KeyError, ValueError, CatalogScanError, RuntimeError) as exc:
             error = str(exc)

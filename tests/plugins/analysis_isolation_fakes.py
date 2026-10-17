@@ -119,3 +119,8 @@ def describe_process(path):
 
 def echo(path, **kwargs):
     return {"path": path, "kwargs": kwargs, "pid": os.getpid(), "pair": (1, b"\x00\xff")}
+
+
+def niceness(path):
+    """The child's pid and CPU niceness."""
+    return {"pid": os.getpid(), "nice": os.nice(0)}

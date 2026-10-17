@@ -43,8 +43,12 @@ diagnostics:
   again, uncounted. A killed or crashed worker is reaped and replaced. The
   pooled worker is reused only by the thread that started it, because its
   ``PR_SET_PDEATHSIG`` fires when that thread exits; a call made while another
-  thread uses it gets a one-off worker. Its environment omits credential-like
-  variables. That is hygiene, not a security boundary: it runs as the same
+  thread uses it gets a one-off worker. A thread inside ``dedicated_worker``
+  (the parallel analysis threads of a reconcile tick, performance plan WP1b)
+  has its own worker instead, reused for every file it analyses until it
+  leaves, at a lower CPU priority; another thread can ``cancel`` its file,
+  which kills the worker and raises ``AnalysisCancelled`` in the thread. Its
+  environment omits credential-like variables. That is hygiene, not a security boundary: it runs as the same
   user and could read the parent's ``/proc/<pid>/environ``.
 * Only the path and keyword arguments go to the child, and only the result
   comes back, as one JSON line (bytes, tuples and dataclasses are tagged). No
@@ -529,6 +533,12 @@ def _child_main():
         faulthandler.enable()
     except Exception:
         pass
+    nice = hello.get("nice")
+    if isinstance(nice, int) and 0 < nice <= 19:
+        try:
+            os.nice(nice)
+        except (AttributeError, OSError):
+            pass
     sys.path[:] = [entry for entry in hello.get("sys_path", sys.path) if entry]
     _stand_in_package(hello["plugin_dir"])
     for module in hello.get("preload", ()):
@@ -657,6 +667,10 @@ class _WorkerGone(Exception):
     """The child exited or broke its protocol before answering."""
 
 
+class AnalysisCancelled(RuntimeError):
+    """Another thread cancelled this thread's file (``DedicatedWorker.cancel``)."""
+
+
 def _signal_name(number):
     try:
         return signal.Signals(number).name
@@ -709,7 +723,7 @@ class _LineReader:
 class _Worker:
     """The exec path: a pooled ``sys.executable`` worker serving many files."""
 
-    def __init__(self, startup_timeout):
+    def __init__(self, startup_timeout, nice=0):
         command = [sys.executable, "-c", _BOOTSTRAP, os.path.abspath(__file__)]
         try:
             # No preexec_fn and no new session: safe with threads, and the
@@ -733,6 +747,7 @@ class _Worker:
                 "plugin_dir": os.path.dirname(os.path.abspath(__file__)),
                 "sys_path": path,
                 "preload": _PRELOAD,
+                **({"nice": int(nice)} if nice else {}),
             })
             ready = self.read(time.monotonic() + startup_timeout)
         except _WorkerGone as exc:
@@ -905,6 +920,10 @@ class _ForkedChild:
 
 _pool_lock = threading.Lock()
 _pooled = None
+# Each thread's DedicatedWorker, for shutdown and a forked copy.
+_dedicated_lock = threading.Lock()
+_dedicated_slots = set()
+_dedicated = threading.local()
 # Set when a worker could not start: this process then analyzes in-process
 # instead of paying the start-up timeout again for every file.
 _unavailable = None
@@ -914,23 +933,122 @@ def _forget_after_fork():
     # A forked copy of the parent must not talk to (or hold open) its worker.
     # Closing the pipe objects (not their descriptors) keeps a later finalizer
     # from closing a reused descriptor number.
-    global _pool_lock, _pooled
+    global _pool_lock, _pooled, _dedicated_lock, _dedicated_slots
     _pool_lock = threading.Lock()
     worker, _pooled = _pooled, None
     if worker is not None:
         worker._close_pipes()
+    slots, _dedicated_slots = _dedicated_slots, set()
+    _dedicated_lock = threading.Lock()
+    for slot in slots:
+        slot._forget()
 
 
 if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_forget_after_fork)
 
 
+class DedicatedWorker:
+    """One thread's own exec worker (``dedicated_worker``; plan WP1b).
+
+    Started on the thread's first file and reused for every later one, so a
+    thread pays the worker start (about 1 s) once. Only its thread uses it,
+    and its ``PR_SET_PDEATHSIG`` fires when that thread exits. ``cancel`` is
+    the one call made from another thread.
+    """
+
+    def __init__(self, nice=0):
+        self.nice = int(nice or 0)
+        self.thread = threading.get_ident()
+        self.worker = None
+        self._file = None
+        self._cancelled = None
+        self._lock = threading.Lock()
+
+    def begin(self, token):
+        """The thread starts a file; ``cancel(token)`` cancels just that file."""
+        with self._lock:
+            self._file = token
+            self._cancelled = None
+
+    def end(self):
+        with self._lock:
+            self._file = None
+            self._cancelled = None
+
+    def cancelled(self):
+        with self._lock:
+            return self._cancelled is not None and self._cancelled is self._file
+
+    def cancel(self, token):
+        """Cancel the file ``token`` if it is this thread's current one (any thread).
+
+        Kills the worker when it is analysing, so the thread's
+        ``run_isolated`` raises ``AnalysisCancelled`` at once. Returns whether
+        the file was current.
+        """
+        with self._lock:
+            if self._file is not token:
+                return False
+            self._cancelled = token
+            worker = self.worker
+        if worker is not None and worker.owner_pid == os.getpid():
+            try:
+                os.kill(worker.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        return True
+
+    def close(self):
+        worker, self.worker = self.worker, None
+        if worker is not None:
+            worker.kill(0)
+
+    def _forget(self):
+        worker, self.worker = self.worker, None
+        if worker is not None:
+            worker._close_pipes()
+
+
+class _dedicated_worker:
+    def __init__(self, nice):
+        self.slot = DedicatedWorker(nice)
+
+    def __enter__(self):
+        if getattr(_dedicated, "slot", None) is not None:
+            raise RuntimeError("this thread already has a dedicated analysis worker")
+        with _dedicated_lock:
+            _dedicated_slots.add(self.slot)
+        _dedicated.slot = self.slot
+        return self.slot
+
+    def __exit__(self, *_exc):
+        _dedicated.slot = None
+        with _dedicated_lock:
+            _dedicated_slots.discard(self.slot)
+        self.slot.close()
+        return False
+
+
+def dedicated_worker(nice=0):
+    """Context manager: this thread analyses on its own worker until it leaves.
+
+    The worker runs at ``nice`` (0: the parent's priority). Leaving stops it.
+    """
+    return _dedicated_worker(nice)
+
+
 def shutdown():
-    """Stop the pooled worker and forget a start failure (exit, tests).
+    """Stop the pooled worker and every dedicated one, and forget a start
+    failure (exit, tests).
 
     Never waits for an analysis in progress: a busy worker is killed.
     """
     global _pooled, _unavailable
+    with _dedicated_lock:
+        slots = list(_dedicated_slots)
+    for slot in slots:
+        slot.close()
     idle = _pool_lock.acquire(timeout=1.0)
     try:
         worker, _pooled = _pooled, None
@@ -970,13 +1088,25 @@ def _use_fork():
 
 
 def _checkout(startup_timeout):
-    """(worker, pooled): the pooled worker, or a one-off when it is busy.
+    """(worker, pooled): the thread's dedicated worker, the pooled worker, or
+    a one-off when that is busy (``pooled`` is a DedicatedWorker, True or
+    False).
 
     The pooled worker is reused only by the thread that started it: its
     ``PR_SET_PDEATHSIG`` fires when that thread exits. Another thread gets a
     fresh pooled worker (the idle one is stopped).
     """
     global _pooled
+    slot = getattr(_dedicated, "slot", None)
+    if slot is not None:
+        if slot.worker is not None and not slot.worker.alive():
+            slot.close()
+        if slot.worker is None:
+            if _unavailable is not None:
+                raise _WorkerUnavailable(_unavailable)
+            slot.worker = _Worker(startup_timeout, nice=slot.nice)
+        slot.worker.healthy = False
+        return slot.worker, slot
     if not _pool_lock.acquire(blocking=False):
         if _unavailable is not None:
             raise _WorkerUnavailable(_unavailable)
@@ -1010,6 +1140,10 @@ def _checkin(worker, pooled, grace):
     global _pooled
     if not worker.healthy:
         worker.kill(grace)
+    if isinstance(pooled, DedicatedWorker):
+        if not worker.healthy and pooled.worker is worker:
+            pooled.worker = None
+        return
     if not pooled:
         if worker.healthy:
             worker.close()
@@ -1117,7 +1251,10 @@ def _run_exec(target, path, kwargs, reference, plugin_package, facts, limit_seco
               headroom, grace, startup):
     global _unavailable
     request = {"target": reference, "path": path, "kwargs": kwargs}
+    slot = getattr(_dedicated, "slot", None)
     for attempt in (1, 2):
+        if slot is not None and slot.cancelled():
+            raise AnalysisCancelled()
         try:
             worker, pooled = _checkout(startup)
         except _WorkerUnavailable as exc:
@@ -1134,12 +1271,19 @@ def _run_exec(target, path, kwargs, reference, plugin_package, facts, limit_seco
                 return _await_answer(
                     worker, facts, limit_seconds, headroom, plugin_package, False,
                 )
+            except IsolatedAnalysisError:
+                if slot is not None and slot.cancelled():
+                    worker.healthy = False
+                    raise AnalysisCancelled() from None
+                raise
             except _WorkerGone:
                 # Gone before it accepted the request (killed while idle, e.g.
                 # by the OOM killer): replace it and send once more, uncounted.
                 if attempt == 1:
                     continue
                 facts.update(worker.exit_facts(0.5))
+                if slot is not None and slot.cancelled():
+                    raise AnalysisCancelled() from None
                 raise IsolatedAnalysisError(ANALYSIS_CRASH, None, facts, worker.pid)
         finally:
             _checkin(worker, pooled, grace)
@@ -1153,7 +1297,8 @@ def run_isolated(target, path, *, limit_seconds, headroom_seconds=None,
     ``limit_seconds`` is the soft deadline (``deadline_seconds``, for a target
     that takes it); the hard limit is ``limit_seconds`` plus
     ``headroom_seconds``. The child is a fork of this process when it has one
-    Python thread (``_use_fork``), else the pooled exec worker. Returns the
+    Python thread (``_use_fork``) and no dedicated worker, else the thread's
+    dedicated worker or the pooled exec worker. Returns the
     target's result. A failure in the child raises ``IsolatedAnalysisError``
     with its category (``failure_category``): exceptions keep their category,
     the hard limit is ``analysis_timeout``, and a child that dies without
@@ -1174,7 +1319,7 @@ def run_isolated(target, path, *, limit_seconds, headroom_seconds=None,
     size = _byte_size(path)
     if size is not None:
         facts["byte_size"] = size
-    if _use_fork():
+    if getattr(_dedicated, "slot", None) is None and _use_fork():
         return _run_forked(target, path, kwargs, plugin_package, facts,
                            limit_seconds, headroom, grace)
     return _run_exec(target, path, kwargs, reference, plugin_package, facts,

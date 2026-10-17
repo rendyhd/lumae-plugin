@@ -401,6 +401,7 @@ def _published_track_count(source):
 
 
 def render_source_preparation_sections(batch_size):
+    workers = _pkg.configured_background_workers()
     try:
         sources = _pkg.resolve_catalog_source(_pkg.get_db())
     except Exception:
@@ -576,6 +577,14 @@ def render_source_preparation_sections(batch_size):
                   <span>Tracks per background batch (1-{_pkg.MAX_BACKFILL_BATCH_SIZE})</span>
                   <input name="backfill_batch_size" value="{batch_size}" inputmode="numeric">
                 </label>
+                <label class="lumae-field">
+                  <span>Files analyzed at once (auto or 1-{_pkg.parallel_analysis.MAX_WORKERS})</span>
+                  <input name="background_workers" value="{_pkg.escape(str(workers))}">
+                </label>
+                <p class="lumae-help">Auto analyzes up to {_pkg.parallel_analysis.MAX_AUTO_WORKERS}
+                  files at once on the AudioMuse worker, fewer when it has few cores or little
+                  memory, at a low priority. With more than one, a batch claims that many times
+                  {_pkg.MAX_BACKFILL_BATCH_SIZE} tracks.</p>
                 <div class="lumae-actions">
                   <button class="lumae-button-secondary" type="submit" name="action"
                     value="start_backfill"{backfill_disabled}>Prepare missing volume &amp; ramps</button>

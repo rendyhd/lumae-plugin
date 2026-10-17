@@ -23,6 +23,11 @@ Fixtures
     with the same stubs, e.g. to check idempotency or to migrate after seeding
     legacy rows.
 
+``_one_analysis_thread`` (autouse)
+    ``background_workers=auto`` resolves to one analysis thread, so a tick
+    runs every file on the calling thread as before WP1b. Tests of the
+    parallel passes open ``parallel_analysis.tick_scope(k)`` themselves.
+
 What is stubbed
 ---------------
 Only work that reaches outside the schema or the host: provider source
@@ -84,6 +89,25 @@ def _load_plugin():
     from test_lumae_analysis import load_plugin
 
     return load_plugin()
+
+
+@pytest.fixture(autouse=True)
+def _one_analysis_thread():
+    """A tick analyses one file at a time unless a test asks for more
+    (performance plan WP1b): ``background_workers=auto`` would size K from
+    the machine running the suite. Tests of K threads set it themselves.
+
+    Its own MonkeyPatch, not the ``monkeypatch`` fixture: an autouse fixture
+    is set up first and torn down last, so sharing it would keep a test's
+    patches (a refused ``psycopg2.connect``) through ``migrated_db``'s
+    teardown."""
+    _load_plugin()
+    from plugins.LumaeAnalysis import parallel_analysis
+
+    patch = pytest.MonkeyPatch()
+    patch.setattr(parallel_analysis, "available_cpus", lambda: parallel_analysis.CPU_RESERVE + 1)
+    yield
+    patch.undo()
 
 
 def _run_plugin_migration(db):

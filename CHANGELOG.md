@@ -42,6 +42,23 @@ Faster background analysis (performance plan 2026-10-16, WP1a).
   library finishes in the same turn. Like the waveform batch, either starts
   once 5 s of the tick are left, whatever its recent average (the average of
   a pass that fills the tick says nothing about what it needs).
+- The waveform batch, the edge pass and the loudness backfill analyse
+  several files at once inside the one reconcile tick (WP1b). The tick stays
+  one AudioMuse task, so AudioMuse is blocked no more than before: only the
+  analysis runs on K threads, each with its own analysis process at a low
+  CPU priority (nice 10), reused for the whole tick; claims, downloads,
+  publication and on-demand work stay on the tick's thread. On-demand work
+  is served whenever a thread frees. No file starts once the tick's deadline
+  is nearer than the pass's average time per file; files still running 5 s
+  after the deadline are stopped and their tracks released uncounted, due
+  again at once.
+- K is the new setting "Files analyzed at once" (`background_workers`):
+  `auto` (the default) takes the AudioMuse worker's cores minus two, a
+  quarter of its (or its container's) memory at 512 MiB per file, and at
+  most 4; 1 to 8 fixes it. 1 analyses one file at a time exactly as before.
+  With K above 1 a waveform batch claims K times 10 tracks. A CPU-bound
+  bench on 8 cores ran 1.86x faster at K=2, 3.38x at K=4 and 4.32x at K=6
+  (`scripts/perf/parallel_bench.py`); not yet measured on the test instance.
 
 ## 1.7.1 (2026-10-13)
 
