@@ -388,7 +388,10 @@ def _work_summary(cur):
                             WHERE status='pending' AND priority='interactive'
                               AND last_error='{DEFERRED_MARKER}')
             UNION ALL
-            SELECT CASE WHEN not_before>now() THEN 'retry' ELSE 'ready' END,
+            -- A re-check of an unchanged album (S7) is idle work: it runs on
+            -- the idle cadence and never arms minute cadence.
+            SELECT CASE WHEN rechecks>0 THEN 'idle'
+                        WHEN not_before>now() THEN 'retry' ELSE 'ready' END,
                    attempts,not_before
               FROM {_work_table('credits_jobs')}
              WHERE status IN('pending','failed') OR (status='running' AND lease_until<now())

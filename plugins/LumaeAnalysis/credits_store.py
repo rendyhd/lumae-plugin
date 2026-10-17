@@ -22,6 +22,15 @@ MAX_RECORD_BYTES = 2 * 1024 * 1024
 # not the month between rematches: full releases are tens of KB to megabytes.
 HTTP_CACHE_TTL_DAYS = 3
 HTTP_CACHE_PURGE_BATCH = 500
+# A found album is matched again after 30 days. One not found (unresolved) or
+# without credits (empty) after 7, then 30, then 90 days as its re-checks of
+# the same input go by (scheduler plan S7, AUD-16): weekly re-checks of every
+# unmatched album woke the watchdog to minute cadence once a week.
+COMPLETE_TTL_DAYS = 30
+RECHECK_TTL_DAYS = (7, 30, 90)
+# A finished walk of the catalogue's albums starts again after an hour, or
+# at once when a new catalogue generation was published (S8, AUD-19).
+SWEEP_REST_SECONDS = 3600
 
 
 def migrate(db):
@@ -41,6 +50,10 @@ def migrate(db):
             last_error TEXT, PRIMARY KEY(catalog_instance_id,album_id),
             CHECK(status IN('pending','running','complete','unresolved','empty','failed')))""",
         lambda cur: migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS {table('credits_jobs_ready')} ON {table('credits_jobs')}(not_before,priority DESC,requested_at)"),
+        # S7: re-checks of the same input since its last change; S8: when the last walk ended.
+        lambda cur: migrations.ensure_columns(cur, table('credits_jobs'), "rechecks INTEGER NOT NULL DEFAULT 0"),
+        lambda cur: migrations.ensure_columns(cur, table('credits_stream'), "swept_at TIMESTAMPTZ",
+                                              "swept_generation BIGINT"),
         f"""CREATE TABLE IF NOT EXISTS {table('credits_results')} (
             catalog_instance_id TEXT NOT NULL REFERENCES {table('catalog_sources')}(catalog_instance_id) ON DELETE CASCADE,
             album_id TEXT NOT NULL,input_fp TEXT NOT NULL,seq BIGINT NOT NULL,payload JSONB NOT NULL,
@@ -146,16 +159,26 @@ def request_album(db, catalog_id, album_id, priority=0):
     old = cur.fetchone()
     if old and old[0] != album["input_fp"]:
         _publish(cur, catalog_id, album_id, album["input_fp"], None)
-    cur.execute(f"""INSERT INTO {table('credits_jobs')}(catalog_instance_id,album_id,input_fp,priority)
+    # Written only when something changes (S8): a sweep visits every album, and an
+    # unchanged one used to be rewritten each time. An expired result with the same
+    # input is a re-check (S7): its expiry is cleared, so it is counted once.
+    jobs = table('credits_jobs')
+    cur.execute(f"""INSERT INTO {jobs}(catalog_instance_id,album_id,input_fp,priority)
         VALUES(%s,%s,%s,%s) ON CONFLICT(catalog_instance_id,album_id) DO UPDATE SET
-        input_fp=excluded.input_fp,priority=GREATEST({table('credits_jobs')}.priority,excluded.priority),
-        status=CASE WHEN {table('credits_jobs')}.input_fp<>excluded.input_fp
-            OR {table('credits_jobs')}.expires_at<=now() THEN 'pending' ELSE {table('credits_jobs')}.status END,
-        not_before=CASE WHEN {table('credits_jobs')}.input_fp<>excluded.input_fp
-            OR {table('credits_jobs')}.expires_at<=now() THEN now() ELSE {table('credits_jobs')}.not_before END,
-        lease_token=CASE WHEN {table('credits_jobs')}.input_fp<>excluded.input_fp THEN NULL ELSE {table('credits_jobs')}.lease_token END,
-        lease_until=CASE WHEN {table('credits_jobs')}.input_fp<>excluded.input_fp THEN NULL ELSE {table('credits_jobs')}.lease_until END,
-        attempts=CASE WHEN {table('credits_jobs')}.input_fp<>excluded.input_fp THEN 0 ELSE {table('credits_jobs')}.attempts END""",
+        input_fp=excluded.input_fp,priority=GREATEST({jobs}.priority,excluded.priority),
+        status=CASE WHEN {jobs}.input_fp<>excluded.input_fp
+            OR {jobs}.expires_at<=now() THEN 'pending' ELSE {jobs}.status END,
+        not_before=CASE WHEN {jobs}.input_fp<>excluded.input_fp
+            OR {jobs}.expires_at<=now() THEN now() ELSE {jobs}.not_before END,
+        expires_at=CASE WHEN {jobs}.input_fp<>excluded.input_fp
+            OR {jobs}.expires_at<=now() THEN NULL ELSE {jobs}.expires_at END,
+        rechecks=CASE WHEN {jobs}.input_fp<>excluded.input_fp THEN 0
+            WHEN {jobs}.expires_at<=now() THEN {jobs}.rechecks+1 ELSE {jobs}.rechecks END,
+        lease_token=CASE WHEN {jobs}.input_fp<>excluded.input_fp THEN NULL ELSE {jobs}.lease_token END,
+        lease_until=CASE WHEN {jobs}.input_fp<>excluded.input_fp THEN NULL ELSE {jobs}.lease_until END,
+        attempts=CASE WHEN {jobs}.input_fp<>excluded.input_fp THEN 0 ELSE {jobs}.attempts END
+        WHERE {jobs}.input_fp<>excluded.input_fp OR {jobs}.expires_at<=now()
+           OR {jobs}.priority<excluded.priority""",
                 (catalog_id, album_id, album["input_fp"], max(0, min(int(priority), 10))))
     cur.close()
     db.commit()
@@ -163,11 +186,27 @@ def request_album(db, catalog_id, album_id, priority=0):
 
 
 def sweep(db, catalog_id, limit=32):
+    """Request the next ``limit`` albums of the published catalogue; returns how many.
+
+    A walk that reached the end rests SWEEP_REST_SECONDS, or until a new
+    catalogue generation is published (S8): an idle library was walked again
+    and again, a page every tick.
+    """
     source(db, catalog_id)
     cur = db.cursor()
     ensure_stream(cur, catalog_id)
-    cur.execute(f"SELECT sweep_after FROM {table('credits_stream')} WHERE catalog_instance_id=%s", (catalog_id,))
-    after = cur.fetchone()[0]
+    cur.execute(f"""SELECT st.sweep_after,
+            st.sweep_after='' AND st.swept_at > now()-(%s*interval '1 second')
+            AND st.swept_generation IS NOT DISTINCT FROM c.published_generation,
+            c.published_generation
+        FROM {table('credits_stream')} st
+        LEFT JOIN {table('catalog_state')} c USING (catalog_instance_id)
+        WHERE st.catalog_instance_id=%s""", (SWEEP_REST_SECONDS, catalog_id))
+    after, resting, generation = cur.fetchone()
+    if resting:
+        cur.close()
+        db.commit()
+        return 0
     cur.execute(f"""SELECT a.album_id FROM {table('catalog_albums')} a JOIN {table('catalog_state')} s
         ON s.catalog_instance_id=a.catalog_instance_id AND s.published_generation=a.published_generation
         WHERE a.catalog_instance_id=%s AND a.available AND a.album_id>%s ORDER BY a.album_id LIMIT %s""",
@@ -178,8 +217,12 @@ def sweep(db, catalog_id, limit=32):
     for album_id in ids:
         request_album(db, catalog_id, album_id)
     cur = db.cursor()
-    cur.execute(f"UPDATE {table('credits_stream')} SET sweep_after=%s WHERE catalog_instance_id=%s",
-                (ids[-1] if len(ids) == limit else "", catalog_id))
+    wrapped = len(ids) < limit
+    cur.execute(f"""UPDATE {table('credits_stream')} SET sweep_after=%s,
+            swept_at=CASE WHEN %s THEN now() ELSE swept_at END,
+            swept_generation=CASE WHEN %s THEN %s ELSE swept_generation END
+        WHERE catalog_instance_id=%s""",
+                ("" if wrapped else ids[-1], wrapped, wrapped, generation, catalog_id))
     # Publish bounded tombstones as unavailable tracks/albums disappear.
     cur.execute(f"""SELECT r.album_id FROM {table('credits_results')} r
         WHERE r.catalog_instance_id=%s AND NOT EXISTS(
@@ -228,7 +271,7 @@ def finish(db, job, payload=None, error=None, retry_seconds=60):
     cur = db.cursor()
     ensure_stream(cur, job["catalog_id"])
     cur.execute(f"SELECT head_seq FROM {table('credits_stream')} WHERE catalog_instance_id=%s FOR UPDATE", (job["catalog_id"],))
-    cur.execute(f"""SELECT input_fp FROM {table('credits_jobs')} WHERE catalog_instance_id=%s AND album_id=%s
+    cur.execute(f"""SELECT input_fp, rechecks FROM {table('credits_jobs')} WHERE catalog_instance_id=%s AND album_id=%s
         AND lease_token=%s AND status='running' AND lease_until>now() FOR UPDATE""",
                 (job["catalog_id"], job["album_id"], job["token"]))
     row = cur.fetchone()
@@ -254,7 +297,9 @@ def finish(db, job, payload=None, error=None, retry_seconds=60):
         _publish(cur, job["catalog_id"], job["album_id"], job["input_fp"], payload)
         status = "unresolved" if payload["match_status"] == "unresolved" else (
             "complete" if any(subject["credits"] for subject in payload["subjects"]) else "empty")
-        ttl_days = 30 if status == "complete" else 7
+        rechecks = int(row[1] or 0)
+        ttl_days = (COMPLETE_TTL_DAYS if status == "complete"
+                    else RECHECK_TTL_DAYS[min(rechecks, len(RECHECK_TTL_DAYS) - 1)])
         cur.execute(f"""UPDATE {table('credits_jobs')} SET status=%s,lease_token=NULL,lease_until=NULL,
             priority=0,last_error=NULL,expires_at=now()+(%s*interval '1 day')
             WHERE catalog_instance_id=%s AND album_id=%s""",

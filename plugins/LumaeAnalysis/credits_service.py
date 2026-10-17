@@ -94,11 +94,27 @@ def run_one(catalog_id, *, db=None, client_factory=Client, critical=playback_pen
                 "album_id": job["album_id"], "retry_seconds": delay}
 
 
+# The catalogues swept in the current reconcile tick (None outside one): a
+# tick asks for a credits turn up to twice and sweeps once (S8, AUD-19).
+_tick_sweeps = None
+
+
+def begin_tick():
+    global _tick_sweeps
+    _tick_sweeps = set()
+
+
+def end_tick():
+    global _tick_sweeps
+    _tick_sweeps = None
+
+
 def reconcile(db, server_id=None, before_background=False, deadline=None):
     """One credits album per turn, with time sharing alongside existing background work.
 
     Before background work a turn waits 300 s (120 s for a requested album)
-    after the last one ended.
+    after the last one ended. Each source's next page of albums is requested
+    first, once per reconcile tick (``begin_tick``).
     """
     if paused():
         return None
@@ -112,7 +128,10 @@ def reconcile(db, server_id=None, before_background=False, deadline=None):
         catalog_id = source["catalog_instance_id"]
         if source.get("rebind_status", "active") != "active":
             continue
-        store.sweep(db, catalog_id)
+        if _tick_sweeps is None or catalog_id not in _tick_sweeps:
+            if _tick_sweeps is not None:
+                _tick_sweeps.add(catalog_id)
+            store.sweep(db, catalog_id)
         cur = db.cursor()
         cur.execute(f"""SELECT EXISTS(SELECT 1 FROM {table('credits_jobs')} j WHERE j.catalog_instance_id=s.catalog_instance_id
             AND j.not_before<=now() AND (j.status IN('pending','failed') OR (j.status='running' AND j.lease_until<now()))),

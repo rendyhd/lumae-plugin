@@ -30,7 +30,7 @@ from .edge_profile_store import (
     UNSUPPORTED as EDGE_UNSUPPORTED, mark_edge_jobs_deferred, claim_deferred_edge_jobs,
     edge_queue_counts, next_edge_backfill, update_edge_backfill, arm_edge_backfill,
     park_edge_backfill, edge_backfill_row, edge_statuses, EDGE_BACKFILL_RESWEEP_HOURS,
-    ensure_edge_backfill_sources, rewind_edge_backfill,
+    ensure_edge_backfill_sources, rewind_edge_backfill, edge_runtime_reported_within,
     edge_payload_sql, edge_schema_v3_ready, upgrade_stored_edges,
 )
 from . import analysis_bundle
@@ -1196,8 +1196,13 @@ def catalog_reconcile_task():
         if status != "yielded":
             # The waveform counts that /settings/status reads follow the
             # tick's work, and a publication left without a summary gets
-            # one (P2-1).
-            refresh_status_snapshot(db, publications=True)
+            # one (P2-1). A tick that changed no profile state counts them
+            # at most every STATUS_SNAPSHOT_IDLE_SECONDS (S8, AUD-19).
+            if _changed_profile_state(report):
+                refresh_status_snapshot(db, publications=True)
+            else:
+                refresh_status_snapshot(db, min_age_seconds=STATUS_SNAPSHOT_IDLE_SECONDS,
+                                        publications=True)
             report.remaining = _safe_remaining_work(db)
         report.cadence = (schedule or {}).get("cron_expr")
         report.log(status)
@@ -1218,13 +1223,28 @@ _COMPLETE_SETTLES = frozenset(("catalog_preparation", "relationships", "profile_
 MAX_TICK_ACTIONS = 100
 
 
+# Actions whose work changes the waveform counts the settings page shows.
+_PROFILE_STATE_ACTIONS = frozenset((
+    "interactive", "analysis_run", "catalog_preparation", "profile_backfill",
+))
+STATUS_SNAPSHOT_IDLE_SECONDS = 300
+
+
+def _changed_profile_state(report):
+    return any(entry["action"] in _PROFILE_STATE_ACTIONS for entry in report.actions)
+
+
 def _reconcile_tick(db, report, host_yield, every_source=False):
     """The tick's actions (``_run_reconcile_actions``) with its K parallel
     analysis threads (WP1b), started on first use and stopped, with their
-    analysis workers, when the tick ends."""
+    analysis workers, when the tick ends. Credits sweep once per tick (S8)."""
     _own_download_refused.clear()
-    with parallel_analysis.tick_scope(background_workers()):
-        return _run_reconcile_actions(db, report, host_yield, every_source)
+    credits_service.begin_tick()
+    try:
+        with parallel_analysis.tick_scope(background_workers()):
+            return _run_reconcile_actions(db, report, host_yield, every_source)
+    finally:
+        credits_service.end_tick()
 
 
 def _run_reconcile_actions(db, report, host_yield, every_source=False):
@@ -4098,6 +4118,12 @@ def report_edge_runtime(force=False):
     db = None
     try:
         db = get_db()
+        # S8: each job is a fresh fork of the worker, so the module global
+        # above never remembered a report and every tick wrote one; the
+        # worker's own row says when it last reported.
+        if not force and edge_runtime_reported_within(db, socket.gethostname(), EDGE_RUNTIME_REPORT_SECONDS):
+            _edge_runtime_reported_at = now
+            return
         status = edge_runtime_status()
         record_edge_runtime(db, socket.gethostname(), status)
         if status.get("available") and edge_setting_enabled():

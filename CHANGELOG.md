@@ -89,6 +89,22 @@ One download and one analysis call per track (WP2).
   empties; a worker start removes those of tasks that are gone. With K
   analysis threads each thread fetches its own file.
 
+Less work while idle (WP4: the scheduler plan's S7 and S8).
+
+- Credits: an album MusicBrainz could not match, or matched without
+  credits, is looked up again after 7 days, then 30, then 90, instead of
+  every week, and such a re-check runs on the hourly idle schedule instead
+  of putting the watchdog on minute cadence (one wave a week of every
+  unmatched album). A changed album is looked up at once, as before.
+- An idle tick does less: the credits walk over the catalogue's albums rests
+  an hour after it reaches the end (at once after a new catalogue), and a
+  tick walks once although it asks for a credits turn twice; an album whose
+  job did not change is no longer rewritten; the settings page's waveform
+  counts are refreshed by a tick that analysed nothing at most every
+  5 minutes; a worker reports its edge runtime at most every 10 minutes
+  (every tick reported, as each AudioMuse job is a fresh process). An idle
+  tick on a small test library went from 59 to 26 database statements.
+
 ## 1.7.1 (2026-10-13)
 
 Follow-ups from testing 1.7.0 against AudioMuse's scheduler changes

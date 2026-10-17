@@ -201,6 +201,20 @@ def record_edge_runtime(db, worker_id, status):
     cur.close()
 
 
+def edge_runtime_reported_within(db, worker_id, seconds):
+    """Whether this worker reported its edge runtime within ``seconds`` (S8):
+    each job runs in a fresh fork of the worker, so a module global never
+    remembered the last report and every tick wrote one."""
+    cur = db.cursor()
+    cur.execute(f"""SELECT EXISTS(SELECT 1 FROM {table('edge_runtime_state')}
+        WHERE worker_id=%s AND reported_at > now()-(%s*interval '1 second'))""",
+                (str(worker_id)[:200], float(seconds)))
+    recent = bool(cur.fetchone()[0])
+    db.commit()
+    cur.close()
+    return recent
+
+
 def edge_worker_runtime(db):
     """The freshest worker verdict: ``(analyzable, status)``.
 
