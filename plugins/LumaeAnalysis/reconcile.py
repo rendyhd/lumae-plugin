@@ -857,11 +857,20 @@ THROUGHPUT_QUEUES = (
 ANALYSIS_QUEUES = ("profile_backfill", "edge_backfill", "loudness_backfill")
 
 
+def _estimated_rows(name):
+    """SQL for the planner's row estimate of a table: the status route is
+    polled, and counting 100k+ rows each time is not worth an "about"."""
+    return (f"(SELECT GREATEST(0, COALESCE(max(reltuples), 0))::bigint FROM pg_class "
+            f"WHERE oid=to_regclass('{_work_table(name)}'))")
+
+
 def queue_throughput(db):
     """Per queue: units done in the last hour and the last 24 hours (from the
     journal, which keeps a day), units left and the ETA at the last hour's
     rate (S12). What is left is approximate for edges and loudness: published
-    waveforms without an edge, music tracks without a loudness record."""
+    waveforms without an edge, the summary's eligible tracks without a
+    loudness record, from the planner's row estimates. Read-only, and it never scans the library: the settings
+    status route renders it (P2-1)."""
     cur = db.cursor()
     cur.execute(
         f"""
@@ -891,15 +900,13 @@ def queue_throughput(db):
                FROM {table('status_summary')} ss
                JOIN {table('catalog_sources')} s USING (catalog_instance_id)
               WHERE s.rebind_status='active'),
-            (SELECT GREATEST(0, (SELECT count(*) FROM {_work_table('published_source_profiles')})
-                               - (SELECT count(*) FROM {_work_table('edge_profiles')}))),
+            (SELECT GREATEST(0, {_estimated_rows('published_source_profiles')}
+                               - {_estimated_rows('edge_profiles')})),
             (SELECT GREATEST(0,
-                (SELECT count(*) FROM {table('catalog_tracks')} t
-                   JOIN {table('catalog_state')} c USING (catalog_instance_id)
+                (SELECT COALESCE(sum(ss.eligible_track_count), 0) FROM {table('status_summary')} ss
                    JOIN {table('catalog_sources')} s USING (catalog_instance_id)
-                  WHERE t.published_generation=c.published_generation AND t.available
-                    AND t.analysis_eligible AND s.rebind_status='active')
-                - (SELECT count(*) FROM {_work_table('loudness_tracks')}))),
+                  WHERE s.rebind_status='active')
+                - {_estimated_rows('loudness_tracks')})),
             NULL,
             (SELECT count(*) FROM {_work_table('credits_jobs')}
               WHERE (status IN ('pending', 'failed') OR (status='running' AND lease_until<now()))
@@ -908,7 +915,6 @@ def queue_throughput(db):
     )
     left = cur.fetchone() or ()
     cur.close()
-    db.commit()
     queues = []
     for index, (action, label, _unit) in enumerate(THROUGHPUT_QUEUES):
         last_hour, last_day = done.get(action, (0, 0))
@@ -940,7 +946,6 @@ def yield_status(db):
         refused = [(str(task_type), float(age) if age is not None else None)
                    for task_type, age in cur.fetchall()]
     cur.close()
-    db.commit()
     return {"waiting_for": waiting_for, "refused": refused}
 
 
