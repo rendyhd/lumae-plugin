@@ -189,20 +189,41 @@ def safe_diagnostics(raw):
     return safe or None
 
 
+# Edge refusals a retry of the same media can never change
+# (``edge_profile_store.UNSUPPORTED_REASONS``): the only exception text that
+# crosses the process boundary, and only as one of these words.
+REFUSALS = (
+    "unqualified channel layout", "unsupported source sample rate",
+    "edge duration limit exceeded", "no audio stream",
+)
+
+
+def _refusal(exc):
+    if "EdgeProfileError" not in _mro_names(exc):
+        return None
+    message = str(exc)
+    return next((reason for reason in REFUSALS if reason in message), None)
+
+
 class IsolatedAnalysisError(RuntimeError):
     """An analysis failure reported by, or observed on, the child process.
 
-    ``str()`` carries only the category and the exception class name.
+    ``str()`` carries only the category, the exception class name and an
+    edge refusal from ``REFUSALS``.
     """
 
-    def __init__(self, category, error_type=None, diagnostics=None, pid=None):
+    def __init__(self, category, error_type=None, diagnostics=None, pid=None, refusal=None):
         self.category = category
         self.error_type = error_type
         self.diagnostics = safe_diagnostics(
             {**(diagnostics or {}), "category": category}
         )
         self.pid = pid
-        super().__init__(f"{category} ({error_type})" if error_type else category)
+        self.refusal = refusal if refusal in REFUSALS else None
+        detail = error_type or ""
+        if self.refusal:
+            detail = f"{detail}: {self.refusal}" if detail else self.refusal
+        super().__init__(f"{category} ({detail})" if detail else category)
 
 
 def _mro_names(exc):
@@ -444,19 +465,41 @@ def _accepts(func, name):
         return False
 
 
-def _error_message(exc, probe):
+def describe_failure(exc, facts=None):
+    """A failure as the child reports it: category, exception class, safe
+    diagnostics and an edge refusal. No exception text otherwise (it can hold
+    a path)."""
     category = failure_category(exc)
-    facts = probe.snapshot()
+    facts = dict(facts or {})
     facts["error_type"] = type(exc).__name__
     code = getattr(exc, "errno", None)
     if "FFmpegError" in _mro_names(exc) and isinstance(code, int):
         facts["errno"] = code
-    message = {
-        "event": "error",
+    described = {
         "category": category,
         "error_type": type(exc).__name__,
         "diagnostics": safe_diagnostics(facts),
     }
+    refusal = _refusal(exc)
+    if refusal:
+        described["refusal"] = refusal
+    return described
+
+
+def failure_from(described, pid=None):
+    """``IsolatedAnalysisError`` from ``describe_failure``'s answer (parent side)."""
+    described = described if isinstance(described, dict) else {}
+    return IsolatedAnalysisError(
+        _identifier_or(described.get("category"), "analysis_error"),
+        _identifier_or(described.get("error_type"), None),
+        described.get("diagnostics") if isinstance(described.get("diagnostics"), dict) else None,
+        pid, refusal=described.get("refusal"),
+    )
+
+
+def _error_message(exc, probe):
+    category = failure_category(exc)
+    message = {"event": "error", **describe_failure(exc, probe.snapshot())}
     # A MemoryError may leave the process unusable: report, then exit.
     return message, category == ANALYSIS_CRASH
 
@@ -1030,6 +1073,13 @@ class _dedicated_worker:
         return False
 
 
+def current_cancelled():
+    """Whether another thread cancelled this thread's current file (a
+    download between chunks asks); False outside ``dedicated_worker``."""
+    slot = getattr(_dedicated, "slot", None)
+    return slot is not None and slot.cancelled()
+
+
 def dedicated_worker(nice=0):
     """Context manager: this thread analyses on its own worker until it leaves.
 
@@ -1221,7 +1271,7 @@ def _await_answer(child, facts, limit_seconds, headroom, plugin_package, accepte
                 child.healthy = True
             raise IsolatedAnalysisError(
                 category, _identifier_or(message.get("error_type"), None),
-                facts, child.pid,
+                facts, child.pid, refusal=message.get("refusal"),
             )
         if event != "result":
             raise IsolatedAnalysisError(ANALYSIS_CRASH, None, facts, child.pid)

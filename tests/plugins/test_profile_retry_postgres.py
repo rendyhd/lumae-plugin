@@ -178,6 +178,7 @@ def test_worker_classifies_exceptions_without_leaking_text(edge_publication_db, 
         "cleanup_path": None,
     })
     monkeypatch.setattr(mod, "analyze_file", lambda path: (_ for _ in ()).throw(error))
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: False)  # the waveform-only call
     assert mod.analyze_one_track(track, SOURCE, "server-a", token)["status"] == "failed"
     state = row(db, track)
     assert state[1:3] == (code, code)

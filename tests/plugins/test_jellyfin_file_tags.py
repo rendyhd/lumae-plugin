@@ -504,7 +504,6 @@ def test_the_analysis_hook_and_profile_download_capture_tags(monkeypatch, tmp_pa
     monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
     monkeypatch.setattr(mod, "upsert_profile", lambda *args, **kwargs: True)
     monkeypatch.setattr(mod, "run_file_analysis", lambda *_args, **_kwargs: object())
-    monkeypatch.setattr(mod, "_schedule_edge_upgrade", lambda *args, **kwargs: None)
     monkeypatch.setattr(mod, "remove_downloaded_file", lambda _path: None)
     audio = tmp_path / "downloaded.flac"
     audio.write_bytes(b"x")

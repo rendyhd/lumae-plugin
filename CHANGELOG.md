@@ -60,6 +60,35 @@ Faster background analysis (performance plan 2026-10-16, WP1a).
   bench on 8 cores ran 1.86x faster at K=2, 3.38x at K=4 and 4.32x at K=6
   (`scripts/perf/parallel_bench.py`); not yet measured on the test instance.
 
+One download and one analysis call per track (WP2).
+
+- With edges on, the waveform backfill, on-demand work and AudioMuse's
+  per-song hook make a song's waveform, edge and loudness in one analysis
+  call on one download, instead of downloading and decoding it again for the
+  edge pass and the loudness backfill. Each analysis still decodes the file
+  itself, so every result equals what its own call gives (tested on 44.1,
+  48 and 96 kHz files). The song hook's file serves all three, so AudioMuse's
+  analysis runs about one edge analysis longer per song. Each analysis keeps
+  the per-file time limit; the call's hard limit covers both.
+- On-demand work no longer queues an AudioMuse task per track for its edge.
+- A file the edge analyzer refuses (more than two channels, unnamed WAV
+  layouts, DSF above 384 kHz) gets its waveform, an `unsupported` edge and
+  its loudness from the standalone meter in the same call. Through the
+  analysis child a refusal used to arrive without its reason, so such edges
+  were retried every 6 hours instead of being marked unsupported; the
+  refusal now crosses the process boundary (an allowlisted reason only).
+- The edge pass and the loudness backfill become a mop-up: songs analysed
+  with edges off, failed edges past their back-off, replaced media, the
+  6-hour re-sweep, and on existing installs every song whose edge predates
+  the loudness measurement.
+- Analysis downloads fetch the original file through the catalogue server's
+  own stream: Navidrome with `format=raw` (AudioMuse's download asks for a
+  stream that may be transcoded), Jellyfin `static=true`. A download that
+  fails falls back to AudioMuse's for the rest of the task. Files go to a
+  directory per task outside AudioMuse's `TEMP_DIR`, which its `clean_temp`
+  empties; a worker start removes those of tasks that are gone. With K
+  analysis threads each thread fetches its own file.
+
 ## 1.7.1 (2026-10-13)
 
 Follow-ups from testing 1.7.0 against AudioMuse's scheduler changes

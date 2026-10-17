@@ -1703,8 +1703,8 @@ def test_the_song_hook_refreshes_the_waveform_snapshot_at_most_every_30_s(monkey
     monkeypatch.setattr(mod, "mark_pending", lambda ids, *_args, **_kwargs: {ids[0]: "token"})
     monkeypatch.setattr(mod, "catalog_media_signature", lambda *_args, **_kwargs: "catalog-media:a")
     monkeypatch.setattr(mod, "analyze_file", lambda _path: object())
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: False)  # the waveform-only call
     monkeypatch.setattr(mod, "upsert_profile", lambda *_args, **_kwargs: True)
-    monkeypatch.setattr(mod, "_schedule_edge_upgrade", lambda *_args: None)
     monkeypatch.setattr(mod, "refresh_status_snapshot", lambda **kwargs: refreshes.append(kwargs))
 
     result = mod.analyze_song_hook(

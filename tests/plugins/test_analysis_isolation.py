@@ -910,7 +910,8 @@ def _task_db(db, monkeypatch, server):
     _seed(db, "track-a", "track-b", server=server)
     monkeypatch.setattr(mod, "get_db", lambda: db)
     monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
-    monkeypatch.setattr(mod, "_schedule_edge_upgrade", lambda *a, **k: None)
+    # The waveform-only call (edges off); the bundled call: test_bundle_paths_postgres.
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: False)
     monkeypatch.setattr(
         mod, "resolve_profile_source",
         lambda **_: {"catalog_instance_id": SOURCE, "server_id": server},

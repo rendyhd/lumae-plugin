@@ -58,7 +58,7 @@ def parallel(tick, monkeypatch, tmp_path):
     for module in (mod, reconcile):
         monkeypatch.setattr(module, "get_db", get_db)
 
-    def load(track_id, catalog_instance_id=None, server_id=None):
+    def load(track_id, catalog_instance_id=None, server_id=None, defer=False):
         _on_main()
         downloads.append(track_id)
         copy = tmp_path / "downloads" / f"{track_id}-{len(downloads)}.flac"
