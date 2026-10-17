@@ -150,6 +150,7 @@ from .reconcile import (
     DEFERRED_MARKER,
     IDLE_CRON as RECONCILE_IDLE_CRON,
     HostYield,
+    TICK_BUDGET_SECONDS,
     TickBudget,
     TickReport,
     action_averages,
@@ -4007,10 +4008,15 @@ DEFERRED = "deferred"
 EDGE_BACKGROUND_BUDGET_SECONDS = 60
 # SF.3: the stored-edge v3 upgrade's time per install or reconcile tick.
 EDGE_V3_UPGRADE_BUDGET_SECONDS = 20
-# One library-pass tick analyses edges for about this long, one track at a
-# time, serving on-demand work between tracks.
-EDGE_BACKFILL_TICK_SECONDS = 30
-EDGE_BACKFILL_TICK_MAX_TRACKS = 25
+# The library pass reads due tracks this many at a time, and pages on until
+# the tick's deadline (performance plan WP1a).
+EDGE_BACKFILL_PAGE_SIZE = 25
+
+
+def _pass_deadline(deadline):
+    """A library pass works until the tick's ``deadline``; called outside a
+    tick, for a tick's budget."""
+    return deadline if deadline is not None else time.monotonic() + TICK_BUDGET_SECONDS
 
 
 def host_queue_busy(exc):
@@ -4187,12 +4193,13 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="backgroun
 
 
 def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
-    """One library-pass tick: edges for a few published tracks, then yield.
+    """One library-pass tick: edges for published tracks until the tick's
+    deadline, then yield.
 
     Runs inside the reconcile tick after the waveform backfill. Analyses one
-    track at a time for about EDGE_BACKFILL_TICK_SECONDS, and not past the
-    tick's ``deadline``, serving on-demand work between tracks, and keeps its
-    cursor at the last track it reached.
+    track at a time until the tick's ``deadline`` (WP1a; it took a fixed 30 s
+    before), reading due tracks a page at a time, serving on-demand work
+    between tracks, and keeps its cursor at the last track it reached.
     """
     if maintenance_paused():
         return {"status": "paused", "processed": 0}
@@ -4204,28 +4211,35 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
     cursor = row.get("cursor") or ""
     started = not cursor
     try:
-        ids = edge_backfill_candidates(db, catalog_instance_id, cursor, EDGE_BACKFILL_TICK_MAX_TRACKS)
+        ids = edge_backfill_candidates(db, catalog_instance_id, cursor, EDGE_BACKFILL_PAGE_SIZE)
         if not ids:
             update_edge_backfill(db, catalog_instance_id, "complete", cursor="",
                                  next_retry_hours=EDGE_BACKFILL_RESWEEP_HOURS, completed=True)
             return {"status": "complete", "processed": 0}
         update_edge_backfill(db, catalog_instance_id, "running", started=started)
-        pass_deadline = time.monotonic() + EDGE_BACKFILL_TICK_SECONDS
-        if deadline is not None:
-            pass_deadline = min(pass_deadline, deadline)
+        pass_deadline = _pass_deadline(deadline)
         reached, counts = cursor, {}
-        for track_id in ids:
-            # Before the first track too: production's pass ran 81 s on
-            # average against its 30 s (AUD-20).
-            remaining = pass_deadline - time.monotonic()
-            if remaining <= 0:
+        while ids:
+            for track_id in ids:
+                # Before the first track too: production's pass ran 81 s on
+                # average against its 30 s (AUD-20).
+                remaining = pass_deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
+                for outcome in analyze_edges_task(jobs, catalog_instance_id, server_id,
+                                                  budget_seconds=remaining):
+                    counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+                reached = track_id
+            if reached != ids[-1] or time.monotonic() >= pass_deadline:
                 break
-            jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
-            for outcome in analyze_edges_task(jobs, catalog_instance_id, server_id,
-                                              budget_seconds=remaining):
-                counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
-            reached = track_id
+            ids = edge_backfill_candidates(get_db(), catalog_instance_id, reached, EDGE_BACKFILL_PAGE_SIZE)
         processed = sum(counts.values())
+        if not ids:
+            # The walk reached the end inside this turn.
+            update_edge_backfill(db, catalog_instance_id, "complete", cursor="", processed=processed,
+                                 next_retry_hours=EDGE_BACKFILL_RESWEEP_HOURS, completed=True)
+            return {"status": "complete", "processed": processed, **counts}
         update_edge_backfill(db, catalog_instance_id, "queued", cursor=reached, processed=processed)
         return {"status": "queued", "processed": processed, **counts}
     except Exception as exc:
@@ -4241,12 +4255,12 @@ def next_loudness_backfill(db, server_id=None):
 
 def loudness_backfill_task(server_id, catalog_instance_id, deadline=None):
     """One loudness turn (LN.4c): follow the published catalogue when its generation moved, then
-    measure a few due tracks on the standalone path and yield.
+    measure due tracks on the standalone path until the tick's deadline and yield.
 
-    Measures one track at a time for about ``loudness_backfill.TICK_SECONDS`` and at most the admin
-    batch size, not past the tick's ``deadline``, serving on-demand work between tracks, publishes
-    the turn's measurements together and keeps its cursor at the last track it reached. A worker
-    without PyAV parks the pass before downloading.
+    Measures one track at a time until the tick's ``deadline`` (WP1a; it took a fixed 30 s and one
+    page before), reading due tracks a page of the admin batch size at a time, serving on-demand
+    work between tracks, publishes each page's measurements together and keeps its cursor at the
+    last track it reached. A worker without PyAV parks the pass before downloading.
     """
     if maintenance_paused():
         return {"status": "paused", "processed": 0}
@@ -4264,28 +4278,39 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None):
             loudness_backfill.park(db, catalog_instance_id)
             return {**result, "status": "paused", "reason": "loudness_runtime_unavailable"}
         cursor = "" if row.get("status") == "complete" else (row.get("cursor") or "")
-        due = loudness_backfill.candidates(db, catalog_instance_id, cursor, configured_backfill_limit(),
-                                           edges_enabled=edge_profiles_enabled())
+        page_size = configured_backfill_limit()
+        edges_enabled = edge_profiles_enabled()
+        due = loudness_backfill.candidates(db, catalog_instance_id, cursor, page_size,
+                                           edges_enabled=edges_enabled)
         if not due:
             loudness_backfill.update(db, catalog_instance_id, "complete", cursor="",
                                      next_retry_hours=loudness_backfill.RESWEEP_HOURS, completed=True)
             return {**result, "status": "complete"}
         loudness_backfill.update(db, catalog_instance_id, "running", started=not cursor)
-        pass_deadline = time.monotonic() + loudness_backfill.TICK_SECONDS
-        if deadline is not None:
-            pass_deadline = min(pass_deadline, deadline)
-        reached, measured = cursor, []
-        for track_id, media_revision in due:
-            serve_deferred_interactive()
-            if time.monotonic() >= pass_deadline:
+        pass_deadline = _pass_deadline(deadline)
+        reached = cursor
+        while due:
+            measured = []
+            for track_id, media_revision in due:
+                serve_deferred_interactive()
+                if time.monotonic() >= pass_deadline:
+                    break
+                outcome = _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured)
+                result[outcome] += 1
+                reached = track_id
+            failed = _publish_loudness(db, catalog_instance_id, measured)
+            result["ready"] -= failed
+            result["failed"] += failed
+            if reached != due[-1][0] or time.monotonic() >= pass_deadline:
                 break
-            outcome = _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured)
-            result[outcome] += 1
-            reached = track_id
-        failed = _publish_loudness(db, catalog_instance_id, measured)
-        result["ready"] -= failed
-        result["failed"] += failed
+            due = loudness_backfill.candidates(db, catalog_instance_id, reached, page_size,
+                                               edges_enabled=edges_enabled)
         result["processed"] = result["ready"] + result["failed"]
+        if not due:
+            # The walk reached the end inside this turn.
+            loudness_backfill.update(db, catalog_instance_id, "complete", cursor="", processed=result["processed"],
+                                     next_retry_hours=loudness_backfill.RESWEEP_HOURS, completed=True)
+            return {**result, "status": "complete"}
         loudness_backfill.update(db, catalog_instance_id, "queued", cursor=reached, processed=result["processed"])
         return {**result, "status": "queued"}
     except Exception as exc:

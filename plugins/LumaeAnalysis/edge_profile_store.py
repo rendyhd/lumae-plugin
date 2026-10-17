@@ -508,8 +508,8 @@ def edge_backfill_candidates(db, catalog_id, after='', limit=100):
 
 
 # ---------------------------------------------------------------- library pass
-# The server walks the published library by track ID, one small batch per
-# reconcile tick, after the waveform backfill. A finished pass sweeps again
+# The server walks the published library by track ID, one turn per
+# reconcile tick until its deadline, after the waveform backfill. A finished pass sweeps again
 # after EDGE_BACKFILL_RESWEEP_HOURS so failed jobs past their back-off, and
 # tracks published since, are covered.
 EDGE_BACKFILL_RESWEEP_HOURS = 6

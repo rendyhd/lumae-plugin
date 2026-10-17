@@ -1,6 +1,7 @@
 """The loudness backfill (Lumae LN.4c; contract §3.9 "Publication", Auralscape D8).
 
-A library pass per source, one small batch per reconcile tick after the tick's other track work, so
+A library pass per source, one turn per reconcile tick (until its deadline) after the tick's other
+track work, so
 it runs only when no interactive or analysis work is waiting: music tracks of the published
 catalogue without a loudness record of the current version for their current media are measured on
 the standalone path (``loudness_v1.measure_file``; above 48 kHz through a conversion): one download
@@ -22,8 +23,7 @@ from plugin.api import table
 from . import migrations
 from .loudness_v1 import VERSION
 
-# A turn's budget (the reconcile tick also ends it) and its track cap (the admin batch size).
-TICK_SECONDS = 30
+# A turn works until the reconcile tick's deadline, a page of the admin batch size at a time.
 RESWEEP_HOURS = 6
 # Back-off after the 1st, 2nd, 3rd and later failure of the same media.
 RETRY_HOURS = (1, 6, 24, 72)

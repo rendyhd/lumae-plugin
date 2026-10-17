@@ -1,7 +1,9 @@
 """LN.4c: the loudness backfill on the real migrated schema: which tracks are due, back-off, the
 pass and its catalogue follow-up, a worker without PyAV, and the scheduler's bookkeeping."""
 import hashlib
+import time
 import wave
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -212,16 +214,14 @@ def test_the_pass_follows_the_catalogue_then_measures(migrated_db, plugin, monke
     monkeypatch.setattr(loudness_stream, "publish_tracks", lambda cur, source, measured: (
         publications.append([item["track_id"] for item in measured]) or publish(cur, source, measured)))
     first = plugin.loudness_backfill_task("server-a", SOURCE)
-    assert (first["status"], first["ready"], first["failed"]) == ("queued", 2, 1)
-    assert publications == [["t1", "t2"]]  # the turn publishes once
-    assert loudness_backfill.state(db, SOURCE)["cursor"] == "t3"
+    # The whole library fits in the turn (WP1a): it reaches the end and finishes the pass.
+    assert (first["status"], first["ready"], first["failed"]) == ("complete", 2, 1)
+    assert publications == [["t1", "t2"]]  # the page publishes once
     page = loudness_stream.bootstrap_page(db, SOURCE)
     assert [i["track_id"] for i in page["items"] if i["kind"] == "track"] == ["t1", "t2"]
     assert all(i["method"] == "bs1770-4-native" for i in page["items"] if i["kind"] == "track")
     assert not [i for i in page["items"] if i["kind"] == "album"]  # t3 is still unmeasured
-    # The failed track backs off; the pass finishes and re-sweeps later.
-    second = plugin.loudness_backfill_task("server-a", SOURCE)
-    assert second["status"] == "complete"
+    # The failed track backs off; the pass re-sweeps later.
     assert loudness_backfill.state(db, SOURCE)["cursor"] == ""
     assert loudness_backfill.next_due(db) is None
     # The catalogue moves: t3 leaves, the album is complete and published, without waiting for the re-sweep.
@@ -258,7 +258,7 @@ def test_a_batch_that_fails_is_published_one_track_at_a_time(migrated_db, plugin
 
     monkeypatch.setattr(loudness_stream, "publish_tracks", refuse_t2)
     result = plugin.loudness_backfill_task("server-a", SOURCE)
-    assert (result["status"], result["ready"], result["failed"], result["processed"]) == ("queued", 1, 1, 2)
+    assert (result["status"], result["ready"], result["failed"], result["processed"]) == ("complete", 1, 1, 2)
     assert [i["track_id"] for i in loudness_stream.bootstrap_page(db, SOURCE)["items"]] == ["t1"]
     with db.cursor() as cur:
         cur.execute(f"SELECT track_id, attempts, last_error FROM {P}loudness_attempts ORDER BY track_id")
@@ -267,18 +267,41 @@ def test_a_batch_that_fails_is_published_one_track_at_a_time(migrated_db, plugin
     assert due(db) == []  # t2 backs off
 
 
-def test_a_turn_keeps_to_the_batch_size_and_the_current_media(migrated_db, plugin, monkeypatch):
+def test_a_turn_pages_at_the_batch_size_and_keeps_to_the_current_media(migrated_db, plugin, monkeypatch):
     db = migrated_db
     _source(db, [("t1", "al", "m1"), ("t2", "al", "m2")])
     loudness_backfill.ensure_sources(db)
     monkeypatch.setattr(plugin, "configured_backfill_limit", lambda: 1)
     plugin.test_files["t1"] = (plugin.test_files["t1"][0], "m1-replaced")  # the file is newer media now
+    pages = []
+    monkeypatch.setattr(loudness_backfill, "candidates", lambda *a, _read=loudness_backfill.candidates, **k: (
+        pages.append(a[2]) or _read(*a, **k)))
     first = plugin.loudness_backfill_task("server-a", SOURCE)
-    assert (first["status"], first["ready"], first["failed"]) == ("queued", 0, 1)
-    assert loudness_stream.bootstrap_page(db, SOURCE)["items"] == []
+    # One track a page, read from the cursor, until the end (WP1a: no longer one page a turn).
+    assert pages == ["", "t1", "t2"]
+    assert (first["status"], first["ready"], first["failed"]) == ("complete", 1, 1)
+    assert [i["track_id"] for i in loudness_stream.bootstrap_page(db, SOURCE)["items"]] == ["t2"]
+
+
+def test_a_turn_stops_at_the_tick_deadline_and_keeps_its_cursor(migrated_db, plugin, monkeypatch):
+    db = migrated_db
+    _source(db, [("t1", "al", "m1"), ("t2", "al", "m2")])
+    loudness_backfill.ensure_sources(db)
+    clock = [100.0]
+    monkeypatch.setattr(plugin, "time", SimpleNamespace(monotonic=lambda: clock[0], time=time.time, sleep=time.sleep))
+    measure = plugin._measure_loudness
+
+    def slow(*args):
+        clock[0] += 10  # each measurement takes 10 s
+        return measure(*args)
+
+    monkeypatch.setattr(plugin, "_measure_loudness", slow)
+    first = plugin.loudness_backfill_task("server-a", SOURCE, deadline=105.0)
+    assert (first["status"], first["ready"], first["failed"]) == ("queued", 1, 0)
+    assert loudness_backfill.state(db, SOURCE)["cursor"] == "t1"
+    # Outside a tick a turn gets a tick's budget.
     second = plugin.loudness_backfill_task("server-a", SOURCE)
-    assert (second["ready"], second["failed"]) == (1, 0)
-    assert loudness_backfill.state(db, SOURCE)["cursor"] == "t2"
+    assert (second["status"], second["ready"]) == ("complete", 1)
 
 
 def test_a_turn_that_raises_marks_the_pass_failed(migrated_db, plugin, monkeypatch):

@@ -40,6 +40,12 @@ YIELD_MINUTES = (5, 15)
 # deadline itself; an action starts only when its recent average fits.
 TICK_BUDGET_SECONDS = 45
 ACTION_AVERAGE_RUNS = 10
+# Actions that take whatever is left of the tick and stop at the deadline
+# themselves, a track at a time (performance plan WP1a): their recent average
+# is the share of a tick they got, not what they need, so one starts once
+# ELASTIC_MIN_SECONDS (or its whole average, when shorter) are left.
+ELASTIC_ACTIONS = frozenset(("profile_backfill", "edge_backfill", "loudness_backfill"))
+ELASTIC_MIN_SECONDS = 5
 # AudioMuse's main jobs and side jobs: its cron gate refuses every start
 # while one is live. A host with task_types adds BATCH_GATE_TASK_TYPES.
 HOST_BLOCKING_TASK_TYPES = (
@@ -1144,11 +1150,14 @@ class TickBudget:
 
     def fits(self, action):
         """Whether ``action`` may start: the tick's first action always may,
-        a later one only when its recent average fits in what is left."""
+        a later one only when its recent average fits in what is left (an
+        elastic action: ELASTIC_MIN_SECONDS of it)."""
         if not self.started:
             return True
         remaining = self.remaining()
         average = self.averages.get(action)
+        if average is not None and action in ELASTIC_ACTIONS:
+            average = min(average, ELASTIC_MIN_SECONDS * 1000.0)
         return remaining > 0 and (average is None or average / 1000.0 <= remaining)
 
     def start(self):

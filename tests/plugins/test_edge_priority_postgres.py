@@ -12,6 +12,8 @@ Plan: docs/plan/EDGE_PRIORITY_AND_VECTORS_PLAN.md (Phases 1-3).
 * The server walks the library in small resumable ticks.
 * Credits and metadata yield to source-scoped on-demand work.
 """
+import time
+
 import pytest
 
 from test_lumae_analysis import (  # noqa: F401  (fixtures)
@@ -312,19 +314,15 @@ def test_library_pass_walks_in_ticks_completes_and_resweeps(edge_publication_db,
     )
     assert store.next_edge_backfill(db) == ("server-a", "catalog-a", "")
 
-    first = mod.edge_backfill_task("server-a", "catalog-a")
-    assert first["status"] == "queued" and first["processed"] == 1
-    # The track gets what is left of the pass's time (plan S2), never None.
+    first = mod.edge_backfill_task("server-a", "catalog-a", deadline=time.monotonic() + 60)
+    # The library fits in the turn (WP1a): the pass reaches its end and finishes.
+    assert first["status"] == "complete" and first["processed"] == 1
+    # The track gets what is left of the tick (plan S2, WP1a), never None.
     [(tracks, priority, budget)] = runs
     assert (tracks, priority) == (["track-a"], "background")
-    assert 0 < budget <= mod.EDGE_BACKFILL_TICK_SECONDS
-    assert _q(db, f"SELECT status, cursor, processed FROM {STATE}") == [("queued", "track-a", 1)]
-
-    second = mod.edge_backfill_task("server-a", "catalog-a")
-    assert second["status"] == "complete"
-    assert _q(db, f"SELECT status, cursor, next_retry_at > now() + interval '5 hours' FROM {STATE}") == [
-        ("complete", "", True)
-    ]
+    assert 55 < budget <= 60
+    assert _q(db, f"SELECT status, cursor, processed, next_retry_at > now() + interval '5 hours' "
+                  f"FROM {STATE}") == [("complete", "", 1, True)]
     assert store.next_edge_backfill(db) is None
 
     store.arm_edge_backfill(db, "catalog-a")

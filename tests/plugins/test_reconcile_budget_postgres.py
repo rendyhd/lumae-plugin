@@ -269,6 +269,41 @@ def test_the_edge_pass_stops_at_the_deadline_and_gives_each_track_what_is_left(
     assert _edge_pass(db) == ("queued", "track-b", 2)
 
 
+def test_the_edge_pass_pages_on_until_the_deadline(tick, monkeypatch):
+    """WP1a: no fixed 30 s and no 25-track cap; the pass reads the next page
+    from where it got to and works until the tick's deadline."""
+    mod, db = tick
+    _edge_library(db, [f"track-{index:02d}" for index in range(7)])
+    monkeypatch.setattr(mod, "EDGE_BACKFILL_PAGE_SIZE", 3)
+    runs = _slow_edges(mod, monkeypatch, 0.1)
+    pages = []
+    monkeypatch.setattr(mod, "edge_backfill_candidates", lambda db, source, after, limit, _read=mod.edge_backfill_candidates: (
+        pages.append(after) or _read(db, source, after, limit)))
+
+    result = mod.edge_backfill_task(SERVER, SOURCE, deadline=time.monotonic() + 0.45)
+
+    assert pages == ["", "track-02"]
+    assert [tracks for tracks, _budget in runs] == [[f"track-{index:02d}"] for index in range(5)]
+    assert result == {"status": "queued", "processed": 5, "ready": 5}
+    assert _edge_pass(db) == ("queued", "track-04", 5)
+
+
+def test_an_elastic_action_starts_once_a_few_seconds_are_left_whatever_its_average():
+    """The waveform, edge and loudness passes take what is left of the tick,
+    so their average is a tick's share: one starts with ELASTIC_MIN_SECONDS
+    left, another action only when its whole average fits."""
+    averages = {"edge_backfill": 45000.0, "loudness_backfill": 2000.0, "relationships": 45000.0}
+    budget = reconcile.TickBudget(seconds=30, averages=averages)
+    budget.start()
+    assert budget.fits("edge_backfill") and budget.fits("loudness_backfill")
+    assert not budget.fits("relationships")
+    short = reconcile.TickBudget(seconds=reconcile.ELASTIC_MIN_SECONDS - 1, averages=averages)
+    short.start()
+    assert not short.fits("edge_backfill")
+    assert short.fits("loudness_backfill")  # its whole average fits
+    assert short.fits("profile_backfill")  # no history
+
+
 # ------------------------------------------------------------------- credits
 class _Clock:
     def __init__(self):

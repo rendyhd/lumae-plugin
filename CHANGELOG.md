@@ -33,6 +33,16 @@ Auralscape LN.3/LN.4). Clients that don't know the new stream never read it.
   cursors. A provider-identity rekey keeps the measurements under the new ids
   and rotates the stream's epoch.
 
+Faster background analysis (performance plan 2026-10-16, WP1a).
+
+- The edge pass and the loudness backfill work until the reconcile tick's
+  deadline instead of a fixed 30 s, reading due tracks a page at a time
+  (25 edges, the admin batch size for loudness), so they get the tick's 45 s
+  instead of about 30 s of every minute. A pass that reaches the end of the
+  library finishes in the same turn. Like the waveform batch, either starts
+  once 5 s of the tick are left, whatever its recent average (the average of
+  a pass that fills the tick says nothing about what it needs).
+
 ## 1.7.1 (2026-10-13)
 
 Follow-ups from testing 1.7.0 against AudioMuse's scheduler changes
