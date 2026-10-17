@@ -2617,6 +2617,7 @@ def test_analyze_song_hook_uses_analysis_audio_path_and_raw_media_item(monkeypat
         return Result()
 
     monkeypatch.setattr(mod, "analyze_file", fake_analyze_file)
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: False)  # the waveform-only call
     monkeypatch.setattr(
         mod,
         "enqueue",
