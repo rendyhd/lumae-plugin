@@ -341,3 +341,27 @@ def test_migration_schedules_the_retention_task_and_keeps_an_admin_change(
     with migrated_db.cursor() as cur:
         cur.execute("SELECT enabled FROM cron WHERE task_type=%s", (task_type,))
         assert cur.fetchall() == [(False,)]
+
+
+def test_migration_removes_schedule_rows_for_unschedulable_tasks(
+        migrated_db, run_plugin_migration):
+    retired = "plugin.lumae_analysis.prepare"
+    with migrated_db.cursor() as cur:
+        for task_type in (retired, "plugin.lumae_analysis.loudness_backfill"):
+            cur.execute(
+                "INSERT INTO cron (name, task_type, cron_expr, enabled) "
+                "VALUES (%s, %s, '0 1 * * *', TRUE)",
+                (task_type, task_type),
+            )
+    migrated_db.commit()
+    run_plugin_migration(migrated_db)
+    with migrated_db.cursor() as cur:
+        cur.execute("SELECT task_type FROM cron ORDER BY task_type")
+        assert [row[0] for row in cur.fetchall()
+                if row[0].startswith("plugin.lumae_analysis.")] == [
+            "plugin.lumae_analysis.analysis_projection",
+            "plugin.lumae_analysis.catalog_reconcile",
+            "plugin.lumae_analysis.catalog_refresh",
+            "plugin.lumae_analysis.collection_retention",
+            "plugin.lumae_analysis.provider_identity_recheck",
+        ]

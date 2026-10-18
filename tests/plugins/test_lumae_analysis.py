@@ -4747,6 +4747,10 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         "DELETE FROM cron WHERE task_type=%s",
         ("plugin.lumae_analysis.music_metadata",),
     ) in db.cursor_obj.executed
+    assert (
+        "DELETE FROM cron WHERE task_type = ANY(%s)",
+        (list(mod.UNSCHEDULABLE_TASK_TYPES),),
+    ) in db.cursor_obj.executed
     cron_inserts = [params for sql, params in db.cursor_obj.executed if "INSERT INTO cron" in sql]
     assert cron_inserts == [
         (
@@ -8586,16 +8590,8 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.flask_hooks == [mod.observe_provider_identities_on_start]
     assert ctx.worker_hooks == [mod.report_edge_runtime_on_start]
     assert ctx.song_hooks == [mod.analyze_song_hook]
-    assert ctx.tasks == [
-        ("prepare", mod.prepare_lumae_task, "default"),
-        ("profile_backfill", mod.profile_backfill_task, "default"),
-        ("edge_backfill", mod.edge_backfill_task, "default"),
-        ("loudness_backfill", mod.loudness_backfill_task, "default"),
-        ("analysis_projection", mod.analysis_projection_task, "default"),
-        ("credits", mod.credits_service.run_one, "default"),
-        ("relationship_preparation", mod.relationship_preparation_task, "default"),
-        ("provider_identity_recheck", mod.provider_identity_recheck_task, "default"),
-    ]
+    # Queued jobs are not registered: AudioMuse would list them as schedulable.
+    assert ctx.tasks == []
     assert ctx.cron_tasks == [
         ("catalog_reconcile", mod.catalog_reconcile_task, "default"),
         ("catalog_refresh", mod.catalog_refresh_task, "default"),
@@ -11581,3 +11577,56 @@ def test_settings_readiness_streams_panel_self_check_mutants(monkeypatch):
         mutant.setattr(mod, "redact_stored_error", lambda value: value)
         unredacted = mod.render_readiness_streams_panel()
     assert READINESS_SECRET in unredacted
+
+
+def test_schedule_guide_shows_each_lumae_schedule_and_its_state(monkeypatch):
+    mod = load_plugin()
+    seen = {}
+
+    class Cursor:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_exc):
+            return False
+
+        def execute(self, sql, params):
+            seen["params"] = params
+
+        def fetchall(self):
+            return [
+                ("plugin.lumae_analysis.catalog_refresh", "17 */6 * * *", True),
+                ("plugin.lumae_analysis.analysis_projection", "47 */6 * * *", False),
+            ]
+
+    class Db:
+        def cursor(self):
+            return Cursor()
+
+    monkeypatch.setattr(mod, "get_db", lambda: Db())
+
+    body = mod.render_schedule_guide()
+
+    assert len(seen["params"][0]) == 5
+    assert "<strong>catalog_refresh</strong> (on, <code>17 */6 * * *</code>)" in body
+    assert "<strong>analysis_projection</strong> (off)" in body
+    assert "<strong>catalog_reconcile</strong> (off)" in body
+    assert "Managed by Lumae" in body
+    assert "prepare" not in body
+
+
+def test_schedule_guide_renders_when_the_cron_table_is_unreadable(monkeypatch):
+    mod = load_plugin()
+
+    class Db:
+        def cursor(self):
+            raise RuntimeError("no cron table")
+
+        def rollback(self):
+            pass
+
+    monkeypatch.setattr(mod, "get_db", lambda: Db())
+
+    body = mod.render_schedule_guide()
+
+    assert "<strong>collection_retention</strong> (off)" in body

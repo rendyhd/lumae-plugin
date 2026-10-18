@@ -1171,6 +1171,63 @@ def _throughput_html():
     """
 
 
+# AudioMuse's Scheduled Tasks page lists these with no description; the
+# Scheduler panel says what each does and whether to touch it.
+SCHEDULE_GUIDE = (
+    ("catalog_refresh", "Re-reads the media server and publishes library changes.",
+     "Yours to enable; every 6 hours suits most libraries"),
+    ("analysis_projection", "Copies new AudioMuse analysis onto the published catalogue.",
+     "Yours to enable; every 6 hours suits most libraries"),
+    ("catalog_reconcile", "Runs one pending Lumae action per tick and sets its own pace.",
+     "Managed by Lumae; edits are overwritten"),
+    ("provider_identity_recheck", "Finishes media-server ID checks and AudioMuse migrations.",
+     "Managed by Lumae; re-enabled on upgrade"),
+    ("collection_retention", "Nightly cleanup of expired collection and Vibe receipts.",
+     "On by default; safe to keep"),
+)
+
+
+def schedule_description(name):
+    """The info tooltip AudioMuse shows next to a Lumae task, on hosts whose
+    add_cron_task takes a description."""
+    for task, purpose, owner in SCHEDULE_GUIDE:
+        if task == name:
+            return f"{purpose} {owner}."
+    return None
+
+
+def render_schedule_guide():
+    db = None
+    try:
+        db = _pkg.get_db()
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT task_type, cron_expr, enabled FROM cron WHERE task_type = ANY(%s)",
+                ([f"plugin.lumae_analysis.{name}" for name, _, _ in SCHEDULE_GUIDE],),
+            )
+            rows = {row[0]: (row[1], bool(row[2])) for row in cur.fetchall()}
+    except Exception:
+        _pkg._rollback_if_possible(db)
+        rows = {}
+    items = []
+    for name, purpose, owner in SCHEDULE_GUIDE:
+        expr, enabled = rows.get(f"plugin.lumae_analysis.{name}", (None, False))
+        state = f"on, <code>{_pkg.escape(expr)}</code>" if enabled and expr else "off"
+        items.append(
+            f"<li><strong>{_pkg.escape(name)}</strong> ({state}): {_pkg.escape(purpose)} "
+            f"<span class=\"lumae-help\">{_pkg.escape(owner)}.</span></li>"
+        )
+    return f"""
+        <details>
+          <summary>AudioMuse schedules for Lumae</summary>
+          <p class="lumae-help">These are the Lumae rows under AudioMuse’s Scheduled Tasks.
+            Enable <strong>catalog_refresh</strong> and <strong>analysis_projection</strong>
+            to keep the app current; leave the rest as they are.</p>
+          <ul>{''.join(items)}</ul>
+        </details>
+    """
+
+
 def render_reconcile_status_panel():
     try:
         snapshot = _pkg.read_reconcile_status(_pkg.get_db())
@@ -1302,6 +1359,7 @@ def render_reconcile_status_panel():
           <summary>Recent meaningful background actions</summary>
           <ul>{journal_html}</ul>
         </details>
+        {render_schedule_guide()}
       </section>
     """
 

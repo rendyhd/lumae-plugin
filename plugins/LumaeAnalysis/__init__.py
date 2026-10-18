@@ -1,5 +1,6 @@
 import base64
 import gzip
+import inspect
 import json
 import os
 import re
@@ -581,6 +582,31 @@ def disable_legacy_backfill_schedule(db):
     cur.execute(
         "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
         (BACKFILL_TASK_TYPE,),
+    )
+    cur.close()
+
+
+# Names AudioMuse offered under Plugin tasks while they were registered with
+# add_task (loudness_backfill: the 1.8.0 test build's). None of them can run
+# from a schedule, so a row an administrator enabled is removed.
+UNSCHEDULABLE_TASK_TYPES = tuple(
+    f"plugin.lumae_analysis.{name}"
+    for name in (
+        "prepare",
+        "profile_backfill",
+        "edge_backfill",
+        "credits",
+        "relationship_preparation",
+        "loudness_backfill",
+    )
+)
+
+
+def retire_unschedulable_cron_rows(db):
+    cur = db.cursor()
+    cur.execute(
+        "DELETE FROM cron WHERE task_type = ANY(%s)",
+        (list(UNSCHEDULABLE_TASK_TYPES),),
     )
     cur.close()
 
@@ -2008,6 +2034,7 @@ def migrate(db):
     ensure_analysis_projection_schedule(db)
     ensure_collection_retention_schedule(db)
     disable_legacy_backfill_schedule(db)
+    retire_unschedulable_cron_rows(db)
     db.commit()
     # Installation is schema work, not a reason to rebuild the full analysis
     # and relationship projections. Only a missing/stale catalogue publication
@@ -6925,6 +6952,8 @@ from .settings_render import (
     _reconcile_duration,
     _reconcile_event_summary,
     render_reconcile_status_panel,
+    render_schedule_guide,
+    schedule_description,
     render_settings_status_panels,
     render_publication_repair_form,
     render_settings,
@@ -7127,20 +7156,27 @@ def register(ctx):
     if hasattr(ctx, "on_worker_start"):
         ctx.on_worker_start(report_edge_runtime_on_start)
     ctx.on_song_analyzed(analyze_song_hook)
-    ctx.add_task("prepare", prepare_lumae_task, queue="default")
-    ctx.add_task("profile_backfill", profile_backfill_task, queue="default")
-    ctx.add_task("edge_backfill", edge_backfill_task, queue="default")
-    ctx.add_task("loudness_backfill", loudness_backfill_task, queue="default")
-    ctx.add_task("analysis_projection", analysis_projection_task, queue="default")
-    ctx.add_task("credits", credits_service.run_one, queue="default")
-    ctx.add_task(
-        "relationship_preparation", relationship_preparation_task, queue="default"
-    )
-    ctx.add_cron_task("catalog_reconcile", catalog_reconcile_task, queue="default")
-    ctx.add_task("provider_identity_recheck", provider_identity_recheck_task, queue="default")
-    ctx.add_cron_task("catalog_refresh", catalog_refresh_task, queue="default")
-    ctx.add_cron_task(
-        "provider_identity_recheck", provider_identity_recheck_task, queue="default"
-    )
-    ctx.add_cron_task("analysis_projection", analysis_projection_task, queue="default")
-    ctx.add_cron_task("collection_retention", collection_retention_task, queue="default")
+    # Only schedulable tasks are registered. AudioMuse lists every add_task
+    # name under Scheduled Tasks > Plugin tasks with an Enable box, and the
+    # worker runs a queued job by its dotted path (enqueue), not by its name,
+    # so the watchdog's one-action jobs (prepare, profile and edge backfill,
+    # relationships, credits) need no registration and must not be scheduled:
+    # a cron row would call them without their source arguments. The loudness
+    # pass runs inside the tick and is never queued.
+    _add_cron_task(ctx, "catalog_reconcile", catalog_reconcile_task)
+    _add_cron_task(ctx, "catalog_refresh", catalog_refresh_task)
+    _add_cron_task(ctx, "provider_identity_recheck", provider_identity_recheck_task)
+    _add_cron_task(ctx, "analysis_projection", analysis_projection_task)
+    _add_cron_task(ctx, "collection_retention", collection_retention_task)
+
+
+def _add_cron_task(ctx, name, func):
+    """Register with the info tooltip text when the host takes one; older
+    hosts' add_cron_task has no description parameter."""
+    kwargs = {"queue": "default"}
+    try:
+        if "description" in inspect.signature(ctx.add_cron_task).parameters:
+            kwargs["description"] = schedule_description(name)
+    except (TypeError, ValueError):
+        pass
+    ctx.add_cron_task(name, func, **kwargs)

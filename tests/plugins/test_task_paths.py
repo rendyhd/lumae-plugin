@@ -75,15 +75,40 @@ EXPECTED_DOTTED_PATHS = {
     "on_install": "plugins.LumaeAnalysis.migrate",
     "on_song_analyzed": "plugins.LumaeAnalysis.analyze_song_hook",
     "on_worker_start": "plugins.LumaeAnalysis.report_edge_runtime_on_start",
-    "task:analysis_projection": "plugins.LumaeAnalysis.analysis_projection_task",
-    "task:credits": "plugins.LumaeAnalysis.credits_service.run_one",
-    "task:edge_backfill": "plugins.LumaeAnalysis.edge_backfill_task",
-    "task:loudness_backfill": "plugins.LumaeAnalysis.loudness_backfill_task",
-    "task:prepare": "plugins.LumaeAnalysis.prepare_lumae_task",
-    "task:profile_backfill": "plugins.LumaeAnalysis.profile_backfill_task",
-    "task:provider_identity_recheck": "plugins.LumaeAnalysis.provider_identity_recheck_task",
-    "task:relationship_preparation": "plugins.LumaeAnalysis.relationship_preparation_task",
 }
+
+# Jobs queued with ``enqueue`` (not registered: AudioMuse would list them as
+# schedulable). The worker imports a queued job by this dotted path, so the
+# same re-export rule applies.
+QUEUED_JOB_PATHS = {
+    "plugins.LumaeAnalysis.prepare_lumae_task",
+    "plugins.LumaeAnalysis.profile_backfill_task",
+    "plugins.LumaeAnalysis.edge_backfill_task",
+    "plugins.LumaeAnalysis.relationship_preparation_task",
+    "plugins.LumaeAnalysis.credits_service.run_one",
+}
+
+
+def test_queued_job_paths_resolve():
+    load_plugin()
+    for dotted in sorted(QUEUED_JOB_PATHS):
+        module_path, _, name = dotted.rpartition(".")
+        func = getattr(importlib.import_module(module_path), name)
+        assert f"{func.__module__}.{func.__qualname__}" == dotted
+
+
+def test_only_schedulable_tasks_are_registered():
+    mod = load_plugin()
+    ctx = RecordingCtx()
+
+    mod.register(ctx)
+
+    assert not [key for key in ctx.recorded if key.startswith("task:")]
+    assert {
+        f"plugin.lumae_analysis.{key[len('cron:'):]}"
+        for key in ctx.recorded
+        if key.startswith("cron:")
+    }.isdisjoint(mod.UNSCHEDULABLE_TASK_TYPES)
 
 
 def test_registered_task_and_hook_paths_resolve_and_are_pinned():
@@ -144,3 +169,34 @@ def test_extracted_modules_bind_the_package_they_were_loaded_from():
     finally:
         for key in [k for k in sys.modules if k == name or k.startswith(name + ".")]:
             del sys.modules[key]
+
+
+class DescribingCtx(RecordingCtx):
+    """A host whose add_cron_task takes the info tooltip text."""
+
+    def __init__(self):
+        super().__init__()
+        self.descriptions = {}
+
+    def add_cron_task(self, name, func, queue="default", description=None):
+        super().add_cron_task(name, func, queue)
+        self.descriptions[name] = description
+
+
+def test_each_scheduled_task_gets_an_info_tooltip_when_the_host_takes_one():
+    mod = load_plugin()
+    ctx = DescribingCtx()
+
+    mod.register(ctx)
+
+    assert set(ctx.descriptions) == {
+        "catalog_reconcile",
+        "catalog_refresh",
+        "provider_identity_recheck",
+        "analysis_projection",
+        "collection_retention",
+    }
+    for name, text in ctx.descriptions.items():
+        assert text and len(text) <= 300, name
+    assert "Yours to enable" in ctx.descriptions["catalog_refresh"]
+    assert "Managed by Lumae" in ctx.descriptions["catalog_reconcile"]
