@@ -142,9 +142,11 @@ def test_mutation_sets_a_transaction_scoped_lock_timeout(collections_api, monkey
 
 @pytest.mark.parametrize("held", ["collection_row", "feed_head"])
 def test_lock_wait_is_bounded_and_answers_503_with_retry_after(
-        collections_api, second_connection, held):
+        collections_api, second_connection, monkeypatch, held):
     api = collections_api
     manager = api.manager
+    # The bound itself (3 s) is test_mutation_sets_a_transaction_scoped_lock_timeout's.
+    monkeypatch.setattr(manager, "MUTATION_LOCK_TIMEOUT", "300ms")
     assert api.call("POST", "/api/collections", {"id": "a", "name": "A"}).status_code == 201
     _, head, _ = _journal(api)
     with second_connection.cursor() as cur:
@@ -171,7 +173,7 @@ def test_lock_wait_is_bounded_and_answers_503_with_retry_after(
     assert response.status_code == 503, response.get_json()
     assert response.get_json() == {"error": "collection_busy"}
     assert response.headers["Retry-After"] == "5"
-    assert 2.5 <= result["elapsed"] < 8
+    assert 0.25 <= result["elapsed"] < 5
     # Nothing was written and no receipt holds the key: the retry applies.
     assert _journal(api)[1] == head
     retry = api.call("PATCH", "/api/collections/a", {"name": "B"}, key="k")

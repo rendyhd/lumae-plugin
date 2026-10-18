@@ -369,7 +369,8 @@ def test_reconcile_runner_keeps_the_edge_pass_resweep_time(monkeypatch):
     assert calls == [("event-1", "success")]
 
 
-@pytest.mark.parametrize("zone", ["UTC", "Asia/Kolkata", "America/Los_Angeles"])
+# A UTC session cannot tell local time from UTC; zones on either side of it can.
+@pytest.mark.parametrize("zone", ["Asia/Kolkata", "America/Los_Angeles"])
 def test_edge_timestamps_are_real_utc_whatever_the_session_time_zone(edge_publication_db, zone):
     from datetime import datetime, timedelta, timezone
 

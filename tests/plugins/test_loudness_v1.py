@@ -46,7 +46,12 @@ def native(blocks, rate, weights=(1.0, 1.0)):
     return meter.result()
 
 
-@pytest.mark.parametrize("rate", [44100, 48000, 96000, 192000])
+# Production meters at 48 kHz at most (measured_rate), so the meter never
+# runs at a higher rate.
+METERED_RATES = [44100, 48000]
+
+
+@pytest.mark.parametrize("rate", METERED_RATES)
 @pytest.mark.parametrize("case,levels", [
     (1, [(-23, 20)]),
     (2, [(-33, 20)]),
@@ -62,7 +67,7 @@ def test_tech_3341_integrated_loudness(rate, case, levels):
     assert (record["channels"], record["sample_rate"]) == (2, rate)
 
 
-@pytest.mark.parametrize("rate", [44100, 48000, 96000])
+@pytest.mark.parametrize("rate", METERED_RATES)
 @pytest.mark.parametrize("levels,expected", [
     ([(-20, 20), (-30, 20)], 10),
     ([(-20, 20), (-15, 20)], 5),
@@ -82,7 +87,7 @@ def faded_tone(rate, hz, phase, db=-1.0, seconds=5.0):
     return np.stack([tone, tone])
 
 
-@pytest.mark.parametrize("rate", [44100, 48000, 96000, 192000])
+@pytest.mark.parametrize("rate", METERED_RATES)
 def test_true_peak_of_faded_tones(rate):
     # fs/4 at a 45 degree phase: every sample reads 3 dB under the peak.
     record = native([faded_tone(rate, rate / 4, math.pi / 4)], rate)

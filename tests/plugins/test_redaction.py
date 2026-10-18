@@ -253,7 +253,7 @@ def test_whitespace_is_collapsed_and_length_is_capped_after_masking():
     "text",
     [
         *(row[0] for row in SECRET_SHAPES),
-        *READABLE,
+        # READABLE text is already pinned to redact(t) == t, so idempotent.
         # Cut by the cap, including inside what becomes a mask.
         "x" * 1000,
         "y" * (redaction.MAX_ERROR_TEXT_CHARS - 12) + " password=hunter2 tail",

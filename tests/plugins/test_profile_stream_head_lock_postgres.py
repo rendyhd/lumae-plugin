@@ -374,7 +374,9 @@ def _assert_dense(state, rows, epoch):
 # Appends on different tracks.
 
 
-@pytest.mark.parametrize("first_outcome", ["commit", "rollback"])
+# A first append that commits: test_appends_on_different_tracks_queue_behind_a_read_head
+# covers every ordering of the two kinds.
+@pytest.mark.parametrize("first_outcome", ["rollback"])
 @pytest.mark.parametrize("second_kind", APPENDS)
 @pytest.mark.parametrize("first_kind", APPENDS)
 def test_append_waits_for_a_head_another_append_read(

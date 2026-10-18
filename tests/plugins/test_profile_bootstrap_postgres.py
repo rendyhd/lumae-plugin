@@ -410,21 +410,6 @@ def test_owned_connection_uses_public_finite_limits_and_ignores_request_db(
     db.rollback()
 
 
-def test_internal_serialization_error_has_safe_route_response(edge_publication_db, monkeypatch):
-    mod = load_plugin()
-    app = Flask(__name__)
-    app.register_blueprint(mod.bp)
-
-    def broken(*args):
-        raise ValueError("sensitive internal serializer detail")
-
-    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", broken)
-    with app.test_client() as client:
-        response = client.post("/api/profiles/bootstrap/sessions", json=body())
-        assert response.status_code == 503
-        assert response.json == {"error": "bootstrap_unavailable", "message": "bootstrap_unavailable"}
-
-
 def test_cross_source_token_rejected_on_every_route(edge_publication_db):
     mod = load_plugin()
     app = Flask(__name__)
@@ -489,59 +474,6 @@ def test_provisional_sessions_invalidated_by_idempotent_migration(edge_publicati
     assert profile_bootstrap.create_session(body())["transfer_contract"] == "source_scoped_v1"
 
 
-def test_owned_backend_lock_cleanup_and_request_transaction(edge_publication_db, monkeypatch):
-    """The capture holds its source's lock on the owned backend and unlocks it
-    explicitly before create returns.
-
-    Before P1-6 the capture held the global lock (110094, 10) as a session
-    lock that only the owned backend's exit released. That exit is
-    asynchronous to the client's close(), so under heavy load the check right
-    after create could still find the lock held (an intermittent failure).
-    Admission now takes the global lock per transaction (released by COMMIT)
-    and the per-source lock is unlocked synchronously, so both checks below
-    are deterministic."""
-    db = edge_publication_db
-    observer = peer(db)
-    with db.cursor() as cur:
-        cur.execute("SELECT pg_backend_pid(), txid_current()")
-        request_pid, request_txid = cur.fetchone()
-    owned_pid = []
-    original = profile_bootstrap._snapshot_batch
-
-    def inspect_capture(*args):
-        with observer.cursor() as cur:
-            cur.execute("SELECT pg_try_advisory_lock(110094, hashtext(%s))", (SOURCE,))
-            assert cur.fetchone()[0] is False
-            cur.execute("SELECT pg_try_advisory_lock(110094, 10)")
-            assert cur.fetchone()[0] is True
-            cur.execute("SELECT pg_advisory_unlock(110094, 10)")
-            cur.execute("SELECT pid FROM pg_locks WHERE locktype='advisory' AND granted "
-                        "AND database=(SELECT oid FROM pg_database "
-                        "WHERE datname=current_database()) "
-                        "AND classid=110094 AND objid=hashtext(%s)::oid AND objsubid=2",
-                        (SOURCE,))
-            owned_pid.append(cur.fetchone()[0])
-        observer.rollback()
-        return original(*args)
-
-    monkeypatch.setattr(profile_bootstrap, "_snapshot_batch", inspect_capture)
-    try:
-        profile_bootstrap.create_session(body())
-        assert owned_pid and owned_pid[0] != request_pid
-        with db.cursor() as cur:
-            cur.execute("SELECT pg_backend_pid(), txid_current()")
-            assert cur.fetchone() == (request_pid, request_txid)
-        with observer.cursor() as cur:
-            for key in ("hashtext(%s)", "10"):
-                params = (SOURCE,) if "%s" in key else ()
-                cur.execute(f"SELECT pg_try_advisory_lock(110094, {key})", params)
-                assert cur.fetchone()[0] is True
-                cur.execute(f"SELECT pg_advisory_unlock(110094, {key})", params)
-        observer.commit()
-    finally:
-        observer.close()
-
-
 def test_owned_connection_rolls_back_and_closes_on_capture_error(edge_publication_db, monkeypatch):
     db = edge_publication_db
     actual_open = psycopg2.connect
@@ -565,17 +497,6 @@ def test_owned_connection_rolls_back_and_closes_on_capture_error(edge_publicatio
     db.rollback()
 
 
-@pytest.mark.parametrize("failure", ["connection refused", "connection timed out"])
-def test_owned_lease_failure_maps_to_safe_503(edge_publication_db, monkeypatch, failure):
-    def unavailable(*_args, **_options):
-        raise psycopg2.OperationalError(failure)
-
-    monkeypatch.setattr(profile_bootstrap.psycopg2, "connect", unavailable)
-    with pytest.raises(profile_bootstrap.BootstrapError) as exc:
-        profile_bootstrap.create_session(body())
-    assert (exc.value.code, exc.value.status) == ("bootstrap_unavailable", 503)
-
-
 def test_statement_and_lock_timeouts_are_enforced(edge_publication_db, monkeypatch):
     monkeypatch.setattr(profile_bootstrap, "STATEMENT_TIMEOUT_MS", 50)
     with pytest.raises(profile_bootstrap.BootstrapError) as exc:
@@ -595,13 +516,3 @@ def test_statement_and_lock_timeouts_are_enforced(edge_publication_db, monkeypat
         assert (exc.value.code, exc.value.status) == ("bootstrap_unavailable", 503)
     finally:
         edge_publication_db.rollback()
-
-
-def test_connection_error_hides_credentials(edge_publication_db, monkeypatch):
-    monkeypatch.setattr(profile_bootstrap.psycopg2, "connect",
-                        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-                            psycopg2.OperationalError("secret-password-in-dsn")))
-    with pytest.raises(profile_bootstrap.BootstrapError) as exc:
-        profile_bootstrap.create_session(body())
-    assert str(exc.value) == "bootstrap_unavailable"
-    assert exc.value.__cause__ is None

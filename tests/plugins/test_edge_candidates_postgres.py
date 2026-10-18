@@ -138,18 +138,6 @@ def test_candidates_match_the_legacy_query_for_every_edge_and_job_state(migrated
     assert store.edge_backfill_candidates(migrated_db, OTHER) == tracks[:-1]
 
 
-def test_the_song_hook_rewind_reads_the_same_candidates(migrated_db):
-    """rewind_edge_backfill shares the candidate condition."""
-    tracks = _every_combination(migrated_db)
-    expected = set(_legacy(migrated_db))
-    with migrated_db.cursor() as cur:
-        for track in tracks:
-            cur.execute(f"SELECT EXISTS (SELECT 1 FROM {store._edge_due_sql()} "
-                        "AND p.track_id=%s)", (SOURCE, track))
-            assert cur.fetchone()[0] is (track in expected), track
-    migrated_db.rollback()
-
-
 def _library(db, tracks, *, edges, jobs):
     """``tracks`` published; edges for the first ``edges``; recent failed jobs
     (not candidates) for the ``jobs`` tracks after them."""

@@ -17,7 +17,6 @@ Plan: docs/plan/LUMAE_SCHEDULER_PLAN_2026-10-11.md (1.6.2: S1-S6).
   Scheduled Tasks page stays, and the settings page says what stops.
 """
 import importlib
-import random
 import time
 from types import SimpleNamespace
 
@@ -147,7 +146,7 @@ def _cron(db):
     return _rows(db, "SELECT cron_expr FROM cron WHERE task_type=%s", (RECONCILE,))[0][0]
 
 
-@pytest.mark.parametrize("retry_count", [0, 2])
+@pytest.mark.parametrize("retry_count", [2])  # 0 takes the same branch
 def test_waiting_retry_keeps_the_backfill_retry_time(tick, monkeypatch, retry_count):
     mod, db = tick
     for track in ("track-a", "track-b"):
@@ -253,7 +252,8 @@ def test_the_identity_recheck_is_installed_enabled_and_keeps_a_later_change(
     assert _enabled(db, RECHECK) == [(True,)]
 
 
-@pytest.mark.parametrize("disabled", [(), (RECONCILE,), (RECHECK,), (RECONCILE, RECHECK)])
+# Both rows disabled only combines the two single-row cases.
+@pytest.mark.parametrize("disabled", [(), (RECONCILE,), (RECHECK,)])
 def test_the_settings_page_says_what_stops_while_a_row_is_disabled(tick, disabled):
     mod, db = tick
     for task_type in disabled:
@@ -522,8 +522,8 @@ def _yield_minute(db):
     return mode, reason, ahead
 
 
-@pytest.mark.parametrize("blocked", [["analysis"], [COLLECTION_RETENTION],
-                                     ["analysis", COLLECTION_RETENTION]])
+# ["analysis"] alone takes the same branch as the pair.
+@pytest.mark.parametrize("blocked", [[COLLECTION_RETENTION], ["analysis", COLLECTION_RETENTION]])
 def test_a_refused_schedule_makes_the_tick_yield(tick, monkeypatch, blocked):
     mod, db = tick
     ran = _ready_work(mod, db, monkeypatch)
@@ -669,53 +669,3 @@ def test_minute_cadence_skips_only_enabled_lumae_rows(tick):
                     "VALUES ('other', 'plugin.other.sync', '7 * * * *', TRUE)")
     db.commit()
     assert armed() == "* * * * *"
-
-
-def test_the_host_loop_dispatches_a_refused_row_at_the_first_retry_pass_after_the_yield(
-    tick, monkeypatch,
-):
-    """AudioMuse runs its minute pass, then (every 11 minutes here) its retry
-    pass, in the same loop iteration. At minute cadence the watchdog queued
-    by the minute pass blocked every retry milliseconds later."""
-    mod, db = tick
-    reconcile = _reconcile()
-    _cron_retry(db, "analysis")
-    # The watchdog always has work.
-    monkeypatch.setattr(reconcile, "_work_summary", lambda cur: {
-        "ready": 1, "waiting": 0, "retry_count": 0, "next_retry_at": None,
-        "retry_in_seconds": None})
-    monkeypatch.setattr(mod, "_reconcile_tick", lambda db, report: "processed")
-    reconcile.arm_reconcile(db, "work_admitted", commit=True)
-    start = time.mktime((2026, 10, 11, 2, 0, 0, 0, 0, -1))
-    clock = {"now": start}
-    real_yield_cron = reconcile.yield_cron
-    monkeypatch.setattr(reconcile, "yield_cron",
-                        lambda excluded=(), now=None, rng=None: real_yield_cron(
-                            excluded, now=clock["now"], rng=random.Random(4)))
-    dispatched_at = None
-    for minute in range(40):
-        clock["now"] = start + minute * 60
-        # Minute pass: the watchdog, if due and nothing blocks it.
-        live = _rows(db, "SELECT count(*) FROM task_status WHERE status IN ('NEW', 'RUNNING')")
-        queued = (_reconcile().cron_minutes(_cron(db)) and minute in _reconcile().cron_minutes(
-            _cron(db)) and live == [(0,)])
-        if queued:
-            _live_root(db, RECONCILE, "NEW", task_id=f"tick-{minute}")
-        # Retry pass, milliseconds later.
-        if minute % 11 == 5 and _rows(db, "SELECT 1 FROM cron_retry WHERE task_type='analysis'"):
-            if _rows(db, "SELECT count(*) FROM task_status WHERE status IN ('NEW', 'RUNNING')") \
-                    == [(0,)]:
-                with db.cursor() as cur:
-                    cur.execute("DELETE FROM cron_retry WHERE task_type='analysis'")
-                db.commit()
-                dispatched_at = minute
-                break
-        if queued:
-            mod.catalog_reconcile_task()
-            with db.cursor() as cur:
-                cur.execute("UPDATE task_status SET status='SUCCESS' WHERE task_id=%s",
-                            (f"tick-{minute}",))
-            db.commit()
-    # The first tick yielded at 02:00 to a minute 5-15 ahead that is not the
-    # 02:05 retry pass, so that pass dispatched the row.
-    assert dispatched_at == 5

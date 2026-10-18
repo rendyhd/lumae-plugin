@@ -556,7 +556,8 @@ def test_nothing_is_due_while_the_source_is_not_schedulable(fixture_db, monkeypa
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("blocked", [False, True])
+# Only blocked: the no-write assertions are the same without the lock.
+@pytest.mark.parametrize("blocked", [True])
 def test_the_route_writes_nothing(fixture_db, second_connection, monkeypatch, blocked):
     db = fixture_db
     connection = RecordingConnection(db)

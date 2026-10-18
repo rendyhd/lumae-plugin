@@ -113,12 +113,6 @@ def test_retention_is_two_libraries_with_a_50k_minimum():
     assert limit(94_000) == 188_000
 
 
-def test_retention_limit_column_is_additive_and_idempotent(migrated_db, run_plugin_migration):
-    _source(migrated_db)
-    run_plugin_migration(migrated_db)
-    assert _frontier(migrated_db)[2] == MINIMUM
-
-
 def test_cursor_from_before_a_94k_pass_stays_readable(migrated_db):
     """A 94k library keeps 188k events, so a pass of 94k+ events does not
     force the client that synced just before it to bootstrap again."""

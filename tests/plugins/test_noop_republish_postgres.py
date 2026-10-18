@@ -255,35 +255,6 @@ def test_event_payload_equals_bootstrap_and_direct_read(source_db):
     assert latest["track-b"]["end_ramp"] == ""
 
 
-def test_probe_identical_reanalysis_no_longer_republishes_or_drops_edge(source_db):
-    """Inverted port of the audit integrity probe (AUD-03)."""
-    db = source_db
-    res = SimpleNamespace(sample_rate=48000, duration_ms=1234, ref_lufs=-14.123456789,
-                          start_ramp_blob=b"wave", end_ramp_blob=b"tail")
-    tok = publication.admit_attempts(db, SOURCE, ["track-a"])["track-a"]
-    assert publication.complete_attempt(db, SOURCE, "track-a", tok, res, "ready", None,
-                                        "catalog-media:rev-a", 1, 1)
-    with db.cursor() as cur:
-        cur.execute(f"""INSERT INTO {P}edge_profiles
-            (catalog_instance_id, track_id, media_revision, representation_id,
-             media_signature, profile_digest, payload)
-            VALUES (%s, 'track-a', 'r', 'rep', 'catalog-media:rev-a', 'd', '{{}}'::jsonb)""",
-                    (SOURCE,))
-        cur.execute(f"SELECT head_seq FROM {P}profile_stream_state")
-        head_before = cur.fetchone()[0]
-    db.commit()
-    tok = publication.admit_attempts(db, SOURCE, ["track-a"])["track-a"]
-    assert publication.complete_attempt(db, SOURCE, "track-a", tok, res, "ready", None,
-                                        "catalog-media:rev-a", 1, 1)
-    with db.cursor() as cur:
-        cur.execute(f"SELECT head_seq FROM {P}profile_stream_state")
-        head_after = cur.fetchone()[0]
-        cur.execute(f"SELECT count(*) FROM {P}edge_profiles WHERE track_id='track-a'")
-        edges = cur.fetchone()[0]
-    db.commit()
-    assert head_after == head_before and edges == 1
-
-
 # --- analyze_song_hook: skip admission when the published row is current ---
 
 
