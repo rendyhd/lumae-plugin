@@ -98,7 +98,10 @@ def test_a_surround_file_gets_its_waveform_an_unsupported_edge_and_loudness(libr
     assert _rows(db, f"SELECT status FROM {P}source_profiles") == [("ready",)]
     [(status, reason)] = _rows(db, f"SELECT status, last_error FROM {P}edge_profile_jobs")
     assert status == "unsupported" and reason.startswith("edge-analysis-unavailable")
-    assert "layout=7.1" in reason
+    if iso._isolation_available():
+        # The analysis child's decode probe adds the stream facts; without
+        # isolation (Windows) the analyzer runs in-process and has none.
+        assert "layout=7.1" in reason
     assert _edges(db) == [] and _loudness(db) == [("track-71",)]
     assert library.downloads == ["track-71"]
 
