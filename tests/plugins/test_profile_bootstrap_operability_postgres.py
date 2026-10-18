@@ -631,9 +631,8 @@ def test_create_without_request_id_never_adopts(db, monkeypatch):
     assert len(_query(db, f"SELECT session_id FROM {SESSIONS}")) == 2
 
 
-@pytest.mark.parametrize("field,value", [
-    ("client_request_id", "not-a-uuid"), ("client_request_id", 7),
-    ("client_request_id", "a" * 100), ("expiry_mode", "forever"), ("expiry_mode", True)])
+# Every rejected value: test_profile_bootstrap_create_options.
+@pytest.mark.parametrize("field,value", [("client_request_id", "not-a-uuid")])
 def test_invalid_create_options_are_400(db, field, value):
     with pytest.raises(profile_bootstrap.BootstrapError) as exc:
         profile_bootstrap.create_session(body(**{field: value}))

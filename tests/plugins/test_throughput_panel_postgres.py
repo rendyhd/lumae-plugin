@@ -137,7 +137,9 @@ def test_the_panel_renders_in_every_state_and_stays_accessible(tick, monkeypatch
                         "VALUES ('profile_backfill', 'running', 'analyzing volume and ramps')")
         if state == "yielded":
             cur.execute("CREATE TABLE cron_retry (task_type TEXT PRIMARY KEY, first_blocked_at DOUBLE PRECISION)")
-            cur.execute("INSERT INTO cron_retry VALUES ('analysis', %s)", (time.time() - 120,))
+            # Mid-way through "2 minutes": the age is PostgreSQL's now() minus
+            # this machine's clock, and 120 s sat on the edge of "1 minute".
+            cur.execute("INSERT INTO cron_retry VALUES ('analysis', %s)", (time.time() - 150,))
     db.commit()
 
     body = settings_render.render_reconcile_status_panel()

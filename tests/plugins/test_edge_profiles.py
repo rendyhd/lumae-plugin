@@ -168,7 +168,8 @@ def test_real_flac_decoder_timeline_silence_and_source_replacement(tmp_path, mon
         edge.analyze_edge_file(path, **args)
 
 
-@pytest.mark.parametrize("rate", [44100, 48000, 96000, 192000])
+# The reference is 48 kHz, so [48000] would compare a measurement with itself.
+@pytest.mark.parametrize("rate", [44100, 96000, 192000])
 def test_equivalent_bandlimited_sources_within_point_two_db(rate):
     def signal(sr):
         t = np.arange(sr * 2, dtype=np.float64) / sr

@@ -252,8 +252,8 @@ def _compact(stream, peer):
     [
         # Compaction commits right after the reader read the stream state.
         ("profile", PROFILE_RETENTION, "profile_stream_state", "after"),
-        # ... or right before the reader reads the journal.
-        ("profile", PROFILE_RETENTION, "profile_changes", "before"),
+        # ... or right before the reader reads the journal (for the profile
+        # stream, test_profile_reader_sees_compaction_as_410_not_a_short_page).
         ("catalog", CATALOG_RETENTION, "catalog_state", "after"),
         ("catalog", CATALOG_RETENTION, "catalog_changes", "before"),
     ],
@@ -307,9 +307,13 @@ def test_profile_reader_sees_compaction_as_410_not_a_short_page(
 
 
 ALL_STREAMS = ["profile", "catalog", "analysis", "relationship", "loudness"]
+# Every stream reads its page through one catalog.read_change_page, and each
+# stream's wiring is pinned by the paging and 410 tests over ALL_STREAMS, so
+# the gap, missing-event and cursor cases run on two of them.
+READER_STREAMS = ["profile", "catalog"]
 
 
-@pytest.mark.parametrize("stream", ALL_STREAMS)
+@pytest.mark.parametrize("stream", READER_STREAMS)
 def test_gap_inside_the_page_is_410(migrated_db, stream):
     _source(migrated_db)
     epoch = _seed(migrated_db, stream, 20)
@@ -319,7 +323,7 @@ def test_gap_inside_the_page_is_410(migrated_db, stream):
     migrated_db.rollback()
 
 
-@pytest.mark.parametrize("stream", ALL_STREAMS)
+@pytest.mark.parametrize("stream", READER_STREAMS)
 def test_missing_first_event_is_410(migrated_db, stream):
     _source(migrated_db)
     epoch = _seed(migrated_db, stream, 20)
@@ -329,7 +333,7 @@ def test_missing_first_event_is_410(migrated_db, stream):
     migrated_db.rollback()
 
 
-@pytest.mark.parametrize("stream", ALL_STREAMS)
+@pytest.mark.parametrize("stream", READER_STREAMS)
 def test_missing_tail_events_are_410(migrated_db, stream):
     _source(migrated_db)
     epoch = _seed(migrated_db, stream, 20)
@@ -392,7 +396,7 @@ def test_profile_page_shape_is_unchanged(migrated_db):
     assert page["changes"][0]["track_id"] == "track-1"
 
 
-@pytest.mark.parametrize("stream", ALL_STREAMS)
+@pytest.mark.parametrize("stream", READER_STREAMS)
 def test_cursor_ahead_of_head_is_still_400(migrated_db, stream):
     _source(migrated_db)
     epoch = _seed(migrated_db, stream, 5)
@@ -420,7 +424,7 @@ def test_old_epoch_and_below_floor_are_still_410(migrated_db, stream):
     migrated_db.rollback()
 
 
-@pytest.mark.parametrize("stream", ALL_STREAMS)
+@pytest.mark.parametrize("stream", READER_STREAMS)
 def test_cursor_at_a_raised_floor_reads_on(migrated_db, stream):
     """cursor == floor (> 0) is valid: the next event is the first retained."""
     _source(migrated_db)

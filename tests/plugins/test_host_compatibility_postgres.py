@@ -42,6 +42,9 @@ SHAPES = {
     ">=3.6.2+AM": {"cron_retry": True, "gate_counts_plugins": True, "task_types": True,
                    "heartbeat": True, "retry_first": True, "plugin_notes": True},
 }
+# ">=3.6.2" sets the same flags as "3.5.2-3.6.1"; it stays in SHAPES as a
+# name for that host, but the matrix runs each distinct shape once.
+MATRIX = [name for name in SHAPES if name != ">=3.6.2"]
 MAIN = ("main_analysis", "main_clustering", "cleaning", "provider_migration", "server_sweep",
         "naming_preview")
 RETRY_EVERY = 11
@@ -218,7 +221,7 @@ class HostLoop:
                 heartbeat.join()
 
 
-@pytest.mark.parametrize("name", list(SHAPES))
+@pytest.mark.parametrize("name", MATRIX)
 def test_host_schedules_start_and_lumae_resumes_on_every_host(tick, monkeypatch, name):
     mod, db = tick
     shape = SHAPES[name]
@@ -243,7 +246,7 @@ def test_host_schedules_start_and_lumae_resumes_on_every_host(tick, monkeypatch,
         RETRY_EVERY + 1 if shape["cron_retry"] else 5), loop.lumae_ticks
 
 
-@pytest.mark.parametrize("name", list(SHAPES))
+@pytest.mark.parametrize("name", MATRIX)
 def test_work_admitted_every_minute_leaves_the_yield_in_place(tick, monkeypatch, name):
     """Seen on the test instance after the 1.7.0 install: every analysed song,
     on-demand request or credits lookup admits work. Arming minute cadence on
@@ -278,7 +281,9 @@ def _one_tick(mod, db, monkeypatch, shape, *, raising):
     return {key: result[key] for key in keys}, _cron(db), worked
 
 
-@pytest.mark.parametrize("name", list(SHAPES))
+# With every host call raising, no shape flag is read: the shape with every
+# feature present stands for all of them.
+@pytest.mark.parametrize("name", [">=3.6.2+AM"])
 def test_every_host_call_raising_ticks_as_with_the_features_absent(tick, monkeypatch, name):
     mod, db = tick
     raised, raised_cron, raised_work = _one_tick(mod, db, monkeypatch, SHAPES[name], raising=True)
@@ -304,7 +309,9 @@ def _host_details(shape, task_type, result):
     return message, note
 
 
-@pytest.mark.parametrize("name", list(SHAPES))
+# ">=3.6.2+AM" takes 3.5.2-3.6.1's path; only its note differs, and that is
+# the message itself.
+@pytest.mark.parametrize("name", [name for name in MATRIX if name != ">=3.6.2+AM"])
 def test_every_host_shows_the_ticks_sentence_and_count(tick, monkeypatch, name):
     mod, db = tick
     shape = SHAPES[name]

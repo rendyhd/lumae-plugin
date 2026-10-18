@@ -1396,24 +1396,8 @@ class CountingCursor:
         return Cursor
 
 
-@pytest.mark.parametrize(
-    "implementation",
-    [
-        "new",
-        pytest.param(
-            "oracle",
-            marks=pytest.mark.xfail(
-                strict=True,
-                reason="the pre-P2-2 projector reads every vector and writes row by row",
-            ),
-        ),
-    ],
-)
-def test_projection_reads_and_writes_only_what_changed(migrated_db, projection_config, implementation):
-    project_analysis = {
-        "new": catalog_analysis.project_analysis,
-        "oracle": oracle.project_analysis,
-    }[implementation]
+def test_projection_reads_and_writes_only_what_changed(migrated_db, projection_config):
+    project_analysis = catalog_analysis.project_analysis
     db = migrated_db
     seed(db)
     project_analysis(SERVER, db=db, adapter=V3Adapter())

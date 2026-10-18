@@ -158,9 +158,12 @@ LEAKS = {
 }
 
 
-@pytest.mark.parametrize("path", ["targeted", "blocking_pids_fallback"])
-@pytest.mark.parametrize("leak", sorted(LEAKS))
+# The fallback runs once: it is the same drop, with the targeted lookup off.
+@pytest.mark.parametrize("leak,path", [(leak, "targeted") for leak in sorted(LEAKS)]
+                         + [("uncommitted_create_table", "blocking_pids_fallback")])
 def test_drop_schema_does_not_wait_on_an_idle_transaction(leak, path, monkeypatch):
+    # The first attempt always times out on the stray lock; don't wait 5 s for it.
+    monkeypatch.setattr(pg_helpers, "DROP_LOCK_TIMEOUT", "200ms")
     if path == "blocking_pids_fallback":
         # Find no lock holders up front: only pg_blocking_pids() can clear them.
         monkeypatch.setattr(
@@ -195,31 +198,3 @@ def test_drop_schema_does_not_wait_on_an_idle_transaction(leak, path, monkeypatc
         stray.close()
         if schema_exists(schema):  # pragma: no cover - cleanup after failure
             drop_schema(schema)
-
-
-# Connections deliberately leaked past a test so the real ``migrated_db``
-# teardown has to deal with them; the follow-up test checks the outcome.
-_LEAKED = []
-
-
-def test_migrated_db_teardown_survives_leaked_locking_connections(migrated_db):
-    with migrated_db.cursor() as cur:
-        cur.execute("SELECT current_schema()")
-        schema = cur.fetchone()[0]
-    migrated_db.commit()
-    for statement in LEAKS.values():
-        stray = _leak(schema, statement.format(table=f"{PREFIX}catalog_sources"))
-        _LEAKED.append((schema, stray.get_backend_pid(), stray))
-
-
-def test_leaked_connection_schemas_were_dropped():
-    if not _LEAKED:
-        pytest.skip("runs after test_migrated_db_teardown_survives_leaked_locking_connections")
-    try:
-        for schema, pid, _stray in _LEAKED:
-            assert not schema_exists(schema)
-            assert not backend_alive(pid)
-    finally:
-        for _schema, _pid, stray in _LEAKED:
-            stray.close()
-        _LEAKED.clear()

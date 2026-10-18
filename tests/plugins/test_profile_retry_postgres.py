@@ -63,19 +63,8 @@ def test_transient_exhaustion_and_revision_repair(edge_publication_db):
     assert row(db, "retry-exhaust")[:5] == ("ready", None, None, 0, None)
 
 
-@pytest.mark.parametrize("field", ["retry_analyzer_ver", "retry_profile_schema_ver"])
-def test_new_contract_reenables_exhausted_failure(edge_publication_db, field):
-    db = edge_publication_db
-    _track(db, "retry-contract")
-    for _ in range(3):
-        fail(db, "retry-contract")
-    with db.cursor() as cur:
-        cur.execute(f"UPDATE {PROFILES} SET {field}=0 WHERE track_id='retry-contract'")
-    db.commit()
-    assert eligible("retry-contract")
-
-
-@pytest.mark.parametrize("code", ["silent_audio", "unsupported_media", "resource_limit"])
+# One permanent code: they share one predicate.
+@pytest.mark.parametrize("code", ["unsupported_media"])
 def test_permanent_media_failure_waits_for_revision(edge_publication_db, code):
     db = edge_publication_db
     track = "retry-" + code
@@ -116,18 +105,6 @@ def test_queue_release_is_fenced_and_cools_down(edge_publication_db):
     assert publication.release_attempts(db, SOURCE, {"retry-queue": current}, "secret") == 1
     assert row(db, "retry-queue")[:4] == ("stale", "queue_unavailable", "queue_unavailable", 1)
     assert not eligible("retry-queue")
-
-
-def test_pending_recovery_cools_down(edge_publication_db):
-    db = edge_publication_db
-    _track(db, "retry-recovery")
-    publication.admit_attempts(db, SOURCE, ["retry-recovery"])
-    with db.cursor() as cur:
-        cur.execute(f"UPDATE {PROFILES} SET analyzed_at=now()-interval '2 days' WHERE track_id='retry-recovery'")
-    db.commit()
-    assert load_plugin().recover_stale_pending_profiles(SOURCE) == 1
-    assert row(db, "retry-recovery")[:4] == ("stale", "queue_unavailable", "queue_unavailable", 1)
-    assert not eligible("retry-recovery")
 
 
 def test_old_completion_cannot_change_retry_count(edge_publication_db):

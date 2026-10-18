@@ -1,7 +1,13 @@
-"""PostgreSQL connection and schema-teardown helpers for the plugin tests.
+"""PostgreSQL connection, database and schema-teardown helpers for the
+plugin tests.
 
 Used by ``conftest.py`` (``migrated_db``/``second_connection``) and by the
 tests that check teardown itself.
+
+``dsn()`` reads ``LUMAE_POSTGRES_TEST_DSN`` when called. While a
+``migrated_db`` test runs, the fixture points that variable at the test's own
+database, so ``dsn()``, ``connect()`` and tests that read the variable
+directly all reach it. ``base_dsn()`` is the database the run was given.
 """
 
 import os
@@ -30,11 +36,52 @@ SELECT DISTINCT l.pid
 """
 
 
+_BASE_DSN = os.environ.get("LUMAE_POSTGRES_TEST_DSN")
+
+
 def dsn():
     value = os.environ.get("LUMAE_POSTGRES_TEST_DSN")
     if not value:
         pytest.skip("set LUMAE_POSTGRES_TEST_DSN to run PostgreSQL integration tests")
     return value
+
+
+def base_dsn():
+    """The DSN the run was started with, even inside a ``migrated_db`` test."""
+    if not _BASE_DSN:
+        pytest.skip("set LUMAE_POSTGRES_TEST_DSN to run PostgreSQL integration tests")
+    return _BASE_DSN
+
+
+def database_dsn(name):
+    """``base_dsn()`` with its database replaced by ``name``."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    return psycopg2.extensions.make_dsn(base_dsn(), dbname=name)
+
+
+def admin_connection():
+    """An autocommit connection to the base database, for CREATE/DROP DATABASE."""
+    psycopg2 = pytest.importorskip("psycopg2")
+    admin = psycopg2.connect(base_dsn())
+    admin.autocommit = True
+    return admin
+
+
+def create_database(admin, name, template):
+    """Copy ``template`` (which must have no open connections) to ``name``.
+
+    WAL_LOG (PostgreSQL 15's default) is spelled out: for a database this
+    small it took ~50 ms against ~350 ms for FILE_COPY, whose checkpoint
+    dominates.
+    """
+    with admin.cursor() as cur:
+        cur.execute(f'CREATE DATABASE "{name}" TEMPLATE "{template}" STRATEGY WAL_LOG')
+
+
+def drop_database(admin, name):
+    """Drop ``name``, terminating any connection a test left open in it."""
+    with admin.cursor() as cur:
+        cur.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
 
 
 def connect(schema):

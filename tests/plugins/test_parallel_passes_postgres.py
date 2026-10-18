@@ -10,11 +10,12 @@ and through real analysis children.
   the whole tick is downloaded and published once, and the pass that met it
   reaches the end of the library (1.8.0's test build killed it 5 s after
   every deadline, so it restarted every tick and its pass never finished).
-* K = 1 on a single-threaded process still takes the fork path.
 * Host shapes (the scheduler plan's matrix): on 3.3.0-3.5.1 (one-thread
   jobs) and 3.5.2+ (a heartbeat thread beside the plugin call) K > 1 analyses
-  every file once on the exec path and leaves no thread or worker behind.
+  every file once on the exec path and leaves no thread or worker behind; K = 1
+  on a single-threaded process still takes the fork path.
 """
+import os
 import shutil
 import threading
 import time
@@ -107,7 +108,7 @@ def _slow(mod, monkeypatch, track_id, seconds):
 
     def analyse(analyzer, path, **kwargs):
         assert threading.current_thread() is not MAIN
-        name = path.rsplit("/", 1)[-1]
+        name = os.path.basename(path)
         calls.append(name.rsplit("-", 1)[0])
         if name.startswith(f"{track_id}-"):
             time.sleep(seconds)
@@ -117,6 +118,11 @@ def _slow(mod, monkeypatch, track_id, seconds):
     # 1.8.0's 5 s drain window, scaled to these ticks (gone since).
     monkeypatch.setattr(par, "DRAIN_SECONDS", 0.5, raising=False)
     return calls
+
+
+# The fork and exec paths exist only where analysis is isolated (POSIX);
+# elsewhere analysis runs in-process and neither is called.
+posix_isolation = pytest.mark.skipif(os.name != "posix", reason="POSIX process isolation")
 
 
 def _until_complete(task, ticks=6, tick_seconds=1.0):
@@ -175,22 +181,6 @@ def test_a_waveform_slower_than_the_tick_finishes_in_the_tick_that_started_it(pa
     assert _rows(db, f"SELECT DISTINCT retry_count FROM {P}source_profiles") == [(0,)]
     # On-demand work was served while the tick waited for it.
     assert [at for at in served if at > began + 1.5]
-
-
-def test_k_equal_one_on_a_single_threaded_process_takes_the_fork_path(parallel, monkeypatch):
-    mod, db, downloads, _served, _tmp = parallel
-    _tracks(db, 3)
-    _queued_backfill(db)
-    monkeypatch.setattr(mod, "background_workers", lambda: 1)
-    paths = []
-    for name in ("_run_forked", "_run_exec"):
-        real = getattr(iso, name)
-        monkeypatch.setattr(iso, name, lambda *a, _real=real, _name=name, **k: (
-            paths.append(_name), _real(*a, **k))[1])
-
-    mod.catalog_reconcile_task()
-
-    assert paths == ["_run_forked"] * 3 and len(downloads) == 3
 
 
 def test_the_edge_pass_runs_on_k_threads_and_finishes_the_library(parallel, monkeypatch):
@@ -269,6 +259,7 @@ def test_a_loudness_measurement_slower_than_the_tick_completes_and_the_pass_reac
     assert loudness_backfill.state(db, SOURCE)["cursor"] == ""
 
 
+@posix_isolation
 @pytest.mark.parametrize("name", ["3.3.0-3.5.1", "3.5.2-3.6.1"])
 @pytest.mark.parametrize("workers", [1, 2])
 def test_k_threads_on_the_host_shapes(parallel, monkeypatch, name, workers):

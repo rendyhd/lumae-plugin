@@ -33,6 +33,7 @@ import pytest
 
 psycopg2 = pytest.importorskip("psycopg2")
 from psycopg2 import errors  # noqa: E402
+from psycopg2.extras import execute_values  # noqa: E402
 
 from pg_helpers import connect  # noqa: E402
 from test_lumae_analysis import RefreshBridge  # noqa: E402  (installs the plugin.api stub)
@@ -233,10 +234,31 @@ PUBLISHED_STATES = ("absent", None, "", "catalog-media:new", "catalog-media:old"
 OPERATIONS = (None, "upsert", "delete")
 
 
+class _BatchedInserts:
+    """Collects the fixture helpers' single-row INSERTs and writes each
+    statement's rows with one ``execute_values`` (about 17,000 rows), in the
+    order each statement first ran, so referenced rows come first."""
+
+    def __init__(self, cur):
+        self._cur = cur
+        self._rows = {}
+
+    def execute(self, sql, params):
+        self._rows.setdefault(sql, []).append(params)
+
+    def flush(self):
+        for sql, rows in self._rows.items():
+            prefix, template = sql.rsplit(" VALUES ", 1)
+            execute_values(self._cur, f"{prefix} VALUES %s", rows,
+                           template=template, page_size=1000)
+        self._rows.clear()
+
+
 def _combinatorial_fixture(db):
     """One track per combination, plus a second source that must stay untouched."""
     changes = [("album", "album-1", "upsert", None, False)]
-    with db.cursor() as cur:
+    with db.cursor() as real:
+        cur = _BatchedInserts(real)
         _source(cur, SOURCE, "server-a")
         _source(cur, OTHER, "server-b")
         combinations = itertools.product(
@@ -280,6 +302,7 @@ def _combinatorial_fixture(db):
                 "floor_seq) VALUES (%s, 'profile-epoch', 7, 0)",
                 (source,),
             )
+        cur.flush()
     db.commit()
     return changes
 

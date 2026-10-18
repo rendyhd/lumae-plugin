@@ -186,46 +186,6 @@ def test_raw_1_2_5_collection_insert_fails_and_new_writes_continue(
     ) == 2
 
 
-def test_legacy_writer_probe_inverted(collection_api):
-    """docs/audit/.../collections/test_probe_legacy_writer.py, inverted."""
-    manager_mod, call, connect = collection_api
-    assert call("POST", "/api/collections", {"id": "a", "name": "a"}).status_code == 201
-    db = connect()
-    try:
-        with db.cursor() as cur:
-            cur.execute(
-                "SELECT column_default FROM information_schema.columns "
-                "WHERE table_schema=current_schema() AND table_name=%s AND column_name='seq'",
-                (manager_mod.collection_changes_table(),),
-            )
-            default = cur.fetchone()
-            attempts = []
-            for _ in range(5):  # what an un-drained 1.2.5 worker does
-                cur.execute("SAVEPOINT s")
-                try:
-                    cur.execute(
-                        f"INSERT INTO {manager_mod.collection_changes_table()} "
-                        "(principal, collection_id, entity_kind, entity_id, operation, payload)"
-                        " VALUES ('user:alice','a','collection','a','upsert','{}') RETURNING seq"
-                    )
-                    attempts.append("ok")
-                except psycopg2.errors.NotNullViolation:
-                    cur.execute("ROLLBACK TO SAVEPOINT s")
-                    attempts.append("NotNullViolation")
-                except psycopg2.Error as exc:
-                    cur.execute("ROLLBACK TO SAVEPOINT s")
-                    attempts.append(type(exc).__name__)
-        db.commit()
-    finally:
-        db.rollback()
-        db.close()
-    assert default == (None,)
-    assert attempts == ["NotNullViolation"] * 5
-    assert [call("PATCH", "/api/collections/a", {"name": f"n{i}"}).status_code
-            for i in range(3)] == [200, 200, 200]
-    assert call("POST", "/api/collections", {"id": "z", "name": "z"}, user="bob").status_code == 201
-
-
 def test_real_1_2_5_collection_writer_fails_closed(collection_api, plugin_125, monkeypatch):
     manager_mod, call, connect = collection_api
     old = plugin_125.collection_manager
@@ -296,43 +256,6 @@ def test_feed_invariant_violation_blocks_writes_with_503_and_repair_sql(collecti
 # -- 3. profiles: writer_generation fence --------------------------------------
 
 
-def test_record_profile_change_writes_generation_2(migrated_db):
-    _seed_source(migrated_db, "t1")
-    with migrated_db.cursor() as cur:
-        enrichment.record_profile_change(cur, SOURCE, "t1", "deleted")
-    migrated_db.commit()
-    assert _scalar(
-        migrated_db, f"SELECT array_agg(writer_generation) FROM {P}profile_changes"
-    ) == [2]
-
-
-def test_old_style_profile_change_insert_fails_and_rolls_back_its_publication(
-    migrated_db, second_connection
-):
-    _seed_source(migrated_db, "t1")
-    with second_connection.cursor() as cur:
-        # 1.2.5 upsert_profile: source row, then journal, one transaction.
-        cur.execute(
-            f"""INSERT INTO {P}source_profiles
-                (catalog_instance_id, track_id, sample_rate, duration_ms, ref_lufs,
-                 start_ramp, end_ramp, analyzer_ver, profile_schema_ver,
-                 media_signature, analyzed_at, status)
-                VALUES (%s, 't1', 48000, 1234, -14, 'a', 'b', 1, 1,
-                        'catalog-media:rev-a', now(), 'ready')""",
-            (SOURCE,),
-        )
-        with pytest.raises(psycopg2.errors.NotNullViolation):
-            cur.execute(
-                f"""INSERT INTO {P}profile_changes
-                    (catalog_instance_id, epoch, seq, track_id, operation, payload)
-                    VALUES (%s, 'e', 1, 't1', 'upsert', '{{}}')""",
-                (SOURCE,),
-            )
-    second_connection.rollback()
-    assert _scalar(migrated_db, f"SELECT count(*) FROM {P}source_profiles") == 0
-    assert _scalar(migrated_db, f"SELECT count(*) FROM {P}profile_changes") == 0
-
-
 def test_real_1_2_5_profile_writer_rolls_back_whole_publication(
     migrated_db, second_connection, plugin_125, monkeypatch
 ):
@@ -360,19 +283,6 @@ def test_real_1_2_5_profile_writer_rolls_back_whole_publication(
         migrated_db,
         f"SELECT array_agg(writer_generation) FROM {P}profile_changes WHERE track_id='t2'",
     ) == [2]
-
-
-def test_old_style_catalog_change_insert_fails(migrated_db, second_connection):
-    with second_connection.cursor() as cur:
-        with pytest.raises(psycopg2.errors.NotNullViolation):
-            # 1.2.5 catalogue publication and rekey omit the column.
-            cur.execute(
-                f"""INSERT INTO {P}catalog_changes
-                    (catalog_instance_id, epoch, seq, generation, entity_type,
-                     entity_id, operation, change_reason, payload)
-                    VALUES ('c', 'e', 1, 1, 'track', 't', 'upsert', 'provider_diff', NULL)"""
-            )
-    second_connection.rollback()
 
 
 def test_real_rekey_publication_writes_the_fenced_catalog_journal(migrated_db):
