@@ -18,6 +18,7 @@ import sys
 import threading
 
 import pytest
+import urllib3
 
 from test_lumae_analysis import plugin_api_module  # noqa: F401  (host stub)
 from plugins.LumaeAnalysis import analysis_download as download
@@ -81,7 +82,13 @@ def test_jellyfin_keeps_its_static_target(tmp_path):
     (200, "application/json", b'{"subsonic-response":{"status":"failed"}}'),
     (403, "audio/flac", b"no"),
     (200, "audio/flac", b""),
-    (200, "audio/flac", None),
+    pytest.param(
+        (200, "audio/flac", None), id="dropped",
+        # urllib3 1.x returns a short body without error; the pinned
+        # requests>=2.32 brings urllib3 2, which enforces Content-Length.
+        marks=pytest.mark.skipif(int(urllib3.__version__.split(".")[0]) < 2,
+                                 reason="urllib3 < 2 does not enforce Content-Length"),
+    ),
 ])
 def test_failures_raise_without_secrets_and_leave_no_file(server, tmp_path, route):
     base, handler = server
@@ -127,6 +134,8 @@ def test_the_task_directory_is_outside_temp_dir_and_survives_clean_temp(tmp_path
     assert os.path.exists(os.path.join(directory, "a.audio"))
 
 
+# On Windows os.kill(pid, 0) is TerminateProcess, not a liveness probe.
+@pytest.mark.skipif(os.name != "posix", reason="os.kill(pid, 0) probes liveness only on POSIX")
 def test_leftovers_of_gone_processes_are_removed_at_worker_start(tmp_path, monkeypatch):
     monkeypatch.setattr(download.tempfile, "gettempdir", lambda: str(tmp_path))
     mine = download.task_directory()
