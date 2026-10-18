@@ -1,6 +1,7 @@
 """Bounded collection writes (P3-4a, LUM-004): block allocation of feed seqs,
 bounded lock waits, and chunked, resumable restores."""
 
+import os
 import random
 import threading
 import time
@@ -9,6 +10,15 @@ import pytest
 from flask import Flask, g
 
 from test_collection_feed_epoch_postgres import _feed, collections_api  # noqa: F401 (fixture)
+
+
+# Restores here are a tenth of production's 2,000-row chunks, with backups a
+# tenth the size, so they take the same number of chunks.
+CHUNK = 200
+BIG = 500
+# LUMAE_FULL_SCALE_RESTORE=1 runs the LUM-004 budget test at production scale
+# (2,000-row chunks, 20,000 rows; about three minutes on a workstation).
+FULL_SCALE = os.environ.get("LUMAE_FULL_SCALE_RESTORE") == "1"
 
 
 def _backup(manager, collections):
@@ -231,7 +241,7 @@ def _restores(api):
 def test_chunked_restore_equals_unchunked_and_resumes_idempotently(collections_api, monkeypatch):
     api = collections_api
     manager = api.manager
-    backup = _backup(manager, [("Big", 5_000), ("Small", 3), ("Empty", 0)])
+    backup = _backup(manager, [("Big", BIG), ("Small", 3), ("Empty", 0)])
     chunks = []
     original = manager._restore_principal_collections
     fail_on = {}
@@ -245,17 +255,17 @@ def test_chunked_restore_equals_unchunked_and_resumes_idempotently(collections_a
 
     monkeypatch.setattr(manager, "_restore_principal_collections", counted)
 
-    # Unchunked reference (one transaction), then the default 2,000-row chunks.
+    # Unchunked reference (one transaction), then CHUNK-row chunks.
     monkeypatch.setattr(manager, "RESTORE_CHUNK_ROWS", 100_000)
     whole = api.call("POST", "/api/collections/restore", backup, key="r", user="carol")
-    monkeypatch.setattr(manager, "RESTORE_CHUNK_ROWS", 2_000)
+    monkeypatch.setattr(manager, "RESTORE_CHUNK_ROWS", CHUNK)
     chunked = api.call("POST", "/api/collections/restore", backup, key="r", user="alice")
     assert whole.status_code == chunked.status_code == 201
-    assert [rows for _, rows in chunks] == [5_006, 2_000, 2_000, 1_006]
+    assert [rows for _, rows in chunks] == [506, 200, 200, 106]
     for body in (whole.get_json(), chunked.get_json()):
-        assert (body["restored"], body["collection_count"], body["item_count"]) == (True, 3, 5_003)
+        assert (body["restored"], body["collection_count"], body["item_count"]) == (True, 3, 503)
         assert [c["name"] for c in body["collections"]] == ["Big", "Small", "Empty"]
-        assert [c["track_count"] for c in body["collections"]] == [5_000, 3, 0]
+        assert [c["track_count"] for c in body["collections"]] == [BIG, 3, 0]
     content, revisions = _principal_state(api, "alice")
     assert (content, revisions) == (_principal_state(api, "carol")[0],
                                     {"Big": 4, "Small": 2, "Empty": 1})
@@ -271,7 +281,7 @@ def test_chunked_restore_equals_unchunked_and_resumes_idempotently(collections_a
         api.call("POST", "/api/collections/restore", backup, key="d", user="dave")
     assert _restores(api) == [("user:dave", 1, 3)]
     partial = api.call("GET", "/api/collections/snapshot", user="dave").get_json()
-    assert [(c["name"], c["track_count"]) for c in partial["collections"]] == [("Big", 1_999)]
+    assert [(c["name"], c["track_count"]) for c in partial["collections"]] == [("Big", 199)]
     # The same key with another body is a conflict, and changes nothing.
     other = _backup(manager, [("Else", 1)])
     conflict = api.call("POST", "/api/collections/restore", other, key="d", user="dave")
@@ -298,7 +308,7 @@ def test_chunked_restore_equals_unchunked_and_resumes_idempotently(collections_a
     assert summary(resumed.get_json()) == summary(chunked.get_json())
     # Chunk 2 was rolled back once, then chunks 2 and 3 applied once each.
     assert [rows for principal, rows in chunks if principal == "user:dave"] == [
-        2_000, 2_000, 2_000, 1_006]
+        200, 200, 200, 106]
     assert _principal_state(api, "dave") == _principal_state(api, "alice")
     assert _event_shape(api, "dave") == _event_shape(api, "alice")
     assert _restores(api) == []
@@ -313,7 +323,7 @@ def test_chunked_restore_equals_unchunked_and_resumes_idempotently(collections_a
     with pytest.raises(RuntimeError, match="injected"):
         api.call("POST", "/api/collections/restore", backup, user="erin")
     erin = api.call("GET", "/api/collections/snapshot", user="erin").get_json()
-    assert [(c["name"], c["track_count"]) for c in erin["collections"]] == [("Big", 1_999)]
+    assert [(c["name"], c["track_count"]) for c in erin["collections"]] == [("Big", 199)]
     assert _restores(api) == []
 
 
@@ -346,7 +356,8 @@ def test_concurrent_retries_with_one_key_apply_each_chunk_once(collections_api, 
 def test_collection_deleted_during_a_restore_stays_deleted(collections_api, monkeypatch):
     api = collections_api
     manager = api.manager
-    backup = _backup(manager, [("Big", 5_000), ("Small", 3)])
+    monkeypatch.setattr(manager, "RESTORE_CHUNK_ROWS", CHUNK)
+    backup = _backup(manager, [("Big", BIG), ("Small", 3)])
     original = manager._restore_principal_collections
     chunks, deleted = [], []
 
@@ -369,7 +380,7 @@ def test_collection_deleted_during_a_restore_stays_deleted(collections_api, monk
     assert len(chunks) == 3 and deleted[0].status_code == 200
     big, small = response.get_json()["collections"]
     # Reported as its tombstone: revision 2 after chunk 1, 3 for the delete.
-    assert (big["name"], big["revision"], big["track_count"]) == ("Big", 3, 1_999)
+    assert (big["name"], big["revision"], big["track_count"]) == ("Big", 3, 199)
     assert big["deleted_at"] is not None
     assert (small["name"], small["revision"], small["track_count"], small["deleted_at"]) == (
         "Small", 2, 3, None)
@@ -377,13 +388,13 @@ def test_collection_deleted_during_a_restore_stays_deleted(collections_api, monk
     assert [c["name"] for c in snapshot["collections"]] == ["Small"]
     # Items after the delete were skipped: no rows and no events for them.
     big_events = [(c["entity_kind"], c["operation"]) for c in _changes(api) if c["collection_id"] == big["id"]]
-    assert big_events == [("collection", "upsert")] + [("item", "upsert")] * 1_999 + [
+    assert big_events == [("collection", "upsert")] + [("item", "upsert")] * 199 + [
         ("collection", "delete")]
     db = api.connect()
     with db.cursor() as cur:
         cur.execute(f"SELECT count(*) FROM {manager.collection_items_table()} "
                     "WHERE collection_id = %s", (big["id"],))
-        assert cur.fetchone()[0] == 1_999
+        assert cur.fetchone()[0] == 199
     db.close()
 
 
@@ -395,7 +406,8 @@ def test_collection_finished_earlier_and_deleted_before_the_last_chunk_is_its_to
     """
     api = collections_api
     manager = api.manager
-    backup = _backup(manager, [("Small", 3), ("Big", 5_000)])
+    monkeypatch.setattr(manager, "RESTORE_CHUNK_ROWS", CHUNK)
+    backup = _backup(manager, [("Small", 3), ("Big", BIG)])
     original = manager._restore_principal_collections
     chunks, deleted = [], []
 
@@ -418,13 +430,13 @@ def test_collection_finished_earlier_and_deleted_before_the_last_chunk_is_its_to
     assert response.status_code == 201, response.get_json()
     assert len(chunks) == 3 and deleted[0].status_code == 200
     body = response.get_json()
-    assert (body["collection_count"], body["item_count"]) == (2, 5_003)
+    assert (body["collection_count"], body["item_count"]) == (2, 503)
     small, big = body["collections"]
     assert (small["id"], small["name"], small["revision"], small["track_count"]) == (
         chunks[0][0]["id"], "Small", 3, 3)
     assert small["deleted_at"] is not None
     assert (big["name"], big["revision"], big["track_count"], big["deleted_at"]) == (
-        "Big", 4, 5_000, None)
+        "Big", 4, BIG, None)
     # The replay returns the same list.
     replay = api.call("POST", "/api/collections/restore", backup, key="late")
     assert replay.headers["Idempotency-Replayed"] == "true" and replay.get_json() == body
@@ -500,9 +512,18 @@ def test_other_principal_write_waits_briefly_during_a_large_restore(
     read every earlier collection while holding the head (review MEDIUM-1).
     While a chunk holds the head, only its event INSERT and, in the last
     chunk, the receipt INSERT may run, whatever the number of collections.
+
+    Scaled down tenfold (CHUNK-row chunks, a tenth of the rows: the same
+    eleven chunks) unless FULL_SCALE.
     """
     api = collections_api
     manager = api.manager
+    if not FULL_SCALE:
+        monkeypatch.setattr(manager, "RESTORE_CHUNK_ROWS", CHUNK)
+        if collections == 1:
+            items //= 10
+        else:
+            collections //= 10
     assert api.call("POST", "/api/collections", {"id": "bobc", "name": "b"}, user="bob").status_code == 201
     backup = _backup(manager, [(f"C{c}", items) for c in range(collections)])
     holds = _record_head_holds(api, monkeypatch, "restore")

@@ -161,6 +161,8 @@ LEAKS = {
 @pytest.mark.parametrize("path", ["targeted", "blocking_pids_fallback"])
 @pytest.mark.parametrize("leak", sorted(LEAKS))
 def test_drop_schema_does_not_wait_on_an_idle_transaction(leak, path, monkeypatch):
+    # The first attempt always times out on the stray lock; don't wait 5 s for it.
+    monkeypatch.setattr(pg_helpers, "DROP_LOCK_TIMEOUT", "200ms")
     if path == "blocking_pids_fallback":
         # Find no lock holders up front: only pg_blocking_pids() can clear them.
         monkeypatch.setattr(
