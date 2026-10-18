@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased
+## 1.8.0 (2026-10-18)
 
 Whole-track loudness for Lumae's volume normalization (contract §3.9, K13;
 Auralscape LN.3/LN.4). Clients that don't know the new stream never read it.
@@ -120,6 +120,20 @@ The scheduler panel shows throughput (WP5: the scheduler plan's S12).
   bench (an estimate, not a measurement of this host).
 - AudioMuse schedules waiting for their retry, which Lumae yields to, and
   how long ago each was refused (AudioMuse 3.3.0 and later).
+
+AudioMuse's Scheduled Tasks lists only Lumae's five schedules.
+
+- Lumae registers only `catalog_reconcile`, `catalog_refresh`,
+  `provider_identity_recheck`, `analysis_projection` and
+  `collection_retention`. The watchdog's one-action jobs (prepare, waveform
+  and edge backfill, relationships, credits, and the loudness pass of the
+  first 1.8.0 test build) were listed under Plugin tasks with an Enable box,
+  and a schedule for one would have run it without its source arguments.
+  Queued jobs still run by their dotted path.
+- The migration removes schedule rows an administrator made for those names.
+- On hosts whose `add_cron_task` takes a description, each schedule gets an
+  info tooltip; the settings page's Scheduler panel lists the five, their
+  state, what each does and whether to touch it.
 
 ## 1.7.1 (2026-10-13)
 
