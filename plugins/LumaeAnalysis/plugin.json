@@ -114,10 +114,10 @@
     {
       "version": "1.8.0",
       "min_core_version": "3.2.0",
-      "changelog": "TEST BUILD (release/1.8, not published). Whole-track loudness for Lumae's volume normalization (ITU-R BS.1770-4, measured in the edge pass's decode or by a low-priority backfill; a new loudness stream; albums pooled once every track is measured). Faster background analysis: the edge and loudness passes work until the watchdog tick's deadline; up to 4 files are analysed at once inside the one tick (setting \"Files analyzed at once\", auto), each in its own worker at nice 10; one download and one analysis call per track give the waveform, edge and loudness together, downloaded by Lumae as the original file (Navidrome format=raw, Jellyfin static=true) outside AudioMuse's TEMP_DIR; credits re-checks back off and idle ticks do less; the settings page shows throughput, ETA and refused schedules. After installing, the loudness backfill measures the whole library once. AudioMuse 3.2.0 is still the minimum.",
+      "changelog": "TEST BUILD (release/1.8, not published). Whole-track loudness for Lumae's volume normalization (ITU-R BS.1770-4, measured in the edge pass's decode or by a low-priority backfill; a new loudness stream; albums pooled once every track is measured). Faster background analysis: the edge and loudness passes work until the watchdog tick's deadline; up to 4 files are analysed at once inside the one tick (setting \"Files analyzed at once\", auto), each in its own worker at nice 10; one download and one analysis call per track give the waveform, edge and loudness together, downloaded by Lumae as the original file (Navidrome format=raw, Jellyfin static=true) outside AudioMuse's TEMP_DIR; credits re-checks back off and idle ticks do less; the settings page shows throughput, ETA and refused schedules. After installing, the loudness backfill measures the whole library once. A file still being analysed at a tick's deadline now finishes instead of restarting every tick, so long tracks no longer stall a parallel pass. AudioMuse's Scheduled Tasks lists only Lumae's five schedules, each with an info tooltip on hosts that show one; the settings page explains them. AudioMuse 3.2.0 is still the minimum.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/release/1.8/dist/lumae_analysis/lumae_analysis_1.8.0.zip",
-      "checksum": "00a7444e20774b90bca050b99ee4f015"
+      "checksum": "4eae57c4e05320ac1e5f078b2e2c4761"
     },
     {
       "version": "1.7.1",
