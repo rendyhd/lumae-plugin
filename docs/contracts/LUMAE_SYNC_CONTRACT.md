@@ -266,6 +266,21 @@ List text follows Python's `repr` of each element: single quotes; double quotes 
 
 **Kept for stability.** This text is the published format, not a defect to be fixed in place: `release_type` is part of every album's and track's `metadata_fp`, and `external_ids` of every track's, so publishing a real array or another text form would change almost every catalogue row at once: a catalogue-wide `upsert` wave to every phone, and Lumae Radio preparing its stations again. A different form needs a new, capability-gated field (§8 rules 1 and 2).
 
+### 2.5 `POST /api/catalog/refresh` (`catalog_refresh_api`; SQ.1, unreleased)
+
+Body: `server_id`, optional `catalog_instance_id`, optional `if_stale_for_seconds` (0–604,800). Answers:
+
+| Status | Body `status` | Meaning |
+|---|---|---|
+| 200 | `fresh` | The published catalogue completed less than `if_stale_for_seconds` ago; nothing is queued. |
+| 202 | `queued` | A refresh task is on AudioMuse's queue. With `coalesced: true` (SQ.1) one was already queued or running and serves this request. |
+| 202 | `deferred`, `reason: "host_busy"` (SQ.1) | AudioMuse refused the task because another queue job runs (an analysis, often). The request is kept (`catalog_state.refresh_wanted_at`) and the watchdog runs it once the queue is free; `Retry-After: 60`. |
+| 409 | `source_required`, `source_mismatch`, `rebind_required` | As before. |
+
+Up to 1.9.0 a busy queue surfaced as AudioMuse's 409 (`[1201] Task In Progress`) and the request was dropped. A client reads the new catalogue with a later sync: a refresh is never awaited in the request. Any finished scan serves every request kept before it started, whatever ran it (an app's refresh, the watchdog, an analysis run's finalization, catalogue preparation).
+
+From SQ.1 a refresh that changed the catalogue projects AudioMuse's analysis at once (as an analysis run's finalization does), so a new song reaches a client with the analysis AudioMuse already holds. Before, the catalogue could publish a song whose analysis stream entry followed only with the next finalization or projection.
+
 ---
 
 ## 3. Profile endpoints

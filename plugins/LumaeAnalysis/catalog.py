@@ -1446,6 +1446,9 @@ def migrate_catalog(db):
         "catalog_builder_version INTEGER NOT NULL DEFAULT 0",
         "refresh_required BOOLEAN NOT NULL DEFAULT TRUE",
         "refresh_reason TEXT",
+        # SQ.1: a refresh an app asked for while AudioMuse's queue refused it
+        # (want_catalog_refresh); the watchdog runs it.
+        "refresh_wanted_at TIMESTAMPTZ",
     )
     # 1.6.0 (JF.8): the Jellyfin server Id bound to a catalogue.
     migrations.ensure_columns(cur, t("catalog_sources"), "provider_server_id TEXT")
@@ -1931,6 +1934,109 @@ def _require_jellyfin_identity(observation):
             "Lumae could not verify the Jellyfin server identity; it preserved the "
             "previous complete generation and will retry."
         )
+
+
+def want_catalog_refresh(db, catalog_instance_id):
+    """Keep a refresh AudioMuse refused to queue (SQ.1).
+
+    The earliest request is kept: any scan that starts after it serves it.
+    The caller arms the watchdog and commits."""
+    cur = db.cursor()
+    cur.execute(
+        f"UPDATE {t('catalog_state')} "
+        "SET refresh_wanted_at=COALESCE(refresh_wanted_at, now()), updated_at=now() "
+        "WHERE catalog_instance_id=%s",
+        (catalog_instance_id,),
+    )
+    cur.close()
+
+
+def catalog_refresh_clock(db):
+    """The database's time before a scan starts; a request older than it is
+    served by the scan (``satisfy_catalog_refresh_wants``)."""
+    cur = db.cursor()
+    cur.execute("SELECT clock_timestamp()")
+    started = cur.fetchone()[0]
+    cur.close()
+    db.commit()
+    return started
+
+
+def satisfy_catalog_refresh_wants(db, catalog_instance_id, started):
+    """Clear a kept refresh request made before a finished scan started."""
+    if started is None:
+        return False
+    cur = db.cursor()
+    cur.execute(
+        f"UPDATE {t('catalog_state')} SET refresh_wanted_at=NULL "
+        "WHERE catalog_instance_id=%s AND refresh_wanted_at <= %s "
+        "RETURNING catalog_instance_id",
+        (catalog_instance_id, started),
+    )
+    cleared = cur.fetchone() is not None
+    cur.close()
+    db.commit()
+    return cleared
+
+
+def next_wanted_catalog_refresh(db, server_id=None):
+    """``(server_id, catalog_instance_id)`` of the oldest kept refresh request
+    with no catalogue refresh task queued or running, or None."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT s.current_core_server_id, c.catalog_instance_id
+          FROM {t('catalog_state')} c
+          JOIN {t('catalog_sources')} s USING (catalog_instance_id)
+         WHERE c.refresh_wanted_at IS NOT NULL
+           AND s.rebind_status='active'
+           AND (%s IS NULL OR s.current_core_server_id=%s)
+         ORDER BY c.refresh_wanted_at, c.catalog_instance_id
+         LIMIT 1
+        """,
+        (server_id, server_id),
+    )
+    row = cur.fetchone()
+    cur.close()
+    db.commit()
+    if row is None or catalog_refresh_task_live(db):
+        return None
+    return str(row[0]), str(row[1])
+
+
+CATALOG_REFRESH_TASK_MARKER = "lumae_analysis.catalog_refresh"
+LIVE_TASK_STATUSES = ("NEW", "QUEUED", "PENDING", "STARTED", "RUNNING", "PROGRESS")
+
+
+def catalog_refresh_task_live(db):
+    """Whether a catalogue refresh task (queued by an app or its schedule) is
+    queued or running on AudioMuse's queue. Fails open (False)."""
+    cur = None
+    try:
+        cur = db.cursor()
+        cur.execute(
+            """
+            SELECT 1 FROM task_status
+             WHERE parent_task_id IS NULL
+               AND position(%s in task_type) > 0
+               AND status = ANY(%s)
+             LIMIT 1
+            """,
+            (CATALOG_REFRESH_TASK_MARKER, list(LIVE_TASK_STATUSES)),
+        )
+        live = cur.fetchone() is not None
+        cur.close()
+        db.commit()
+        return live
+    except Exception:
+        rollback = getattr(db, "rollback", None)
+        if callable(rollback):
+            try:
+                rollback()
+            except Exception:
+                pass
+        logger.debug("lumae_analysis could not read AudioMuse's queue", exc_info=True)
+        return False
 
 
 def refresh_catalog(server_id=None, db=None, bridge=None):

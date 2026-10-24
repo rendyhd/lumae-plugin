@@ -384,6 +384,11 @@ def _work_summary(cur):
              WHERE status IN ('queued', 'failed')
                 OR (status='running' AND updated_at < now() - interval '30 minutes')
             UNION ALL
+            -- SQ.1: a catalogue refresh an app asked for while the queue was busy.
+            SELECT 'ready', 0, NULL::timestamp
+              FROM {_work_table('catalog_state')}
+             WHERE refresh_wanted_at IS NOT NULL
+            UNION ALL
             SELECT 'ready', 0, NULL::timestamp
              WHERE EXISTS (SELECT 1 FROM {_work_table('source_profiles')}
                             WHERE status='pending_interactive' AND last_error='{DEFERRED_MARKER}')
@@ -1113,8 +1118,11 @@ def catalog_refresh_sentence(result):
     if reason == "no_change":
         return f"Lumae: catalogue unchanged, {_plural(tracks, 'track')}"
     changes = int(result.get("changes") or 0)
-    return (f"Lumae: catalogue refreshed, {_plural(changes, 'change')}, "
-            f"{_plural(tracks, 'track')}")
+    sentence = (f"Lumae: catalogue refreshed, {_plural(changes, 'change')}, "
+                f"{_plural(tracks, 'track')}")
+    if (result.get("analysis") or {}).get("status") == "projected":
+        sentence += ", analysis projected"
+    return sentence
 
 
 def analysis_projection_sentence(result):

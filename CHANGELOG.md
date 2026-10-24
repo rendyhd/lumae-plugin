@@ -7,6 +7,21 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased
+
+New songs and their analysis reach the phone without waiting for a busy
+AudioMuse (contract §2.5; Auralscape RCA 2026-10-24, SQ.1).
+
+- `POST /api/catalog/refresh` no longer loses a request while AudioMuse's
+  queue runs another job: it answers 202 `deferred` (`reason: "host_busy"`,
+  `Retry-After: 60`) and keeps the request, and the watchdog runs it once the
+  queue is free. A refresh already on the queue serves a new request (202
+  `queued`, `coalesced: true`). Up to 1.9.0 the phone got a 409 and read the
+  old catalogue.
+- A refresh that changed the catalogue projects AudioMuse's analysis right
+  after, so a new song never arrives without the analysis AudioMuse already
+  has.
+
 ## 1.9.0 (2026-10-24)
 
 Journeys (contract §5.7; Auralscape JN.10). Clients that don't know them never

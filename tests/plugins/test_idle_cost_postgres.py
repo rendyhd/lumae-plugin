@@ -246,8 +246,8 @@ class _Counting:
 # Statements of an idle tick with an idle credits library (one source, two
 # albums, both current). Before WP4 it ran 59: a page of the credits walk and
 # an upsert per album twice a tick, and the settings snapshot counted every
-# tick.
-IDLE_TICK_STATEMENTS = 26
+# tick. SQ.1 added one indexed read: a catalogue refresh kept for the tick.
+IDLE_TICK_STATEMENTS = 27
 
 
 def test_an_idle_tick_runs_few_statements(tick, monkeypatch):

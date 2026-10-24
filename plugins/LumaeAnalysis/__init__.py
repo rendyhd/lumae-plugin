@@ -62,16 +62,21 @@ from .catalog import (
     CATALOG_BUILDER_VERSION,
     CatalogScanError,
     bootstrap_page,
+    catalog_refresh_clock,
+    catalog_refresh_task_live,
     create_bootstrap_session,
     ensure_catalog_sources,
     migrate_catalog,
+    next_wanted_catalog_refresh,
     prune_catalog_storage,
     read_catalog_changes,
     refresh_catalog,
     release_bootstrap_session,
     resolve_catalog_source,
+    satisfy_catalog_refresh_wants,
     source_matches_server_id,
     verify_library_scope,
+    want_catalog_refresh,
 )
 from .catalog_analysis import (
     AnalysisProjectionDeferred,
@@ -731,11 +736,13 @@ def catalog_refresh_task(server_id=None):
     if not resolved_server_id:
         return task_message({"status": "skipped", "reason": "source_rebind_required"},
                             "Lumae: catalogue refresh skipped; the source awaits rebinding")
+    started = _safe_catalog_refresh_clock()
     result = refresh_catalog(server_id=resolved_server_id)
+    _satisfy_catalog_refresh_wants(result.get("catalog_instance_id"), started)
+    changed = bool(result.get("changes") or
+                   result.get("change_reason") == "fingerprint_schema_rebase")
     try:
         source = result["catalog_instance_id"]
-        changed = bool(result.get("changes") or
-                       result.get("change_reason") == "fingerprint_schema_rebase")
         if (changed or
                 find_backfill_ids(1, catalog_instance_id=source,
                                   server_id=result["server_id"]) or
@@ -751,6 +758,11 @@ def catalog_refresh_task(server_id=None):
     except Exception:
         _rollback_if_possible(get_db())
         logger.exception("Could not arm source profile repair after catalogue publication")
+    if changed:
+        # SQ.1: a new song goes out with the analysis AudioMuse already has;
+        # without this an app read it with none until an analysis run's
+        # finalization or another trigger projected.
+        result["analysis"] = _project_after_catalog_refresh(resolved_server_id)
     try:
         db = get_db()
         optional_storage.prune(db)
@@ -762,6 +774,69 @@ def catalog_refresh_task(server_id=None):
     # these counts (P2-1).
     refresh_status_snapshot(get_db(), result.get("catalog_instance_id"))
     return task_message(result, catalog_refresh_sentence(result))
+
+
+def _safe_catalog_refresh_clock():
+    try:
+        return catalog_refresh_clock(get_db())
+    except Exception:
+        _rollback_if_possible(get_db())
+        logger.debug("lumae_analysis could not read the database clock", exc_info=True)
+        return None
+
+
+def _satisfy_catalog_refresh_wants(catalog_instance_id, started):
+    """A finished scan serves every refresh request kept before it started."""
+    if not catalog_instance_id:
+        return
+    try:
+        satisfy_catalog_refresh_wants(get_db(), catalog_instance_id, started)
+    except Exception:
+        _rollback_if_possible(get_db())
+        logger.exception("lumae_analysis could not clear the kept catalogue refresh request")
+
+
+def _project_after_catalog_refresh(server_id):
+    """Project AudioMuse's analysis after a catalogue change (SQ.1). This task
+    already owns a root slot, so the projection runs inline; it admits the
+    relationship work itself."""
+    try:
+        projection = analysis_projection_task(server_id)
+    except Exception as exc:
+        _rollback_if_possible(get_db())
+        logger.exception(
+            "lumae_analysis could not project analysis after the catalogue refresh; "
+            "the next analysis run or projection does"
+        )
+        return {"status": "failed", "error": str(exc)}
+    projection = projection or {}
+    return {
+        "status": projection.get("status") or "projected",
+        **{key: projection[key]
+           for key in ("reason", "generation", "changes", "ready_count", "unchanged")
+           if key in projection},
+    }
+
+
+def wanted_catalog_refresh_task(server_id, catalog_instance_id):
+    """A refresh an app asked for while AudioMuse's queue was busy, run by the
+    watchdog (SQ.1); ``{"status": "failed"}`` when the scan raised. A finished
+    scan serves the request (``catalog_refresh_task``). A failed one marks the
+    catalogue for repair itself (``refresh_required``), and the repair
+    retries, so the request is not kept for another try either."""
+    started = _safe_catalog_refresh_clock()
+    try:
+        result = catalog_refresh_task(server_id)
+    except Exception as exc:
+        _rollback_if_possible(get_db())
+        logger.exception("lumae_analysis could not run the requested catalogue refresh")
+        _satisfy_catalog_refresh_wants(catalog_instance_id, started)
+        return {"status": "failed", "catalog_instance_id": catalog_instance_id,
+                "error": str(exc)[:500]}
+    status = str((result or {}).get("status") or "")
+    if status in ("paused", "skipped"):
+        return result
+    return {**(result or {}), "status": "complete"}
 
 
 def next_settled_analysis_run(db=None, server_id=None):
@@ -1113,6 +1188,15 @@ def _safe_metadata_reconcile(db, before_background, deadline=None):
         return None
 
 
+def _safe_next_wanted_catalog_refresh(db, server_id):
+    try:
+        return next_wanted_catalog_refresh(db, server_id=server_id)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not read the kept catalogue refresh request")
+        return None
+
+
 def _elapsed_ms(started):
     return int((time.monotonic() - started) * 1000)
 
@@ -1282,7 +1366,8 @@ def _run_reconcile_actions(db, report, host_yield, every_source=False):
 
     The order is unchanged: on-demand work AudioMuse refused to queue, a batch
     of the stored-edge v3 upgrade (SF.3), analysis runs, catalogue
-    preparation, a credits and a MusicBrainz turn when their share has come,
+    preparation, a catalogue refresh an app asked for while the queue was busy
+    (SQ.1), a credits and a MusicBrainz turn when their share has come,
     relationships, the waveform backfill, the edge pass, the loudness pass
     (LN.4c), then credits and MusicBrainz lookups. After each action the order starts
     again, so higher-priority work that became due goes first, and before
@@ -1365,6 +1450,17 @@ def _next_reconcile_action(db, report, budget, server_id, done):
                 prepare_lumae_task, *preparation[:2],
             )
         done.add("catalog_preparation")
+    # SQ.1: a catalogue refresh an app asked for while AudioMuse's queue was
+    # busy. One a tick; a refresh task on the queue serves it instead.
+    if due("catalog_refresh"):
+        done.add("catalog_refresh")
+        wanted = _safe_next_wanted_catalog_refresh(db, server_id)
+        if wanted:
+            budget.start()
+            start = time.monotonic()
+            result = wanted_catalog_refresh_task(*wanted)
+            _record_turn(db, report, "catalog_refresh", wanted[0], wanted[1], result, start)
+            return "catalog_refresh", result
     # A share-gated turn each, checked once a tick: the check sweeps.
     for action, call in (("credits", _safe_credits_reconcile),
                          ("music_metadata", _safe_metadata_reconcile)):
@@ -3437,20 +3533,38 @@ def catalog_refresh_api():
                     )
             except ValueError:
                 pass
-        enqueue_bounded(
-            catalog_refresh_task,
-            source["server_id"],
-            queue="default",
-            timeout=CATALOG_JOB_TIMEOUT_SECONDS,
-        )
-        return _private_json(
-            {
-                "status": "queued",
-                "server_id": source["server_id"],
-                "catalog_instance_id": source["catalog_instance_id"],
-            },
-            202,
-        )
+        queued = {
+            "status": "queued",
+            "server_id": source["server_id"],
+            "catalog_instance_id": source["catalog_instance_id"],
+        }
+        db = get_db()
+        if catalog_refresh_task_live(db):
+            # One refresh on the queue serves every request made before it scans.
+            return _private_json({**queued, "coalesced": True}, 202)
+        try:
+            enqueue_bounded(
+                catalog_refresh_task,
+                source["server_id"],
+                queue="default",
+                timeout=CATALOG_JOB_TIMEOUT_SECONDS,
+            )
+        except Exception as exc:
+            if not host_queue_busy(exc):
+                raise
+            # SQ.1: AudioMuse refuses a plugin task while another queue job
+            # runs (an analysis, often). Keep the request; the watchdog runs
+            # it once the queue is free. Before, the app got a 409 and the
+            # request was gone.
+            want_catalog_refresh(db, source["catalog_instance_id"])
+            arm_reconcile(db, "catalog_refresh_wanted")
+            db.commit()
+            response = _private_json(
+                {**queued, "status": "deferred", "reason": "host_busy"}, 202
+            )
+            response.headers["Retry-After"] = str(CATALOG_REFRESH_RETRY_AFTER_SECONDS)
+            return response
+        return _private_json(queued, 202)
     except (KeyError, ValueError, CatalogScanError) as exc:
         return _catalog_error("invalid_refresh", str(exc), 400)
 
@@ -4191,6 +4305,8 @@ def report_edge_runtime_on_start():
 # serves it (serve_deferred_interactive).
 HOST_BUSY_ERROR_CODE = 1201
 DEFERRED = "deferred"
+# A refresh refused that way is kept (SQ.1); an app may look again after this.
+CATALOG_REFRESH_RETRY_AFTER_SECONDS = 60
 # A queued background edge batch yields its slot after this long; its
 # unstarted jobs are released and due again at once.
 EDGE_BACKGROUND_BUDGET_SECONDS = 60
@@ -5229,9 +5345,11 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
         )
         if source["catalog_instance_id"] != catalog_instance_id:
             raise CatalogScanError("Catalogue identity changed before run finalization")
+        started = _safe_catalog_refresh_clock()
         catalog_result = refresh_catalog(server_id=server_id)
         if catalog_result["catalog_instance_id"] != catalog_instance_id:
             raise CatalogScanError("Catalogue identity changed during run finalization")
+        _satisfy_catalog_refresh_wants(catalog_instance_id, started)
         _safe_progress("projecting AudioMuse analysis")
         projection_result = project_analysis(
             server_id=server_id,
@@ -6840,9 +6958,11 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
             "running",
             "catalog_refresh",
         )
+        started = _safe_catalog_refresh_clock()
         catalog_result = refresh_catalog(server_id=resolved_server_id)
         if catalog_result["catalog_instance_id"] != resolved_catalog_instance_id:
             raise CatalogScanError("Catalogue identity changed during preparation")
+        _satisfy_catalog_refresh_wants(resolved_catalog_instance_id, started)
         if (
             int(catalog_result.get("builder_version") or 0) < CATALOG_BUILDER_VERSION
             or catalog_result.get("refresh_required") is not False
