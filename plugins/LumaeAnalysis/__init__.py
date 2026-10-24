@@ -47,7 +47,7 @@ from .shelves import (
     purge_expired_shelf_mutations,
     register_shelf_routes,
 )
-from . import covers, vibes
+from . import covers, journeys, vibes
 from . import file_tags
 from . import loudness_backfill, loudness_stream, loudness_v1
 from .core_compat import (
@@ -278,6 +278,7 @@ bp = Blueprint("lumae_analysis", __name__)
 register_collection_routes(bp)
 register_shelf_routes(bp)
 vibes.register_vibe_routes(bp)
+journeys.register_journey_routes(bp)
 covers.register_cover_routes(bp)
 personal_discovery.register_routes(bp)
 music_metadata.register_routes(bp)
@@ -1628,6 +1629,7 @@ def collection_retention_task():
         restores_deleted = purge_stale_collection_restores(db)
         shelf_deleted = purge_expired_shelf_mutations(db)
         vibe_deleted = vibes.purge_expired_vibe_mutations(db)
+        journey_deleted = journeys.purge_expired_journey_mutations(db)
         cover_deleted = covers.purge_expired_cover_mutations(db)
         cover_images_deleted = covers.purge_unused_cover_images(db)
     except Exception:
@@ -1640,6 +1642,7 @@ def collection_retention_task():
         "collection_restores_deleted": restores_deleted,
         "shelf_mutations_deleted": shelf_deleted,
         "vibe_mutations_deleted": vibe_deleted,
+        "journey_mutations_deleted": journey_deleted,
         "cover_mutations_deleted": cover_deleted,
         "cover_images_deleted": cover_images_deleted,
     }
@@ -2024,6 +2027,7 @@ def migrate(db):
     refresh_status_summaries(db)
     migrate_shelves(db)
     vibes.migrate_vibes(db)
+    journeys.migrate_journeys(db)
     covers.migrate_covers(db)
     personal_discovery.migrate(db)
     music_metadata.migrate(db)
@@ -2973,6 +2977,7 @@ def health():
                     "scope": health_scope_mode(),
                 },
                 "vibes": vibes.capability(collections_enabled(), health_scope_mode()),
+                "journeys": journeys.capability(collections_enabled(), health_scope_mode()),
                 "covers": covers.capability(collections_enabled(), health_scope_mode()),
                 "collections": {
                     "schema_version": COLLECTIONS_SCHEMA_VERSION,

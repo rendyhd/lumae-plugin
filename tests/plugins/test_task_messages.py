@@ -143,9 +143,10 @@ def test_provider_identity_recheck_says_what_it_checked(monkeypatch, mod, result
 @pytest.mark.parametrize(
     ("deleted", "expected"),
     [
-        ((0, 0, 0, 0, 0, 0), "Lumae: no expired collection entries"),
-        ((3, 1, 0, 0, 2, 1), "Lumae: removed 7 expired collection entries"),
-        ((1, 0, 0, 0, 0, 0), "Lumae: removed 1 expired collection entry"),
+        ((0, 0, 0, 0, 0, 0, 0), "Lumae: no expired collection entries"),
+        ((3, 1, 0, 0, 2, 1, 0), "Lumae: removed 7 expired collection entries"),
+        ((1, 0, 0, 0, 0, 0, 0), "Lumae: removed 1 expired collection entry"),
+        ((0, 0, 0, 0, 0, 0, 2), "Lumae: removed 2 expired collection entries"),
     ],
 )
 def test_collection_retention_says_what_it_removed(monkeypatch, mod, deleted, expected):
@@ -155,6 +156,8 @@ def test_collection_retention_says_what_it_removed(monkeypatch, mod, deleted, ex
                  "purge_expired_shelf_mutations"):
         monkeypatch.setattr(mod, name, lambda _db, value=next(counts): value)
     monkeypatch.setattr(mod.vibes, "purge_expired_vibe_mutations",
+                        lambda _db, value=next(counts): value)
+    monkeypatch.setattr(mod.journeys, "purge_expired_journey_mutations",
                         lambda _db, value=next(counts): value)
     monkeypatch.setattr(mod.covers, "purge_expired_cover_mutations",
                         lambda _db, value=next(counts): value)

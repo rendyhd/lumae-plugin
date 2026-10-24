@@ -400,9 +400,11 @@ def _rekey_plugin_owned_state(cur, catalog_instance_id, mappings, legacy_profile
     from .shelves import rekey_shelves
     from .vibes import rekey_vibes
     from .covers import rekey_covers
+    from .journeys import rekey_journeys
     rekey_shelves(cur, catalog_instance_id, exact)
     rekey_vibes(cur, catalog_instance_id, exact)
     rekey_covers(cur, catalog_instance_id, exact)
+    rekey_journeys(cur, catalog_instance_id, exact)
 
 
 def _rekey_collections(cur, catalog_instance_id, mappings):

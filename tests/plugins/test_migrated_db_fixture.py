@@ -29,6 +29,9 @@ PRODUCTION_TABLES = (
     "vibe_scopes",
     "vibe_records",
     "vibe_mutations",
+    "journey_scopes",
+    "journey_records",
+    "journey_mutations",
     "cover_scopes",
     "cover_records",
     "cover_mutations",
@@ -111,6 +114,7 @@ def test_migrated_db_has_production_tables(migrated_db):
         sequences = {row[0] for row in cur.fetchall()}
     assert PREFIX + "shelf_sequence" in sequences
     assert PREFIX + "vibe_sequence" in sequences
+    assert PREFIX + "journey_sequence" in sequences
     assert PREFIX + "cover_sequence" in sequences
 
 
