@@ -7,6 +7,29 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.9.0 (2026-10-24)
+
+Journeys (contract §5.7; Auralscape JN.10). Clients that don't know them never
+read them.
+
+- Lumae's listening journeys (an artist's albums in order, a collection, songs
+  from anywhere, each song's played state and the place to continue from)
+  are kept on the server, so they survive a reinstall and follow you to
+  another phone. `GET /api/journeys/changes` and
+  `POST /api/journeys/mutations`, announced as `capabilities.journeys`
+  (`schema_version: 1`, `max_journey_bytes: 1500000`).
+- The phone owns a journey; the plugin stores what it sends. A write names the
+  revision it was based on; a stale one is refused with the current record
+  (409 `journey_conflict`), and the phone writes again over it.
+- Two phones' writes merge: the receipts of journey plays (credits) are a set
+  that only grows; per song, the state changed last wins, so a song played on
+  one phone stays played and a song marked not played stays so; the place is
+  the one played last.
+- Gated by Living Collections and scoped per account and catalogue, like
+  Vibes and covers. Deletes are tombstones; receipts expire after 30 days in
+  the daily collection cleanup; a provider-identity rekey rewrites the song
+  and album ids inside stored journeys.
+
 ## 1.8.0 (2026-10-18)
 
 Whole-track loudness for Lumae's volume normalization (contract §3.9, K13;

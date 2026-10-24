@@ -144,6 +144,8 @@ def test_current_release_contains_supported_source_only():
         assert f'PLUGIN_VERSION = "{version}"'.encode() in package.read("__init__.py")
         # 1.6.0: Jellyfin reader, move continuity and file tags.
         assert {"jellyfin_provider.py", "jellyfin_continuity.py", "file_tags.py"} <= set(names)
+        # 1.9.0: journey sync.
+        assert "journeys.py" in names
         assert "edge_qualification_v2.json" in names
         if _lumae_release_policy()["mode"] == "source":
             # Only a source-mode release must match the working source.
