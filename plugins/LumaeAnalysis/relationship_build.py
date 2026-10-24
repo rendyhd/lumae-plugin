@@ -4,6 +4,15 @@ The session advisory lock owns computation, including across checkpoint commits.
 Published rows are never used as scratch space. The catalogue generation, a
 digest of the analysis rows the build reads, AND both epochs pin all
 checkpoints; the final transaction locks and revalidates their source rows.
+
+Once a build has staged its inputs it no longer reads the live catalogue or
+analysis: a newer catalogue generation or analysis digest no longer restarts
+it (SQ.2). It finishes and publishes the generation it started, recording the
+generations it read, and leaves the state queued, so the next build starts
+from the newer inputs. Before, every catalogue change restarted the build from
+zero, and on a library that changes more often than a build takes, no
+generation was ever published. A different epoch, server or algorithm still
+restarts it: those can change what the staged rows mean.
 """
 
 from contextlib import contextmanager
@@ -30,6 +39,18 @@ def t(name):
 
 class InputsChanged(CatalogScanError):
     pass
+
+
+# The identity fields a staged build must share with the live inputs to be
+# finished (SQ.2); the generations and the analysis digest may move on.
+SNAPSHOT_SOURCE_FIELDS = (
+    "server_id", "catalog_epoch", "analysis_epoch", "algorithm_version", "build_format_version",
+)
+
+
+def same_snapshot_source(staged, live):
+    """Whether staged inputs still describe the live source (SQ.2)."""
+    return all((staged or {}).get(key) == (live or {}).get(key) for key in SNAPSHOT_SOURCE_FIELDS)
 
 
 def migrate_relationship_builds(cur):
@@ -191,6 +212,10 @@ class Build:
         self.work = 0
         self.diagnostics = {"timings_ms": {}, "counts": {}}
         self.active_phase = "claiming"
+        # SQ.2: inputs staged in relationship_build_tracks, and the live
+        # identity last read; a staged build finishes on its own inputs.
+        self.inputs_staged = False
+        self.live_identity = None
 
     @contextmanager
     def timed(self, phase):
@@ -233,20 +258,46 @@ class Build:
 
     def verify_inputs(self, cur, lock=False):
         identity, analysis_generation = input_state(cur, self.source_id, lock=lock)
-        if identity != self.identity:
-            raise InputsChanged("Catalogue or sonic analysis changed; restarting relationship build")
-        # An equal digest means the current generation holds the same inputs.
-        self.analysis_generation = analysis_generation
+        self.live_identity = identity
+        if identity == self.identity:
+            # An equal digest means the current generation holds the same inputs.
+            self.analysis_generation = analysis_generation
+            return
+        if self.inputs_staged and same_snapshot_source(self.identity, identity):
+            # SQ.2: the staged inputs are the build's; newer ones wait for the next.
+            return
+        raise InputsChanged("Catalogue or sonic analysis changed; restarting relationship build")
+
+    @property
+    def inputs_current(self):
+        """Whether the live inputs last read are the ones this build used."""
+        return self.live_identity is None or self.live_identity == self.identity
 
     def initialize(self, cur):
         self.identity, self.analysis_generation = input_state(cur, self.source_id)
-        cur.execute(f"SELECT build_id, input_identity, phase, progress FROM {t('relationship_builds')} "
-                    "WHERE catalog_instance_id=%s", (self.source_id,))
+        self.live_identity = self.identity
+        cur.execute(f"SELECT build_id, input_identity, phase, progress, inputs_ready "
+                    f"FROM {t('relationship_builds')} WHERE catalog_instance_id=%s",
+                    (self.source_id,))
         old = cur.fetchone()
-        if old and old[1] == self.identity:
+        finish_staged = bool(
+            old and old[1] != self.identity and old[4]
+            and old[2] in ("fingerprints", "scoring", "publishing")
+            and same_snapshot_source(old[1], self.identity)
+        )
+        if old and (old[1] == self.identity or finish_staged):
             self.build_id, self.phase = old[0], old[2]
             self.diagnostics = old[3]
             self.diagnostics.pop("error", None)
+            self.inputs_staged = bool(old[4])
+            if finish_staged:
+                # SQ.2: finish the generation this build started.
+                self.identity = old[1]
+                self.analysis_generation = int(
+                    self.diagnostics.get("analysis_generation") or self.analysis_generation
+                )
+                log.info("relationship build source=%s build=%s finishes its staged inputs; "
+                         "newer inputs wait for the next build", self.source_id, self.build_id)
         else:
             cur.execute(f"DELETE FROM {t('relationship_builds')} WHERE catalog_instance_id=%s",
                         (self.source_id,))
@@ -255,6 +306,8 @@ class Build:
                 INSERT INTO {t('relationship_builds')} (catalog_instance_id, build_id, input_identity)
                 VALUES (%s, %s, %s::jsonb)
             """, (self.source_id, self.build_id, canonical_json(self.identity)))
+            # Recorded at publication if the build outlives these inputs (SQ.2).
+            self.diagnostics["analysis_generation"] = self.analysis_generation
             cur.execute(f"UPDATE {t('relationship_state')} SET started_at=now(), completed_at=NULL "
                         "WHERE catalog_instance_id=%s", (self.source_id,))
         cur.execute(f"UPDATE {t('relationship_state')} SET status='running', last_error=NULL, "
@@ -297,6 +350,7 @@ class Build:
         if not inputs_ready:
             with self.timed("input_staging"):
                 self.stage_inputs(cur, tracks, album_keys, artist_keys)
+        self.inputs_staged = True
         self.checkpoint(cur)
         cur.execute(f"SELECT entity_type, entity_id FROM {t('relationship_build_entities')} "
                     "WHERE catalog_instance_id=%s", (self.source_id,))
@@ -514,10 +568,13 @@ def run_relationship_build(source_id, *, db, candidate_lookup, progress=None,
             # full-library embeddings. Retain only counts/timings after success.
             # A completed build whose input digest still matches is current for
             # the present analysis generation too: record that generation
-            # instead of recomputing identical relationships.
-            cur.execute(f"UPDATE {t('relationship_state')} SET status='complete', "
+            # instead of recomputing identical relationships. One that
+            # finished its staged inputs after newer ones arrived (SQ.2) stays
+            # queued: its generation is published, and the next build starts.
+            cur.execute(f"UPDATE {t('relationship_state')} SET status=%s, "
                         "source_analysis_generation=%s WHERE catalog_instance_id=%s",
-                        (build.analysis_generation, source_id))
+                        ('complete' if build.inputs_current else 'queued',
+                         build.analysis_generation, source_id))
             db.commit()
             try:
                 cur.execute(f"DELETE FROM {t('relationship_build_entities')} WHERE catalog_instance_id=%s", (source_id,))

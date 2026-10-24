@@ -2070,8 +2070,14 @@ def claim_relationship_preparation(db, catalog_instance_id):
     return claimed
 
 
+# Entities a build step may handle (SQ.2): the step's time budget is the real
+# bound. At 128 a watchdog tick stopped after 128 albums or artists however much
+# of its budget was left, and a 10,000-entity library took about 150 ticks.
+RELATIONSHIP_STEP_ENTITIES = 1024
+
+
 def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None, progress=None,
-                          *, batch_size=128, time_budget_seconds=20):
+                          *, batch_size=RELATIONSHIP_STEP_ENTITIES, time_budget_seconds=20):
     """Advance a durable build; only complete generations become visible."""
     from .relationship_build import run_relationship_build
     return run_relationship_build(

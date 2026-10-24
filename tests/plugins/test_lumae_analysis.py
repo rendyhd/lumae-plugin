@@ -1311,6 +1311,29 @@ def test_enrichment_stream_endpoints_are_source_scoped_and_nonblocking(monkeypat
     assert profiles.headers["Cache-Control"] == "private, no-cache"
 
 
+def test_relationship_prepare_api_leaves_the_build_to_the_watchdog(monkeypatch):
+    """SQ.2: the claim is durable and the watchdog builds it; no root task is
+    queued (one did a single 20-second step, and was refused while AudioMuse
+    analysed)."""
+    mod = load_plugin()
+    calls = []
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: {
+        "catalog_instance_id": "catalog-a", "server_id": "server-a"})
+    monkeypatch.setattr(mod, "start_relationship_preparation",
+                        lambda **kwargs: calls.append(kwargs) or {"queued": True, "deferred": True})
+    monkeypatch.setattr(mod, "relationship_status", lambda _db, catalog_instance_id: {
+        "catalog_instance_id": catalog_instance_id, "status": "queued", "generation": 3})
+
+    response = plugin_client(mod).post(
+        "/api/catalog/relationships/prepare", json={"catalog_instance_id": "catalog-a"})
+
+    assert response.status_code == 200
+    assert calls == [{"catalog_instance_id": "catalog-a", "server_id": "server-a",
+                      "enqueue_job": False}]
+    assert response.get_json()["relationships"]["generation"] == 3
+
+
 def test_bootstrap_session_api_keeps_token_out_of_url_and_private_cache(monkeypatch):
     mod = load_plugin()
     captured = {}

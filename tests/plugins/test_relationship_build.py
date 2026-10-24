@@ -309,25 +309,79 @@ def test_temporarily_unavailable_inputs_do_not_corrupt_completed_checkpoint(rela
     assert finish(db) == first
 
 
-@pytest.mark.parametrize('changed', ['catalog_generation', 'analysis_generation', 'catalog_epoch', 'analysis_epoch'])
-def test_input_changes_discard_stale_checkpoints(relationship_db, changed):
-    db = relationship_db
-    advance(db, batch_size=1)
-    old_id = scalar(db, 'SELECT build_id FROM plugin_lumae_analysis__relationship_builds')
-    table, column = {
-        'catalog_generation': ('catalog_state', 'published_generation'),
-        'analysis_generation': ('analysis_state', 'projection_generation'),
-        'catalog_epoch': ('catalog_state', 'catalog_epoch'),
-        'analysis_epoch': ('analysis_state', 'analysis_epoch'),
-    }[changed]
+INPUT_COLUMNS = {
+    'catalog_generation': ('catalog_state', 'published_generation'),
+    'analysis_generation': ('analysis_state', 'projection_generation'),
+    'catalog_epoch': ('catalog_state', 'catalog_epoch'),
+    'analysis_epoch': ('analysis_state', 'analysis_epoch'),
+}
+
+
+def change_input(db, changed):
+    table, column = INPUT_COLUMNS[changed]
     with db.cursor() as cur:
         value = '2' if 'generation' in changed else "'changed-epoch'"
         cur.execute(f'UPDATE plugin_lumae_analysis__{table} SET {column}={value}')
     db.commit()
+
+
+@pytest.mark.parametrize('changed', ['catalog_epoch', 'analysis_epoch'])
+def test_epoch_changes_discard_stale_checkpoints(relationship_db, changed):
+    db = relationship_db
+    advance(db, batch_size=1)
+    old_id = scalar(db, 'SELECT build_id FROM plugin_lumae_analysis__relationship_builds')
+    change_input(db, changed)
     result = advance(db, batch_size=1)
     assert result['status'] in ('queued', 'complete')
     assert scalar(db, 'SELECT build_id FROM plugin_lumae_analysis__relationship_builds') != old_id
     assert scalar(db, 'SELECT count(*) FROM plugin_lumae_analysis__relationship_builds') == 1
+
+
+# SQ.2 (Auralscape RCA 2026-10-24): a catalogue refresh or a projection used to
+# restart a build from zero, so a library that changed more often than a build
+# took never got a generation.
+@pytest.mark.parametrize('changed', ['catalog_generation', 'analysis_generation'])
+def test_a_staged_build_finishes_its_inputs_and_queues_the_next(relationship_db, changed):
+    db = relationship_db
+    advance(db, batch_size=1)
+    old_id = scalar(db, 'SELECT build_id FROM plugin_lumae_analysis__relationship_builds')
+    change_input(db, changed)
+
+    first = finish(db, batch_size=1)
+
+    assert first['generation'] == 1 and first['album_count'] == 2
+    assert scalar(db, 'SELECT build_id FROM plugin_lumae_analysis__relationship_builds') == old_id
+    status = e.relationship_status(db, 'catalog-a')
+    # Published from the inputs it read; the newer inputs wait for the next build.
+    assert (status['status'], status['generation']) == ('queued', 1)
+    assert (status['source_catalog_generation'], status['source_analysis_generation']) == (1, 1)
+    assert len(published(db)) == 4
+
+    second = finish(db)
+
+    assert second['generation'] == 2
+    assert scalar(db, 'SELECT build_id FROM plugin_lumae_analysis__relationship_builds') != old_id
+    assert e.relationship_status(db, 'catalog-a')['status'] == 'complete'
+
+
+def test_inputs_changing_before_they_are_staged_still_restart(relationship_db, monkeypatch):
+    db = relationship_db
+    original = e._load_relationship_inputs
+
+    def load_then_change(cur, source):
+        rows = original(cur, source)
+        other = connection_like(db)
+        try:
+            change_input(other, 'catalog_generation')
+        finally:
+            other.close()
+        return rows
+
+    monkeypatch.setattr(e, '_load_relationship_inputs', load_then_change)
+    result = advance(db, batch_size=1)
+    assert result['status'] == 'queued'
+    assert 'changed' in result['reason']
+    assert scalar(db, 'SELECT inputs_ready FROM plugin_lumae_analysis__relationship_builds') is False
 
 
 def republish_analysis(db, change_sql=None):

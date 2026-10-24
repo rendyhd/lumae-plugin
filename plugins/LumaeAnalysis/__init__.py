@@ -4033,9 +4033,13 @@ def relationships_prepare_api():
             catalog_instance_id=body.get("catalog_instance_id"),
             server_id=body.get("server_id"),
         )
+        # The claim is durable and the watchdog builds it a step a tick
+        # (SQ.2): a queued task did one 20-second step, and while AudioMuse
+        # analysed it was refused and logged as an error at every sync.
         result = start_relationship_preparation(
             catalog_instance_id=source["catalog_instance_id"],
             server_id=source["server_id"],
+            enqueue_job=False,
         )
         return _private_json(
             {
@@ -6644,10 +6648,14 @@ def start_relationship_preparation(
             timeout=RELATIONSHIP_JOB_TIMEOUT_SECONDS,
         )
     except Exception as exc:
-        logger.exception(
-            "lumae_analysis could not queue relationship preparation; "
-            "the durable watchdog will retry it"
-        )
+        if host_queue_busy(exc):
+            logger.info("lumae_analysis left relationship preparation to the watchdog: "
+                        "AudioMuse's queue is busy")
+        else:
+            logger.exception(
+                "lumae_analysis could not queue relationship preparation; "
+                "the durable watchdog will retry it"
+            )
         return {
             "queued": True,
             "coalesced": False,

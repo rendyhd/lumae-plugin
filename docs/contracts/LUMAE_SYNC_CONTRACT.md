@@ -281,6 +281,14 @@ Up to 1.9.0 a busy queue surfaced as AudioMuse's 409 (`[1201] Task In Progress`)
 
 From SQ.1 a refresh that changed the catalogue projects AudioMuse's analysis at once (as an analysis run's finalization does), so a new song reaches a client with the analysis AudioMuse already holds. Before, the catalogue could publish a song whose analysis stream entry followed only with the next finalization or projection.
 
+### 2.6 Album and artist relationships while a build runs (SQ.2, unreleased)
+
+`POST /api/catalog/relationships/prepare`, `GET …/relationships/status`, `…/bootstrap` and `…/changes` carry the relationship state: `status` (`not_initialized | queued | running | complete | failed | waiting_for_index`) describes the **build**, while `generation`, `cursor`, `album_count` and `artist_count` describe the last **published** generation. The bootstrap and changes routes always serve that published generation, whatever the build is doing. A client downloads it when `generation > 0` with a `cursor`, and waits only when nothing was ever published. Lumae up to the 2026-10-24 RCA waited whenever `status` wasn't `complete` (app SQ.3 fixes that, and works with every plugin version).
+
+From SQ.2:
+- A build that has staged its inputs finishes the generation it started when the catalogue generation or the analysis digest changes; `source_catalog_generation` and `source_analysis_generation` name the inputs it read, and `status` stays `queued` after its publication so the next build starts. A changed epoch, server or algorithm still restarts it.
+- `prepare` records the request and arms the watchdog, which builds a step a tick; it no longer queues a root task (`job_id` is absent).
+
 ---
 
 ## 3. Profile endpoints

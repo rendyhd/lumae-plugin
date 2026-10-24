@@ -22,6 +22,21 @@ AudioMuse (contract §2.5; Auralscape RCA 2026-10-24, SQ.1).
   after, so a new song never arrives without the analysis AudioMuse already
   has.
 
+Similar albums and artists get published on a library that keeps changing
+(contract §2.6; SQ.2).
+
+- A relationship build that has staged its inputs finishes and publishes the
+  generation it started when the catalogue or analysis changes, and leaves
+  the state `queued` so the next build starts from the newer inputs. Before,
+  every catalogue change restarted it from zero, so a library that changed
+  more often than a build took never got a generation.
+- A build step does as much as the watchdog tick's time allows (up to 1,024
+  albums and artists, was 128).
+- `POST /api/catalog/relationships/prepare` records the request and leaves
+  the build to the watchdog; it no longer queues a task that did one
+  20-second step and was refused, with an error in the log, at every sync
+  while AudioMuse analysed.
+
 ## 1.9.0 (2026-10-24)
 
 Journeys (contract §5.7; Auralscape JN.10). Clients that don't know them never
