@@ -456,6 +456,28 @@ server, downloads and analyzes one file through the exec path, runs one relation
 and one catalogue refresh. Measure R5's gate. Exit: the numbers in this plan and a go or
 no-go.
 
+**Result (2026-10-25): go.** The pinned stock host (v3.6.3 tree, gunicorn gthread 1×4)
+with a real Navidrome 0.64.2 and 25 generated tracks, host auth on, no worker; a scratch
+copy of the plugin whose `on_flask_start` started the spike thread (2 threads in the
+process at start, 8 while analyzing):
+
+| Step, from the thread | Result |
+|---|---|
+| `database.connect_raw` (own connection, autocommit) | 22–41 ms |
+| `pg_try_advisory_lock` | granted |
+| `LISTEN` / `pg_notify` from another connection | delivered in 1–2 ms |
+| `with app.app_context(): get_db()`, `list_servers()` | 20 ms; unbound `active_server_id()` is None |
+| `use_server` + `get_all_songs` + `download_track` | 73 ms, a 2.6 MB FLAC into `/tmp/lumae-analysis/task-<pid>` (outside `TEMP_DIR`) |
+| Waveform analysis through `run_isolated` | exec path (not fork), 685 ms with the child's start |
+| `refresh_catalog` in the thread | 60 ms for 25 tracks, generation 1 |
+| `plugin_manager.records["lumae_analysis"]`, `restart_pending(<plugins rows>)` | readable; `False` |
+
+The edge call failed only on the spike's fake media revision (`EdgeProfileError`); the edge
+pass is covered in RN.8 with real revisions. R5's latency gate needs a library at scale and
+is measured in RN.8. The same stack reproduced the bug: with no worker, the boot-time
+`catalog_reconcile` stayed `NEW`, and `/api/analysis/start` answered 1201 "Another queue job
+(plugin.lumae_analysis.catalog_reconcile) is still running".
+
 ### Phase 1 — Waste cuts (in 1.9.0)
 
 - **WC.1** — W2, relationship rebuild spacing.
