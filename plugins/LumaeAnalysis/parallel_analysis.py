@@ -1,11 +1,11 @@
-"""Parallel file analysis inside the one reconcile tick (performance plan WP1b).
+"""Parallel file analysis inside a runner turn (performance plan WP1b).
 
-The tick stays a single root task. Only the work inside an action runs in
+The turn stays on its runner's thread. Only the work inside an action runs in
 parallel: K long-lived threads, each with its own exec analysis worker
 (``analysis_isolation.dedicated_worker``) at a lower CPU priority, run the
 analysis of one file at a time. The calling thread keeps every database and
 host call: it claims, downloads (until the analysis's own download, WP2),
-publishes, serves deferred on-demand work and reports progress. A worker
+publishes, serves on-demand work and reports progress. A worker
 thread holds no database connection and never calls the host, whose server
 binding may not be thread-local.
 
@@ -22,7 +22,7 @@ start: a file longer than the tick restarted every tick, never completed and
 held its thread for good, and a pass with one never reached its end. A file
 is cancelled only when the pass itself raises: its child is killed and
 ``finish`` gets ``Cancelled`` (the caller releases the track uncounted).
-With one worker, or outside a tick, the work runs on the calling thread,
+With one worker, or outside a turn, the work runs on the calling thread,
 exactly as before WP1b.
 
 K is the setting ``background_workers``: ``auto`` (the default) takes the
@@ -55,8 +55,8 @@ RAM_SHARE = 0.25
 # The children compete with playback and transcoding on the media host.
 NICE = 10
 # While a pass only waits for files in flight (past the deadline, or with no
-# unit left), it serves on-demand work this often: AudioMuse refuses
-# on-demand enqueues while the tick runs (E3).
+# unit left), it serves on-demand work this often (E3): the runner serves it
+# between files, so a request waits about one file.
 WAIT_SERVE_SECONDS = 5
 # How long a cancelled thread gets to hand its file back.
 CANCEL_JOIN_SECONDS = 10
@@ -187,10 +187,10 @@ class _Job:
 
 
 class Pool:
-    """``workers`` analysis threads for one tick; ``close`` stops them and their workers.
+    """``workers`` analysis threads for one turn; ``close`` stops them and their workers.
 
     Threads start on first use and live until ``close``, so each exec worker
-    is started once a tick and reused across files and actions.
+    is started once a turn and reused across files and actions.
     """
 
     def __init__(self, workers, nice=NICE):
@@ -272,7 +272,7 @@ _scope = threading.local()
 
 
 class tick_scope:
-    """The reconcile tick's pool: ``current()`` inside, closed on leaving."""
+    """A runner turn's pool: ``current()`` inside, closed on leaving."""
 
     def __init__(self, workers):
         self.pool = Pool(workers)
@@ -289,7 +289,7 @@ class tick_scope:
 
 
 def current():
-    """The tick's pool on this thread, or None (outside a tick: serial)."""
+    """The turn's pool on this thread, or None (outside a turn: serial)."""
     return getattr(_scope, "pool", None)
 
 

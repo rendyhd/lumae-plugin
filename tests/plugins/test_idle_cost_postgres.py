@@ -3,19 +3,20 @@
 S7 (AUD-16): an album not found (unresolved) or without credits (empty) is
 re-checked after 30 days, then 90, then 180 (W4 of the runner plan; S7 had 7,
 30, 90), each ±25 %, not every week; a re-check of an unchanged album is idle
-work and never moves the watchdog off its idle cadence. A changed album still
-does. W4: background re-checks run only after background work, at most 60 an
-hour, and the ones due at upgrade spread over 14 days.
+work and never makes a runner due. A changed album still does. W4: background
+re-checks run only after background work, at most 60 an hour, and the ones
+due at upgrade spread over 14 days.
 
-S8 (AUD-19): an idle tick does almost nothing: the credits walk rests an
-hour after it reaches the end (or until a new catalogue generation), and a
-tick sweeps once however many credits turns it asks for; an unchanged album
+S8 (AUD-19): an idle runner turn does almost nothing: the credits walk rests
+an hour after it reaches the end (or until a new catalogue generation), and a
+turn sweeps once however many credits turns it asks for; an unchanged album
 is not rewritten; the settings snapshot is counted at most every 5 minutes
-by ticks that changed no profile; one edge runtime report per 10 minutes per
-worker across forked jobs.
+when no profile changed; one edge runtime report per 10 minutes per worker
+across forked jobs.
 """
 import pytest
 
+from runner_helpers import turn
 from test_lumae_analysis import lumae_postgres_db  # noqa: F401  (fixture)
 from test_credits import credits_db, payload, uid  # noqa: F401  (fixtures)
 from test_reconcile_scheduler_postgres import P, SOURCE, SERVER, _rows, tick  # noqa: F401
@@ -310,16 +311,17 @@ def test_one_edge_runtime_report_per_ten_minutes_across_forked_jobs(migrated_db,
     assert len(reports) == 3
 
 
-def test_an_idle_tick_counts_the_settings_snapshot_at_most_every_five_minutes(tick, monkeypatch):
+def test_an_idle_turn_counts_the_settings_snapshot_at_most_every_five_minutes(tick, monkeypatch):
     mod, db = tick
     refreshes = []
     monkeypatch.setattr(mod, "refresh_status_snapshot", lambda db=None, catalog_instance_id=None,
                         min_age_seconds=0, publications=False: refreshes.append(min_age_seconds))
-    mod.catalog_reconcile_task()
-    assert refreshes == [mod.STATUS_SNAPSHOT_IDLE_SECONDS]
-    monkeypatch.setattr(mod, "serve_deferred_interactive", (lambda served: (
+    idle, _actions = turn(mod)
+    # The server runner's bookkeeping (at most a minute apart) counts it.
+    assert not idle.worked and refreshes == [mod.STATUS_SNAPSHOT_IDLE_SECONDS]
+    monkeypatch.setattr(mod, "serve_interactive", (lambda served: (
         lambda *a, **k: served.pop() if served else 0))([2]))
-    mod.catalog_reconcile_task()
+    turn(mod)
     assert refreshes[-1] == 0  # on-demand work changed profiles: counted now
 
 
@@ -340,16 +342,17 @@ class _Counting:
         monkeypatch.setattr(db, "cursor_factory", Cursor)
 
 
-# Statements of an idle tick with an idle credits library (one source, two
-# albums, both current). Before WP4 it ran 59: a page of the credits walk and
-# an upsert per album twice a tick, and the settings snapshot counted every
-# tick. SQ.1 added one indexed read: a catalogue refresh kept for the tick.
-# W1 one more: the identity recheck's look for a transition that needs it,
-# which replaced 48 recheck tasks a day.
-IDLE_TICK_STATEMENTS = 28
+# Statements of an idle server runner turn with an idle credits library (one
+# source, two albums, both current). Before WP4 a tick ran 59: a page of the
+# credits walk and an upsert per album twice a tick, and the settings snapshot
+# counted every tick; 1.8.0's idle tick ran 28. A runner turn has no schedule
+# to keep and no cron_retry to read (R2, R4); the server's bookkeeping (events,
+# preparations, the snapshot's age) adds five at most once a minute.
+IDLE_TURN_STATEMENTS = 17
+IDLE_BOOKKEEPING_STATEMENTS = 22
 
 
-def test_an_idle_tick_runs_few_statements(tick, monkeypatch):
+def test_an_idle_turn_runs_few_statements(tick, monkeypatch):
     mod, db = tick
     with db.cursor() as cur:
         for name in ("a", "b"):
@@ -361,12 +364,17 @@ def test_an_idle_tick_runs_few_statements(tick, monkeypatch):
                         credits_service.reconcile(db, server_id, before_background=before_background,
                                                   deadline=deadline))
     monkeypatch.setattr(credits_service, "run_one", lambda *a, **k: pytest.fail("no album is due"))
-    mod.catalog_reconcile_task()  # walks the albums once
+    turn(mod)  # walks the albums once
     _q(db, f"UPDATE {JOBS} SET status='complete', expires_at=now()+interval '30 days'")
-    mod.catalog_reconcile_task()  # the walk reaches its end
+    turn(mod)  # the walk reaches its end
     counting = _Counting(db, monkeypatch)
 
-    result = mod.catalog_reconcile_task()
+    result, actions = turn(mod)
 
-    assert result["actions"] == []
-    assert counting.count <= IDLE_TICK_STATEMENTS, counting.count
+    assert not result.worked and actions == []
+    assert counting.count <= IDLE_TURN_STATEMENTS, counting.count
+    # With the server's bookkeeping, at most once a minute.
+    monkeypatch.setattr(mod, "_runner_bookkeeping_at", None)
+    counting.count = 0
+    turn(mod)
+    assert counting.count <= IDLE_BOOKKEEPING_STATEMENTS, counting.count

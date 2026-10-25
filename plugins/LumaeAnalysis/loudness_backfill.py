@@ -1,6 +1,6 @@
 """The loudness backfill (Lumae LN.4c; contract §3.9 "Publication", Auralscape D8).
 
-A library pass per source, one turn per reconcile tick (until its deadline) after the tick's other
+A library pass per source, a slice at a time (until its deadline) after a runner turn's other
 track work, so
 it runs only when no interactive or analysis work is waiting: music tracks of the published
 catalogue without a loudness record of the current version for their current media are measured on
@@ -30,7 +30,7 @@ from plugin.api import table
 from . import migrations
 from .loudness_v1 import MAX_SECONDS, VERSION
 
-# A turn works until the reconcile tick's deadline, a page of the admin batch size at a time.
+# A slice works until its deadline, a page of the admin batch size at a time.
 RESWEEP_HOURS = 6
 # Back-off after the 1st, 2nd, 3rd and 4th failure of the same media; the next one parks.
 RETRY_HOURS = (1, 6, 24, 72)
@@ -63,7 +63,7 @@ def runtime_available():
 def migrate_backfill(db):
     cur = db.cursor()
     migrations.apply(cur, [
-        # ``retry_count`` and ``next_retry_at`` follow the reconcile watchdog's retry contract.
+        # ``retry_count`` and ``next_retry_at`` follow the reconcile retry contract (``update_work_retry``).
         f"""
         CREATE TABLE IF NOT EXISTS {t('loudness_backfill_state')} (
             catalog_instance_id TEXT PRIMARY KEY

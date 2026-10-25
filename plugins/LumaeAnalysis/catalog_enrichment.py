@@ -26,7 +26,7 @@ import numpy as np
 from plugin.api import get_db, table
 
 from . import migrations
-from .reconcile import arm_reconcile
+from .reconcile import wake_runners
 from .edge_profiles import edge_profile_v3, opaque_revision
 from .edge_profile_store import edge_join, edge_payload_sql, edge_v3_digest_sql
 
@@ -2102,7 +2102,7 @@ def claim_relationship_preparation(db, catalog_instance_id, force=False):
         )
         claimed = cur.fetchone() is not None
     if claimed:
-        arm_reconcile(db, "relationship_preparation_admitted")
+        wake_runners(db, "relationship_preparation_admitted")
     db.commit()
     cur.close()
     return claimed

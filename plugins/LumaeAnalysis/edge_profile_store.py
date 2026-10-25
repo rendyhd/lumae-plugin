@@ -68,7 +68,7 @@ def migrate_edge_profiles(db):
         reported_at TIMESTAMP NOT NULL DEFAULT now()
     )""")
     # The server-driven library pass, one row per source. ``retry_count`` and
-    # ``next_retry_at`` follow the reconcile watchdog's retry contract.
+    # ``next_retry_at`` follow the reconcile retry contract (``update_work_retry``).
     cur.execute(f"""CREATE TABLE IF NOT EXISTS {table('edge_backfill_state')} (
         catalog_instance_id TEXT PRIMARY KEY REFERENCES {table('catalog_sources')}(catalog_instance_id) ON DELETE CASCADE,
         cursor TEXT NOT NULL DEFAULT '',
@@ -323,8 +323,8 @@ def claim_edge_requests(db, catalog_id, ids, priority='background'):
     return accepted, ready, pending, unsupported
 
 
-def mark_edge_jobs_deferred(db, catalog_id, jobs, marker):
-    """Keep refused on-demand jobs pending, marked for the next worker task."""
+def mark_edge_jobs_waiting(db, catalog_id, jobs, marker):
+    """Mark on-demand jobs as waiting for a runner (runner plan R6)."""
     cur = db.cursor()
     for job in jobs:
         cur.execute(f"""UPDATE {table('edge_profile_jobs')} SET last_error=%s, priority='interactive', updated_at=now()
@@ -334,16 +334,16 @@ def mark_edge_jobs_deferred(db, catalog_id, jobs, marker):
     cur.close()
 
 
-def claim_deferred_edge_jobs(db, marker, limit):
-    """Take up to ``limit`` refused on-demand jobs, oldest first, for this task."""
+def claim_waiting_edge_jobs(db, markers, limit):
+    """Take up to ``limit`` on-demand jobs waiting for a runner, oldest first."""
     cur = db.cursor()
     cur.execute(f"""UPDATE {table('edge_profile_jobs')} j SET last_error=NULL, updated_at=now()
         FROM (SELECT catalog_instance_id, track_id FROM {table('edge_profile_jobs')}
-               WHERE status='pending' AND priority='interactive' AND last_error=%s
+               WHERE status='pending' AND priority='interactive' AND last_error = ANY(%s)
                ORDER BY updated_at, track_id LIMIT %s FOR UPDATE SKIP LOCKED) d
         WHERE j.catalog_instance_id=d.catalog_instance_id AND j.track_id=d.track_id
         RETURNING j.catalog_instance_id, j.track_id, j.media_revision, j.job_token""",
-                (marker, int(limit)))
+                (list(markers), int(limit)))
     rows = cur.fetchall()
     db.commit()
     cur.close()
@@ -553,8 +553,8 @@ def edge_backfill_candidates(db, catalog_id, after='', limit=100):
 
 
 # ---------------------------------------------------------------- library pass
-# The server walks the published library by track ID, one turn per
-# reconcile tick until its deadline, after the waveform backfill. A finished pass sweeps again
+# A runner walks the published library by track ID, a slice at a time until
+# its deadline, after the waveform backfill. A finished pass sweeps again
 # after EDGE_BACKFILL_RESWEEP_HOURS so failed jobs past their back-off, and
 # tracks published since, are covered.
 EDGE_BACKFILL_RESWEEP_HOURS = 6
@@ -652,7 +652,7 @@ def rewind_edge_backfill(db, catalog_id, track_id):
 
 
 def park_edge_backfill(db):
-    """No qualified worker: park due passes so the watchdog can go idle."""
+    """No qualified worker: park due passes so the runners can go idle."""
     cur = db.cursor()
     cur.execute(f"""UPDATE {table('edge_backfill_state')} SET status='waiting_runtime', updated_at=now()
         WHERE status IN ('queued', 'failed')""")
@@ -715,7 +715,7 @@ def edge_statuses(db, catalog_id, ids):
 
 # ------------------------------------------------------------ schema v3 upgrade
 # Edges stored before 1.7.0 get their v3 digest in short batches after the
-# migration and on reconcile ticks; health lists schema 3 only when none is
+# migration and in runner turns; health lists schema 3 only when none is
 # missing. The same pass flags edges whose tail window opens below the excerpt
 # floor for a music-end recheck (D9, about 0.1% of a library).
 EDGE_V3_BATCH = 200

@@ -228,7 +228,7 @@ def plugin(migrated_db, monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
     monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: False)
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 10)
-    monkeypatch.setattr(mod, "serve_deferred_interactive", lambda *a, **k: 0)
+    monkeypatch.setattr(mod, "serve_interactive", lambda *a, **k: 0)
     monkeypatch.setattr(mod, "run_file_analysis", lambda analyzer, path, **kw: analyzer(path, **kw))
 
     def load(track_id, catalog_instance_id=None, server_id=None):
@@ -399,6 +399,5 @@ def test_a_worker_without_a_decoder_parks_before_downloading(migrated_db, plugin
 def test_the_scheduler_knows_the_action():
     assert reconcile.action_counts("loudness_backfill", {"ready": 2, "failed": 1}) == (2, 1)
     assert reconcile._retry_target("loudness_backfill") == "loudness_backfill_state"
-    assert reconcile.ACTION_UNITS["loudness_backfill"] == ("loudness measurement", "loudness measurements")
     mod = load_plugin()
     assert "loudness_backfill" in mod._COMPLETE_SETTLES

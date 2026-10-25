@@ -13,8 +13,8 @@ Each summary is written by the work that changes what it describes:
 ``status_summary`` catalogue coverage (eligible, mapped and fingerprinted tracks)
     ``refresh_status_summary``, in its own short transaction right after
     every catalogue refresh (publication or no change), every projection
-    (publication or no change) and the rekey publication, and by the watchdog
-    tick for a source whose summary is missing. Eligible tracks change with a
+    (publication or no change) and the rekey publication, and by a runner
+    for a source whose summary is missing. Eligible tracks change with a
     catalogue generation; the AudioMuse mapping and Chromaprint rows are host
     data that change between publications, and every analysis run ends with a
     catalogue refresh and a projection. It is read, compared and written only
@@ -23,7 +23,7 @@ Each summary is written by the work that changes what it describes:
     ``coverage_server_id`` say what the counts describe.
 ``status_summary`` waveform profile counts
     ``store_profile_counts``, a snapshot taken by background work: at install,
-    after every watchdog tick, after the catalogue refresh cron, after an
+    after every runner turn, after a catalogue refresh, after an
     interactive analysis and, during an AudioMuse run, at most every
     ``PROFILE_COUNTS_MIN_AGE_SECONDS``. ``profile_generation`` is the catalogue
     generation.
@@ -328,7 +328,7 @@ def refresh_status_summary(db, catalog_instance_id, adapter=None):
     readiness reads the summaries (coverage needs its per-server mapping and
     Chromaprint tables), so on AudioMuse 2 this does nothing. Best effort: a
     failure leaves the previous summary, which readers then ignore for a newer
-    generation, and the watchdog tick retries.
+    generation, and the server runner retries.
     """
     if getattr(adapter, "mode", None) != "v3_registry":
         return False

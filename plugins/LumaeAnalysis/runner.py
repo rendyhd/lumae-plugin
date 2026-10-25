@@ -65,18 +65,6 @@ Turn = namedtuple("Turn", "worked mode reason next_due_seconds action")
 ROLE = ContextVar("lumae_runner_role", default=None)
 
 
-def enabled():
-    """The setting ``runner_enabled`` (RN.1–RN.4: off by default). With it on,
-    the runners do the background work and nothing is queued or armed."""
-    try:
-        from plugin.api import get_setting
-
-        value = get_setting("runner_enabled", False)
-    except Exception:
-        return False
-    return value is True or str(value).strip().lower() in {"1", "true", "yes", "on"}
-
-
 def idle_turn(next_due_seconds=None, reason="nothing_due"):
     return Turn(False, "idle", reason, next_due_seconds, None)
 
@@ -107,6 +95,35 @@ def migrate_runner_state(cur):
         )
         """
     )
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {marks_table()} (
+            name TEXT PRIMARY KEY,
+            done_at TIMESTAMPTZ NOT NULL
+        )
+        """
+    )
+
+
+def marks_table():
+    from plugin.api import table
+
+    return table("runner_marks")
+
+
+def claim_mark(cur, name, every_seconds):
+    """Take ``name``'s turn when it last ran ``every_seconds`` ago or never:
+    True once per period, whichever runner asks first."""
+    cur.execute(
+        f"""
+        INSERT INTO {marks_table()} AS m (name, done_at) VALUES (%s, now())
+        ON CONFLICT (name) DO UPDATE SET done_at=now()
+         WHERE m.done_at <= now() - make_interval(secs => %s)
+        RETURNING name
+        """,
+        (name, int(every_seconds)),
+    )
+    return cur.fetchone() is not None
 
 
 def notify(cur, reason):

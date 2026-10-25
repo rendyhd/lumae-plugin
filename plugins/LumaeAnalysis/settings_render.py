@@ -1128,11 +1128,10 @@ def _age_text(seconds):
 
 def _throughput_html():
     """Per queue: done in the last hour and 24 hours, left, ETA; the ETA of the
-    analysis queues at a higher K; refused AudioMuse schedules (S12, WP5)."""
+    analysis queues at a higher K (S12, WP5)."""
     db = _pkg.get_db()
     try:
         queues = _pkg.reconcile_queue_throughput(db)
-        yielding = _pkg.reconcile_yield_status(db)
     except Exception:
         _pkg._rollback_if_possible(db)
         _pkg.logger.exception("lumae_analysis could not read the queue throughput")
@@ -1158,74 +1157,63 @@ def _throughput_html():
         if now and then:
             workers_text += (f" At {higher} at once: {_eta_text(analysis_eta * now / then)} for the"
                              " analysis queues (estimated from a CPU-bound bench on 8 cores).")
-    refused = ""
-    if yielding.get("refused"):
-        refused = "; ".join(f"{task} (refused {_age_text(age)})" for task, age in yielding["refused"])
-        refused = (f'<p class="lumae-help">AudioMuse schedules waiting for their retry, which Lumae'
-                   f' yields to: {_pkg.escape(refused)}.</p>')
     return f"""
         <h4>Throughput</h4>
         <ul class="lumae-help">{''.join(items)}</ul>
         <p class="lumae-help">{_pkg.escape(workers_text)}</p>
-        {refused}
     """
 
 
-# AudioMuse's Scheduled Tasks page lists these with no description; the
-# Scheduler panel says what each does and whether to touch it.
-SCHEDULE_GUIDE = (
-    ("catalog_refresh", "Re-reads the media server and publishes library changes.",
-     "Yours to enable; every 6 hours suits most libraries"),
-    ("analysis_projection", "Copies new AudioMuse analysis onto the published catalogue.",
-     "Yours to enable; every 6 hours suits most libraries"),
-    ("catalog_reconcile", "Runs one pending Lumae action per tick and sets its own pace.",
-     "Managed by Lumae; edits are overwritten"),
-    ("provider_identity_recheck", "Finishes media-server ID checks and AudioMuse migrations.",
-     "Managed by Lumae; re-enabled on upgrade"),
-    ("collection_retention", "Nightly cleanup of expired collection and Vibe receipts.",
-     "On by default; safe to keep"),
+# What a runner's mode and reason say on the settings page (runner plan R9).
+_RUNNER_REASONS = {
+    "maintenance_paused": "paused by the administrator",
+    "heavy_work_on_server": "heavy work runs on the server (Heavy work: server)",
+    "light_lane": "catalogue, credits and lookups",
+    "heavy_lane": "analysis passes, on-demand tracks and relationships",
+    "no_worker_online": "catalogue, credits and lookups, and on-demand tracks while no worker is online",
+    "nothing_due": "nothing due",
+}
+_RUNNER_MODES = {"waiting_host": "stepping aside", "standby": "standing by"}
+_RUNNER_ROLES = (
+    ("server", "Server",
+     "In AudioMuse’s web process, always up: catalogue, finalization, credits and lookups."),
+    ("worker", "Worker",
+     "In an AudioMuse worker, up while one is: waveform, edge and loudness passes, "
+     "on-demand tracks and relationships."),
 )
 
 
-def schedule_description(name):
-    """The info tooltip AudioMuse shows next to a Lumae task, on hosts whose
-    add_cron_task takes a description."""
-    for task, purpose, owner in SCHEDULE_GUIDE:
-        if task == name:
-            return f"{purpose} {owner}."
-    return None
+def _runner_reason(row):
+    reason = str(row.get("reason") or "")
+    if reason.startswith("audiomuse:"):
+        return f"waiting for AudioMuse’s {reason[len('audiomuse:'):].replace('_', ' ')}"
+    return _RUNNER_REASONS.get(reason, reason.replace("_", " ") or "starting")
 
 
-def render_schedule_guide():
-    db = None
-    try:
-        db = _pkg.get_db()
-        with db.cursor() as cur:
-            cur.execute(
-                "SELECT task_type, cron_expr, enabled FROM cron WHERE task_type = ANY(%s)",
-                ([f"plugin.lumae_analysis.{name}" for name, _, _ in SCHEDULE_GUIDE],),
-            )
-            rows = {row[0]: (row[1], bool(row[2])) for row in cur.fetchall()}
-    except Exception:
-        _pkg._rollback_if_possible(db)
-        rows = {}
-    items = []
-    for name, purpose, owner in SCHEDULE_GUIDE:
-        expr, enabled = rows.get(f"plugin.lumae_analysis.{name}", (None, False))
-        state = f"on, <code>{_pkg.escape(expr)}</code>" if enabled and expr else "off"
-        items.append(
-            f"<li><strong>{_pkg.escape(name)}</strong> ({state}): {_pkg.escape(purpose)} "
-            f"<span class=\"lumae-help\">{_pkg.escape(owner)}.</span></li>"
-        )
-    return f"""
-        <details>
-          <summary>AudioMuse schedules for Lumae</summary>
-          <p class="lumae-help">These are the Lumae rows under AudioMuse’s Scheduled Tasks.
-            Enable <strong>catalog_refresh</strong> and <strong>analysis_projection</strong>
-            to keep the app current; leave the rest as they are.</p>
-          <ul>{''.join(items)}</ul>
-        </details>
-    """
+def _runner_row_html(role, label, purpose, row):
+    if not row:
+        state = ("not seen yet; it starts with the next AudioMuse restart"
+                 if role == "server" else "no worker has run Lumae’s worker runner yet")
+        return (f"<li><strong>{_pkg.escape(label)}</strong>: {_pkg.escape(state)}."
+                f"<div class=\"lumae-help\">{_pkg.escape(purpose)}</div></li>")
+    age = row.get("heartbeat_age_seconds")
+    online = age is not None and float(age) < _pkg.runner.WORKER_ONLINE_SECONDS
+    if not online:
+        state = f"not running (last seen {_age_text(float(age) if age is not None else None)})"
+    elif row.get("current_action"):
+        state = f"working: {str(row['current_action']).replace('_', ' ')}"
+    elif row.get("mode") == "working":
+        state = f"working ({_runner_reason(row)})"
+    elif row.get("mode") == "paused":
+        state = _runner_reason(row)
+    else:
+        mode = str(row.get("mode") or "idle")
+        state = f"{_RUNNER_MODES.get(mode, mode.replace('_', ' '))}: {_runner_reason(row)}"
+    detail = f"{purpose} Host {row.get('host') or 'unknown'}, {int(row.get('actions') or 0):,} actions"
+    if row.get("last_action"):
+        detail += f", last {str(row['last_action']).replace('_', ' ')}"
+    return (f"<li><strong>{_pkg.escape(label)}</strong>: {_pkg.escape(state)}."
+            f"<div class=\"lumae-help\">{_pkg.escape(detail)}.</div></li>")
 
 
 def render_reconcile_status_panel():
@@ -1234,33 +1222,20 @@ def render_reconcile_status_panel():
     except Exception:
         db = _pkg.get_db()
         _pkg._rollback_if_possible(db)
-        _pkg.logger.exception("lumae_analysis could not render reconcile status")
+        _pkg.logger.exception("lumae_analysis could not render the background work status")
         return """
-          <section class="lumae-panel" aria-label="Background reconcile status">
-            <span class="lumae-section-priority lumae-section-advanced">Scheduler</span>
-            <h3>Background reconcile status is unavailable</h3>
+          <section class="lumae-panel" aria-label="Background work">
+            <span class="lumae-section-priority lumae-section-advanced">Background work</span>
+            <h3>Background work status is unavailable</h3>
             <p class="lumae-help">The operational status tables could not be read. Published
               Lumae data is unaffected; restart AudioMuse after verifying the plugin migration.</p>
           </section>
         """
-    control = snapshot["control"]
-    mode = control.get("mode") or "unknown"
-    cron_expr = control.get("cron_expr") or ""
-    reason = control.get("reason") or ""
-    cadence = {
-        "active": "Every minute while work is ready"
-        + ("" if cron_expr == "* * * * *"
-           else f" ({cron_expr.split(' ')[0]}: not when Lumae’s other schedules are due)"),
-        "waiting": "Every five minutes while AudioMuse analysis finishes",
-        "backoff": f"Retry schedule: {cron_expr or 'adaptive'}",
-        "idle": "Hourly safety sweep at :11",
-        "paused": "Paused; hourly safety check at :11",
-    }.get(mode, "Schedule unavailable")
-    if mode == "waiting" and reason.startswith("yield:"):
-        cadence = (
-            f"Waiting for AudioMuse ({reason[len('yield:'):]}) to start or finish its own "
-            f"work; next check at minute {cron_expr.split(' ')[0]}"
-        )
+    rows = {str(row.get("role")): row for row in snapshot.get("runners") or []}
+    runners_html = "".join(
+        _runner_row_html(role, label, purpose, rows.get(role))
+        for role, label, purpose in _RUNNER_ROLES
+    )
     pending = snapshot.get("pending") or {}
     pending_html = "".join(
         f"<li><strong>{int(count):,}</strong> {_pkg.escape(str(label))}</li>"
@@ -1283,7 +1258,7 @@ def render_reconcile_status_panel():
               {int(running.get('attempt') or 1)}.</span>
           </div>
         """
-    rows = []
+    journal = []
     for event in events:
         if event.get("status") == "running":
             continue
@@ -1300,7 +1275,7 @@ def render_reconcile_status_panel():
             if event.get("last_error")
             else ""
         )
-        rows.append(
+        journal.append(
             f"""
             <li>
               <strong>{_pkg.escape(str(event.get('action') or '').replace('_', ' ').title())}</strong>
@@ -1311,55 +1286,24 @@ def render_reconcile_status_panel():
             </li>
             """
         )
-    journal_html = "".join(rows) or "<li>No meaningful background actions recorded yet.</li>"
-    next_retry = (
-        f"<p class=\"lumae-help\">Next retry: "
-        f"{_pkg.escape(_pkg.reconcile_iso(control.get('next_retry_at')) or '')}.</p>"
-        if control.get("next_retry_at")
-        else ""
-    )
-    schedules = snapshot.get("schedules") or {}
-    disabled_html = ""
-    if schedules.get(_pkg.CATALOG_RECONCILE_TASK_TYPE) is False:
-        disabled_html += f"""
-          <div class="lumae-notice lumae-notice-warning" role="status">
-            <strong>The catalogue watchdog is disabled in AudioMuse’s Scheduled Tasks.</strong>
-            <span>While it is, Lumae does no background work: waveform and edge backfills,
-              album and artist relationships, credits and MusicBrainz lookups wait, finished
-              AudioMuse analysis runs are not picked up, and on-demand requests AudioMuse
-              refused to queue are not served. Enable
-              <code>{_pkg.escape(_pkg.CATALOG_RECONCILE_TASK_TYPE)}</code> there to resume.</span>
-          </div>
-        """
-    if schedules.get(_pkg.PROVIDER_IDENTITY_RECHECK_TASK_TYPE) is False:
-        disabled_html += f"""
-          <div class="lumae-notice lumae-notice-warning" role="status">
-            <strong>The provider identity recheck is disabled in AudioMuse’s Scheduled Tasks.</strong>
-            <span>While it is, a pending media-server ID change and a finished AudioMuse
-              provider migration are carried through only by a catalogue refresh or an
-              analysis run, not every 30 minutes. Enable
-              <code>{_pkg.escape(_pkg.PROVIDER_IDENTITY_RECHECK_TASK_TYPE)}</code> there to
-              resume.</span>
-          </div>
-        """
+    journal_html = "".join(journal) or "<li>No meaningful background actions recorded yet.</li>"
+    working = bool(running) or any(row.get("current_action") for row in rows.values())
     return f"""
-      <section class="lumae-panel" aria-label="Background reconcile status"
-        data-lumae-active="{str(bool(running)).lower()}">
-        <span class="lumae-section-priority lumae-section-advanced">Scheduler</span>
-        <h3>Background reconcile is {_pkg.escape(str(mode).replace('_', ' '))}</h3>
-        <p class="lumae-action-copy">{_pkg.escape(cadence)}. In Recent tasks, older AudioMuse
-          hosts note these tasks with a “Songs analyzed” count and newer hosts show the
-          sentence Lumae returns; the action and phase below are Lumae’s authoritative status.</p>
-        {disabled_html}
+      <section class="lumae-panel" aria-label="Background work"
+        data-lumae-active="{str(working).lower()}">
+        <span class="lumae-section-priority lumae-section-advanced">Background work</span>
+        <h3>Background work</h3>
+        <p class="lumae-action-copy">Lumae works in two loops of its own, outside AudioMuse’s task
+          queue: it never holds up an analysis you start, and it steps aside while AudioMuse
+          cleans, migrates or analyses.</p>
+        <ul class="lumae-help">{runners_html}</ul>
         {running_html}
         <ul class="lumae-help">{pending_html}</ul>
         {_throughput_html()}
-        {next_retry}
         <details>
           <summary>Recent meaningful background actions</summary>
           <ul>{journal_html}</ul>
         </details>
-        {render_schedule_guide()}
       </section>
     """
 

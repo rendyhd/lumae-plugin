@@ -9,15 +9,13 @@ from . import migrations
 from .personal_discovery import principal, identifier
 from .credits_musicbrainz import Client, MusicBrainzDeferred, _quoted
 from .credits_service import paused, playback_pending
-from .reconcile import arm_reconcile
+from .reconcile import wake_runners
 
 SCHEMA_VERSION = 1
 KINDS = {"artist", "release-group", "release", "recording"}
-# 1.2.2-1.5.0 ran jobs from their own every-minute cron row.
-LEGACY_CRON_TASK_TYPE = "plugin.lumae_analysis.music_metadata"
 # Before background work, a job runs only this long after the last one was
-# claimed: just under two minute ticks, so lookups and library backfill
-# batches alternate on the watchdog despite a few seconds of tick latency.
+# claimed (just under two of 1.8.0's minute ticks), so lookups and library
+# backfill batches alternate in a runner that has both.
 SHARE_SECONDS = 110
 
 
@@ -32,16 +30,6 @@ def migrate(db):
             not_before TIMESTAMPTZ NOT NULL DEFAULT now(), lease TEXT, lease_until TIMESTAMPTZ,
             updated_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY(principal,id))""")
         migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS lumae_metadata_due ON {table('metadata_jobs')}(status,not_before)")
-
-
-def retire_schedule(db):
-    """Delete the legacy every-minute cron row; the catalogue watchdog runs jobs.
-
-    It fired 1,440 times a day, almost always on an empty queue, and AudioMuse
-    records every firing in its ten-row task history, pushing real tasks out.
-    """
-    with db.cursor() as cur:
-        cur.execute("DELETE FROM cron WHERE task_type=%s", (LEGACY_CRON_TASK_TYPE,))
 
 
 def validate_entity(entity):
@@ -90,7 +78,7 @@ def submit(db, user, entities):
             fingerprint = hashlib.sha256(json.dumps(entity, sort_keys=True).encode()).hexdigest()
             cur.execute(f"INSERT INTO {table('metadata_jobs')}(principal,id,fingerprint,input) VALUES(%s,%s,%s,%s::jsonb) ON CONFLICT DO NOTHING", (user, entity["id"], fingerprint, json.dumps(entity)))
     if not paused():
-        arm_reconcile(db, "metadata_requested")  # Same transaction as the jobs.
+        wake_runners(db, "metadata_requested")  # Same transaction as the jobs.
     return {"schema_version": 1, "job_ids": [e["id"] for e in entities], "status": "queued"}, 202
 
 
@@ -192,7 +180,7 @@ def resolve(entity, client):
 
 
 def run_one(*, db=None, client_factory=Client, critical=playback_pending, deadline=None):
-    """One lookup; ``deadline`` (a watchdog tick's) bounds its uncached requests."""
+    """One lookup; ``deadline`` (a runner slice's) bounds its uncached requests."""
     db = db or get_db()
     if paused() or critical(db):
         return {"status": "deferred"}
@@ -238,7 +226,7 @@ def run_one(*, db=None, client_factory=Client, critical=playback_pending, deadli
 
 
 def reconcile(db, before_background=False, deadline=None):
-    """Run one due job on a watchdog tick, taking turns with background work."""
+    """Run one due job in a runner turn, taking turns with background work."""
     if paused():
         return None
     with db.cursor() as cur:
@@ -251,7 +239,7 @@ def reconcile(db, before_background=False, deadline=None):
     if not due or (before_background and float(idle_seconds) < SHARE_SECONDS):
         return None
     result = run_one(db=db) if deadline is None else run_one(db=db, deadline=deadline)
-    # Nothing claimed (playback first, or another worker won): the tick goes on.
+    # Nothing claimed (playback first, or another worker won): the turn goes on.
     return result if result.get("job_id") else None
 
 

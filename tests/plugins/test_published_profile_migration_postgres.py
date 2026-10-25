@@ -11,10 +11,11 @@ MARKERS = "plugin_lumae_analysis__profile_migrations"
 
 def _setup(db, monkeypatch, mod, *, two_sources):
     # Each test owns a disposable schema. Keep the real migrate(db) path while
-    # disabling external source discovery, scheduling, and queued work.
+    # disabling external source discovery and the preparation request.
     catalog.migrate_catalog(db)
     with db.cursor() as cur:
-        cur.execute("CREATE TABLE cron (task_type TEXT PRIMARY KEY)")
+        cur.execute("CREATE TABLE cron (name TEXT, task_type TEXT PRIMARY KEY, cron_expr TEXT, "
+                    "enabled BOOLEAN)")
         cur.execute(
             """INSERT INTO plugin_lumae_analysis__catalog_sources
                (catalog_instance_id, current_core_server_id, provider_type,
@@ -54,17 +55,6 @@ def _setup(db, monkeypatch, mod, *, two_sources):
     db.commit()
     monkeypatch.setattr(mod, "ensure_catalog_sources", lambda *_args: None)
     monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
-    monkeypatch.setattr(mod, "_safe_reconcile_schedule", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(mod.music_metadata, "retire_schedule", lambda *_args: None)
-    for name in (
-        "ensure_catalog_refresh_schedule",
-        "ensure_catalog_reconcile_schedule",
-        "ensure_provider_identity_recheck_schedule",
-        "ensure_analysis_projection_schedule",
-        "ensure_collection_retention_schedule",
-        "disable_legacy_backfill_schedule",
-    ):
-        monkeypatch.setattr(mod, name, lambda *_args: None)
 
 
 def _put(cur, table, track, *, source=None, status="ready", start=b"\x00\xff\x10\x80",

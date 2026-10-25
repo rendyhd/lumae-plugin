@@ -1,27 +1,25 @@
-"""The catalogue watchdog's tick, through ``catalog_reconcile_task``.
+"""The runners' actions, through ``run_runner_turn`` (runner plan RN.6).
 
-Plan: docs/plan/LUMAE_SCHEDULER_PLAN_2026-10-11.md (1.6.2: S1-S6).
+Plan: docs/plan/LUMAE_RUNNER_PLAN_2026-10-25.md. The watchdog's tick and its
+cadence, yield and schedules are gone (R8); the actions and their journal
+stay (scheduler plan S4, S5):
 
 * S4 (AUD-15): a waveform backfill that only waits for retry-armed tracks
-  keeps its own retry time. The tick used to reset it, so the row was due at
-  once, the watchdog stayed on minute cadence after the backfill had
-  finished, and the edge pass ordered after it never ran.
-* S1 (AUD-13): while AudioMuse has a refused schedule in ``cron_retry`` or a
-  main job running, the tick does no work and waits on the yield cadence;
-  minute cadence leaves out the minutes of Lumae's other enabled rows.
-* S5 (AUD-18): the tick returns what it did (``tracks_analyzed``, one
-  sentence as ``message``/``status_message``, actions, remaining work,
-  cadence), logs one INFO line, journals credits, MusicBrainz and on-demand
-  turns, and the journal keeps a day of events.
-* S6 (AUD-18): an administrator's disable of Lumae's cron rows on AudioMuse's
-  Scheduled Tasks page stays, and the settings page says what stops.
+  keeps its own retry time, and the runner sleeps until it.
+* S5 (AUD-18): each turn journals credits, MusicBrainz and on-demand turns
+  and the waveform, loudness and edge passes; the journal keeps a day of
+  events.
+* W1: the identity recheck runs while a transition needs it. R8: expired
+  collection receipts go once a day; an administrator's catalogue refresh
+  schedule became ``catalog_refresh_hours``.
 """
+import contextlib
 import importlib
 import time
-from types import SimpleNamespace
 
 import pytest
 
+from runner_helpers import turn
 from test_lumae_analysis import load_plugin
 from plugins.LumaeAnalysis import profile_publication as publication  # noqa: E402
 
@@ -29,18 +27,12 @@ from plugins.LumaeAnalysis import profile_publication as publication  # noqa: E4
 P = "plugin_lumae_analysis__"
 SOURCE = "catalog-a"
 SERVER = "server-a"
-RECONCILE = "plugin.lumae_analysis.catalog_reconcile"
-RECHECK = "plugin.lumae_analysis.provider_identity_recheck"
-COLLECTION_RETENTION = "plugin.lumae_analysis.collection_retention"
-# Minute cadence on the migrated schema: without the minutes of the installed
-# identity recheck (2 4 * * *, W1) and collection retention (23 3 * * *) rows (S1).
-EVERY_MINUTE = "0,1,3-22,24-59 * * * *"
 
 
 def _rows(db, sql, params=()):
     with db.cursor() as cur:
         cur.execute(sql, params)
-        rows = cur.fetchall()
+        rows = cur.fetchall() if cur.description else []
     db.commit()
     return rows
 
@@ -51,8 +43,9 @@ def _reconcile():
 
 @pytest.fixture
 def tick(migrated_db, monkeypatch):
-    """The real tick on one source; actions this module does not exercise
-    report no work."""
+    """A server runner's turn on one source, heavy work included
+    (``heavy_work=server``); actions this module does not exercise report
+    no work."""
     mod = load_plugin()
     db = migrated_db
     with db.cursor() as cur:
@@ -75,9 +68,12 @@ def tick(migrated_db, monkeypatch):
     db.commit()
     for module in (mod, _reconcile()):
         monkeypatch.setattr(module, "get_db", lambda: db)
+    monkeypatch.setattr(mod.runner, "PAUSE_SECONDS", 0)
+    monkeypatch.setattr(mod, "_runner_bookkeeping_at", None)
+    monkeypatch.setattr(mod, "heavy_work_setting", lambda: "server")
     monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
     monkeypatch.setattr(mod, "report_edge_runtime", lambda *args, **kwargs: None)
-    monkeypatch.setattr(mod, "serve_deferred_interactive", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(mod, "serve_interactive", lambda *args, **kwargs: 0)
     monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
     for name in ("next_settled_analysis_run", "next_preparation_run", "next_relationship_run"):
         monkeypatch.setattr(mod, name, lambda db=None, server_id=None: None)
@@ -85,12 +81,17 @@ def tick(migrated_db, monkeypatch):
     monkeypatch.setattr(mod, "_safe_metadata_reconcile", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: False)
     monkeypatch.setattr(mod, "next_loudness_backfill", lambda db=None, server_id=None: None)
+    monkeypatch.setattr(mod, "collection_retention_task", lambda: {"status": "ok"})
     monkeypatch.setattr(
         mod, "resolve_profile_source",
         lambda **_kwargs: {"catalog_instance_id": SOURCE, "server_id": SERVER},
     )
     monkeypatch.setattr(mod, "get_core_adapter", lambda: type(
         "Adapter", (), {"active_server_id": staticmethod(lambda: SERVER)})())
+    # A day's retention ran already; the tests that want it clear the mark.
+    with db.cursor() as cur:
+        assert mod.runner.claim_mark(cur, "collection_retention", 0)
+    db.commit()
     return mod, db
 
 
@@ -142,10 +143,6 @@ def _backfill_row(db):
     )[0]
 
 
-def _cron(db):
-    return _rows(db, "SELECT cron_expr FROM cron WHERE task_type=%s", (RECONCILE,))[0][0]
-
-
 @pytest.mark.parametrize("retry_count", [2])  # 0 takes the same branch
 def test_waiting_retry_keeps_the_backfill_retry_time(tick, monkeypatch, retry_count):
     mod, db = tick
@@ -155,9 +152,9 @@ def test_waiting_retry_keeps_the_backfill_retry_time(tick, monkeypatch, retry_co
     analysed = []
     monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: analysed.append(ids))
 
-    result = mod.catalog_reconcile_task()
+    result, actions = turn(mod)
 
-    assert [(entry["action"], entry["status"]) for entry in result["actions"]] == [
+    assert [(entry["action"], entry["status"]) for entry in actions] == [
         ("profile_backfill", "waiting_retry")]
     assert analysed == []
     status, next_retry_at, stored_retry_count = _backfill_row(db)
@@ -177,14 +174,12 @@ def test_waiting_retry_keeps_the_backfill_retry_time(tick, monkeypatch, retry_co
     db.commit()
     assert summary["ready"] == 0
     assert summary["next_retry_at"] is not None
-    # The cadence follows the backoff ladder to the retry 20 minutes away,
-    # not minute ticks.
-    assert _rows(db, f"SELECT mode, cron_expr FROM {P}reconcile_control")[0] == (
-        "backoff", "*/15 * * * *")
-    assert _cron(db) == "*/15 * * * *"
-    # Until the retry is due, the next tick finds no waveform batch to run.
+    # Until the retry is due the next turn finds nothing, and sleeps until it
+    # (20 minutes), not a minute.
     assert mod.next_profile_backfill_run(db=db) is None
-    assert mod.catalog_reconcile_task()["status"] == "current"
+    idle, actions = turn(mod)
+    assert (idle.worked, actions) == (False, [])
+    assert 18 * 60 < idle.next_due_seconds <= 20 * 60
     assert _backfill_row(db)[1] == next_retry_at
 
 
@@ -193,106 +188,18 @@ def test_complete_backfill_stays_complete(tick, monkeypatch):
     _queued_backfill(db, retry_count=1)
     monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: pytest.fail(ids))
 
-    result = mod.catalog_reconcile_task()
+    _result, actions = turn(mod)
 
-    assert result["actions"][0]["status"] == "complete"
+    assert actions[0]["status"] == "complete"
     assert _backfill_row(db) == ("complete", None, 0)
-    assert _rows(db, f"SELECT mode FROM {P}reconcile_control")[0][0] == "idle"
 
 
-def _enabled(db, task_type):
-    return _rows(db, "SELECT enabled FROM cron WHERE task_type=%s", (task_type,))
-
-
-def _disable(db, task_type):
-    with db.cursor() as cur:
-        cur.execute("UPDATE cron SET enabled=FALSE WHERE task_type=%s", (task_type,))
-    db.commit()
-
-
-def test_a_disabled_watchdog_stays_disabled_through_every_cadence_and_a_reinstall(
-    tick, monkeypatch, run_plugin_migration,
-):
-    mod, db = tick
-    reconcile = _reconcile()
-    _disable(db, RECONCILE)
-
-    reconcile.arm_reconcile(db, "work_admitted", commit=True)
-    assert _cron(db) == EVERY_MINUTE
-    reconcile.set_paused(db, True)
-    assert _cron(db) == reconcile.IDLE_CRON
-    _queued_backfill(db)
-    assert reconcile.reconcile_schedule_from_state(db)["mode"] == "active"
-    monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: pytest.fail(ids))
-    mod.catalog_reconcile_task()
-    assert _rows(db, f"SELECT mode FROM {P}reconcile_control")[0][0] == "idle"
-    assert _enabled(db, RECONCILE) == [(False,)]
-
-    run_plugin_migration(db)
-    assert _enabled(db, RECONCILE) == [(False,)]
-
-
-def test_the_identity_recheck_is_installed_enabled_and_keeps_a_later_change(
-    migrated_db, run_plugin_migration,
-):
-    db = migrated_db
-    assert _rows(db, "SELECT cron_expr, enabled FROM cron WHERE task_type=%s", (RECHECK,)) == [
-        ("2 4 * * *", True)]
-    # W1: the half-hourly row earlier releases installed moves to daily.
-    with db.cursor() as cur:
-        cur.execute("UPDATE cron SET cron_expr='2,32 * * * *' WHERE task_type=%s", (RECHECK,))
-    db.commit()
-    run_plugin_migration(db)
-    assert _rows(db, "SELECT cron_expr, enabled FROM cron WHERE task_type=%s", (RECHECK,)) == [
-        ("2 4 * * *", True)]
-    with db.cursor() as cur:
-        cur.execute("UPDATE cron SET enabled=FALSE, cron_expr='5 * * * *' WHERE task_type=%s",
-                    (RECHECK,))
-    db.commit()
-    run_plugin_migration(db)
-    assert _rows(db, "SELECT cron_expr, enabled FROM cron WHERE task_type=%s", (RECHECK,)) == [
-        ("5 * * * *", False)]
-    with db.cursor() as cur:
-        cur.execute("DELETE FROM cron WHERE task_type=%s", (RECHECK,))
-    db.commit()
-    run_plugin_migration(db)
-    assert _enabled(db, RECHECK) == [(True,)]
-
-
-# Both rows disabled only combines the two single-row cases.
-@pytest.mark.parametrize("disabled", [(), (RECONCILE,), (RECHECK,)])
-def test_the_settings_page_says_what_stops_while_a_row_is_disabled(tick, disabled):
-    mod, db = tick
-    for task_type in disabled:
-        _disable(db, task_type)
-
-    html = mod.render_reconcile_status_panel()
-
-    assert ("The catalogue watchdog is disabled" in html) is (RECONCILE in disabled)
-    assert ("Lumae does no background work" in html) is (RECONCILE in disabled)
-    assert ("The provider identity recheck is disabled" in html) is (RECHECK in disabled)
-    for task_type in disabled:
-        assert f"<code>{task_type}</code>" in html
-
-
-# ---------------------------------------------------------------- S5 report
 def _events(db):
     return _rows(
         db,
         f"SELECT action, status, phase, summary FROM {P}reconcile_events "
         "WHERE status <> 'running' ORDER BY event_id",
     )
-
-
-def _info_lines(monkeypatch):
-    lines = []
-    monkeypatch.setattr(_reconcile(), "logger", type("Logger", (), {
-        "info": staticmethod(lambda message, *args: lines.append(message % args)),
-        "debug": staticmethod(lambda *args, **kwargs: None),
-        "warning": staticmethod(lambda *args, **kwargs: None),
-        "exception": staticmethod(lambda *args, **kwargs: None),
-    })())
-    return lines
 
 
 def test_a_waveform_batch_reports_its_tracks_and_matches_its_event(tick, monkeypatch):
@@ -304,79 +211,169 @@ def test_a_waveform_batch_reports_its_tracks_and_matches_its_event(tick, monkeyp
     monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: {
         "processed": len(ids), "attempted": len(ids), "ready": len(ids) - 1, "failed": 1,
         "skipped": 0})
-    lines = _info_lines(monkeypatch)
 
-    result = mod.catalog_reconcile_task()
+    result, actions = turn(mod)
 
-    # Batches of two and one in one tick (plan S2), each journaled; each
-    # batch's stub fails one track.
+    # Batches of two and one in one turn, each journaled; each batch's stub
+    # fails one track.
     events = _events(db)
     assert [(action, status) for action, status, _phase, _summary in events] == [
         ("profile_backfill", "success")] * 2
-    [entry] = result["actions"]
+    [entry] = actions
     assert (entry["action"], entry["runs"]) == ("profile_backfill", 2)
-    assert result["tracks_analyzed"] == entry["count"] == sum(
-        summary["ready"] for *_rest, summary in events) == 1
+    assert entry["count"] == sum(summary["ready"] for *_rest, summary in events) == 1
     assert entry["failed"] == sum(summary["failed"] for *_rest, summary in events) == 2
-    assert result["remaining"]["waveforms"] == 3
-    assert result["message"] == result["status_message"]
-    assert result["message"].startswith("Lumae: 1 waveform (2 failed) in ")
-    assert result["message"].endswith("; 3 tracks left")
-    assert result["cadence"] == EVERY_MINUTE
-    [line] = lines
-    assert line.startswith("lumae_analysis watchdog: " + result["message"])
-    assert "actions profile_backfill " in line and " 1/2 failed in 2 runs " in line
-    assert f"cadence {EVERY_MINUTE}" in line
+    assert result.worked and result.action == "profile_backfill"
 
 
 @pytest.mark.parametrize(
-    ("stub", "value", "action", "message", "tracks"),
+    ("stub", "value", "action"),
     [
-        ("serve_deferred_interactive", 3, "interactive", "Lumae: 3 on-demand tracks in ", 3),
+        ("serve_interactive", 3, "interactive"),
         ("_safe_credits_reconcile",
          {"status": "published", "album_id": "album-a", "match_status": "matched", "credits": 4},
-         "credits", "Lumae: 1 credits album in ", 0),
-        ("_safe_metadata_reconcile", {"status": "verified", "job_id": "job-a"},
-         "music_metadata", "Lumae: 1 MusicBrainz lookup in ", 0),
+         "credits"),
+        ("_safe_metadata_reconcile", {"status": "verified", "job_id": "job-a"}, "music_metadata"),
         ("_safe_credits_reconcile", {"status": "deferred", "album_id": "album-a",
-                                     "retry_seconds": 60}, "credits", "Lumae: 1 credits album in ", 0),
+                                     "retry_seconds": 60}, "credits"),
     ],
 )
-def test_credits_lookups_and_on_demand_turns_are_journaled(
-    tick, monkeypatch, stub, value, action, message, tracks,
-):
+def test_credits_lookups_and_on_demand_turns_are_journaled(tick, monkeypatch, stub, value, action):
     mod, db = tick
     queued = [value]
     monkeypatch.setattr(mod, stub, lambda *args, **kwargs: queued.pop() if queued else (
-        0 if stub == "serve_deferred_interactive" else None))
+        0 if stub == "serve_interactive" else None))
 
-    result = mod.catalog_reconcile_task()
+    _result, actions = turn(mod)
 
     [(event_action, status, phase, summary)] = _events(db)
     assert event_action == action
     assert status == ("deferred" if phase == "deferred" else "success")
     assert summary["status"] == phase
-    assert [entry["action"] for entry in result["actions"]] == [action]
-    assert result["message"].startswith(message)
-    assert result["tracks_analyzed"] == tracks
+    assert [entry["action"] for entry in actions] == [action]
     if action == "interactive":
-        assert summary["served"] == 3
+        assert summary["served"] == 3 and actions[0]["count"] == 3
     if action == "credits" and phase == "published":
         assert (summary["match_status"], summary["credits"]) == ("matched", 4)
 
 
-def test_idle_and_paused_ticks_say_so(tick, monkeypatch):
+def _batch_result(ids, **_kwargs):
+    return {"processed": len(ids), "attempted": len(ids), "ready": len(ids), "failed": 0,
+            "skipped": 0}
+
+
+def test_a_turn_runs_due_actions_highest_priority_first(tick, monkeypatch):
+    """Plan S2: one turn runs several actions, highest priority first, and
+    starts the order again after each."""
     mod, db = tick
-    lines = _info_lines(monkeypatch)
-    idle = mod.catalog_reconcile_task()
-    assert (idle["status"], idle["message"], idle["cadence"]) == (
-        "current", "Lumae: up to date", "11 * * * *")
-    assert idle["actions"] == [] and idle["tracks_analyzed"] == 0
+    calls = []
+    runs = [{"server_id": SERVER, "catalog_instance_id": SOURCE, "run_id": "run-a"}]
+    monkeypatch.setattr(mod, "next_settled_analysis_run",
+                        lambda db=None, server_id=None: runs.pop(0) if runs else None)
+    monkeypatch.setattr(mod, "finalize_analysis_run_task",
+                        lambda *args: calls.append(("analysis", args)) or {"status": "complete"})
+    for track in ("track-a", "track-b", "track-c"):
+        _track(db, track)
+    _queued_backfill(db)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 2)
+    monkeypatch.setattr(mod, "analyze_tracks_task",
+                        lambda ids, **kw: calls.append(("waveforms", ids)) or _batch_result(ids))
+
+    result, actions = turn(mod)
+
+    assert result.worked
+    assert [(entry["action"], entry["runs"], entry["count"]) for entry in actions] == [
+        ("analysis_run", 1, 1), ("profile_backfill", 2, 3)]
+    assert calls[0] == ("analysis", (SERVER, SOURCE, "run-a"))
+    assert [name for name, _ids in calls[1:]] == ["waveforms", "waveforms"]
+
+
+@pytest.mark.parametrize(
+    ("background", "metadata_results", "expected_actions", "expected_turns"),
+    [
+        # A due lookup whose turn has come runs before the library backfill,
+        # and the backfill runs after it in the same turn.
+        (True, {True: [{"status": "verified", "job_id": "job-a"}]},
+         ["music_metadata", "profile_backfill"], [True, False]),
+        # A lookup that ran recently waits; the backfill takes the turn.
+        (True, {}, ["profile_backfill"], [True, False]),
+        # With no background work left, due lookups run one after another.
+        (False, {False: [{"status": "verified", "job_id": "job-a"},
+                         {"status": "verified", "job_id": "job-b"}]},
+         ["music_metadata"], [True, False, False, False]),
+        (False, {}, [], [True, False]),
+    ],
+)
+def test_lookups_take_turns_with_background_work(
+        tick, monkeypatch, background, metadata_results, expected_actions, expected_turns):
+    mod, db = tick
+    turns = []
+    if background:
+        _track(db, "track-a")
+        _queued_backfill(db)
+        monkeypatch.setattr(mod, "analyze_tracks_task", _batch_result)
+
+    def metadata(_db, before_background, deadline=None):
+        turns.append(before_background)
+        assert deadline is not None and deadline > time.monotonic()
+        queued = metadata_results.get(before_background) or []
+        return queued.pop(0) if queued else None
+
+    monkeypatch.setattr(mod, "_safe_metadata_reconcile", metadata)
+    lookups = sum(len(results) for results in metadata_results.values())
+
+    result, actions = turn(mod)
+
+    assert [entry["action"] for entry in actions] == expected_actions
+    assert turns == expected_turns
+    if expected_actions[:1] == ["music_metadata"]:
+        assert (actions[0]["status"], actions[0]["runs"]) == ("verified", lookups)
+    assert result.worked == bool(expected_actions)
+
+
+def test_each_action_runs_bound_to_its_source_server(tick, monkeypatch):
+    """R3: a runner thread starts without AudioMuse's server binding, so each
+    action binds its source's server, as the queue bound a cron task."""
+    mod, db = tick
+    bound, seen = [], []
+
+    class Adapter:
+        @staticmethod
+        def active_server_id():
+            return bound[-1] if bound else None
+
+        @staticmethod
+        def bind(server_id):
+            @contextlib.contextmanager
+            def scope():
+                bound.append(server_id)
+                try:
+                    yield
+                finally:
+                    bound.pop()
+            return scope()
+
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: Adapter())
+    _track(db, "track-a")
+    _queued_backfill(db)
+    monkeypatch.setattr(mod, "analyze_tracks_task",
+                        lambda ids, **kw: seen.append(list(bound)) or _batch_result(ids))
+
+    turn(mod)
+
+    assert seen == [[SERVER]] and bound == []
+    # Outside a runner the caller's binding stands.
+    with mod._source_binding(SERVER):
+        assert bound == []
+
+
+def test_idle_and_paused_turns_do_nothing(tick, monkeypatch):
+    mod, db = tick
+    idle, actions = turn(mod)
+    assert (idle.worked, idle.mode, actions) == (False, "idle", [])
     monkeypatch.setattr(mod, "maintenance_paused", lambda: True)
-    paused = mod.catalog_reconcile_task()
-    assert (paused["status"], paused["message"], paused["cadence"]) == (
-        "paused", "Lumae: paused", "11 * * * *")
-    assert len(lines) == 2 and lines[1].startswith("lumae_analysis watchdog: Lumae: paused")
+    paused, actions = turn(mod)
+    assert (paused.mode, paused.reason, actions) == ("paused", "maintenance_paused", [])
     assert _events(db) == []
 
 
@@ -396,11 +393,11 @@ def test_the_loudness_turn_comes_after_the_waveform_batch(tick, monkeypatch):
     downloads = []
     monkeypatch.setattr(mod, "load_track_file", lambda track_id, **_: downloads.append(track_id))
 
-    result = mod.catalog_reconcile_task()
+    _result, actions = turn(mod)
 
-    actions = [(action, status) for action, status, _phase, _summary in _events(db)]
-    assert actions.index(("loudness_backfill", "success")) > actions.index(("profile_backfill", "success"))
-    entry = next(entry for entry in result["actions"] if entry["action"] == "loudness_backfill")
+    journal = [(action, status) for action, status, _phase, _summary in _events(db)]
+    assert journal.index(("loudness_backfill", "success")) > journal.index(("profile_backfill", "success"))
+    entry = next(entry for entry in actions if entry["action"] == "loudness_backfill")
     assert (entry["count"], entry["failed"]) == (0, 1) and downloads == ["track-a"]
     assert mod.loudness_backfill.state(db, SOURCE)["status"] == "complete"
 
@@ -408,24 +405,25 @@ def test_the_loudness_turn_comes_after_the_waveform_batch(tick, monkeypatch):
 def test_a_finished_loudness_pass_rests_until_its_resweep(tick, monkeypatch):
     mod, db = tick
     _loudness_on(mod, monkeypatch)
-    first = mod.catalog_reconcile_task()  # follows the catalogue; nothing to measure
-    assert [entry["action"] for entry in first["actions"]] == ["loudness_backfill"]
-    idle = mod.catalog_reconcile_task()
-    assert (idle["status"], idle["actions"]) == ("current", [])
+    _first, actions = turn(mod)  # follows the catalogue; nothing to measure
+    assert [entry["action"] for entry in actions] == ["loudness_backfill"]
+    idle, actions = turn(mod)
+    assert (idle.worked, actions) == (False, [])
 
 
-def test_a_failed_action_still_logs_its_tick(tick, monkeypatch):
+def test_a_failed_action_is_journaled_and_the_turn_goes_on(tick, monkeypatch):
     mod, db = tick
     _queued_backfill(db)
     monkeypatch.setattr(mod, "profile_backfill_task", lambda *_args: (_ for _ in ()).throw(
         RuntimeError("decoder crashed")))
-    lines = _info_lines(monkeypatch)
-    with pytest.raises(RuntimeError):
-        mod.catalog_reconcile_task()
-    [line] = lines
-    assert line.startswith("lumae_analysis watchdog: Lumae: an action failed")
-    assert "actions profile_backfill failed 0 " in line
+    credits = [{"status": "published", "album_id": "album-a"}]
+    monkeypatch.setattr(mod, "_safe_credits_reconcile",
+                        lambda *a, before_background, **k: None if before_background or not credits
+                        else credits.pop())
+    result, actions = turn(mod)
     assert _events(db)[0][:2] == ("profile_backfill", "failed")
+    assert [entry["action"] for entry in actions] == ["profile_backfill", "credits"]
+    assert result.worked
 
 
 def test_the_journal_keeps_a_day_per_source_within_its_bounds(tick):
@@ -482,204 +480,8 @@ def test_the_journal_keeps_a_day_per_source_within_its_bounds(tick):
     assert len(reconcile.read_reconcile_status(db)["events"]) == 25
 
 
-# ---------------------------------------------------------------- S1 yield
-def _cron_retry(db, *task_types):
-    with db.cursor() as cur:
-        cur.execute(
-            "CREATE TABLE IF NOT EXISTS cron_retry (task_type TEXT PRIMARY KEY, "
-            "retry_until DOUBLE PRECISION, attempts INTEGER DEFAULT 0, "
-            "first_blocked_at DOUBLE PRECISION, blocker_task_id TEXT, blocker_task_type TEXT)"
-        )
-        for task_type in task_types:
-            cur.execute(
-                "INSERT INTO cron_retry (task_type, retry_until, first_blocked_at) "
-                "VALUES (%s, extract(epoch FROM now()) + 14400, extract(epoch FROM now()))",
-                (task_type,),
-            )
-    db.commit()
-
-
-def _live_root(db, task_type, status="RUNNING", task_id="host-task"):
-    with db.cursor() as cur:
-        cur.execute(
-            "INSERT INTO task_status (task_id, parent_task_id, task_type, status) "
-            "VALUES (%s, NULL, %s, %s)",
-            (task_id, task_type, status),
-        )
-    db.commit()
-
-
-def _ready_work(mod, db, monkeypatch):
-    """Ready waveform work: the cadence would be minute cadence."""
-    _track(db, "track-a")
-    _queued_backfill(db)
-    ran = []
-    monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: ran.append(ids) or {
-        "processed": len(ids), "attempted": len(ids), "ready": 0, "failed": 0, "skipped": 0})
-    return ran
-
-
-def _yield_minute(db):
-    mode, cron_expr, reason = _rows(
-        db, f"SELECT mode, cron_expr, reason FROM {P}reconcile_control")[0]
-    assert _cron(db) == cron_expr
-    minute, rest = cron_expr.split(" ", 1)
-    assert rest == "* * * *"
-    ahead = (int(minute) - time.localtime().tm_min) % 60
-    return mode, reason, ahead
-
-
-# ["analysis"] alone takes the same branch as the pair.
-@pytest.mark.parametrize("blocked", [[COLLECTION_RETENTION], ["analysis", COLLECTION_RETENTION]])
-def test_a_refused_schedule_makes_the_tick_yield(tick, monkeypatch, blocked):
-    mod, db = tick
-    ran = _ready_work(mod, db, monkeypatch)
-    _cron_retry(db, RECONCILE, *blocked)
-    monkeypatch.setattr(mod, "serve_deferred_interactive",
-                        lambda *args, **kwargs: pytest.fail("a yielding tick serves nothing"))
-
-    result = mod.catalog_reconcile_task()
-
-    assert (result["status"], result["yielded_to"]) == ("yielded", sorted(blocked)[0])
-    assert result["message"] == f"Lumae: yielded to {sorted(blocked)[0]}"
-    assert result["actions"] == [] and ran == [] and _events(db) == []
-    mode, reason, ahead = _yield_minute(db)
-    assert (mode, reason) == ("waiting", f"yield:{sorted(blocked)[0]}")
-    assert 5 <= ahead <= 15
-    assert result["cadence"] == _cron(db)
-    # The settings page says why.
-    assert "Waiting for AudioMuse" in mod.render_reconcile_status_panel()
-
-
-def test_the_watchdogs_own_retry_row_is_not_a_reason_to_yield(tick, monkeypatch):
-    mod, db = tick
-    ran = _ready_work(mod, db, monkeypatch)
-    _cron_retry(db, RECONCILE)
-    result = mod.catalog_reconcile_task()
-    assert result["status"] == "processed" and result["yielded_to"] is None
-    assert ran == [["track-a"]]
-
-
-def test_the_tick_resumes_and_returns_to_minute_cadence_once_the_retry_clears(tick, monkeypatch):
-    mod, db = tick
-    ran = _ready_work(mod, db, monkeypatch)
-    _cron_retry(db, "analysis")
-    assert mod.catalog_reconcile_task()["status"] == "yielded"
-    with db.cursor() as cur:
-        cur.execute("DELETE FROM cron_retry")
-    db.commit()
-
-    result = mod.catalog_reconcile_task()
-
-    assert result["status"] == "processed" and ran == [["track-a"]]
-    with db.cursor() as cur:
-        cur.execute(f"UPDATE {P}profile_backfill_state SET status='queued', next_retry_at=NULL")
-    db.commit()
-    assert _reconcile().reconcile_schedule_from_state(db)["cron_expr"] == EVERY_MINUTE
-    assert _rows(db, f"SELECT mode, reason FROM {P}reconcile_control")[0] == (
-        "active", "runnable_work")
-
-
-@pytest.mark.parametrize("caller", ["work_admitted", "startup", "install"])
-def test_only_a_tick_ends_a_yield(tick, monkeypatch, caller):
-    """Work admitted during a yield (an analysed song, an on-demand request, a
-    credits lookup) waits for the tick that finds nothing to yield to, and so
-    do the startup and install recomputes; minute cadence from any of them put
-    a fire back ahead of the host's retry pass."""
-    mod, db = tick
-    ran = _ready_work(mod, db, monkeypatch)
-    _cron_retry(db, COLLECTION_RETENTION)
-    assert mod.catalog_reconcile_task()["status"] == "yielded"
-    held = _rows(db, f"SELECT mode, cron_expr, reason FROM {P}reconcile_control")[0]
-
-    if caller == "work_admitted":
-        _reconcile().arm_reconcile(db, "deferred_on_demand", commit=True)
-    elif caller == "startup":
-        monkeypatch.setattr(mod, "ProviderCatalogBridge", lambda: SimpleNamespace(
-            list_servers=lambda: []))
-        mod.observe_provider_identities_on_start()
-    else:
-        mod.migrate(db)
-
-    assert _rows(db, f"SELECT mode, cron_expr, reason FROM {P}reconcile_control")[0] == held
-    assert _cron(db) == held[1]
-    with db.cursor() as cur:
-        cur.execute("DELETE FROM cron_retry")
-    db.commit()
-    assert mod.catalog_reconcile_task()["status"] == "processed" and ran == [["track-a"]]
-    # Outside a yield, admitted work arms minute cadence as before.
-    _reconcile().arm_reconcile(db, "deferred_on_demand", commit=True)
-    assert _rows(db, f"SELECT mode, cron_expr, reason FROM {P}reconcile_control")[0] == (
-        "active", EVERY_MINUTE, "deferred_on_demand")
-
-
-@pytest.mark.parametrize(("task_type", "status", "yields"), [
-    ("main_analysis", "RUNNING", True),
-    ("main_analysis", "NEW", True),
-    ("main_clustering", "STARTED", True),
-    ("cleaning", "PENDING", True),
-    ("server_sweep", "PROGRESS", True),
-    ("main_analysis", "SUCCESS", False),
-    ("plugin.lumae_analysis.analyze_edges_task", "RUNNING", False),
-    ("plugin.other_plugin.sync", "RUNNING", False),
-    ("alchemy_radio", "RUNNING", False),
-    ("album_analysis", "RUNNING", False),
-])
-def test_a_live_audiomuse_main_job_makes_the_tick_yield(tick, monkeypatch, task_type, status,
-                                                        yields):
-    """Without cron_retry (AudioMuse before 3.3.0) only live tasks count."""
-    mod, db = tick
-    ran = _ready_work(mod, db, monkeypatch)
-    _live_root(db, task_type, status)
-    assert _rows(db, "SELECT to_regclass('cron_retry')") == [(None,)]
-
-    result = mod.catalog_reconcile_task()
-
-    assert result["yielded_to"] == (task_type if yields else None)
-    assert (ran == []) is yields
-
-
-def test_a_child_of_a_main_job_is_not_a_root(tick, monkeypatch):
-    mod, db = tick
-    _ready_work(mod, db, monkeypatch)
-    with db.cursor() as cur:
-        cur.execute("INSERT INTO task_status (task_id, parent_task_id, task_type, status) "
-                    "VALUES ('child', 'parent', 'main_analysis', 'RUNNING')")
-    db.commit()
-    assert mod.catalog_reconcile_task()["yielded_to"] is None
-
-
-def test_minute_cadence_skips_only_enabled_lumae_rows(tick):
-    _mod, db = tick
-    reconcile = _reconcile()
-
-    def armed():
-        reconcile.arm_reconcile(db, "work_admitted", commit=True)
-        return _cron(db)
-
-    assert armed() == EVERY_MINUTE
-    with db.cursor() as cur:
-        cur.execute("UPDATE cron SET enabled=TRUE WHERE task_type IN (%s, %s)",
-                    ("plugin.lumae_analysis.catalog_refresh",
-                     "plugin.lumae_analysis.analysis_projection"))
-    db.commit()
-    assert armed() == "0,1,3-16,18-22,24-46,48-59 * * * *"
-    for task_type in ("plugin.lumae_analysis.catalog_refresh",
-                      "plugin.lumae_analysis.analysis_projection", COLLECTION_RETENTION):
-        _disable(db, task_type)
-    assert armed() == "0,1,3-59 * * * *"
-    _disable(db, RECHECK)
-    assert armed() == "* * * * *"
-    # Another plugin's rows are not Lumae's to avoid.
-    with db.cursor() as cur:
-        cur.execute("INSERT INTO cron (name, task_type, cron_expr, enabled) "
-                    "VALUES ('other', 'plugin.other.sync', '7 * * * *', TRUE)")
-    db.commit()
-    assert armed() == "* * * * *"
-
-
 def test_the_identity_recheck_runs_while_a_transition_needs_it(tick, monkeypatch):
-    """W1: a watchdog action while a transition needs it, at most every 30 minutes."""
+    """W1: a runner action while a transition needs it, at most every 30 minutes."""
     mod, db = tick
     runs = []
     monkeypatch.setattr(mod, "provider_identity_recheck_task",
@@ -690,21 +492,69 @@ def test_the_identity_recheck_runs_while_a_transition_needs_it(tick, monkeypatch
             cur.execute(sql.format(table=f"{P}provider_identity_transitions"), params)
         db.commit()
 
-    mod.catalog_reconcile_task()
+    turn(mod)
     assert runs == []  # no transition
     transition("INSERT INTO {table} (catalog_instance_id, state) VALUES (%s, 'transition_pending')",
                (SOURCE,))
-    mod.catalog_reconcile_task()
+    turn(mod)
     assert runs == [SERVER]
-    mod.catalog_reconcile_task()
+    turn(mod)
     assert runs == [SERVER]  # not again within 30 minutes
     transition("UPDATE {table} SET recheck_attempted_at=now()-interval '31 minutes'")
-    mod.catalog_reconcile_task()
+    turn(mod)
     assert runs == [SERVER, SERVER]
     transition("UPDATE {table} SET state='applied', audiomuse_health='ready', "
                "recheck_attempted_at=NULL")
-    mod.catalog_reconcile_task()
+    turn(mod)
     assert len(runs) == 2  # applied, AudioMuse ready: nothing to do
     transition("UPDATE {table} SET projection_reconcile_required=TRUE")
-    mod.catalog_reconcile_task()
+    turn(mod)
     assert len(runs) == 3  # a projection owed
+
+
+def test_expired_collection_receipts_go_once_a_day(tick, monkeypatch):
+    mod, db = tick
+    runs = []
+    monkeypatch.setattr(mod, "collection_retention_task", lambda: runs.append(1) or {"status": "ok"})
+    turn(mod)
+    assert runs == []  # the fixture's mark: today's ran
+    _rows(db, f"UPDATE {P}runner_marks SET done_at=now()-interval '25 hours'")
+    result, actions = turn(mod)
+    assert runs == [1] and [entry["action"] for entry in actions] == ["collection_retention"]
+    turn(mod)
+    assert runs == [1]
+
+
+def test_a_catalogue_refresh_cadence_wants_old_catalogues_refreshed(tick, monkeypatch):
+    mod, db = tick
+    refreshed = []
+    monkeypatch.setattr(mod, "wanted_catalog_refresh_task",
+                        lambda server, catalog: refreshed.append(catalog) or {"status": "complete"})
+    _rows(db, f"UPDATE {P}catalog_state SET completed_at=now()-interval '7 hours'")
+    turn(mod)
+    assert refreshed == []  # no cadence by default: refreshes only when asked
+    monkeypatch.setattr(mod, "catalog_refresh_hours", lambda: 6.0)
+    turn(mod)
+    assert refreshed == [SOURCE]
+
+
+def test_the_install_leaves_no_lumae_schedule_and_keeps_a_refresh_cadence(
+    migrated_db, run_plugin_migration, monkeypatch,
+):
+    mod = load_plugin()
+    db = migrated_db
+    with db.cursor() as cur:
+        cur.execute("INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES "
+                    "('r', 'plugin.lumae_analysis.catalog_reconcile', '* * * * *', TRUE), "
+                    "('c', 'plugin.lumae_analysis.catalog_refresh', '17 */6 * * *', TRUE), "
+                    "('o', 'plugin.other.sync', '7 * * * *', TRUE)")
+        cur.execute("CREATE TABLE cron_retry (task_type TEXT PRIMARY KEY)")
+        cur.execute("INSERT INTO cron_retry VALUES ('plugin.lumae_analysis.catalog_refresh'), "
+                    "('plugin.other.sync')")
+    db.commit()
+    saved = {}
+    monkeypatch.setattr(mod, "set_setting", lambda key, value: saved.update({key: value}))
+    run_plugin_migration(db)
+    assert _rows(db, "SELECT task_type FROM cron ORDER BY task_type") == [("plugin.other.sync",)]
+    assert _rows(db, "SELECT task_type FROM cron_retry") == [("plugin.other.sync",)]
+    assert saved == {"catalog_refresh_hours": 6}

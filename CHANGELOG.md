@@ -9,15 +9,56 @@ still matters. Exact, code-verified wire behaviour for every version lives in
 
 ## Unreleased
 
+Lumae no longer holds AudioMuse's task queue (runner plan 2026-10-25,
+R1–R9; contract §3.6).
+
+- Lumae works in two loops of its own, outside AudioMuse's queue: a server
+  runner in AudioMuse's web process (catalogue, analysis finalization,
+  credits, MusicBrainz lookups, collection retention) and a worker runner in
+  an AudioMuse worker (waveform, edge and loudness passes, on-demand tracks,
+  relationships). One process leads each role (a PostgreSQL advisory lock).
+  A runner wakes when work is recorded (`NOTIFY`) and otherwise sleeps until
+  its next retry, at most 15 minutes; an idle turn runs about 17 statements.
+- AudioMuse starts no task while a plugin task runs, so an analysis the
+  administrator started waited behind Lumae's tasks, and AudioMuse refused
+  Lumae's schedules while it analysed. An analysis now starts at once, and
+  Lumae steps aside instead: the worker runner while any AudioMuse job runs,
+  the server runner while AudioMuse cleans, migrates or sweeps, and the
+  per-track passes while AudioMuse analyses.
+- The setting **Heavy work** (`heavy_work`) says where the heavy lane runs:
+  `auto` (the default) gives it to the worker runner while a worker is
+  online, and has the server serve on-demand tracks while none is; `server`
+  runs everything in the web process, for a host without a worker; `worker`
+  never runs heavy work in the web process.
+- Lumae's schedules (`catalog_reconcile`, `catalog_refresh`,
+  `provider_identity_recheck`, `analysis_projection`, `collection_retention`)
+  and their pending retries are removed on install, and none is registered.
+  An enabled catalogue refresh schedule becomes the setting
+  `catalog_refresh_hours` = 6; without it a catalogue is refreshed when an
+  app or an analysis asks. A job 1.8.0 queued before the upgrade still runs;
+  its watchdog tick only wakes the runners.
+- On-demand requests (`/api/analyze`, `/api/profiles/edges/analyze`) are
+  recorded and served first in the next pass, between files of a library
+  pass. Their `deferred` lists stay, always empty, and the edge capability in
+  health adds `pending_requests: true`. A background edge request
+  (`/api/profiles/edges/backfill`, the settings page's retry) makes the
+  library pass due now. An AudioMuse analysis run wakes the runners once,
+  not once a song.
+- The settings page's Background work panel shows each runner (working,
+  idle, stepping aside or not running), its host and its last action,
+  instead of AudioMuse schedules.
+- In the web process `background_workers` `auto` analyses at most 2 files at
+  once, and a file a runner downloads through AudioMuse goes to Lumae's
+  download directory, not AudioMuse's temporary directory, which every
+  AudioMuse analysis run empties when it starts.
+
 New songs and their analysis reach the phone without waiting for a busy
 AudioMuse (contract §2.5; Auralscape RCA 2026-10-24, SQ.1).
 
 - `POST /api/catalog/refresh` no longer loses a request while AudioMuse's
-  queue runs another job: it answers 202 `deferred` (`reason: "host_busy"`,
-  `Retry-After: 60`) and keeps the request, and the watchdog runs it once the
-  queue is free. A refresh already on the queue serves a new request (202
-  `queued`, `coalesced: true`). Up to 1.9.0 the phone got a 409 and read the
-  old catalogue.
+  queue runs another job: it keeps the request and answers 202 `queued`, and
+  the server runner refreshes on its next pass; a scan that starts after the
+  request serves it. Before, the phone got a 409 and read the old catalogue.
 - A refresh that changed the catalogue projects AudioMuse's analysis right
   after, so a new song never arrives without the analysis AudioMuse already
   has.
@@ -30,12 +71,12 @@ Similar albums and artists get published on a library that keeps changing
   the state `queued` so the next build starts from the newer inputs. Before,
   every catalogue change restarted it from zero, so a library that changed
   more often than a build took never got a generation.
-- A build step does as much as the watchdog tick's time allows (up to 1,024
-  albums and artists, was 128).
+- A build step does as much as its runner slice allows (up to 1,024 albums
+  and artists, was 128).
 - `POST /api/catalog/relationships/prepare` records the request and leaves
-  the build to the watchdog; it no longer queues a task that did one
-  20-second step and was refused, with an error in the log, at every sync
-  while AudioMuse analysed.
+  the build to a runner; it no longer queues a task that did one 20-second
+  step and was refused, with an error in the log, at every sync while
+  AudioMuse analysed.
 
 Less repeated work (runner plan 2026-10-25, W2).
 
@@ -56,11 +97,10 @@ Less repeated work (runner plan 2026-10-25, W2).
   spread ±25 %, so albums first checked together no longer come due together,
   and re-checks run only when nothing else waits, at most 60 an hour. The
   re-checks already due spread over the next 14 days.
-- The provider identity recheck runs while a server's track IDs are changing
-  (or AudioMuse still has to catch up with a change), at most every 30
-  minutes, instead of every half hour on every server: 48 AudioMuse tasks a
-  day with nothing to check. Its schedule moves to once a day; one an
-  administrator changed is kept.
+- The provider identity recheck runs in the server runner while a server's
+  track IDs are changing (or AudioMuse still has to catch up with a change),
+  at most every 30 minutes, instead of an AudioMuse task every half hour on
+  every server: 48 tasks a day with nothing to check.
 
 ## 1.9.0 (2026-10-24)
 

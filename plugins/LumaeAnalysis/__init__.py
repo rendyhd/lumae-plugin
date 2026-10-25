@@ -1,18 +1,18 @@
 import base64
 import gzip
 import importlib
-import inspect
 import json
 import os
 import re
 import socket
 import time
+from contextlib import nullcontext
 from datetime import datetime, timezone
 from html import escape
 
 from flask import Blueprint, Response, g, jsonify, request, url_for
 
-from plugin.api import config, enqueue, get_db, get_setting, logger, render_page, set_setting, table
+from plugin.api import config, get_db, get_setting, logger, render_page, set_setting, table
 import plugin.api as host_api
 
 from .loudness import (
@@ -29,7 +29,7 @@ from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job, fail_edge_job,
     publish_edge_profile, edge_backfill_candidates, edge_profile_status,
     claim_edge_requests, record_edge_runtime, edge_worker_runtime, is_unsupported_failure,
-    UNSUPPORTED as EDGE_UNSUPPORTED, mark_edge_jobs_deferred, claim_deferred_edge_jobs,
+    UNSUPPORTED as EDGE_UNSUPPORTED, mark_edge_jobs_waiting, claim_waiting_edge_jobs,
     edge_queue_counts, next_edge_backfill, update_edge_backfill, arm_edge_backfill,
     park_edge_backfill, edge_backfill_row, edge_statuses, EDGE_BACKFILL_RESWEEP_HOURS,
     ensure_edge_backfill_sources, rewind_edge_backfill, edge_runtime_reported_within,
@@ -65,7 +65,6 @@ from .catalog import (
     CatalogScanError,
     bootstrap_page,
     catalog_refresh_clock,
-    catalog_refresh_task_live,
     create_bootstrap_session,
     ensure_catalog_sources,
     migrate_catalog,
@@ -158,16 +157,12 @@ from .collection_manager import (
     register_collection_routes,
     render_collections_settings_panel,
 )
+from . import reconcile
 from .reconcile import (
-    DEFERRED_MARKER,
-    IDLE_CRON as RECONCILE_IDLE_CRON,
-    HostYield,
-    TICK_BUDGET_SECONDS,
-    TickBudget,
-    TickReport,
-    action_averages,
+    RUNNER_WAITING_MARKER,
+    WAITING_MARKERS,
+    TurnReport,
     analysis_projection_sentence,
-    arm_reconcile,
     begin_event,
     catalog_refresh_sentence,
     collection_retention_sentence,
@@ -181,13 +176,11 @@ from .reconcile import (
     progress_event,
     queue_throughput as reconcile_queue_throughput,
     read_reconcile_status,
-    reconcile_schedule_from_state,
+    recover_interrupted_events,
     record_event,
-    remaining_work,
-    set_paused as set_reconcile_paused,
     task_message,
     update_work_retry,
-    yield_status as reconcile_yield_status,
+    wake_runners,
 )
 
 SCHEMA_VERSION = 1
@@ -261,16 +254,13 @@ CATALOG_FEATURE_ROUTES = {
         ("/api/catalog/provider-identity/manifest", "GET"),
     ),
 }
-BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
 PROVIDER_IDENTITY_RECHECK_TASK_TYPE = "plugin.lumae_analysis.provider_identity_recheck"
-# W1 (runner plan 2026-10-25): the recheck runs as a watchdog action while a
+# W1 (runner plan 2026-10-25): the recheck is a runner action while a
 # provider transition needs it, each source at most every
-# IDENTITY_RECHECK_SPACING_SECONDS; its schedule is a daily backstop. It ran
-# half-hourly: 48 root tasks a day on a server with nothing pending.
-IDENTITY_RECHECK_CRON = "2 4 * * *"
-SHIPPED_IDENTITY_RECHECK_CRON = "2,32 * * * *"
+# IDENTITY_RECHECK_SPACING_SECONDS. Its half-hourly schedule put 48 root
+# tasks a day on AudioMuse's queue with nothing pending.
 IDENTITY_RECHECK_SPACING_SECONDS = 30 * 60
 ANALYSIS_PROJECTION_TASK_TYPE = "plugin.lumae_analysis.analysis_projection"
 COLLECTION_RETENTION_TASK_TYPE = "plugin.lumae_analysis.collection_retention"
@@ -353,23 +343,6 @@ def _compress_json_response(response):
     response.headers["Content-Encoding"] = "gzip"
     response.headers["Content-Length"] = str(len(compressed))
     return response
-
-
-def enqueue_bounded(func, *args, queue="default", timeout=None, **kwargs):
-    """Queue root plugin work through AudioMuse's stable public API.
-
-    ``timeout`` remains accepted for call-site and older-core compatibility,
-    but queue internals are deliberately not imported by the plugin. AudioMuse
-    owns execution limits and queue implementation details.
-
-    AudioMuse enforces no execution limit on plugin tasks: RQ-era hosts
-    enqueued them with an RQ ``job_timeout`` of -1 (no timeout), and the
-    database task queue that replaced RQ has no per-task timeout. ``timeout`` is therefore
-    not enforced by anyone. File analysis has its own hard limit per file
-    instead (``run_file_analysis``, LUM-018).
-    """
-    del timeout
-    return enqueue(func, *args, queue=queue, **kwargs)
 
 
 def sync_collections_menu(enabled, manager=None):
@@ -500,12 +473,12 @@ def analysis_time_limit_seconds():
 def run_file_analysis(analyzer, path, limit_seconds=None, **kwargs):
     """Run one file analysis in a child process under the hard limit (LUM-018).
 
-    The host puts no timeout on the task (see ``enqueue_bounded``), and the
+    Nothing else puts a time limit on one file, and the
     analyzer's soft deadline cannot interrupt a decoder hung in native code.
     The setting is the analyzer's soft deadline, passed with each file, and
     the child is killed 30 s after it, so a progressing analysis stops at the
     soft deadline first. Failures raise with a LUM-007 category. A parallel
-    analysis thread (WP1b) passes ``limit_seconds``, read on the tick's own
+    analysis thread (WP1b) passes ``limit_seconds``, read on the turn's own
     thread: it reads no setting itself.
     """
     if limit_seconds is None:
@@ -527,7 +500,7 @@ def save_background_workers(form):
 
 
 def background_workers():
-    """K, the parallel analysis threads of a reconcile tick (setting
+    """K, the parallel analysis threads of a runner turn (setting
     ``background_workers``; ``auto`` sized from this process's cores and
     memory). One when it cannot be read."""
     try:
@@ -598,98 +571,63 @@ def track_count_label(value):
     return f"{format_count(count)} {suffix}"
 
 
-def disable_legacy_backfill_schedule(db):
+# Runner plan R8: Lumae's rows under AudioMuse's Scheduled Tasks, all gone
+# with the runners (a downgrade's install recreates its own).
+LUMAE_CRON_PREFIX = "plugin.lumae_analysis."
+# An administrator's enabled catalogue refresh carries over as this cadence.
+CATALOG_REFRESH_HOURS_DEFAULT = 6
+
+
+def retire_lumae_schedules(db):
+    """Delete Lumae's cron rows and their pending retries (R8). An enabled
+    catalogue refresh row becomes the setting ``catalog_refresh_hours``, so
+    the runner keeps refreshing on its own; an administrator's setting
+    stands."""
     cur = db.cursor()
-    cur.execute(
-        "UPDATE cron SET enabled=FALSE WHERE task_type=%s",
-        (BACKFILL_TASK_TYPE,),
-    )
+    cur.execute("SELECT enabled FROM cron WHERE task_type=%s", (CATALOG_REFRESH_TASK_TYPE,))
+    row = cur.fetchone()
+    if row and row[0] and get_setting("catalog_refresh_hours", None) in (None, ""):
+        set_setting("catalog_refresh_hours", CATALOG_REFRESH_HOURS_DEFAULT)
+    cur.execute("DELETE FROM cron WHERE task_type LIKE %s", (LUMAE_CRON_PREFIX + "%",))
+    cur.execute("SELECT to_regclass('cron_retry') IS NOT NULL")
+    exists = cur.fetchone()
+    if exists and exists[0]:
+        cur.execute("DELETE FROM cron_retry WHERE task_type LIKE %s", (LUMAE_CRON_PREFIX + "%",))
     cur.close()
 
 
-# Names AudioMuse offered under Plugin tasks while they were registered with
-# add_task (loudness_backfill: the 1.8.0 test build's). None of them can run
-# from a schedule, so a row an administrator enabled is removed.
-UNSCHEDULABLE_TASK_TYPES = tuple(
-    f"plugin.lumae_analysis.{name}"
-    for name in (
-        "prepare",
-        "profile_backfill",
-        "edge_backfill",
-        "credits",
-        "relationship_preparation",
-        "loudness_backfill",
-    )
-)
+def catalog_refresh_hours():
+    """``catalog_refresh_hours``: refresh each catalogue this often on the
+    runner's own (0: only when asked, the default)."""
+    try:
+        value = float(get_setting("catalog_refresh_hours", 0) or 0)
+    except (TypeError, ValueError):
+        return 0.0
+    return value if 0 < value <= 24 * 30 else 0.0
 
 
-def retire_unschedulable_cron_rows(db):
+def want_scheduled_catalog_refreshes(db):
+    """Keep a refresh request for each catalogue older than
+    ``catalog_refresh_hours`` (R8: the schedule's replacement)."""
+    hours = catalog_refresh_hours()
+    if not hours:
+        return 0
     cur = db.cursor()
     cur.execute(
-        "DELETE FROM cron WHERE task_type = ANY(%s)",
-        (list(UNSCHEDULABLE_TASK_TYPES),),
+        f"""
+        UPDATE {table('catalog_state')} c SET refresh_wanted_at=now(), updated_at=now()
+          FROM {table('catalog_sources')} s
+         WHERE s.catalog_instance_id=c.catalog_instance_id AND s.rebind_status='active'
+           AND c.refresh_wanted_at IS NULL AND c.status='complete'
+           AND c.completed_at < now() - make_interval(secs => %s)
+        RETURNING c.catalog_instance_id
+        """,
+        (int(hours * 3600),),
     )
+    count = len(cur.fetchall())
     cur.close()
-
-
-def ensure_catalog_refresh_schedule(db):
-    cur = db.cursor()
-    cur.execute(
-        "INSERT INTO cron (name, task_type, cron_expr, enabled) "
-        "VALUES (%s, %s, %s, FALSE) ON CONFLICT (task_type) DO NOTHING",
-        (CATALOG_REFRESH_TASK_TYPE, CATALOG_REFRESH_TASK_TYPE, "17 */6 * * *"),
-    )
-    cur.close()
-
-
-def ensure_catalog_reconcile_schedule(db):
-    """Install additive reconciliation state and an initially quiet schedule."""
-    migrate_reconcile(db)
-
-
-def ensure_provider_identity_recheck_schedule(db):
-    """Enabled on install; an administrator's later change to the row is kept
-    (1.6.1 re-enabled it on every install, AUD-18). Daily (W1): a row still at
-    the half-hourly expression earlier releases installed moves to daily."""
-    cur = db.cursor()
-    cur.execute(
-        "INSERT INTO cron (name, task_type, cron_expr, enabled) "
-        "VALUES (%s, %s, %s, TRUE) ON CONFLICT (task_type) DO NOTHING",
-        (
-            PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
-            PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
-            IDENTITY_RECHECK_CRON,
-        ),
-    )
-    cur.execute(
-        "UPDATE cron SET cron_expr=%s WHERE task_type=%s AND cron_expr=%s",
-        (IDENTITY_RECHECK_CRON, PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
-         SHIPPED_IDENTITY_RECHECK_CRON),
-    )
-    cur.close()
-
-
-def ensure_analysis_projection_schedule(db):
-    cur = db.cursor()
-    cur.execute(
-        "INSERT INTO cron (name, task_type, cron_expr, enabled) "
-        "VALUES (%s, %s, %s, FALSE) ON CONFLICT (task_type) DO NOTHING",
-        (ANALYSIS_PROJECTION_TASK_TYPE, ANALYSIS_PROJECTION_TASK_TYPE, "47 */6 * * *"),
-    )
-    cur.close()
-
-
-def ensure_collection_retention_schedule(db):
-    """Daily bounded cleanup of expired collection, shelf and Vibe receipts and
-    abandoned restore progress (F2). Enabled on install; an administrator's
-    later change to the row is kept."""
-    cur = db.cursor()
-    cur.execute(
-        "INSERT INTO cron (name, task_type, cron_expr, enabled) "
-        "VALUES (%s, %s, %s, TRUE) ON CONFLICT (task_type) DO NOTHING",
-        (COLLECTION_RETENTION_TASK_TYPE, COLLECTION_RETENTION_TASK_TYPE, "23 3 * * *"),
-    )
-    cur.close()
+    db.commit()
+    return count
 
 
 def _resolve_task_server_id(adapter, server_id):
@@ -739,12 +677,12 @@ def wake_profile_backfill_after_catalog_refresh(result, db=None):
         )
         active = cur.fetchone() is not None
     if active:
-        arm_reconcile(db, "catalog_profile_repair")
+        wake_runners(db, "catalog_profile_repair")
         db.commit()
         return True
     db.commit()
     return start_profile_backfill(
-        catalog_instance_id=source, server_id=server_id, enqueue_job=False,
+        catalog_instance_id=source, server_id=server_id,
     )
 
 
@@ -770,12 +708,12 @@ def catalog_refresh_task(server_id=None):
                 next_profile_retry_at(source)):
             wake_profile_backfill_after_catalog_refresh(result)
         if changed and arm_edge_backfill(get_db(), source):
-            arm_reconcile(get_db(), "edge_backfill_ready", commit=True)
+            wake_runners(get_db(), "edge_backfill_ready", commit=True)
         if changed:
             # LN.4c: new tracks to measure, and loudness records to follow the catalogue.
             loudness_backfill.ensure_sources(get_db())
             loudness_backfill.arm(get_db(), source)
-            arm_reconcile(get_db(), "loudness_backfill_ready", commit=True)
+            wake_runners(get_db(), "loudness_backfill_ready", commit=True)
     except Exception:
         _rollback_if_possible(get_db())
         logger.exception("Could not arm source profile repair after catalogue publication")
@@ -840,8 +778,7 @@ def _project_after_catalog_refresh(server_id):
 
 
 def wanted_catalog_refresh_task(server_id, catalog_instance_id):
-    """A refresh an app asked for while AudioMuse's queue was busy, run by the
-    watchdog (SQ.1); ``{"status": "failed"}`` when the scan raised. A finished
+    """A refresh an app asked for, run by the server runner (SQ.1, R6); ``{"status": "failed"}`` when the scan raised. A finished
     scan serves the request (``catalog_refresh_task``). A failed one marks the
     catalogue for repair itself (``refresh_required``), and the repair
     retries, so the request is not kept for another try either."""
@@ -986,22 +923,6 @@ def _rollback_if_possible(db):
         rollback()
 
 
-def _safe_reconcile_schedule(db, paused=None, yield_to=None, host_retries=True,
-                             keep_yield=False):
-    try:
-        return reconcile_schedule_from_state(
-            db,
-            paused=maintenance_paused() if paused is None else bool(paused),
-            yield_to=yield_to,
-            host_retries=host_retries,
-            keep_yield=keep_yield,
-        )
-    except Exception:
-        _rollback_if_possible(db)
-        logger.exception("lumae_analysis could not update the adaptive reconcile schedule")
-        return None
-
-
 def _safe_progress(phase, current=None, total=None):
     try:
         progress_event(phase, current=current, total=total)
@@ -1042,6 +963,22 @@ def _reconcile_result_summary(result):
     return {key: result[key] for key in allowed if key in result}
 
 
+def _source_binding(server_id):
+    """The AudioMuse server binding a queued task had (R3): a runner thread
+    starts without one, and an unbound host call uses the default server. In
+    a runner turn only; elsewhere the caller's binding stands."""
+    if not server_id or runner.ROLE.get() is None:
+        return nullcontext()
+    bind = getattr(get_core_adapter(), "bind", None)
+    if not callable(bind):
+        return nullcontext()
+    try:
+        return bind(server_id)
+    except Exception:
+        logger.warning("lumae_analysis runs %s's work without its server binding", server_id)
+        return nullcontext()
+
+
 def _run_reconcile_action(
     db,
     action,
@@ -1067,7 +1004,8 @@ def _run_reconcile_action(
         logger.exception("lumae_analysis could not start the reconcile status event")
     try:
         _safe_progress("starting")
-        result = function(*args)
+        with _source_binding(server_id):
+            result = function(*args)
         result_status = str((result or {}).get("status") or "complete")
         if result_status in ("coalesced", "already_finalized", "paused"):
             try:
@@ -1178,7 +1116,7 @@ def _run_reconcile_action(
 def _safe_edge_v3_upgrade(db, budget_seconds=None):
     """One bounded batch of the stored-edge v3 upgrade (SF.3) while any edge
     lacks its v3 digest: ``(upgraded, flagged)``, or None when there is nothing
-    to do or it failed (logged; the next tick tries again). It works for
+    to do or it failed (logged; the next turn tries again). It works for
     ``budget_seconds``, EDGE_V3_UPGRADE_BUDGET_SECONDS by default."""
     try:
         if edge_schema_v3_ready(db):
@@ -1191,6 +1129,31 @@ def _safe_edge_v3_upgrade(db, budget_seconds=None):
         _rollback_if_possible(db)
         logger.exception("lumae_analysis stored edge v3 upgrade unavailable")
         return None
+
+
+def _safe_want_scheduled_catalog_refreshes(db):
+    try:
+        return want_scheduled_catalog_refreshes(db)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not schedule a catalogue refresh")
+        return 0
+
+
+def _safe_claim_collection_retention(db):
+    """Whether today's retention is this runner's to run (R8); False on error
+    and outside a runner."""
+    if runner.ROLE.get() is None:
+        return False
+    try:
+        with db.cursor() as cur:
+            claimed = runner.claim_mark(cur, "collection_retention", COLLECTION_RETENTION_SECONDS)
+        db.commit()
+        return claimed
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not check the collection retention")
+        return False
 
 
 def _safe_claim_identity_recheck(db, server_id):
@@ -1267,104 +1230,20 @@ def _reconcile_step(db, report, action, *args):
     return result
 
 
-def _safe_remaining_work(db):
-    try:
-        return remaining_work(db)
-    except Exception:
-        _rollback_if_possible(db)
-        logger.debug("lumae_analysis could not count the remaining work", exc_info=True)
-        return None
-
-
-def _safe_action_averages(db):
-    try:
-        return action_averages(db)
-    except Exception:
-        _rollback_if_possible(db)
-        logger.debug("lumae_analysis could not read the action averages", exc_info=True)
-        return {}
-
-
-_reconcile_dispatch_id = None
-
-
-def _reconcile_dispatch():
-    """``(first, task_id)`` for this host dispatch (plan S2, AUD-19).
-
-    With several media servers AudioMuse calls the tick once per server in
-    one task (``server_scope='all'``). The first call works for every source
-    within the budget; later calls in the same task return at once. Without
-    a task id (``taskqueue.current_task_id``, AudioMuse 3.2.0, or a raising
-    call) each call is a tick for the active server, as before.
-    """
-    global _reconcile_dispatch_id
-    try:
-        import taskqueue
-
-        task_id = taskqueue.current_task_id()
-    except Exception:
-        task_id = None
-    if not task_id:
-        return True, None
-    if task_id == _reconcile_dispatch_id:
-        return False, task_id
-    _reconcile_dispatch_id = task_id
-    return True, task_id
-
-
 def catalog_reconcile_task():
-    """Work through due actions for up to TICK_BUDGET_SECONDS, retune cadence
-    and report what the tick did."""
-    report = TickReport()
-    versions = {
-        "plugin_version": PLUGIN_VERSION,
-        "catalog_builder_version": CATALOG_BUILDER_VERSION,
-    }
-    first, task_id = _reconcile_dispatch()
-    if not first:
-        return report.result("same_dispatch", **versions)
-    if runner_enabled():
-        # Runner plan: the runners do this work; a queued tick does none.
-        return report.result("runner", **versions)
+    """1.8.0's watchdog tick, for a job queued before the upgrade: the runners
+    do its work now (R8), so it wakes them and returns. Kept one release."""
     db = get_db()
-    if maintenance_paused():
-        try:
-            set_reconcile_paused(db, True)
-        except Exception:
-            _rollback_if_possible(db)
-            logger.exception("lumae_analysis could not pause the reconcile schedule")
-        report.cadence = RECONCILE_IDLE_CRON
-        report.log("paused")
-        return report.result("paused", **versions)
-    status = "failed"
-    host_yield = HostYield()
     try:
-        # While AudioMuse has a refused schedule to retry or a main job
-        # running, the tick does no work (plan S1, AUD-13).
-        report.yielded_to = host_yield.check(db)
-        status = "yielded" if report.yielded_to else _reconcile_tick(
-            db, report, host_yield, every_source=bool(task_id))
-    finally:
-        schedule = _safe_reconcile_schedule(db, yield_to=report.yielded_to,
-                                            host_retries=host_yield.cron_retry is True)
-        if status != "yielded":
-            # The waveform counts that /settings/status reads follow the
-            # tick's work, and a publication left without a summary gets
-            # one (P2-1). A tick that changed no profile state counts them
-            # at most every STATUS_SNAPSHOT_IDLE_SECONDS (S8, AUD-19).
-            if _changed_profile_state(report):
-                refresh_status_snapshot(db, publications=True)
-            else:
-                refresh_status_snapshot(db, min_age_seconds=STATUS_SNAPSHOT_IDLE_SECONDS,
-                                        publications=True)
-            report.remaining = _safe_remaining_work(db)
-        report.cadence = (schedule or {}).get("cron_expr")
-        report.log(status)
-    return report.result(status, **versions)
+        wake_runners(db, "queued_tick", commit=True)
+    except Exception:
+        _rollback_if_possible(db)
+    return {"status": "runner", "plugin_version": PLUGIN_VERSION,
+            "catalog_builder_version": CATALOG_BUILDER_VERSION}
 
 
 # A result in one of these says the action has nothing more to do now: it is
-# not run again in the same tick.
+# not run again in the same turn.
 _SETTLED_STATUSES = frozenset((
     "current", "coalesced", "paused", "deferred", "failed", "failure", "error",
     "waiting_retry", "waiting_for_index", "already_finalized", "superseded",
@@ -1373,8 +1252,6 @@ _SETTLED_STATUSES = frozenset((
 # "complete" is one run of several).
 _COMPLETE_SETTLES = frozenset(("catalog_preparation", "relationships", "profile_backfill",
                                "edge_backfill", "loudness_backfill"))
-# A guard against an action that stays due without progress.
-MAX_TICK_ACTIONS = 100
 
 
 # Actions whose work changes the waveform counts the settings page shows.
@@ -1388,78 +1265,24 @@ def _changed_profile_state(report):
     return any(entry["action"] in _PROFILE_STATE_ACTIONS for entry in report.actions)
 
 
-def _reconcile_tick(db, report, host_yield, every_source=False):
-    """The tick's actions (``_run_reconcile_actions``) with its K parallel
-    analysis threads (WP1b), started on first use and stopped, with their
-    analysis workers, when the tick ends. Credits sweep once per tick (S8)."""
-    _own_download_refused.clear()
-    credits_service.begin_tick()
-    try:
-        with parallel_analysis.tick_scope(background_workers()):
-            return _run_reconcile_actions(db, report, host_yield, every_source)
-    finally:
-        credits_service.end_tick()
-
-
-def _run_reconcile_actions(db, report, host_yield, every_source=False):
-    """Due actions in priority order until the budget is used (plan S2).
-
-    The order is unchanged: on-demand work AudioMuse refused to queue, a batch
-    of the stored-edge v3 upgrade (SF.3), analysis runs, catalogue
-    preparation, a catalogue refresh an app asked for while the queue was busy
-    (SQ.1), a credits and a MusicBrainz turn when their share has come,
-    relationships, the waveform backfill, the edge pass, the loudness pass
-    (LN.4c), then credits and MusicBrainz lookups. After each action the order starts
-    again, so higher-priority work that became due goes first, and before
-    each action the tick yields as at its start. Returns the tick's status.
-    """
-    server_id = None
-    if not every_source:
-        try:
-            server_id = str(get_core_adapter().active_server_id() or "") or None
-        except Exception:
-            server_id = None
-    budget = TickBudget(averages=_safe_action_averages(db))
-    report_edge_runtime()
-    report.requested = enqueue_required_catalog_preparations(db=db, server_id=server_id)
-    done = set()
-    status = "current"
-    for _ in range(MAX_TICK_ACTIONS):
-        action, result = _next_reconcile_action(db, report, budget, server_id, done)
-        if action is None:
-            break
-        status = "processed"
-        result_status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
-        if result_status in _SETTLED_STATUSES or (
-            result_status == "complete" and action in _COMPLETE_SETTLES
-        ):
-            done.add(action)
-        if not budget.remaining():
-            break
-        report.yielded_to = host_yield.check(db)
-        if report.yielded_to:
-            break
-    return status
-
-
 def _next_reconcile_action(db, report, budget, server_id, done):
     """Run the first due action the budget fits; ``(action, result)`` or
     ``(None, None)`` when none ran. ``done`` collects actions with nothing
-    more to do this tick."""
+    more to do this turn."""
 
     def due(action):
         return action not in done and budget.fits(action)
 
     if due("interactive"):
         start = time.monotonic()
-        served = serve_deferred_interactive()
+        served = serve_interactive()
         if served:
             budget.start()
             result = {"status": "served", "served": served}
             _record_turn(db, report, "interactive", server_id, None, result, start)
             return "interactive", result
         done.add("interactive")
-    # SF.3: stored edges still without a v3 digest, one bounded batch a tick.
+    # SF.3: stored edges still without a v3 digest, one bounded batch a turn.
     if due("edge_schema_v3"):
         done.add("edge_schema_v3")
         start = time.monotonic()
@@ -1490,10 +1313,11 @@ def _next_reconcile_action(db, report, budget, server_id, done):
                 prepare_lumae_task, *preparation[:2],
             )
         done.add("catalog_preparation")
-    # SQ.1: a catalogue refresh an app asked for while AudioMuse's queue was
-    # busy. One a tick; a refresh task on the queue serves it instead.
+    # SQ.1: a catalogue refresh an app asked for (R6), or one the refresh
+    # cadence wants. One a turn; a refresh task on the queue serves it instead.
     if due("catalog_refresh"):
         done.add("catalog_refresh")
+        _safe_want_scheduled_catalog_refreshes(db)
         wanted = _safe_next_wanted_catalog_refresh(db, server_id)
         if wanted:
             budget.start()
@@ -1501,6 +1325,15 @@ def _next_reconcile_action(db, report, budget, server_id, done):
             result = wanted_catalog_refresh_task(*wanted)
             _record_turn(db, report, "catalog_refresh", wanted[0], wanted[1], result, start)
             return "catalog_refresh", result
+    # R8: expired collection receipts, once a day.
+    if due("collection_retention"):
+        done.add("collection_retention")
+        if _safe_claim_collection_retention(db):
+            budget.start()
+            start = time.monotonic()
+            result = collection_retention_task()
+            _record_turn(db, report, "collection_retention", None, None, result, start)
+            return "collection_retention", result
     # W1: the provider identity recheck, while a transition needs it.
     if due("identity_recheck"):
         done.add("identity_recheck")
@@ -1511,7 +1344,7 @@ def _next_reconcile_action(db, report, budget, server_id, done):
             result = provider_identity_recheck_task(recheck_server)
             _record_turn(db, report, "identity_recheck", recheck_server, None, result, start)
             return "identity_recheck", result
-    # A share-gated turn each, checked once a tick: the check sweeps.
+    # A share-gated turn each, checked once a turn: the check sweeps.
     for action, call in (("credits", _safe_credits_reconcile),
                          ("music_metadata", _safe_metadata_reconcile)):
         slot = f"{action}:before_background"
@@ -1622,7 +1455,6 @@ def analysis_projection_task(server_id=None):
         result["relationships"] = start_relationship_preparation(
             catalog_instance_id=result["catalog_instance_id"],
             server_id=resolved_server_id,
-            enqueue_job=False,
         )
     except Exception as exc:
         logger.exception(
@@ -1640,7 +1472,7 @@ def enqueue_required_catalog_preparations(db=None, server_id=None):
     """Durably request first-run and builder-upgrade preparation.
 
     The historical name remains API-compatible. No queue operation occurs;
-    ``catalog_reconcile_task`` executes admitted work on a later watchdog tick.
+    the server runner executes admitted work on its next pass.
     """
     if maintenance_paused():
         return 0
@@ -1763,9 +1595,9 @@ def provider_identity_recheck_task(server_id=None):
 def collection_retention_task():
     """Delete idempotency receipts and stale restore progress past their
     retention window, in bounded batches (F2, docs/plan P3-4 item 6:
-    collections growth). Runs from the same cron watchdog as the other
-    periodic maintenance tasks; see collection_manager and shelves for
-    the retention windows, batch limits and lock order."""
+    collections growth). The server runner runs it once a day (R8); see
+    collection_manager and shelves for the retention windows, batch limits
+    and lock order."""
     if maintenance_paused():
         return task_message({"status": "paused", "reason": "maintenance_paused"},
                             "Lumae: paused")
@@ -1855,10 +1687,8 @@ def observe_provider_identities_on_start():
                 server["server_id"],
             )
     enqueue_required_catalog_preparations(db=db)
-    # A restart leaves a yield to AudioMuse in place (plan S1).
-    _safe_reconcile_schedule(db, keep_yield=True)
-    # The scheduled provider-identity recheck consumes durable transition
-    # state. Startup never reaches into queue internals or creates root work.
+    # The runners' identity recheck consumes durable transition state.
+    # Startup never creates root work.
 
 
 def _drop_dj_tables(db):
@@ -1933,12 +1763,17 @@ def migrate(db):
         f"ON {source_profiles_table()} (catalog_instance_id, status)",
     )
     migrate_attempts(cur)
+    # On-demand attempts waiting for a runner (R6); 1.8.0's index named only
+    # the refused ones.
     migrations.ensure_index(
         cur,
-        f"CREATE INDEX IF NOT EXISTS {source_profiles_table()}_deferred_idx "
+        f"CREATE INDEX IF NOT EXISTS {source_profiles_table()}_waiting_idx "
         f"ON {source_profiles_table()} (analyzed_at) "
-        f"WHERE status='pending_interactive' AND last_error='{DEFERRED_MARKER}'",
+        f"WHERE status='pending_interactive' "
+        f"AND last_error IN ('{WAITING_MARKERS[0]}', '{WAITING_MARKERS[1]}')",
     )
+    migrations.ensure_no_index(cur, source_profiles_table(),
+                               f"{source_profiles_table()}_deferred_idx")
     migrate_edge_profiles(db)
     _drop_dj_tables(db)
     optional_storage.migrate(db)
@@ -2177,30 +2012,25 @@ def migrate(db):
     covers.migrate_covers(db)
     personal_discovery.migrate(db)
     music_metadata.migrate(db)
-    music_metadata.retire_schedule(db)
-    ensure_catalog_refresh_schedule(db)
-    ensure_catalog_reconcile_schedule(db)
-    ensure_provider_identity_recheck_schedule(db)
-    ensure_analysis_projection_schedule(db)
-    ensure_collection_retention_schedule(db)
-    disable_legacy_backfill_schedule(db)
-    retire_unschedulable_cron_rows(db)
+    # The reconcile tables (the journal, runner_state, the work tables'
+    # retry columns); R8: no schedule of Lumae's stays.
+    migrate_reconcile(db)
+    retire_lumae_schedules(db)
     db.commit()
     # Installation is schema work, not a reason to rebuild the full analysis
     # and relationship projections. Only a missing/stale catalogue publication
     # is admitted here; ordinary analysis hooks and explicit prepare requests
     # own later enrichment.
     enqueue_required_catalog_preparations(db=db)
-    _safe_reconcile_schedule(db, keep_yield=True)
-    # Provider and catalogue watchdogs consume the durable requests above.
-    # Install hooks remain schema-only and never queue root work.
+    # The runners consume the durable requests above. Install hooks remain
+    # schema-only and never queue root work.
     # Storage reclaimed after the migration commits, in short transactions:
     # MusicBrainz responses an older version cached for 30 days, and edges
     # that pre-K6 journal rows still embed.
     credits_store.purge_http_cache_fully(db)
     externalize_journal_edges(db)
     # SF.3: v3 digests (and music-end recheck flags) for the stored edges,
-    # within a budget here; reconcile ticks finish the rest.
+    # within a budget here; runner turns finish the rest.
     _safe_edge_v3_upgrade(db)
 
 
@@ -2356,7 +2186,7 @@ def arm_profile_claim_recovery(catalog_instance_id, db=None, commit=True):
         )
         armed = cur.fetchone() is not None
         if armed:
-            arm_reconcile(db, "profile_claim_recovery")
+            wake_runners(db, "profile_claim_recovery")
         if commit:
             db.commit()
         return armed
@@ -2426,50 +2256,17 @@ def release_pending(ids, catalog_instance_id=None,
     db.commit()
     cur.close()
 
-def enqueue_profile_analysis(
-    ids,
-    catalog_instance_id=None,
-    server_id=None,
-    *,
-    priority="background",
-):
-    queue_name = "high" if priority == "interactive" else "default"
-    tokens = mark_pending(
-        ids, catalog_instance_id=catalog_instance_id, priority=priority
-    )
-    if catalog_instance_id and not tokens:
-        return None
-    admitted_ids = [track_id for track_id in ids if not catalog_instance_id or track_id in tokens]
-    if priority == "interactive" and catalog_instance_id and runner_enabled():
-        # R6: recorded for the runner, which serves on-demand work first.
+
+def record_interactive_profiles(ids, catalog_instance_id):
+    """On-demand waveforms for the runners: pending attempts marked as
+    waiting, and a wake (R6). Returns the attempt tokens."""
+    tokens = mark_pending(ids, catalog_instance_id=catalog_instance_id, priority="interactive")
+    if tokens:
         db = get_db()
-        mark_profiles_deferred(db, catalog_instance_id, tokens)
-        wake_runner(db, "interactive_profiles")
-        return RECORDED
-    try:
-        return enqueue_bounded(
-            analyze_tracks_task,
-            admitted_ids,
-            catalog_instance_id,
-            server_id,
-            priority,
-            tokens if catalog_instance_id else None,
-            queue=queue_name,
-            timeout=PROFILE_JOB_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        if priority == "interactive" and catalog_instance_id and host_queue_busy(exc):
-            # Saved, not lost: the next worker task serves it.
-            mark_profiles_deferred(get_db(), catalog_instance_id, tokens)
-            _wake_for_deferred()
-            return DEFERRED
-        release_pending(
-            admitted_ids,
-            catalog_instance_id=catalog_instance_id,
-            reason=f"Profile job could not be queued: {exc}",
-            tokens=tokens,
-        )
-        raise
+        mark_profiles_waiting(db, catalog_instance_id, tokens)
+        wake_runners(db, "interactive_profiles", commit=True)
+    return tokens
+
 
 def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=False):
     """The track's file for analysis: ``{track_id, file_path, media_signature,
@@ -2477,7 +2274,7 @@ def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=Fa
 
     WP2: Lumae's own download of the original file first (``_own_download``),
     the host's download when that is not possible. ``defer``: a parallel
-    pass's tick thread resolves the download here and an analysis thread
+    pass's turn thread resolves the download here and an analysis thread
     fetches it (``fetch_track_file``); the host's download never defers.
     """
     db = get_db()
@@ -2565,8 +2362,8 @@ def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=Fa
 
 
 # WP2: sources whose own download failed, with when; the host downloads for
-# them for OWN_DOWNLOAD_RETRY_SECONDS (each AudioMuse job is a fresh process,
-# every reconcile tick starts over, and a runner lives for days: R8).
+# them for OWN_DOWNLOAD_RETRY_SECONDS, then Lumae tries its own again. A runner
+# lives for days, so a refusal is not kept for its life (R8).
 _own_download_refused = {}
 OWN_DOWNLOAD_RETRY_SECONDS = 600
 
@@ -2969,7 +2766,7 @@ def edge_profiles_capability():
             "server_backfill": True, "edge_status": True, "deferred_requests": True,
             # Runner plan R6: on-demand requests are recorded and served by
             # the runners; the deferred lists stay, empty.
-            "pending_requests": runner_enabled(),
+            "pending_requests": True,
             "queue": queue, "schema_versions": edge_schema_versions()}
 
 
@@ -3515,20 +3312,7 @@ def catalog_prepare_api():
             return _private_json(initial, 200)
         if not preparation_is_active(preparation_state(source["catalog_instance_id"])):
             # R6: the claim records the work and wakes the runners.
-            if claim_preparation(source) and not runner_enabled():
-                try:
-                    enqueue_bounded(
-                        prepare_lumae_task,
-                        source["server_id"],
-                        source["catalog_instance_id"],
-                        queue="default",
-                        timeout=CATALOG_JOB_TIMEOUT_SECONDS,
-                    )
-                except Exception:
-                    logger.exception(
-                        "lumae_analysis could not queue catalogue preparation; "
-                        "the durable watchdog will retry it"
-                    )
+            claim_preparation(source)
         payload = _preparation_api_payload(
             source, preparation_state(source["catalog_instance_id"])
         )
@@ -3618,39 +3402,12 @@ def catalog_refresh_api():
             "server_id": source["server_id"],
             "catalog_instance_id": source["catalog_instance_id"],
         }
+        # R6: the request is kept, and the runner's next pass refreshes; a
+        # scan that starts after it serves it (SQ.1).
         db = get_db()
-        if runner_enabled():
-            # R6: the request is kept, and the runner's next pass refreshes;
-            # a scan that starts after it serves it (SQ.1).
-            want_catalog_refresh(db, source["catalog_instance_id"])
-            arm_reconcile(db, "catalog_refresh_wanted")
-            db.commit()
-            return _private_json(queued, 202)
-        if catalog_refresh_task_live(db):
-            # One refresh on the queue serves every request made before it scans.
-            return _private_json({**queued, "coalesced": True}, 202)
-        try:
-            enqueue_bounded(
-                catalog_refresh_task,
-                source["server_id"],
-                queue="default",
-                timeout=CATALOG_JOB_TIMEOUT_SECONDS,
-            )
-        except Exception as exc:
-            if not host_queue_busy(exc):
-                raise
-            # SQ.1: AudioMuse refuses a plugin task while another queue job
-            # runs (an analysis, often). Keep the request; the watchdog runs
-            # it once the queue is free. Before, the app got a 409 and the
-            # request was gone.
-            want_catalog_refresh(db, source["catalog_instance_id"])
-            arm_reconcile(db, "catalog_refresh_wanted")
-            db.commit()
-            response = _private_json(
-                {**queued, "status": "deferred", "reason": "host_busy"}, 202
-            )
-            response.headers["Retry-After"] = str(CATALOG_REFRESH_RETRY_AFTER_SECONDS)
-            return response
+        want_catalog_refresh(db, source["catalog_instance_id"])
+        wake_runners(db, "catalog_refresh_wanted")
+        db.commit()
         return _private_json(queued, 202)
     except (KeyError, ValueError, CatalogScanError) as exc:
         return _catalog_error("invalid_refresh", str(exc), 400)
@@ -4120,13 +3877,12 @@ def relationships_prepare_api():
             catalog_instance_id=body.get("catalog_instance_id"),
             server_id=body.get("server_id"),
         )
-        # The claim is durable and the watchdog builds it a step a tick
-        # (SQ.2): a queued task did one 20-second step, and while AudioMuse
+        # The claim is durable and a runner builds it step by step (SQ.2,
+        # R6): a queued task did one 20-second step, and while AudioMuse
         # analysed it was refused and logged as an error at every sync.
         result = start_relationship_preparation(
             catalog_instance_id=source["catalog_instance_id"],
             server_id=source["server_id"],
-            enqueue_job=False,
         )
         return _private_json(
             {
@@ -4261,36 +4017,20 @@ def analyze():
         return _catalog_error("source_required", str(exc), 409)
     ids = parse_ids(",".join(body.get("ids", [])))[:MAX_INTERACTIVE_PROFILE_IDS]
     catalog_instance_id = source["catalog_instance_id"]
-    server_id = source["server_id"]
     accepted, already_ready, already_pending = split_analyze_ids(
         ids, catalog_instance_id=catalog_instance_id
     )
-    # A library catch-up may already have marked these rows pending on the
-    # default queue. Re-enqueue them in tiny high-priority chunks so current
-    # playback is never trapped behind an hours-long library backfill. The
-    # default task re-checks readiness before each track and becomes a no-op.
-    interactive_ids = accepted + already_pending
-    deferred = []
-    if runner_enabled():
-        # R6: one record for the runner, however many ids; nothing is deferred.
-        enqueue_profile_analysis(interactive_ids, catalog_instance_id, server_id,
-                                 priority="interactive")
-        interactive_ids = []
-    for start in range(0, len(interactive_ids), INTERACTIVE_PROFILE_CHUNK_SIZE):
-        chunk = interactive_ids[start : start + INTERACTIVE_PROFILE_CHUNK_SIZE]
-        if enqueue_profile_analysis(
-            chunk,
-            catalog_instance_id,
-            server_id,
-            priority="interactive",
-        ) == DEFERRED:
-            deferred.extend(chunk)
+    # A library catch-up may already have marked these rows pending. They are
+    # recorded on demand too, so the runner serves them first: current
+    # playback is never trapped behind an hours-long library backfill (R6).
+    record_interactive_profiles(accepted + already_pending, catalog_instance_id)
     return jsonify(
         {
-            "accepted": [track_id for track_id in accepted if track_id not in deferred],
+            "accepted": accepted,
             "already_ready": already_ready,
             "already_pending": already_pending,
-            "deferred": deferred,
+            # Older plugins named refused requests here; the runner refuses none.
+            "deferred": [],
         }
     ), 202
 
@@ -4349,12 +4089,11 @@ def report_edge_runtime(force=False, park=True):
     """Record this process's edge runtime verdict: a worker's, or the web
     process's before its runner takes heavy work (R7, ``park=False``).
 
-    Called at worker start, by every edge task and by the reconcile tick. A
+    Called at worker start, by every edge task and by the runners. A
     qualified worker creates missing pass rows and resumes parked passes, and
-    when either happened wakes the reconcile watchdog, so a fresh install or
-    upgrade starts the library pass within a minute instead of at the next
-    idle (hourly) tick. A worker without a qualified runtime parks due passes
-    so the watchdog can go idle.
+    when either happened wakes the runners, so a fresh install or upgrade
+    starts the library pass at once. A worker without a qualified runtime
+    parks due passes so the runners can go idle.
     """
     global _edge_runtime_reported_at
     now = time.monotonic()
@@ -4365,7 +4104,7 @@ def report_edge_runtime(force=False, park=True):
     try:
         db = get_db()
         # S8: each job is a fresh fork of the worker, so the module global
-        # above never remembered a report and every tick wrote one; the
+        # above never remembered a report and every job wrote one; the
         # worker's own row says when it last reported.
         if not force and edge_runtime_reported_within(db, socket.gethostname(), EDGE_RUNTIME_REPORT_SECONDS):
             _edge_runtime_reported_at = now
@@ -4374,14 +4113,14 @@ def report_edge_runtime(force=False, park=True):
         record_edge_runtime(db, socket.gethostname(), status)
         if status.get("available") and edge_setting_enabled():
             if ensure_edge_backfill_sources(db) + arm_edge_backfill(db, include_complete=False):
-                arm_reconcile(db, "edge_backfill_ready", commit=True)
+                wake_runners(db, "edge_backfill_ready", commit=True)
         elif park:
             # The web process without a runtime leaves the passes to a
             # worker that has one, and parks nothing of theirs.
             park_edge_backfill(db)
         # A worker with PyAV reports: loudness passes parked for want of it resume (LN.4c).
         if status.get("pyav") and loudness_backfill.arm(db, include_complete=False):
-            arm_reconcile(db, "loudness_backfill_ready", commit=True)
+            wake_runners(db, "loudness_backfill_ready", commit=True)
         _edge_runtime_reported_at = now
     except Exception:
         if db is not None:
@@ -4398,82 +4137,47 @@ def report_edge_runtime_on_start():
         logger.warning("lumae_analysis could not remove leftover analysis downloads")
 
 
-# AudioMuse refuses a new root task from the web process while any plugin
-# task or AudioMuse main job runs (``ERR_TASK_IN_PROGRESS``). On-demand work
-# refused that way stays pending with this marker, and the next worker task
-# serves it (serve_deferred_interactive).
-HOST_BUSY_ERROR_CODE = 1201
-DEFERRED = "deferred"
-# A refresh refused that way is kept (SQ.1); an app may look again after this.
-CATALOG_REFRESH_RETRY_AFTER_SECONDS = 60
 # A queued background edge batch yields its slot after this long; its
 # unstarted jobs are released and due again at once.
 EDGE_BACKGROUND_BUDGET_SECONDS = 60
-# SF.3: the stored-edge v3 upgrade's time per install or reconcile tick.
+# SF.3: the stored-edge v3 upgrade's time per install or runner pass.
 EDGE_V3_UPGRADE_BUDGET_SECONDS = 20
 # The library pass reads due tracks this many at a time, and pages on until
-# the tick's deadline (performance plan WP1a).
+# its slice's deadline (performance plan WP1a).
 EDGE_BACKFILL_PAGE_SIZE = 25
 
 
 def _pass_deadline(deadline):
-    """A library pass works until the tick's ``deadline``; called outside a
-    tick, for a tick's budget."""
-    return deadline if deadline is not None else time.monotonic() + TICK_BUDGET_SECONDS
+    """A library pass works until its slice's ``deadline``; called outside a
+    runner, for one slice."""
+    return deadline if deadline is not None else time.monotonic() + RUNNER_SLICE_SECONDS
 
 
-def host_queue_busy(exc):
-    """The host refused a root task because another one is running."""
-    return getattr(exc, "code", None) == HOST_BUSY_ERROR_CODE
-
-
-def enqueue_edge_profiles(ids, catalog_instance_id, server_id, *, priority="background"):
+def request_edge_profiles(ids, catalog_instance_id, *, priority="background"):
+    """Edges asked for: on demand, jobs recorded for the runners and a wake;
+    in the background, the library pass made due now, which covers them (R6):
+    a finished pass starts again, costing one scan, since its candidates skip
+    tracks that have an edge."""
     empty = {"available": False, "accepted": [], "already_ready": [], "already_pending": [],
              "unsupported": [], "deferred": []}
     if not edge_scheduling_allowed():
         return empty
     db = get_db()
-    if priority != "interactive" and runner_enabled():
-        # R6: the server's library pass covers the tracks; nothing is queued.
-        if arm_edge_backfill(db, catalog_instance_id, include_complete=False):
-            arm_reconcile(db, "edge_backfill_ready")
+    if priority != "interactive":
+        ensure_edge_backfill_sources(db)
+        if arm_edge_backfill(db, catalog_instance_id):
+            wake_runners(db, "edge_backfill_ready")
         db.commit()
         return {**empty, "available": True, "already_pending": list(ids)}
     jobs, ready, pending, unsupported = claim_edge_requests(db, catalog_instance_id, ids, priority)
-    deferred = []
-    if jobs and runner_enabled():
-        # R6: recorded for the runner, which serves on-demand work first.
-        mark_edge_jobs_deferred(db, catalog_instance_id, jobs, DEFERRED_MARKER)
-        wake_runner(db, "interactive_edges")
-        jobs_recorded = True
-    else:
-        jobs_recorded = False
-    if jobs and not jobs_recorded:
-        try:
-            # AudioMuse admits one root task per plugin. Submit the bounded
-            # source-bound batch as one task; per-track tasks would make the
-            # second item contend with the first and strand its durable job.
-            enqueue_bounded(analyze_edges_task, jobs, catalog_instance_id, server_id, priority,
-                            queue="high" if priority == "interactive" else "default",
-                            timeout=PROFILE_JOB_TIMEOUT_SECONDS)
-        except Exception as exc:
-            if not host_queue_busy(exc):
-                for job in jobs:
-                    update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-enqueue-failed")
-                raise
-            if priority == "interactive":
-                mark_edge_jobs_deferred(get_db(), catalog_instance_id, jobs, DEFERRED_MARKER)
-                _wake_for_deferred()
-            else:
-                # Due again at once; the library pass also covers them.
-                for job in jobs:
-                    update_edge_job(get_db(), catalog_instance_id, job, "failed", "edge-enqueue-failed")
-            deferred = [job["track_id"] for job in jobs]
-    waiting = set(pending) | set(deferred)
+    if jobs:
+        mark_edge_jobs_waiting(db, catalog_instance_id, jobs, RUNNER_WAITING_MARKER)
+        wake_runners(db, "interactive_edges", commit=True)
     return {"available": True,
-            "accepted": [job["track_id"] for job in jobs if job["track_id"] not in waiting],
+            "accepted": [job["track_id"] for job in jobs if job["track_id"] not in set(pending)],
             "already_ready": ready, "already_pending": pending, "unsupported": unsupported,
-            "deferred": deferred}
+            # Older plugins named refused requests here; the runner refuses none.
+            "deferred": []}
 
 
 def _leave_edge_to_pass(track_id, catalog_instance_id):
@@ -4486,11 +4190,7 @@ def _leave_edge_to_pass(track_id, catalog_instance_id):
     The host admits a plugin root task from inside its own analysis, so a task
     per song put hundreds on the queue, and the host's analysis page shows the
     newest root task and kept switching to them. The pass is made due to reach
-    the track instead and runs once the reconcile watchdog ticks again (the
-    host skips plugin crons while its own analysis runs). The waveform
-    backfill's tick runs several batches (plan S2), so its task per track kept
-    a Lumae root task on the host's queue for most of every minute, and the
-    host refused its schedules meanwhile.
+    the track instead, and a runner reaches it on its next pass (R6).
     """
     if not catalog_instance_id or not edge_profiles_enabled() or not edge_scheduling_allowed():
         return
@@ -4498,7 +4198,7 @@ def _leave_edge_to_pass(track_id, catalog_instance_id):
     try:
         db = get_db()
         if rewind_edge_backfill(db, catalog_instance_id, track_id):
-            arm_reconcile(db, "edge_backfill_ready", commit=True)
+            wake_runners(db, "edge_backfill_ready", commit=True)
     except Exception:
         if db is not None:
             _rollback_if_possible(db)
@@ -4513,7 +4213,7 @@ def edge_analyze_api():
         ids = body.get("ids")
         if not isinstance(ids, list) or len(ids) > 100 or any(not isinstance(i, str) or not 0 < len(i) <= 512 for i in ids):
             raise ValueError("ids must contain at most 100 track IDs")
-        return _private_json(enqueue_edge_profiles(ids, source["catalog_instance_id"], source["server_id"], priority="interactive")), 202
+        return _private_json(request_edge_profiles(ids, source["catalog_instance_id"], priority="interactive")), 202
     except (KeyError, ValueError, CatalogScanError) as exc:
         return _catalog_error("invalid_edge_request", str(exc), 400)
 
@@ -4531,7 +4231,7 @@ def edge_backfill_api():
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
             raise ValueError("limit must be an integer from 1 to 100")
         ids = edge_backfill_candidates(get_db(), source["catalog_instance_id"], after, limit)
-        result = enqueue_edge_profiles(ids, source["catalog_instance_id"], source["server_id"])
+        result = request_edge_profiles(ids, source["catalog_instance_id"])
         result["next_after"] = ids[-1] if ids else None
         return _private_json(result), 202
     except (KeyError, ValueError, CatalogScanError) as exc:
@@ -4542,7 +4242,7 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="backgroun
                        budget_seconds=EDGE_BACKGROUND_BUDGET_SECONDS):
     """Compute edges for claimed jobs, one file at a time.
 
-    A background batch serves refused on-demand work before each track and
+    A background batch serves on-demand work before each track and
     releases its unstarted jobs once ``budget_seconds`` have passed (None: no
     budget), so it never holds the plugin's task slot for long.
     """
@@ -4553,7 +4253,7 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="backgroun
     jobs = list(jobs)[:100]
     for index, job in enumerate(jobs):
         if background:
-            serve_deferred_interactive()
+            serve_interactive()
             if deadline is not None and time.monotonic() > deadline:
                 for rest in jobs[index:]:
                     update_edge_job(get_db(), catalog_instance_id, rest, "failed", "edge-enqueue-failed")
@@ -4577,7 +4277,7 @@ def _prepare_edge(job, catalog_instance_id, server_id, defer=False):
 
     ``(outcome, None)`` when it settled here (None: another worker has the
     job), or ``(None, state)`` with the downloaded file for the analysis and
-    ``_finish_edge``. Database and host calls only: the tick's own thread.
+    ``_finish_edge``. Database and host calls only: the turn's own thread.
     """
     if not update_edge_job(get_db(), catalog_instance_id, job, "running"):
         return None, None
@@ -4600,7 +4300,7 @@ def _prepare_edge(job, catalog_instance_id, server_id, defer=False):
 
 def _finish_edge(state, payload, error):
     """Publish an edge (and its loudness) or record its failure, and remove the
-    download; the tick's own thread."""
+    download; the turn's own thread."""
     job, catalog_instance_id, info = state["job"], state["catalog_instance_id"], state["info"]
     try:
         if error is not None:
@@ -4643,11 +4343,11 @@ def _release_edge(state):
 
 
 def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
-    """One library-pass tick: edges for published tracks until the tick's
+    """One library-pass slice: edges for published tracks until the slice's
     deadline, then yield.
 
-    Runs inside the reconcile tick after the waveform backfill. Analyses one
-    track at a time until the tick's ``deadline`` (WP1a; it took a fixed 30 s
+    Runs inside a runner turn after the waveform backfill. Analyses one
+    track at a time until the slice's ``deadline`` (WP1a; it took a fixed 30 s
     before), reading due tracks a page at a time, serving on-demand work
     between tracks, and keeps its cursor at the last track it reached.
     """
@@ -4702,8 +4402,8 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
 
 
 def _serve_between():
-    """A parallel pass serves deferred on-demand work whenever a thread frees (WP1b)."""
-    serve_deferred_interactive()
+    """A parallel pass serves on-demand work whenever a thread frees (WP1b)."""
+    serve_interactive()
     return True
 
 
@@ -4717,11 +4417,11 @@ def _paged(first_page, next_page):
 
 
 def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, deadline):
-    """The edge pass's turn on the tick's K analysis threads (WP1b).
+    """The edge pass's turn on the runner's K analysis threads (WP1b).
 
     Each due track is claimed, started and downloaded here, analysed on a
-    thread and published here as it completes, serving deferred on-demand
-    work whenever a thread frees. A file in flight at the deadline runs to
+    thread and published here as it completes, serving on-demand work
+    whenever a thread frees. A file in flight at the deadline runs to
     completion, as on the serial path. The cursor stays at the last track of
     the unbroken run of finished tracks, so a file cancelled because the pass
     raised (released, due again at once) is reached again next turn.
@@ -4777,9 +4477,9 @@ def next_loudness_backfill(db, server_id=None):
 
 def loudness_backfill_task(server_id, catalog_instance_id, deadline=None):
     """One loudness turn (LN.4c): follow the published catalogue when its generation moved, then
-    measure due tracks on the standalone path until the tick's deadline and yield.
+    measure due tracks on the standalone path until the slice's deadline and yield.
 
-    Measures one track at a time until the tick's ``deadline`` (WP1a; it took a fixed 30 s and one
+    Measures one track at a time until the slice's ``deadline`` (WP1a; it took a fixed 30 s and one
     page before), reading due tracks a page of the admin batch size at a time, serving on-demand
     work between tracks, publishes each page's measurements together and keeps its cursor at the
     last track it reached. A worker without PyAV parks the pass before downloading.
@@ -4818,7 +4518,7 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None):
         while due:
             measured = []
             for track_id, media_revision in due:
-                serve_deferred_interactive()
+                serve_interactive()
                 if time.monotonic() >= pass_deadline:
                     break
                 outcome = _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured)
@@ -4860,7 +4560,7 @@ def _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revisi
 
 def _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revision, defer=False):
     """A loudness measurement's download (WP1b's split of ``_measure_loudness``):
-    ``("failed", None)`` or ``(None, state)``; the tick's own thread."""
+    ``("failed", None)`` or ``(None, state)``; the turn's own thread."""
     state = {"db": db, "catalog_instance_id": catalog_instance_id, "track_id": track_id,
              "media_revision": media_revision, "info": None}
     try:
@@ -4877,7 +4577,7 @@ def _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revisi
 
 def _finish_loudness(state, record, error, measured):
     """``ready`` (the measurement appended to ``measured``) or ``failed`` (backing off), and the
-    download removed; the tick's own thread."""
+    download removed; the turn's own thread."""
     db, info = state["db"], state["info"]
     try:
         if error is not None:
@@ -4898,7 +4598,7 @@ def _finish_loudness(state, record, error, measured):
 
 def _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, due, page_size,
                             edges_enabled, deadline, result):
-    """The loudness turn on the tick's K analysis threads (WP1b).
+    """The loudness turn on the turn's K analysis threads (WP1b).
 
     Downloads and publication stay here; a page of measurements (the admin
     batch size) is published together as it fills. A file in flight at the
@@ -4983,24 +4683,23 @@ def _publish_loudness(db, catalog_instance_id, measured):
     return failed
 
 
-def serve_deferred_interactive(limit=None):
-    """Serve on-demand work the host refused to queue; returns tracks served.
+def serve_interactive(limit=None):
+    """Serve on-demand work recorded for the runners; returns tracks served.
 
-    Called by background batches before each track, first thing by every
-    reconcile tick, and after each AudioMuse song hook, so a refused request
-    waits about one track. Waveform first, then edges. Never raises.
+    First in every runner pass, and between the files of a library pass, so
+    a request waits about one file. Waveform first, then edges. Never raises.
     """
-    global _serving_deferred
-    if _serving_deferred or maintenance_paused():
+    global _serving_interactive
+    if _serving_interactive or maintenance_paused():
         return 0
     limit = limit or INTERACTIVE_PROFILE_CHUNK_SIZE
-    _serving_deferred = True
+    _serving_interactive = True
     served = 0
     db = None
     try:
         db = get_db()
         by_source = {}
-        for source, track_id, token in claim_deferred_profiles(db, limit):
+        for source, track_id, token in claim_waiting_profiles(db, limit):
             by_source.setdefault(source, {})[track_id] = token
         for source, tokens in by_source.items():
             server = resolve_profile_source(catalog_instance_id=source)["server_id"]
@@ -5009,7 +4708,7 @@ def serve_deferred_interactive(limit=None):
             served += len(tokens)
         if edge_profiles_enabled():
             by_source = {}
-            for job in claim_deferred_edge_jobs(db, DEFERRED_MARKER, limit):
+            for job in claim_waiting_edge_jobs(db, WAITING_MARKERS, limit):
                 by_source.setdefault(job.pop("catalog_instance_id"), []).append(job)
             for source, jobs in by_source.items():
                 server = resolve_profile_source(catalog_instance_id=source)["server_id"]
@@ -5018,43 +4717,28 @@ def serve_deferred_interactive(limit=None):
     except Exception:
         if db is not None:
             _rollback_if_possible(db)
-        logger.exception("lumae_analysis could not serve deferred on-demand work")
+        logger.exception("lumae_analysis could not serve on-demand work")
     finally:
-        _serving_deferred = False
+        _serving_interactive = False
     return served
 
 
-_serving_deferred = False
+_serving_interactive = False
 
 
-def _wake_for_deferred():
-    """Put the reconcile watchdog on minute cadence for saved on-demand work.
-
-    The schedule also counts deferred work as ready, so it stays active until
-    that work is served. Never fails the request that deferred.
-    """
-    db = None
-    try:
-        db = get_db()
-        arm_reconcile(db, "deferred_on_demand", commit=True)
-    except Exception:
-        if db is not None:
-            _rollback_if_possible(db)
-        logger.warning("lumae_analysis could not wake the watchdog for deferred work")
-
-
-def claim_deferred_profiles(db, limit):
-    """Take refused on-demand waveform attempts, oldest first: (source, track, token)."""
+def claim_waiting_profiles(db, limit):
+    """Take on-demand waveform attempts waiting for a runner, oldest first:
+    (source, track, token)."""
     cur = db.cursor()
     cur.execute(
         f"""UPDATE {source_profiles_table()} p SET last_error=NULL
               FROM (SELECT catalog_instance_id, track_id FROM {source_profiles_table()}
-                     WHERE status='pending_interactive' AND last_error=%s
+                     WHERE status='pending_interactive' AND last_error IN (%s, %s)
                        AND attempt_token IS NOT NULL
                      ORDER BY analyzed_at, track_id LIMIT %s FOR UPDATE SKIP LOCKED) d
              WHERE p.catalog_instance_id=d.catalog_instance_id AND p.track_id=d.track_id
          RETURNING p.catalog_instance_id, p.track_id, p.attempt_token""",
-        (DEFERRED_MARKER, int(limit)),
+        (*WAITING_MARKERS, int(limit)),
     )
     rows = cur.fetchall()
     db.commit()
@@ -5062,15 +4746,15 @@ def claim_deferred_profiles(db, limit):
     return [(row[0], row[1], row[2]) for row in rows]
 
 
-def mark_profiles_deferred(db, catalog_instance_id, tokens):
-    """Keep refused on-demand attempts pending, marked for the next worker task."""
+def mark_profiles_waiting(db, catalog_instance_id, tokens):
+    """Mark on-demand attempts as waiting for a runner (R6)."""
     cur = db.cursor()
     for track_id, token in tokens.items():
         cur.execute(
             f"""UPDATE {source_profiles_table()} SET last_error=%s
                  WHERE catalog_instance_id=%s AND track_id=%s AND attempt_token=%s
                    AND status='pending_interactive'""",
-            (DEFERRED_MARKER, catalog_instance_id, track_id, token),
+            (RUNNER_WAITING_MARKER, catalog_instance_id, track_id, token),
         )
     db.commit()
     cur.close()
@@ -5113,7 +4797,7 @@ def _bundle_edges(signature):
 
 def _analyse_track_file(state, limit_seconds=None):
     """The analysis child call for a waveform's state (any thread: settings
-    are read only when ``limit_seconds`` is None, on the tick's thread).
+    are read only when ``limit_seconds`` is None, on the turn's thread).
 
     With ``state["bundle"]`` one call makes the waveform, the edge and its
     loudness (``analysis_bundle``), each analysis with the per-file limit.
@@ -5134,7 +4818,7 @@ def _prepare_track(track_id, catalog_instance_id, server_id, attempt_token, prio
 
     ``(outcome, None)`` when it settled here, or ``(None, state)`` with the
     downloaded file for the analysis and ``_finish_track``. Database and host
-    calls only: it runs on the tick's own thread. ``defer``: an analysis
+    calls only: it runs on the turn's own thread. ``defer``: an analysis
     thread fetches the file (``fetch_track_file``).
     """
     if maintenance_paused():
@@ -5183,7 +4867,7 @@ def _prepare_track(track_id, catalog_instance_id, server_id, attempt_token, prio
 
 def _finish_track(state, result, error):
     """Publish a waveform analysis (or its failure) and remove the download;
-    the tick's own thread."""
+    the turn's own thread."""
     track_id, info, complete = state["track_id"], state["info"], state["complete"]
     catalog_instance_id = state["catalog_instance_id"]
     try:
@@ -5406,7 +5090,10 @@ def record_analysis_run(server_id, catalog_instance_id, run_id, db=None):
         (catalog_instance_id, run_id, server_id),
     )
     row = cur.fetchone()
-    arm_reconcile(db, "analysis_hook")
+    if not row or int(row[1] or 0) <= 1:
+        # A new run wakes the runners once; they follow it until it settles
+        # (R7), so the songs after it send no wake each.
+        wake_runners(db, "analysis_hook")
     db.commit()
     cur.close()
     return {
@@ -5475,14 +5162,12 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
         profile_result = start_profile_backfill(
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
-            enqueue_job=False,
         )
         try:
             _safe_progress("admitting relationship work")
             relationship_result = start_relationship_preparation(
                 catalog_instance_id=catalog_instance_id,
                 server_id=server_id,
-                enqueue_job=False,
             )
         except Exception as exc:
             logger.exception(
@@ -5526,13 +5211,8 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
 
 def analyze_song_hook(song):
     """AudioMuse per-song hook. It records the analysis run, which wakes the
-    runners (R7). Without them no plugin task can start while AudioMuse
-    analyses, so each song also serves one deferred on-demand track."""
-    try:
-        return _analyze_song_hook(song)
-    finally:
-        if not runner_enabled():
-            serve_deferred_interactive(limit=1)
+    runners (R7); they serve on-demand work, analysis or not."""
+    return _analyze_song_hook(song)
 
 
 def _analyze_song_hook(song):
@@ -5659,10 +5339,10 @@ def analyze_tracks_task(
     attempt_tokens=None,
     deadline=None,
 ):
-    """``deadline``: a watchdog tick's (``time.monotonic()``); no track starts
+    """``deadline``: a runner slice's (``time.monotonic()``); no track starts
     after it, and the unstarted ones are released uncounted (plan S2).
 
-    Inside a tick with K analysis threads (WP1b) a background batch analyses
+    Inside a runner turn with K analysis threads (WP1b) a background batch analyses
     K files at once (``_analyze_tracks_parallel``)."""
     ids = parse_ids(",".join(ids or []))
     if maintenance_paused():
@@ -5710,7 +5390,6 @@ def analyze_tracks_task(
                 start_profile_backfill(
                     catalog_instance_id=catalog_instance_id,
                     server_id=server_id,
-                    enqueue_job=False,
                 )
             except Exception:
                 logger.exception("lumae_analysis could not migrate a legacy backfill job")
@@ -5736,7 +5415,7 @@ def analyze_tracks_task(
             release_pending(
                 remaining,
                 catalog_instance_id=catalog_instance_id,
-                reason="The Lumae watchdog tick's time was used",
+                reason="The Lumae runner's slice was used",
                 tokens=attempt_tokens,
                 count_failure=False,
             )
@@ -5746,7 +5425,7 @@ def analyze_tracks_task(
             )
             break
         if priority == "background":
-            serve_deferred_interactive()
+            serve_interactive()
         if priority == "background" and catalog_instance_id:
             heartbeat_profile_backfill(catalog_instance_id)
         if maintenance_paused():
@@ -5792,13 +5471,13 @@ def analyze_tracks_task(
 
 
 def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_tokens, deadline):
-    """A background waveform batch on the tick's K analysis threads (WP1b):
+    """A background waveform batch on the turn's K analysis threads (WP1b):
     ``(results, attempted)``.
 
     Each track is claimed, checked and downloaded here, analysed on a thread,
     and published here as it completes. Deferred on-demand work is served
     whenever a thread frees, before the next track. No track starts once the
-    tick's deadline is nearer than the batch's average time per file; a file
+    slice's deadline is nearer than the batch's average time per file; a file
     in flight at the deadline runs to completion, as on the serial path, and
     the tracks never started are released uncounted.
     """
@@ -5807,7 +5486,7 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
     tokens = attempt_tokens or {}
 
     def between():
-        serve_deferred_interactive()
+        serve_interactive()
         if catalog_instance_id:
             heartbeat_profile_backfill(catalog_instance_id)
         if maintenance_paused():
@@ -5835,7 +5514,7 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
         return (lambda: (fetch_track_file(state["info"]), _analyse_track_file(state, limit))[1]), state
 
     def finish(track_id, state, result, error):
-        reason = "The Lumae watchdog tick's time was used"
+        reason = "The Lumae runner's slice was used"
         if isinstance(error, analysis_download.DownloadError):
             # Due again at once; the host downloads it for the rest of the task.
             _refuse_own_download(catalog_instance_id, error)
@@ -5858,7 +5537,7 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
             remaining,
             catalog_instance_id=catalog_instance_id,
             reason=("Lumae background maintenance was paused during the batch" if paused[0]
-                    else "The Lumae watchdog tick's time was used"),
+                    else "The Lumae runner's slice was used"),
             tokens=attempt_tokens,
             count_failure=False,
         )
@@ -5881,7 +5560,7 @@ def _tracks_summary(results, attempted, catalog_instance_id, priority):
     if catalog_instance_id:
         finalize_preparation_if_settled(catalog_instance_id)
         if priority != "background":
-            # Background batches run inside a watchdog tick, which refreshes
+            # Background batches run inside a runner turn, which refreshes
             # the settings counts when it ends; an interactive batch refreshes
             # them itself (P2-1).
             refresh_status_snapshot(catalog_instance_id=catalog_instance_id)
@@ -6234,32 +5913,6 @@ def _committed_profile_counts(source):
         return None
 
 
-def queue_backfill_batch(
-    limit=None,
-    catalog_instance_id=None,
-    server_id=None,
-    include_failed=False,
-):
-    batch_limit = normalize_backfill_limit(limit or configured_backfill_limit())
-    ids = (
-        find_backfill_ids(
-            batch_limit,
-            catalog_instance_id=catalog_instance_id,
-            server_id=server_id,
-            include_failed=include_failed,
-        )
-        if catalog_instance_id or server_id
-        else find_backfill_ids(batch_limit)
-    )
-    if ids:
-        enqueue_profile_analysis(
-            ids,
-            catalog_instance_id=catalog_instance_id,
-            server_id=server_id,
-        )
-    return {"queued": len(ids), "limit": batch_limit}
-
-
 def profile_backfill_state(catalog_instance_id, db=None):
     db = db or get_db()
     cur = db.cursor()
@@ -6341,7 +5994,7 @@ def claim_profile_backfill(source, db=None):
     )
     claimed = cur.fetchone() is not None
     if claimed:
-        arm_reconcile(db, "profile_backfill_admitted")
+        wake_runners(db, "profile_backfill_admitted")
     db.commit()
     cur.close()
     return claimed
@@ -6456,17 +6109,7 @@ def update_profile_backfill_state(
     cur.close()
 
 
-def enqueue_next_profile_backfill(server_id, catalog_instance_id):
-    return enqueue_bounded(
-        profile_backfill_task,
-        server_id,
-        catalog_instance_id,
-        queue="default",
-        timeout=PROFILE_BACKFILL_JOB_TIMEOUT_SECONDS,
-    )
-
-
-def start_profile_backfill(catalog_instance_id=None, server_id=None, enqueue_job=True):
+def start_profile_backfill(catalog_instance_id=None, server_id=None):
     if maintenance_paused():
         return {
             "queued": False,
@@ -6480,32 +6123,12 @@ def start_profile_backfill(catalog_instance_id=None, server_id=None, enqueue_job
     )
     if not claim_profile_backfill(source):
         return {"queued": False, "coalesced": True, "batch_size": configured_backfill_limit()}
-    if not enqueue_job or runner_enabled():
-        return {
-            "queued": True,
-            "coalesced": False,
-            "deferred": True,
-            "batch_size": configured_backfill_limit(),
-        }
-    try:
-        job = enqueue_next_profile_backfill(source["server_id"], source["catalog_instance_id"])
-    except Exception as exc:
-        logger.exception(
-            "lumae_analysis could not queue the first profile batch; "
-            "the durable watchdog will retry it"
-        )
-        return {
-            "queued": True,
-            "coalesced": False,
-            "deferred": True,
-            "batch_size": configured_backfill_limit(),
-            "error": str(exc),
-        }
+    # The claim recorded it and woke the runners (R6).
     return {
         "queued": True,
         "coalesced": False,
+        "deferred": True,
         "batch_size": configured_backfill_limit(),
-        "job_id": getattr(job, "id", None),
     }
 
 
@@ -6543,9 +6166,9 @@ def next_profile_retry_at(catalog_instance_id, db=None):
 
 
 def profile_backfill_task(server_id, catalog_instance_id, deadline=None):
-    """Process one small batch; the watchdog resumes a queued next batch.
+    """Process one small batch; the runner resumes a queued next batch.
 
-    ``deadline``: the watchdog tick's; tracks not started by then are due
+    ``deadline``: the runner slice's; tracks not started by then are due
     again at once.
     """
     if maintenance_paused():
@@ -6649,20 +6272,11 @@ def profile_backfill_task(server_id, catalog_instance_id, deadline=None):
             last_error=exc,
             completed=True,
             # Its rows are due at once (an uncounted release), so a persistent
-            # error would abort a batch on every reconcile tick: retry the
+            # error would abort a batch on every runner turn: retry the
             # batch after a fixed minute instead (LUM-007).
             retry_after_seconds=BACKFILL_ABORT_RETRY_SECONDS,
         )
         raise
-
-
-def queue_whole_library(catalog_instance_id=None, server_id=None, include_failed=False):
-    """Compatibility wrapper that starts one bounded durable workflow."""
-    del include_failed
-    return start_profile_backfill(
-        catalog_instance_id=catalog_instance_id,
-        server_id=server_id,
-    )
 
 
 def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=None):
@@ -6695,7 +6309,7 @@ def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=No
 
 
 def relationship_preparation_task(server_id, catalog_instance_id, time_budget_seconds=20):
-    """One build step; a watchdog tick passes what is left of its budget."""
+    """One build step; a runner passes what is left of its slice."""
     if maintenance_paused():
         return {"status": "paused", "reason": "maintenance_paused"}
     source = resolve_profile_source(
@@ -6709,7 +6323,7 @@ def relationship_preparation_task(server_id, catalog_instance_id, time_budget_se
 
 
 def start_relationship_preparation(
-    catalog_instance_id=None, server_id=None, enqueue_job=True, force=False
+    catalog_instance_id=None, server_id=None, force=False
 ):
     """Request one coalesced relationship build without delaying readiness.
     ``force`` (the settings page's rebuild) skips W2's spacing."""
@@ -6746,39 +6360,11 @@ def start_relationship_preparation(
             "coalesced": True,
             "reason": "already_running",
         }
-    if not enqueue_job or runner_enabled():
-        return {
-            "queued": True,
-            "coalesced": False,
-            "deferred": True,
-        }
-    try:
-        job = enqueue_bounded(
-            relationship_preparation_task,
-            source["server_id"],
-            source["catalog_instance_id"],
-            queue="default",
-            timeout=RELATIONSHIP_JOB_TIMEOUT_SECONDS,
-        )
-    except Exception as exc:
-        if host_queue_busy(exc):
-            logger.info("lumae_analysis left relationship preparation to the watchdog: "
-                        "AudioMuse's queue is busy")
-        else:
-            logger.exception(
-                "lumae_analysis could not queue relationship preparation; "
-                "the durable watchdog will retry it"
-            )
-        return {
-            "queued": True,
-            "coalesced": False,
-            "deferred": True,
-            "error": str(exc),
-        }
+    # The claim recorded it and woke the runners (R6).
     return {
         "queued": True,
         "coalesced": False,
-        "job_id": getattr(job, "id", None),
+        "deferred": True,
     }
 
 
@@ -6841,7 +6427,7 @@ def assert_preparation_worker_current(catalog_instance_id):
             "AudioMuse queued catalogue preparation for Lumae Analysis "
             f"{expected_plugin} (builder {expected_builder}), but this worker is still "
             f"running {PLUGIN_VERSION} (builder {CATALOG_BUILDER_VERSION}). "
-            "Restart the AudioMuse workers; the repair watchdog will retry automatically."
+            "Restart the AudioMuse workers; Lumae retries automatically."
         )
 
 
@@ -6892,7 +6478,7 @@ def claim_preparation(source, db=None):
     )
     claimed = cur.fetchone() is not None
     if claimed:
-        arm_reconcile(db, "catalog_preparation_admitted")
+        wake_runners(db, "catalog_preparation_admitted")
     db.commit()
     cur.close()
     return claimed
@@ -7116,7 +6702,6 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
             profile_result = start_profile_backfill(
                 catalog_instance_id=resolved_catalog_instance_id,
                 server_id=resolved_server_id,
-                enqueue_job=False,
             )
         except Exception as exc:
             # The catalogue is already safe and usable. Enrichment failures
@@ -7128,7 +6713,6 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
             relationship_result = start_relationship_preparation(
                 catalog_instance_id=resolved_catalog_instance_id,
                 server_id=resolved_server_id,
-                enqueue_job=False,
             )
         except Exception as exc:
             logger.exception(
@@ -7198,8 +6782,6 @@ from .settings_render import (
     _reconcile_duration,
     _reconcile_event_summary,
     render_reconcile_status_panel,
-    render_schedule_guide,
-    schedule_description,
     render_settings_status_panels,
     render_publication_repair_form,
     render_settings,
@@ -7224,7 +6806,8 @@ def settings():
             if action in ("pause_maintenance", "resume_maintenance"):
                 paused = action == "pause_maintenance"
                 set_setting("maintenance_paused", paused)
-                _safe_reconcile_schedule(get_db(), paused=paused)
+                if not paused:
+                    wake_runners(get_db(), "maintenance_resumed", commit=True)
                 message = (
                     "Background maintenance paused. Published Lumae data remains available."
                     if paused
@@ -7256,23 +6839,6 @@ def settings():
                     if not claim_preparation(source):
                         message = f"Preparation is already running for {source['name']}."
                     else:
-                        try:
-                            if runner_enabled():
-                                raise _RecordedForRunner()
-                            enqueue_bounded(
-                                prepare_lumae_task,
-                                server_id,
-                                catalog_instance_id,
-                                queue="default",
-                                timeout=CATALOG_JOB_TIMEOUT_SECONDS,
-                            )
-                        except _RecordedForRunner:
-                            pass
-                        except Exception:
-                            logger.exception(
-                                "lumae_analysis could not queue catalogue preparation; "
-                                "the durable watchdog will retry it"
-                            )
                         message = (
                             f"Preparing {source['name']}: library refresh and app sync index first, "
                             "then fair background volume and ramp work. Lumae can sync as soon as "
@@ -7293,24 +6859,22 @@ def settings():
                     )
             elif action == "retry_edge_profiles":
                 # LUM-017 (P3-9): edge profiles had no settings-page retry path;
-                # this reuses the exact enqueue the app-facing backfill API
-                # already uses (P3-7's ``edge_backfill_candidates`` /
-                # ``enqueue_edge_profiles``), just bounded to one batch here.
+                # this makes the library pass due now, as the app-facing
+                # backfill API does (``request_edge_profiles``, R6).
                 source = resolve_profile_source(
                     catalog_instance_id=request.form.get("catalog_instance_id"),
                     server_id=request.form.get("server_id"),
                 )
                 ids = edge_backfill_candidates(get_db(), source["catalog_instance_id"], "", 100)
-                result = enqueue_edge_profiles(
-                    ids, source["catalog_instance_id"], source["server_id"]
-                )
+                result = request_edge_profiles(ids, source["catalog_instance_id"])
                 if not result.get("available"):
                     message = "Edge profile upgrades are currently disabled or paused."
                 else:
                     message = (
-                        f"Queued {format_count(len(result.get('accepted') or []))} edge "
-                        f"profile(s) for {source['name']}; "
-                        f"{format_count(len(result.get('already_ready') or []))} were already ready."
+                        f"Lumae's edge pass for {source['name']} runs next; "
+                        f"{format_count(len(ids))}{'+' if len(ids) >= 100 else ''} "
+                        "track(s) still need an edge."
+                        if ids else f"Every track of {source['name']} has an edge."
                     )
             elif action == "retry_relationships":
                 # LUM-017 (P3-9): relationships had no settings-page retry
@@ -7411,11 +6975,6 @@ RUNNER_PRELOAD_MODULES = (
 )
 
 
-def runner_enabled():
-    """RN.1–RN.4: the runners start only with this setting on (off by default)."""
-    return runner.enabled()
-
-
 def _runner_code_current():
     """R2: this process still runs the installed plugin. AudioMuse has no hot
     reload: an upgrade, a disable or an uninstall waits for a restart, and
@@ -7455,8 +7014,6 @@ def _preload_runner_modules():
 
 def start_runner(role):
     """Start this process's ``role`` runner (R1, R2); never raises, never blocks."""
-    if not runner_enabled():
-        return None
     try:
         from flask import current_app
 
@@ -7476,35 +7033,16 @@ def start_runner(role):
     )
 
 
-# What enqueue_profile_analysis answers when the runners take the request.
-RECORDED = "recorded"
-
-
-class _RecordedForRunner(Exception):
-    """A settings action's work is recorded; the runners do it (R6)."""
-
-
-def wake_runner(db, reason):
-    """Wake the runners for work just recorded, and commit it (R2, R6)."""
-    cur = db.cursor()
-    try:
-        runner.notify(cur, reason)
-    finally:
-        cur.close()
-    db.commit()
-
-
 def flask_start():
     """``on_flask_start``: observe provider identities, start the server runner."""
     try:
         observe_provider_identities_on_start()
     finally:
-        if runner_enabled():
-            try:
-                # The server runner's downloads of a process that is gone.
-                analysis_download.remove_leftovers(getattr(config, "TEMP_DIR", None))
-            except Exception:
-                logger.warning("lumae_analysis could not remove leftover analysis downloads")
+        try:
+            # The server runner's downloads of a process that is gone.
+            analysis_download.remove_leftovers(getattr(config, "TEMP_DIR", None))
+        except Exception:
+            logger.warning("lumae_analysis could not remove leftover analysis downloads")
         start_runner(runner.ROLE_SERVER)
 
 
@@ -7521,8 +7059,10 @@ def worker_start():
 # the worker's heartbeat allow.
 LIGHT_ACTIONS = frozenset((
     "edge_schema_v3", "analysis_run", "catalog_preparation", "catalog_refresh",
-    "identity_recheck", "credits", "music_metadata",
+    "identity_recheck", "collection_retention", "credits", "music_metadata",
 ))
+# R8: the retention schedule's replacement, once a day.
+COLLECTION_RETENTION_SECONDS = 24 * 60 * 60
 HEAVY_ACTIONS = frozenset((
     "interactive", "relationships", "profile_backfill", "edge_backfill", "loudness_backfill",
 ))
@@ -7566,7 +7106,9 @@ class SliceBudget:
 
 
 def heavy_work_setting():
-    """``heavy_work``: where heavy work runs while no worker is online (R1)."""
+    """``heavy_work``: which runner does the heavy lane (R1). ``auto`` the
+    worker's while one is online, else on-demand tracks on the server;
+    ``server`` all of it on the server; ``worker`` none on the server."""
     value = str(get_setting("heavy_work", "auto") or "auto").strip().lower()
     return value if value in HEAVY_WORK_SETTINGS else "auto"
 
@@ -7629,6 +7171,8 @@ def run_runner_turn(active):
         return runner.Turn(False, "waiting_host", f"audiomuse:{blocker}",
                            RUNNER_HOST_WAIT_SECONDS, None)
     allowed, lane = runner_lane(db, role)
+    if role == runner.ROLE_SERVER:
+        _runner_bookkeeping(db)
     if not allowed:
         return runner.idle_turn(None, lane)
     if role == runner.ROLE_WORKER:
@@ -7641,30 +7185,75 @@ def run_runner_turn(active):
         done.update(("credits:before_background", "music_metadata:before_background"))
     if PER_TRACK_ACTIONS & allowed and reconcile.live_host_task(db, ("main_analysis",)):
         done.update(PER_TRACK_ACTIONS)
-    report = TickReport()
+    report = TurnReport()
     started = time.monotonic()
     worked = None
+    # Credits sweep once a turn (S8); the K analysis threads (WP1b) start on
+    # first use and stop, with their analysis workers, when the turn ends.
     credits_service.begin_tick()
     try:
-        while time.monotonic() - started < RUNNER_TURN_SECONDS and not active.stopped.is_set():
-            action, result = _next_runner_action(db, report, active, done)
-            if action is None:
-                break
-            worked = action
-            status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
-            if status in _SETTLED_STATUSES or (status == "complete" and action in _COMPLETE_SETTLES):
-                done.add(action)
-            blocker = _runner_blocker(db, role)
-            if blocker:
-                return runner.Turn(True, "waiting_host", f"audiomuse:{blocker}",
-                                   RUNNER_HOST_WAIT_SECONDS, worked)
-            if active.stopped.wait(runner.PAUSE_SECONDS):
-                break
+        with parallel_analysis.tick_scope(background_workers()):
+            while time.monotonic() - started < RUNNER_TURN_SECONDS and not active.stopped.is_set():
+                action, result = _next_runner_action(db, report, active, done)
+                if action is None:
+                    break
+                worked = action
+                status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
+                if status in _SETTLED_STATUSES or (status == "complete" and action in _COMPLETE_SETTLES):
+                    done.add(action)
+                blocker = _runner_blocker(db, role)
+                if blocker:
+                    return runner.Turn(True, "waiting_host", f"audiomuse:{blocker}",
+                                       RUNNER_HOST_WAIT_SECONDS, worked)
+                if active.stopped.wait(runner.PAUSE_SECONDS):
+                    break
     finally:
         credits_service.end_tick()
+        if report.actions:
+            _refresh_status_after_turn(db, report)
     if worked:
         return runner.Turn(True, "working", lane, None, worked)
     return runner.idle_turn(_runner_next_due_seconds(db))
+
+
+# The server runner's bookkeeping (what 1.8.0's watchdog tick did) at most this often.
+RUNNER_BOOKKEEPING_SECONDS = 60
+_runner_bookkeeping_at = None
+
+
+def _runner_bookkeeping(db):
+    """Events whose process went away become ``interrupted``, catalogues
+    that need a publication (first run, a builder upgrade) are claimed for
+    preparation, and a publication left without a summary gets one, with the
+    waveform counts at most every STATUS_SNAPSHOT_IDLE_SECONDS, as each 1.8.0
+    tick did (P2-1, S8). Never raises."""
+    global _runner_bookkeeping_at
+    now = time.monotonic()
+    if _runner_bookkeeping_at is not None and now - _runner_bookkeeping_at < RUNNER_BOOKKEEPING_SECONDS:
+        return
+    _runner_bookkeeping_at = now
+    try:
+        recover_interrupted_events(db)
+        enqueue_required_catalog_preparations(db=db)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis runner bookkeeping failed")
+    refresh_status_snapshot(db, min_age_seconds=STATUS_SNAPSHOT_IDLE_SECONDS, publications=True)
+
+
+def _refresh_status_after_turn(db, report):
+    """The waveform counts /settings/status reads follow the turn's work; a
+    publication left without a summary gets one (P2-1). A turn that changed no
+    profile state counts them at most every STATUS_SNAPSHOT_IDLE_SECONDS (S8)."""
+    try:
+        if _changed_profile_state(report):
+            refresh_status_snapshot(db, publications=True)
+        else:
+            refresh_status_snapshot(db, min_age_seconds=STATUS_SNAPSHOT_IDLE_SECONDS,
+                                    publications=True)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not refresh the status snapshot")
 
 
 def _next_runner_action(db, report, active, done):
@@ -7703,27 +7292,9 @@ def register(ctx):
     if hasattr(ctx, "on_worker_start"):
         ctx.on_worker_start(worker_start)
     ctx.on_song_analyzed(analyze_song_hook)
-    # Only schedulable tasks are registered. AudioMuse lists every add_task
-    # name under Scheduled Tasks > Plugin tasks with an Enable box, and the
-    # worker runs a queued job by its dotted path (enqueue), not by its name,
-    # so the watchdog's one-action jobs (prepare, profile and edge backfill,
-    # relationships, credits) need no registration and must not be scheduled:
-    # a cron row would call them without their source arguments. The loudness
-    # pass runs inside the tick and is never queued.
-    _add_cron_task(ctx, "catalog_reconcile", catalog_reconcile_task)
-    _add_cron_task(ctx, "catalog_refresh", catalog_refresh_task)
-    _add_cron_task(ctx, "provider_identity_recheck", provider_identity_recheck_task)
-    _add_cron_task(ctx, "analysis_projection", analysis_projection_task)
-    _add_cron_task(ctx, "collection_retention", collection_retention_task)
+    # Runner plan R8: no task is registered. AudioMuse lists every registered
+    # name under Scheduled Tasks with an Enable box, and an enabled row would
+    # put a Lumae task back on its queue. A job an older version queued runs
+    # by its dotted path, which stays.
 
 
-def _add_cron_task(ctx, name, func):
-    """Register with the info tooltip text when the host takes one; older
-    hosts' add_cron_task has no description parameter."""
-    kwargs = {"queue": "default"}
-    try:
-        if "description" in inspect.signature(ctx.add_cron_task).parameters:
-            kwargs["description"] = schedule_description(name)
-    except (TypeError, ValueError):
-        pass
-    ctx.add_cron_task(name, func, **kwargs)

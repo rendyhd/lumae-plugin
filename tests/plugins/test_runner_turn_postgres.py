@@ -54,11 +54,9 @@ def turn(tick, monkeypatch):
         return None
 
     monkeypatch.setattr(mod, "next_relationship_run", relationship)
-    monkeypatch.setattr(mod, "serve_deferred_interactive", lambda *a, **k: calls.append("interactive") or 0)
+    monkeypatch.setattr(mod, "serve_interactive", lambda *a, **k: calls.append("interactive") or 0)
     settings = {}
-    real = mod.get_setting
-    monkeypatch.setattr(mod, "get_setting",
-                        lambda key, default=None: settings.get(key, real(key, default)))
+    monkeypatch.setattr(mod, "heavy_work_setting", lambda: settings.get("heavy_work", "auto"))
     return mod, db, calls, settings
 
 

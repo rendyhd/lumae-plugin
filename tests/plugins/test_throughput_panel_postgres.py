@@ -1,11 +1,9 @@
 """Performance plan WP5 (scheduler plan S12, AUD-18): the settings page shows,
 for each queue, its throughput per hour from the journal, what is left and
 an ETA; for the analysis queues the ETA at the current number of files
-analysed at once and at a higher one; and the last yield with the refused
-AudioMuse schedule it waits for and how long ago that was refused.
+analysed at once and at a higher one. Since the runners (R9) the panel shows
+each runner's state, not a schedule's or a refused AudioMuse schedule's.
 """
-import time
-
 import pytest
 
 from test_lumae_analysis import load_plugin, plugin_client  # noqa: F401
@@ -86,25 +84,7 @@ def test_the_eta_at_more_files_at_once_follows_the_measured_scaling():
     assert par.speedup(4) == pytest.approx(3.38) and par.speedup(3) == pytest.approx((1.86 + 3.38) / 2)
 
 
-def test_the_last_yield_names_the_refused_schedule_and_its_age(tick):
-    mod, db = tick
-    with db.cursor() as cur:
-        cur.execute("CREATE TABLE cron_retry (task_type TEXT PRIMARY KEY, first_blocked_at DOUBLE PRECISION)")
-        cur.execute("INSERT INTO cron_retry VALUES ('analysis', %s)", (time.time() - 14 * 60,))
-        cur.execute(f"UPDATE {P}reconcile_control SET mode='waiting', reason='yield:cron_retry:analysis', "
-                    "cron_expr='17 * * * *'")
-    db.commit()
-    status = reconcile.yield_status(db)
-    assert status["waiting_for"] == "cron_retry:analysis"
-    assert status["refused"] == [("analysis", pytest.approx(14 * 60, abs=5))]
-
-
-def test_without_cron_retry_the_yield_line_has_no_refusals(tick):
-    mod, db = tick
-    assert reconcile.yield_status(db)["refused"] is None
-
-
-def test_the_panel_renders_throughput_eta_and_the_yield(tick, monkeypatch):
+def test_the_panel_renders_throughput_and_eta(tick, monkeypatch):
     mod, db = tick
     _summary(db, ready=1000, total=1500)
     _event(db, "profile_backfill", 10, ready=250)
@@ -120,31 +100,42 @@ def test_the_panel_renders_throughput_eta_and_the_yield(tick, monkeypatch):
     assert "At 4 at once: about 1.1 hours" in body  # 2.0 h x 1.86 / 3.38
 
 
-@pytest.mark.parametrize("state", ["working", "yielded", "idle", "paused"])
-def test_the_panel_renders_in_every_state_and_stays_accessible(tick, monkeypatch, state):
+@pytest.mark.parametrize(("state", "server_line"), [
+    ("working", "<strong>Server</strong>: working: profile backfill."),
+    ("waiting_host", "<strong>Server</strong>: stepping aside: waiting for AudioMuse’s main analysis."),
+    ("idle", "<strong>Server</strong>: idle: nothing due."),
+    ("paused", "<strong>Server</strong>: paused by the administrator."),
+    ("stopped", "<strong>Server</strong>: not running (last seen 10 minutes ago)."),
+])
+def test_the_panel_renders_in_every_state_and_stays_accessible(tick, monkeypatch, state, server_line):
     from test_lumae_analysis import _a11y_lint
 
     mod, db = tick
     _summary(db, ready=1000, total=1500)
     _event(db, "profile_backfill", 10, ready=250)
-    mode, reason = {"working": ("active", "work_ready"), "yielded": ("waiting", "yield:cron_retry:analysis"),
-                    "idle": ("idle", "no_work"), "paused": ("paused", "maintenance")}[state]
+    mode, reason, action = {
+        "working": ("working", "light_lane", "profile_backfill"),
+        "waiting_host": ("waiting_host", "audiomuse:main_analysis", None),
+        "idle": ("idle", "nothing_due", None),
+        "paused": ("paused", "maintenance_paused", None),
+        "stopped": ("idle", "nothing_due", None),
+    }[state]
+    seen = "now() - interval '10 minutes'" if state == "stopped" else "now()"
     with db.cursor() as cur:
-        cur.execute(f"UPDATE {P}reconcile_control SET mode=%s, reason=%s, cron_expr='17 * * * *'",
-                    (mode, reason))
+        cur.execute(f"INSERT INTO {P}runner_state (role, host, pid, mode, reason, current_action, "
+                    f"actions, heartbeat_at) VALUES ('server', 'web-1', 7, %s, %s, %s, 3, {seen})",
+                    (mode, reason, action))
         if state == "working":
             cur.execute(f"INSERT INTO {P}reconcile_events (action, status, phase) "
                         "VALUES ('profile_backfill', 'running', 'analyzing volume and ramps')")
-        if state == "yielded":
-            cur.execute("CREATE TABLE cron_retry (task_type TEXT PRIMARY KEY, first_blocked_at DOUBLE PRECISION)")
-            # Mid-way through "2 minutes": the age is PostgreSQL's now() minus
-            # this machine's clock, and 120 s sat on the edge of "1 minute".
-            cur.execute("INSERT INTO cron_retry VALUES ('analysis', %s)", (time.time() - 150,))
     db.commit()
 
     body = settings_render.render_reconcile_status_panel()
 
     assert "Throughput" in body and "250 in the last hour" in body
-    assert ("analysis (refused 2 minutes ago)" in body) == (state == "yielded")
+    text = " ".join(body.split())
+    assert server_line in text
+    assert "<strong>Worker</strong>: no worker has run Lumae’s worker runner yet." in text
+    assert f'data-lumae-active="{str(state == "working").lower()}"' in body
     # The page's live region is elsewhere; the panel adds no other violation.
     assert [v for v in _a11y_lint(body) if "aria-live" not in v] == []

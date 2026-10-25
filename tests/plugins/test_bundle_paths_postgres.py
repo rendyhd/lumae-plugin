@@ -20,6 +20,7 @@ import types
 
 import pytest
 
+from runner_helpers import turn
 from test_analysis_bundle import _write
 from test_reconcile_scheduler_postgres import (  # noqa: F401  (fixtures)
     P, SOURCE, SERVER, _queued_backfill, _rows, _track, tick,
@@ -37,7 +38,7 @@ def _stop_workers_at_end():
 
 @pytest.fixture
 def library(tick, monkeypatch, tmp_path):
-    """The tick with edges on; downloads hand out a copy of ``library.source``."""
+    """A runner turn with edges on; downloads hand out a copy of ``library.source``."""
     mod, db = tick
     state = types.SimpleNamespace(mod=mod, db=db, downloads=[], tags=[], tmp=tmp_path,
                                   source=_write(tmp_path / "song.flac", seconds=8.0))
@@ -55,7 +56,6 @@ def library(tick, monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "edge_scheduling_allowed", lambda: True)
     monkeypatch.setattr(mod.file_tags, "capture", lambda db, source, track, path: state.tags.append(
         (track, path)))
-    monkeypatch.setattr(mod, "enqueue_bounded", lambda *a, **k: pytest.fail("a root task per track"))
     return state
 
 
@@ -76,7 +76,7 @@ def test_one_download_per_track_makes_all_three(library, monkeypatch, workers):
     _queued_backfill(db)
     monkeypatch.setattr(mod, "background_workers", lambda: workers)
 
-    mod.catalog_reconcile_task()
+    turn(mod)
 
     assert _rows(db, f"SELECT DISTINCT status FROM {P}source_profiles") == [("ready",)]
     assert _edges(db) == [(name,) for name in names]
@@ -93,7 +93,7 @@ def test_a_surround_file_gets_its_waveform_an_unsupported_edge_and_loudness(libr
     _track(db, "track-71")
     _queued_backfill(db)
 
-    mod.catalog_reconcile_task()
+    turn(mod)
 
     assert _rows(db, f"SELECT status FROM {P}source_profiles") == [("ready",)]
     [(status, reason)] = _rows(db, f"SELECT status, last_error FROM {P}edge_profile_jobs")
@@ -116,7 +116,7 @@ def test_edges_off_makes_the_waveform_only(library, monkeypatch):
     monkeypatch.setattr(mod, "run_file_analysis", lambda analyzer, path, **kw: (
         analysed.append(analyzer.__name__), real(analyzer, path, **kw))[1])
 
-    mod.catalog_reconcile_task()
+    turn(mod)
 
     assert analysed == ["analyze_file"]
     assert _edges(db) == [] and _loudness(db) == []
@@ -222,7 +222,7 @@ def test_without_credentials_the_host_downloads(own_download):
     assert fetched == [] and hosted == ["track-a"] and info["file_path"].endswith("hosted.flac")
 
 
-def test_a_refused_download_falls_back_to_the_host_for_the_rest_of_the_tick(own_download, monkeypatch):
+def test_a_refused_download_falls_back_to_the_host_for_a_while(own_download, monkeypatch):
     mod, _fetched, hosted, configure = own_download
     configure({"u": "lumae", "t": "token", "s": "salt"})
     attempts = []
@@ -236,6 +236,11 @@ def test_a_refused_download_falls_back_to_the_host_for_the_rest_of_the_tick(own_
         mod.load_track_file("track-a", catalog_instance_id=SOURCE, server_id=SERVER)
 
     assert attempts == [1] and hosted == ["track-a", "track-a"]
+
+    # After OWN_DOWNLOAD_RETRY_SECONDS Lumae tries its own download again.
+    mod._own_download_refused[SOURCE] -= mod.OWN_DOWNLOAD_RETRY_SECONDS
+    mod.load_track_file("track-a", catalog_instance_id=SOURCE, server_id=SERVER)
+    assert attempts == [1, 1] and hosted == ["track-a"] * 3
 
 
 def test_a_parallel_pass_defers_the_fetch_to_the_analysis_thread(own_download):

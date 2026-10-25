@@ -45,7 +45,7 @@ def retry_after(value, fallback=60):
 class Client:
     def __init__(self, db, allowed=lambda: True, http=None, sleep=time.sleep, reserve_request=None,
                  deadline=None):
-        """``deadline``: a watchdog tick's (``time.monotonic()``); the turn defers
+        """``deadline``: a runner slice's (``time.monotonic()``); the turn defers
         before an uncached request past it and resumes from the cache."""
         self.db, self.allowed = db, allowed
         self.http, self.sleep = http or requests.Session(), sleep

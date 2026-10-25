@@ -1,17 +1,17 @@
-"""A catalogue refresh an app asks for is never lost to a busy queue (SQ.1).
+"""A catalogue refresh an app asks for is never lost (SQ.1, runner plan R6).
 
 Auralscape RCA 2026-10-24 (docs/new-song-sync-and-queue-end-rca-2026-10-24.md):
-AudioMuse refuses a plugin task while another queue job runs, the refresh API
+AudioMuse refused a plugin task while another queue job ran, the refresh API
 let that refusal out as a 409, and the phone read the old catalogue twice. A
 refresh that published a new song also never projected its analysis, so the
 phone got the song without an embedding.
 
-* The refresh API keeps a refused refresh (``refresh_wanted_at``), answers
-  202 ``deferred`` and arms the watchdog; the tick runs it once the queue is
-  free, one a tick, and not while a refresh task is on the queue.
-* A refresh task already on the queue serves a new request (``coalesced``).
-* A finished scan serves every request made before it started, whichever
-  path ran it; a request made during the scan is kept.
+* The refresh API keeps every request (``refresh_wanted_at``), answers 202
+  ``queued`` and wakes the runners; the server runner refreshes, not while a
+  refresh task an older version queued is on AudioMuse's queue, and not
+  while AudioMuse rewrites track IDs. AudioMuse's analysis does not hold it.
+* A finished scan serves every request made before it started; a request
+  made during the scan is kept.
 * A refresh that changed the catalogue projects the analysis inline.
 """
 import importlib
@@ -19,6 +19,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from runner_helpers import turn
 from test_lumae_analysis import load_plugin, plugin_client
 
 
@@ -26,12 +27,6 @@ P = "plugin_lumae_analysis__"
 SOURCE = "catalog-a"
 SERVER = "server-a"
 REFRESH_TASK = "plugin.audiomuse_plugins.lumae_analysis.catalog_refresh_task"
-
-
-class HostBusy(Exception):
-    """AudioMuse's refusal: another root task is running."""
-
-    code = 1201
 
 
 def _rows(db, sql, params=()):
@@ -90,10 +85,14 @@ def plugin(migrated_db, monkeypatch):
 
 @pytest.fixture
 def tick(plugin, monkeypatch):
-    """The real tick; actions this module does not exercise report no work."""
+    """A server runner's turn; actions this module does not exercise report no work."""
     mod, db = plugin
+    monkeypatch.setattr(mod.runner, "PAUSE_SECONDS", 0)
+    monkeypatch.setattr(mod, "_runner_bookkeeping", lambda db: None)
+    monkeypatch.setattr(mod, "_safe_claim_collection_retention", lambda db: False)
+    monkeypatch.setattr(mod, "_safe_claim_identity_recheck", lambda db, server_id: None)
     monkeypatch.setattr(mod, "report_edge_runtime", lambda *args, **kwargs: None)
-    monkeypatch.setattr(mod, "serve_deferred_interactive", lambda *args, **kwargs: 0)
+    monkeypatch.setattr(mod, "serve_interactive", lambda *args, **kwargs: 0)
     monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
     for name in ("next_settled_analysis_run", "next_preparation_run", "next_relationship_run",
                  "next_profile_backfill_run"):
@@ -141,71 +140,25 @@ def _refresh(client):
     )
 
 
-def test_a_refused_refresh_is_kept_and_answered_deferred(plugin, monkeypatch):
+def test_a_refresh_request_is_kept_and_answered_queued(plugin):
     mod, db = plugin
-
-    def refuse(*_args, **_kwargs):
-        raise HostBusy("Another queue job (main_analysis) is still running.")
-
-    monkeypatch.setattr(mod, "enqueue", refuse)
 
     response = _refresh(plugin_client(mod))
 
     assert response.status_code == 202
-    body = response.get_json()
-    assert (body["status"], body["reason"]) == ("deferred", "host_busy")
-    assert response.headers["Retry-After"] == "60"
+    assert response.get_json() == {"status": "queued", "server_id": SERVER,
+                                   "catalog_instance_id": SOURCE}
+    assert "Retry-After" not in response.headers
     assert _wanted_at(db) is not None
-    # The watchdog is armed for it, and counts it as work.
-    assert _rows(db, f"SELECT reason FROM {P}reconcile_control")[0][0] == "catalog_refresh_wanted"
-    assert _reconcile().reconcile_schedule_from_state(db)["mode"] == "active"
 
 
-def test_a_second_refusal_keeps_the_first_request_time(plugin, monkeypatch):
+def test_a_second_request_keeps_the_first_request_time(plugin):
     mod, db = plugin
     _want(db, age_minutes=10)
     first = _wanted_at(db)
-    monkeypatch.setattr(mod, "enqueue", lambda *_a, **_k: (_ for _ in ()).throw(HostBusy()))
 
-    assert _refresh(plugin_client(mod)).get_json()["status"] == "deferred"
+    assert _refresh(plugin_client(mod)).get_json()["status"] == "queued"
     assert _wanted_at(db) == first
-
-
-def test_a_refresh_task_on_the_queue_serves_a_new_request(plugin, monkeypatch):
-    mod, db = plugin
-    _live_refresh_task(db, status="NEW")
-    monkeypatch.setattr(mod, "enqueue", lambda *_a, **_k: pytest.fail("one refresh is enough"))
-
-    response = _refresh(plugin_client(mod))
-
-    assert response.status_code == 202
-    assert response.get_json() == {
-        "status": "queued", "coalesced": True,
-        "server_id": SERVER, "catalog_instance_id": SOURCE,
-    }
-    assert _wanted_at(db) is None
-
-
-def test_a_kept_request_is_queued_directly_once_the_queue_takes_it(plugin, monkeypatch):
-    mod, db = plugin
-    _want(db, age_minutes=3)
-    queued = []
-    monkeypatch.setattr(mod, "enqueue", lambda func, *args, **_kwargs: queued.append(args))
-
-    response = _refresh(plugin_client(mod))
-
-    assert response.status_code == 202 and response.get_json()["status"] == "queued"
-    assert queued == [(SERVER,)]
-    # Kept until a scan serves it.
-    assert _wanted_at(db) is not None
-
-
-def test_another_enqueue_failure_is_not_kept(plugin, monkeypatch):
-    mod, db = plugin
-    monkeypatch.setattr(mod, "enqueue", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("x")))
-
-    assert _refresh(plugin_client(mod)).status_code == 500
-    assert _wanted_at(db) is None
 
 
 def test_a_finished_scan_serves_requests_made_before_it_started_only(plugin):
@@ -296,28 +249,28 @@ def _events(db):
     return _rows(db, f"SELECT action, status FROM {P}reconcile_events ORDER BY event_id")
 
 
-def test_the_tick_runs_a_kept_refresh_once_the_queue_is_free(tick, refresh_task):
+def test_the_runner_refreshes_a_kept_request(tick, refresh_task):
     mod, db, calls = refresh_task
     calls["changes"] = 1
     _want(db, age_minutes=5)
 
-    result = mod.catalog_reconcile_task()
+    result, actions = turn(mod)
 
-    assert result["status"] == "processed"
+    assert result.worked and [entry["action"] for entry in actions] == ["catalog_refresh"]
     assert calls["refresh"] == 1 and calls["projection"] == [SERVER]
     assert _wanted_at(db) is None
     assert ("catalog_refresh", "success") in _events(db)
-    # Served: the next tick has nothing to refresh.
-    assert mod.catalog_reconcile_task()["status"] == "current"
+    # Served: the next turn has nothing to refresh.
+    assert turn(mod)[0].worked is False
     assert calls["refresh"] == 1
 
 
-def test_the_tick_leaves_a_kept_refresh_to_a_refresh_task_on_the_queue(tick, refresh_task):
+def test_the_runner_leaves_a_kept_refresh_to_an_older_versions_queued_refresh(tick, refresh_task):
     mod, db, calls = refresh_task
     _want(db, age_minutes=5)
     _live_refresh_task(db)
 
-    mod.catalog_reconcile_task()
+    turn(mod)
 
     assert calls["refresh"] == 0 and _wanted_at(db) is not None
 
@@ -329,18 +282,30 @@ def test_a_failed_kept_refresh_is_journaled_and_left_to_the_repair(tick, refresh
     monkeypatch.setattr(mod, "refresh_catalog",
                         lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("navidrome down")))
 
-    mod.catalog_reconcile_task()
+    turn(mod)
 
     assert ("catalog_refresh", "failed") in _events(db)
     assert _wanted_at(db) is None
 
 
-def test_the_tick_waits_out_a_main_job_before_a_kept_refresh(tick, refresh_task):
+def test_audiomuse_analysing_does_not_hold_a_kept_refresh(tick, refresh_task):
     mod, db, calls = refresh_task
     _want(db, age_minutes=5)
     with db.cursor() as cur:
         cur.execute("INSERT INTO task_status VALUES ('main', NULL, 'main_analysis', 'RUNNING')")
     db.commit()
 
-    assert mod.catalog_reconcile_task()["status"] == "yielded"
+    assert turn(mod)[0].worked
+    assert calls["refresh"] == 1 and _wanted_at(db) is None
+
+
+def test_the_runner_waits_out_a_cleaning_before_a_kept_refresh(tick, refresh_task):
+    mod, db, calls = refresh_task
+    _want(db, age_minutes=5)
+    with db.cursor() as cur:
+        cur.execute("INSERT INTO task_status VALUES ('clean', NULL, 'cleaning', 'RUNNING')")
+    db.commit()
+
+    result, _actions = turn(mod)
+    assert (result.mode, result.reason) == ("waiting_host", "audiomuse:cleaning")
     assert calls["refresh"] == 0 and _wanted_at(db) is not None

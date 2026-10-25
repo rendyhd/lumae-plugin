@@ -225,7 +225,7 @@ def test_catalog_revision_rearms_completed_repair(edge_publication_db, monkeypat
     _backfill_state(db)
     _track(db, "retry-catalog-repair", "revision-b")
     assert eligible("retry-catalog-repair")
-    monkeypatch.setattr(mod, "arm_reconcile", lambda *_args: None)
+    monkeypatch.setattr(mod, "wake_runners", lambda *_args, **_kwargs: None)
     assert mod.wake_profile_backfill_after_catalog_refresh({
         "catalog_instance_id": SOURCE, "server_id": "server-a", "changes": 1,
     }, db=db)["queued"]
@@ -236,7 +236,7 @@ def test_running_batch_keeps_concurrent_catalog_wake(edge_publication_db, monkey
     db = edge_publication_db
     mod = load_plugin()
     _backfill_state(db, "running")
-    monkeypatch.setattr(mod, "arm_reconcile", lambda *_args: None)
+    monkeypatch.setattr(mod, "wake_runners", lambda *_args, **_kwargs: None)
     assert mod.wake_profile_backfill_after_catalog_refresh({
         "catalog_instance_id": SOURCE, "server_id": "server-a", "changes": 1,
     }, db=db) is True
@@ -263,7 +263,7 @@ def test_due_boundary_cannot_complete_workflow(edge_publication_db, monkeypatch)
 def test_due_retry_runs_through_claim_and_publication(edge_publication_db, monkeypatch):
     db = edge_publication_db
     mod = load_plugin()
-    monkeypatch.setattr(mod, "arm_reconcile", lambda *_args: None)
+    monkeypatch.setattr(mod, "wake_runners", lambda *_args, **_kwargs: None)
     _track(db, "retry-actual")
     fail(db, "retry-actual")
     _backfill_state(db, "queued")
@@ -302,7 +302,7 @@ def test_interactive_only_claim_arms_stale_recovery(edge_publication_db, monkeyp
     mod = load_plugin()
     _track(db, "retry-hook-crash")
     _backfill_state(db, "complete")
-    monkeypatch.setattr(mod, "arm_reconcile", lambda *_args: None)
+    monkeypatch.setattr(mod, "wake_runners", lambda *_args, **_kwargs: None)
     token = mod.mark_pending(["retry-hook-crash"], SOURCE, priority="interactive")["retry-hook-crash"]
     with db.cursor() as cur:
         cur.execute("SELECT status,next_retry_at FROM plugin_lumae_analysis__profile_backfill_state WHERE catalog_instance_id=%s", (SOURCE,))

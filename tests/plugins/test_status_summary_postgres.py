@@ -35,6 +35,7 @@ from test_lumae_analysis import (  # noqa: E402  (installs the plugin.api host s
     plugin_client,
 )
 
+from runner_helpers import turn  # noqa: E402
 from plugin.api import table  # noqa: E402
 from plugins.LumaeAnalysis import (  # noqa: E402
     catalog,
@@ -1117,7 +1118,26 @@ def test_settings_waveform_counts_are_a_committed_snapshot(migrated_db, host, mo
     assert {key: value for key, value in snapshot.items() if key != "counted_at"} == live()
 
 
-def test_the_watchdog_tick_and_catalogue_cron_refresh_the_waveform_snapshot(
+def _quiet_runner(mod, monkeypatch, db):
+    """A server runner's turn with nothing else to do: what follows a turn
+    (the waveform snapshot, P2-1) is what these tests read."""
+    with db.cursor() as cur:
+        assert mod.runner.claim_mark(cur, "collection_retention", 0)  # today's ran
+    db.commit()
+    monkeypatch.setattr(mod, "_runner_bookkeeping_at", None)
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "serve_interactive", lambda *_args, **_kwargs: 0)
+    monkeypatch.setattr(mod, "_safe_metadata_reconcile", lambda *_args, **_kwargs: None)
+
+
+def _idle_turn(mod):
+    mod._runner_bookkeeping_at = None  # restored by _quiet_runner's monkeypatch
+    result, _actions = turn(mod)
+    return not result.worked
+
+
+def test_a_runner_turn_and_the_catalogue_refresh_refresh_the_waveform_snapshot(
     migrated_db, host, monkeypatch
 ):
     mod = load_plugin()
@@ -1132,9 +1152,9 @@ def test_the_watchdog_tick_and_catalogue_cron_refresh_the_waveform_snapshot(
         monkeypatch.setattr(mod, name, lambda db=None, server_id=None: None)
     monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
     monkeypatch.setattr(mod, "_safe_credits_reconcile", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(mod, "_safe_reconcile_schedule", lambda *_args, **_kwargs: None)
+    _quiet_runner(mod, monkeypatch, db)
 
-    assert mod.catalog_reconcile_task()["status"] == "current"
+    assert _idle_turn(mod)
     assert status_model.profile_counts(db, current_source(db))["ready_current"] == 1
     db.commit()
 
@@ -1516,7 +1536,7 @@ def test_a_newer_waveform_snapshot_is_never_replaced(migrated_db, host, monkeypa
     db.commit()
 
 
-def test_the_watchdog_tick_summarizes_unsummarized_publications(migrated_db, host, monkeypatch):
+def test_a_runner_turn_summarizes_unsummarized_publications(migrated_db, host, monkeypatch):
     mod = load_plugin()
     db = migrated_db
     monkeypatch.setattr(mod, "get_db", lambda: db)
@@ -1527,7 +1547,7 @@ def test_the_watchdog_tick_summarizes_unsummarized_publications(migrated_db, hos
         monkeypatch.setattr(mod, name, lambda db=None, server_id=None: None)
     monkeypatch.setattr(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
     monkeypatch.setattr(mod, "_safe_credits_reconcile", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(mod, "_safe_reconcile_schedule", lambda *_args, **_kwargs: None)
+    _quiet_runner(mod, monkeypatch, db)
     publish(db, set(range(6)))
     host.map({0: 0, 1: 1})
     host.analyse([0, 1])
@@ -1544,26 +1564,26 @@ def test_the_watchdog_tick_summarizes_unsummarized_publications(migrated_db, hos
     db.commit()
     assert summary["links"] is None and summary["coverage"] is None
 
-    assert mod.catalog_reconcile_task()["status"] == "current"
+    assert _idle_turn(mod)
     summary = status_model.read_summary(db, source)
     db.commit()
     assert summary["links"] is not None and summary["coverage"] is not None
     assert_equivalent(db, monkeypatch)
 
     # Only the server changed; the link summary and the coverage generation
-    # are current. The tick still recounts it.
+    # are current. The turn still recounts it.
     with db.cursor() as cur:
         cur.execute(f"UPDATE {P}status_summary SET coverage_server_id='legacy-default'")
         cur.execute(f"SELECT summary_generation = projection_generation FROM {P}analysis_state")
         assert cur.fetchone()[0] is True
     db.commit()
     assert _coverage_row(db)[0] == source["catalog"]["generation"]
-    assert mod.catalog_reconcile_task()["status"] == "current"
+    assert _idle_turn(mod)
     assert _coverage_row(db)[1] == SERVER
     assert_equivalent(db, monkeypatch)
 
     # Only active sources are counted: readiness stops at a pending rebind,
-    # and the tick does not count coverage that nothing reads.
+    # and the turn does not count coverage that nothing reads.
     with db.cursor() as cur:
         cur.execute(f"UPDATE {P}catalog_sources SET rebind_status='rebind_required'")
         cur.execute(f"DELETE FROM {P}status_summary")
@@ -1577,7 +1597,7 @@ def test_the_watchdog_tick_summarizes_unsummarized_publications(migrated_db, hos
 
     db.cursor_factory = Recording
     try:
-        assert mod.catalog_reconcile_task()["status"] == "current"
+        assert _idle_turn(mod)
     finally:
         db.cursor_factory = None
     assert statements

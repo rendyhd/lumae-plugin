@@ -521,6 +521,6 @@ def test_the_analysis_hook_and_profile_download_capture_tags(monkeypatch, tmp_pa
     monkeypatch.setattr(mod, "resolve_profile_source",
                         lambda **_kwargs: {"catalog_instance_id": "catalog-a"})
     monkeypatch.setattr(mod, "published_profile_current", lambda *args: True)
-    monkeypatch.setattr(mod, "serve_deferred_interactive", lambda **_kwargs: None)
+    monkeypatch.setattr(mod, "serve_interactive", lambda **_kwargs: None)
     mod.analyze_song_hook({"item_id": "track-b", "audio_path": str(audio)})
     assert seen == [("catalog-a", "track-b", str(audio))]

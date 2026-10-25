@@ -10,9 +10,9 @@ time.
 Host limits. AudioMuse puts no wall-clock limit on a plugin task. RQ-era hosts
 enqueued plugin tasks with an RQ ``job_timeout`` of -1 ("no timeout"). The
 database task queue that replaced RQ (AudioMuse bd23c90f6, 2026-08-06, and
-still at 8aa1639c) has no per-task timeout at all, which is why
-``enqueue_bounded`` discards its ``timeout`` argument. This limit is the only
-wall-clock bound on one file. A host cancel still ends the child: the child
+still at 8aa1639c) has no per-task timeout at all, and Lumae's runners
+(1.9.0) run outside the queue. This limit is the only wall-clock bound on
+one file. A host cancel still ends the child: the child
 stays in the job's process group, which the host's cancel kills, and it dies
 with its parent (``PR_SET_PDEATHSIG`` on Linux, a parent watchdog elsewhere).
 
@@ -44,7 +44,7 @@ diagnostics:
   pooled worker is reused only by the thread that started it, because its
   ``PR_SET_PDEATHSIG`` fires when that thread exits; a call made while another
   thread uses it gets a one-off worker. A thread inside ``dedicated_worker``
-  (the parallel analysis threads of a reconcile tick, performance plan WP1b)
+  (the parallel analysis threads of a runner turn, performance plan WP1b)
   has its own worker instead, reused for every file it analyses until it
   leaves, at a lower CPU priority; another thread can ``cancel`` its file,
   which kills the worker and raises ``AnalysisCancelled`` in the thread. Its

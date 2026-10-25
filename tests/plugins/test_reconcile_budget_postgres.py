@@ -1,29 +1,24 @@
-"""A time-boxed watchdog tick that runs several actions (plan S2).
+"""Each runner action in a slice of its own (runner plan R3; scheduler plan S2).
 
-AUD-13, AUD-16, AUD-17, AUD-19, AUD-20: one action per tick and no bound on
-its wall-clock time (8-minute ticks, 81 s edge passes against 30 s, 160
-MusicBrainz requests per credits turn) meant a tick could cover the next
-minute's host fire, and minute cadence lasted far longer than the work.
+AUD-13, AUD-16, AUD-17, AUD-19, AUD-20: one action without a bound on its
+wall-clock time (8-minute ticks, 81 s edge passes against 30 s, 160
+MusicBrainz requests per credits turn) held everything behind it.
 
-* The tick works for TICK_BUDGET_SECONDS over as many actions as fit; an
-  action starts only when its recent average fits in what is left, and the
-  first always starts. Each action stops at the deadline itself: the
-  waveform batch starts no track after it, the edge pass checks it before
-  every track (the first too), the relationship build gets what is left,
-  and a credits or MusicBrainz turn defers before an uncached request past
-  it and resumes from the cache.
+* A turn runs as many actions as are due, each with RUNNER_SLICE_SECONDS from
+  when it is chosen. Each action stops at its deadline itself: the waveform
+  batch starts no track after it, the edge pass checks it before every
+  track (the first too), the relationship build gets the slice, and a
+  credits or MusicBrainz turn defers before an uncached request past it and
+  resumes from the cache.
 * Credits' before-background share is measured from the end of a turn.
-* With several media servers the host calls the tick once per server in one
-  task; the first call does the work, later ones return at once.
 """
-import sys
 import time
 from types import SimpleNamespace
 
-import pytest
 
-from test_lumae_analysis import load_plugin, lumae_postgres_db  # noqa: F401
+from test_lumae_analysis import lumae_postgres_db  # noqa: F401
 from test_credits import credits_db, uid  # noqa: F401
+from runner_helpers import turn
 from test_reconcile_scheduler_postgres import (  # noqa: F401
     P, SOURCE, SERVER, _events, _queued_backfill, _rows, _track, tick,
 )
@@ -31,11 +26,10 @@ from plugins.LumaeAnalysis import credits_musicbrainz as mb  # noqa: E402
 from plugins.LumaeAnalysis import credits_service as service  # noqa: E402
 from plugins.LumaeAnalysis import credits_store as store  # noqa: E402
 from plugins.LumaeAnalysis import edge_profile_store  # noqa: E402
-from plugins.LumaeAnalysis import reconcile  # noqa: E402
 
 
-def _budget(monkeypatch, seconds):
-    monkeypatch.setattr(reconcile, "TICK_BUDGET_SECONDS", seconds)
+def _slice(mod, monkeypatch, seconds):
+    monkeypatch.setattr(mod, "RUNNER_SLICE_SECONDS", seconds)
 
 
 def _slow_tracks(mod, monkeypatch, seconds):
@@ -84,75 +78,29 @@ def _credits_turn(mod, monkeypatch, seconds):
     return turns
 
 
-def test_a_tick_runs_several_actions_and_ends_within_its_budget_plus_one_item(
-    tick, monkeypatch,
-):
+def test_a_turn_runs_every_due_action_each_in_a_slice_of_its_own(tick, monkeypatch):
     mod, db = tick
-    _budget(monkeypatch, 3)
+    _slice(mod, monkeypatch, 1)
     for index in range(10):
         _track(db, f"track-{index:02d}")
     _queued_backfill(db)
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 10)
-    started_tracks = _slow_tracks(mod, monkeypatch, 0.4)
+    started_tracks = _slow_tracks(mod, monkeypatch, 0.3)
     budgets = _relationship_steps(mod, monkeypatch, steps=2, seconds=0.3)
     turns = _credits_turn(mod, monkeypatch, 0.2)
 
-    began = time.monotonic()
-    result = mod.catalog_reconcile_task()
-    elapsed = time.monotonic() - began
+    _result, actions = turn(mod)
 
-    assert [entry["action"] for entry in result["actions"]] == [
-        "credits", "relationships", "profile_backfill"]
-    assert [entry["runs"] for entry in result["actions"]] == [1, 2, 1]
-    # Ended within the budget plus one track (and the tick's bookkeeping).
-    assert elapsed < 3 + 0.4 + 0.5, elapsed
-    assert 2 <= len(started_tracks) < 10
-    batch = [summary for action, _s, _p, summary in _events(db) if action == "profile_backfill"]
-    assert batch[0]["deferred"] == 10 - len(started_tracks)
-    # Each action got what was left of the budget, not a fixed allowance.
+    assert [entry["action"] for entry in actions] == ["credits", "relationships", "profile_backfill"]
+    assert [entry["runs"] for entry in actions][:2] == [1, 2]
+    # Each action had a slice of its own from when it was chosen.
     assert turns[0] is not None
-    assert 2 < budgets[0] < 3 and budgets[1] < budgets[0]
-    # The tracks not started are due again at once, uncounted.
-    unstarted = sorted(set(f"track-{index:02d}" for index in range(10)) - set(started_tracks))
-    assert sorted(mod.find_backfill_ids(25, catalog_instance_id=SOURCE, server_id=SERVER,
-                                        include_failed=False)) == unstarted
-    assert _rows(db, f"SELECT DISTINCT retry_count FROM {P}source_profiles "
-                     "WHERE track_id = ANY(%s)", (unstarted,)) == [(0,)]
-
-
-def test_an_action_whose_recent_average_does_not_fit_is_not_started(tick, monkeypatch):
-    mod, db = tick
-    _budget(monkeypatch, 2)
-    for index in range(2):
-        _track(db, f"track-{index}")
-    _queued_backfill(db)
-    started_tracks = _slow_tracks(mod, monkeypatch, 0.05)
-    budgets = _relationship_steps(mod, monkeypatch, steps=1, seconds=0.1)
-    _credits_turn(mod, monkeypatch, 0.2)
-    for _ in range(3):
-        reconcile.record_event(db, "relationships", SERVER, SOURCE, "deferred",
-                               phase="relationship build checkpointed", duration_ms=5000)
-
-    result = mod.catalog_reconcile_task()
-
-    # Credits went first; a 5 s relationship step does not fit in what was
-    # left of 2 s, and the waveform batch (no history) does.
-    assert [entry["action"] for entry in result["actions"]] == ["credits", "profile_backfill"]
-    assert budgets == [] and len(started_tracks) == 2
-
-
-def test_the_first_action_starts_whatever_its_average(tick, monkeypatch):
-    mod, db = tick
-    _budget(monkeypatch, 2)
-    budgets = _relationship_steps(mod, monkeypatch, steps=1, seconds=0.1)
-    for _ in range(3):
-        reconcile.record_event(db, "relationships", SERVER, SOURCE, "deferred",
-                               phase="relationship build checkpointed", duration_ms=50000)
-
-    result = mod.catalog_reconcile_task()
-
-    assert [entry["action"] for entry in result["actions"]] == ["relationships"]
-    assert len(budgets) == 1
+    assert all(0.9 < budget <= 1 for budget in budgets), budgets
+    # Each waveform batch started no track after its slice; the turn ran
+    # batches until the library was done.
+    batches = [summary for action, _s, _p, summary in _events(db) if action == "profile_backfill"]
+    assert len(batches) >= 2 and batches[0]["deferred"] > 0
+    assert sorted(started_tracks) == [f"track-{index:02d}" for index in range(10)]
 
 
 def _stored_v2_edges(db, tracks):
@@ -168,44 +116,42 @@ def _stored_v2_edges(db, tracks):
     db.commit()
 
 
-def test_the_stored_edge_v3_upgrade_is_one_turn_a_tick_and_reported(tick, monkeypatch):
-    """SF.3's upgrade batch goes after on-demand work, once a tick, within
-    EDGE_V3_UPGRADE_BUDGET_SECONDS or what is left; the tick goes on to other
-    work, and the next tick finds nothing to upgrade."""
+def test_the_stored_edge_v3_upgrade_is_one_batch_a_turn_and_journaled(tick, monkeypatch):
+    """SF.3's upgrade batch goes after on-demand work, once a turn, within
+    EDGE_V3_UPGRADE_BUDGET_SECONDS or its slice; the turn goes on to other
+    work, and the next turn finds nothing to upgrade."""
     mod, db = tick
     _stored_v2_edges(db, ["t1", "t2", "t3"])
     budgets = _relationship_steps(mod, monkeypatch, steps=1, seconds=0)
 
-    result = mod.catalog_reconcile_task()
+    _result, actions = turn(mod)
 
-    assert [(entry["action"], entry["runs"], entry["count"]) for entry in result["actions"]] == [
+    assert [(entry["action"], entry["runs"], entry["count"]) for entry in actions] == [
         ("edge_schema_v3", 1, 3), ("relationships", 1, 1)]
-    assert result["message"].startswith("Lumae: 3 edges upgraded to v3, 1 relationship step in ")
-    assert result["tracks_analyzed"] == 0
     [summary] = [summary for action, _s, _p, summary in _events(db) if action == "edge_schema_v3"]
     assert summary == {"status": "processed", "upgraded": 3, "flagged": 0}
     assert edge_profile_store.edge_schema_v3_ready(db) and len(budgets) == 1
 
-    result = mod.catalog_reconcile_task()
-    assert "edge_schema_v3" not in [entry["action"] for entry in result["actions"]]
+    _result, actions = turn(mod)
+    assert "edge_schema_v3" not in [entry["action"] for entry in actions]
 
 
-def test_the_stored_edge_v3_upgrade_gets_at_most_what_is_left_of_the_tick(tick, monkeypatch):
+def test_the_stored_edge_v3_upgrade_gets_at_most_its_slice(tick, monkeypatch):
     mod, db = tick
     _stored_v2_edges(db, ["t1"])
-    _budget(monkeypatch, 3)
+    _slice(mod, monkeypatch, 3)
     budgets = []
 
     def upgrade(_db, budget_seconds=None):
         budgets.append(budget_seconds)
-        return 1, 0  # more left: still one batch this tick
+        return 1, 0  # more left: still one batch this turn
 
     monkeypatch.setattr(mod, "upgrade_stored_edges", upgrade)
-    result = mod.catalog_reconcile_task()
-    assert [entry["action"] for entry in result["actions"]] == ["edge_schema_v3"]
+    _result, actions = turn(mod)
+    assert [entry["action"] for entry in actions] == ["edge_schema_v3"]
     assert len(budgets) == 1 and 2 < budgets[0] <= 3
-    _budget(monkeypatch, 60)
-    mod.catalog_reconcile_task()
+    _slice(mod, monkeypatch, 60)
+    turn(mod)
     assert budgets[1] == mod.EDGE_V3_UPGRADE_BUDGET_SECONDS
 
 
@@ -271,7 +217,7 @@ def test_the_edge_pass_stops_at_the_deadline_and_gives_each_track_what_is_left(
 
 def test_the_edge_pass_pages_on_until_the_deadline(tick, monkeypatch):
     """WP1a: no fixed 30 s and no 25-track cap; the pass reads the next page
-    from where it got to and works until the tick's deadline."""
+    from where it got to and works until its slice's deadline."""
     mod, db = tick
     _edge_library(db, [f"track-{index:02d}" for index in range(7)])
     monkeypatch.setattr(mod, "EDGE_BACKFILL_PAGE_SIZE", 3)
@@ -286,22 +232,6 @@ def test_the_edge_pass_pages_on_until_the_deadline(tick, monkeypatch):
     assert [tracks for tracks, _budget in runs] == [[f"track-{index:02d}"] for index in range(5)]
     assert result == {"status": "queued", "processed": 5, "ready": 5}
     assert _edge_pass(db) == ("queued", "track-04", 5)
-
-
-def test_an_elastic_action_starts_once_a_few_seconds_are_left_whatever_its_average():
-    """The waveform, edge and loudness passes take what is left of the tick,
-    so their average is a tick's share: one starts with ELASTIC_MIN_SECONDS
-    left, another action only when its whole average fits."""
-    averages = {"edge_backfill": 45000.0, "loudness_backfill": 2000.0, "relationships": 45000.0}
-    budget = reconcile.TickBudget(seconds=30, averages=averages)
-    budget.start()
-    assert budget.fits("edge_backfill") and budget.fits("loudness_backfill")
-    assert not budget.fits("relationships")
-    short = reconcile.TickBudget(seconds=reconcile.ELASTIC_MIN_SECONDS - 1, averages=averages)
-    short.start()
-    assert not short.fits("edge_backfill")
-    assert short.fits("loudness_backfill")  # its whole average fits
-    assert short.fits("profile_backfill")  # no history
 
 
 # ------------------------------------------------------------------- credits
@@ -350,7 +280,7 @@ def _due_now(db):
     db.commit()
 
 
-def test_a_credits_album_defers_at_the_tick_deadline_and_resumes_from_the_cache(
+def test_a_credits_album_defers_at_its_deadline_and_resumes_from_the_cache(
     credits_db, monkeypatch,
 ):
     db = credits_db
@@ -378,7 +308,7 @@ def test_a_credits_album_defers_at_the_tick_deadline_and_resumes_from_the_cache(
     assert _job(db)[0] == "unresolved"
 
 
-def test_a_cached_album_still_publishes_after_the_tick_deadline(credits_db, monkeypatch):
+def test_a_cached_album_still_publishes_after_its_deadline(credits_db, monkeypatch):
     """The deadline is checked before uncached requests only, never in
     run_one's final allowed() check, which would discard a finished album."""
     db = credits_db
@@ -417,53 +347,3 @@ def test_the_credits_share_is_measured_from_the_end_of_a_turn(credits_db, monkey
     [(last_work_at,)] = _rows(
         db, f"SELECT last_work_at FROM {P}credits_stream WHERE catalog_instance_id='c'")
     assert (last_work_at - claimed[0]).total_seconds() >= 1.0
-
-
-# ------------------------------------------------------------------ dispatch
-@pytest.fixture
-def dispatch(monkeypatch):
-    task = {"id": "task-1"}
-
-    def current_task_id():
-        if isinstance(task["id"], Exception):
-            raise task["id"]
-        return task["id"]
-
-    monkeypatch.setitem(sys.modules, "taskqueue", SimpleNamespace(current_task_id=current_task_id))
-    monkeypatch.setattr(load_plugin(), "_reconcile_dispatch_id", None)
-    return task
-
-
-def _scopes(mod, monkeypatch):
-    seen = []
-    monkeypatch.setattr(mod, "next_settled_analysis_run",
-                        lambda db=None, server_id=None: seen.append(server_id) or None)
-    return seen
-
-
-def test_a_second_per_server_call_in_one_dispatch_returns_at_once(tick, monkeypatch, dispatch):
-    mod, db = tick
-    seen = _scopes(mod, monkeypatch)
-
-    first = mod.catalog_reconcile_task()
-    # The first call works for every source, not only the bound server.
-    assert seen == [None] and first["status"] == "current"
-    monkeypatch.setattr(mod, "get_db", lambda: pytest.fail("a later call does no work"))
-    second = mod.catalog_reconcile_task()
-    assert (second["status"], second["message"]) == (
-        "same_dispatch", "Lumae: ran earlier in this task")
-    assert seen == [None]
-    # The next dispatch works again.
-    monkeypatch.setattr(mod, "get_db", lambda: db)
-    dispatch["id"] = "task-2"
-    assert mod.catalog_reconcile_task()["status"] == "current" and seen == [None, None]
-
-
-@pytest.mark.parametrize("task_id", [None, RuntimeError("no task context")])
-def test_without_a_task_id_each_call_ticks_for_its_server(tick, monkeypatch, dispatch, task_id):
-    mod, _db = tick
-    seen = _scopes(mod, monkeypatch)
-    dispatch["id"] = task_id
-    assert mod.catalog_reconcile_task()["status"] == "current"
-    assert mod.catalog_reconcile_task()["status"] == "current"
-    assert seen == [SERVER, SERVER]

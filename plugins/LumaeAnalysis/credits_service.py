@@ -11,7 +11,7 @@ from .credits_matching import extract_credits, MATCHING_VERSION
 from .credits_qualification import evaluate_audit
 from .credits_musicbrainz import Client, MusicBrainzDeferred, resolve
 from .catalog import resolve_catalog_source, CatalogScanError
-from .reconcile import arm_reconcile
+from .reconcile import wake_runners
 
 
 def capability():
@@ -53,7 +53,7 @@ def playback_pending(db):
 def run_one(catalog_id, *, db=None, client_factory=Client, critical=playback_pending,
             deadline=None, rechecks=True):
     """One album's turn. ``deadline`` bounds its uncached MusicBrainz requests
-    (a watchdog tick's); the final allowed() check never uses it, so a
+    (a runner slice's); the final allowed() check never uses it, so a
     finished album is published. ``rechecks`` lets it take a background
     re-check (W4)."""
     db = db or get_db()
@@ -95,8 +95,8 @@ def run_one(catalog_id, *, db=None, client_factory=Client, critical=playback_pen
                 "album_id": job["album_id"], "retry_seconds": delay}
 
 
-# The catalogues swept in the current reconcile tick (None outside one): a
-# tick asks for a credits turn up to twice and sweeps once (S8, AUD-19).
+# The catalogues swept in the current runner turn (None outside one): a
+# turn asks for a credits turn up to twice and sweeps once (S8, AUD-19).
 _tick_sweeps = None
 
 
@@ -116,7 +116,7 @@ def reconcile(db, server_id=None, before_background=False, deadline=None):
     Before background work a turn waits 300 s (120 s for a requested album)
     after the last one ended, and takes no background re-check: those run only
     after background work, when nothing else is ready (W4). Each source's next
-    page of albums is requested first, once per reconcile tick (``begin_tick``).
+    page of albums is requested first, once per runner turn (``begin_tick``).
     """
     if paused():
         return None
@@ -202,7 +202,7 @@ def register_routes(bp):
             count = sum(store.request_album(get_db(), catalog, value, priority=10) for value in dict.fromkeys(ids))
             if not ids:
                 count = store.sweep(get_db(), catalog)
-            arm_reconcile(get_db(), "credits_requested", commit=True)
+            wake_runners(get_db(), "credits_requested", commit=True)
             return {"catalog_instance_id": catalog, "status": "queued", "requested": count, "schema_version": 1}
         return invoke(prepare)
 

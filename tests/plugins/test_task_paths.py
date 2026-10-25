@@ -66,22 +66,25 @@ class RecordingCtx:
 # package's ``__init__.py`` re-export is enough) so already-persisted task
 # and cron rows keep resolving, then regenerate this list.
 EXPECTED_DOTTED_PATHS = {
-    "cron:analysis_projection": "plugins.LumaeAnalysis.analysis_projection_task",
-    "cron:catalog_reconcile": "plugins.LumaeAnalysis.catalog_reconcile_task",
-    "cron:collection_retention": "plugins.LumaeAnalysis.collection_retention_task",
-    "cron:catalog_refresh": "plugins.LumaeAnalysis.catalog_refresh_task",
-    "cron:provider_identity_recheck": "plugins.LumaeAnalysis.provider_identity_recheck_task",
     "on_flask_start": "plugins.LumaeAnalysis.flask_start",
     "on_install": "plugins.LumaeAnalysis.migrate",
     "on_song_analyzed": "plugins.LumaeAnalysis.analyze_song_hook",
     "on_worker_start": "plugins.LumaeAnalysis.worker_start",
 }
 
-# Jobs queued with ``enqueue`` (not registered: AudioMuse would list them as
-# schedulable). The worker imports a queued job by this dotted path, so the
-# same re-export rule applies.
+# Jobs an older version queued or scheduled. Since 1.9.0 Lumae queues none
+# (runner plan R8), but a job queued before the upgrade runs after it, and the
+# worker imports it by this dotted path, so the same re-export rule applies
+# for a release: 1.8.0's schedules, its own jobs and older versions' jobs.
 QUEUED_JOB_PATHS = {
+    "plugins.LumaeAnalysis.catalog_reconcile_task",
+    "plugins.LumaeAnalysis.catalog_refresh_task",
+    "plugins.LumaeAnalysis.provider_identity_recheck_task",
+    "plugins.LumaeAnalysis.analysis_projection_task",
+    "plugins.LumaeAnalysis.collection_retention_task",
     "plugins.LumaeAnalysis.prepare_lumae_task",
+    "plugins.LumaeAnalysis.analyze_tracks_task",
+    "plugins.LumaeAnalysis.analyze_edges_task",
     "plugins.LumaeAnalysis.profile_backfill_task",
     "plugins.LumaeAnalysis.edge_backfill_task",
     "plugins.LumaeAnalysis.relationship_preparation_task",
@@ -97,18 +100,14 @@ def test_queued_job_paths_resolve():
         assert f"{func.__module__}.{func.__qualname__}" == dotted
 
 
-def test_only_schedulable_tasks_are_registered():
+def test_no_task_or_schedule_is_registered():
+    # R8: the runners do Lumae's work outside AudioMuse's queue.
     mod = load_plugin()
     ctx = RecordingCtx()
 
     mod.register(ctx)
 
-    assert not [key for key in ctx.recorded if key.startswith("task:")]
-    assert {
-        f"plugin.lumae_analysis.{key[len('cron:'):]}"
-        for key in ctx.recorded
-        if key.startswith("cron:")
-    }.isdisjoint(mod.UNSCHEDULABLE_TASK_TYPES)
+    assert not [key for key in ctx.recorded if key.startswith(("task:", "cron:"))]
 
 
 def test_registered_task_and_hook_paths_resolve_and_are_pinned():
@@ -169,34 +168,3 @@ def test_extracted_modules_bind_the_package_they_were_loaded_from():
     finally:
         for key in [k for k in sys.modules if k == name or k.startswith(name + ".")]:
             del sys.modules[key]
-
-
-class DescribingCtx(RecordingCtx):
-    """A host whose add_cron_task takes the info tooltip text."""
-
-    def __init__(self):
-        super().__init__()
-        self.descriptions = {}
-
-    def add_cron_task(self, name, func, queue="default", description=None):
-        super().add_cron_task(name, func, queue)
-        self.descriptions[name] = description
-
-
-def test_each_scheduled_task_gets_an_info_tooltip_when_the_host_takes_one():
-    mod = load_plugin()
-    ctx = DescribingCtx()
-
-    mod.register(ctx)
-
-    assert set(ctx.descriptions) == {
-        "catalog_reconcile",
-        "catalog_refresh",
-        "provider_identity_recheck",
-        "analysis_projection",
-        "collection_retention",
-    }
-    for name, text in ctx.descriptions.items():
-        assert text and len(text) <= 300, name
-    assert "Yours to enable" in ctx.descriptions["catalog_refresh"]
-    assert "Managed by Lumae" in ctx.descriptions["catalog_reconcile"]

@@ -22,8 +22,8 @@ def api(lumae_postgres_db, monkeypatch):
     monkeypatch.setattr(mod, "collections_enabled", lambda: True)
     monkeypatch.setattr(meta, "paused", lambda: False)
     armed = []
-    # The watchdog control table belongs to the full migration (migrated_db).
-    monkeypatch.setattr(meta, "arm_reconcile", lambda _db, reason: armed.append(reason))
+    # The runners' wake belongs to the full plugin; record the reason instead.
+    monkeypatch.setattr(meta, "wake_runners", lambda _db, reason, **_kw: armed.append(reason))
     monkeypatch.setattr(meta, "armed", armed, raising=False)
     app = Flask(__name__)
     app.register_blueprint(plugin.bp)

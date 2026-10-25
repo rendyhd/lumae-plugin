@@ -1,5 +1,5 @@
-"""Runner plan RN.3 (R6): with the runners on, a web route records its work,
-wakes the runners and answers at once. Nothing is queued, so nothing can be
+"""Runner plan RN.3 (R6): a web route records its work, wakes the runners
+and answers at once. Nothing is queued, so nothing can be
 refused or strand a task; the ``deferred`` lists stay, empty."""
 import select
 
@@ -13,8 +13,6 @@ from plugins.LumaeAnalysis import reconcile, runner
 @pytest.fixture
 def runners_on(plugin, monkeypatch, second_connection):
     mod, db = plugin
-    monkeypatch.setattr(runner, "enabled", lambda: True)
-    monkeypatch.setattr(mod, "enqueue", lambda *a, **k: pytest.fail("nothing is queued"))
     listener = second_connection
     listener.autocommit = True
     with listener.cursor() as cur:
@@ -51,7 +49,7 @@ def test_every_track_asked_for_is_accepted_and_none_deferred(runners_on, monkeyp
     monkeypatch.setattr(mod, "mark_pending", lambda ids, catalog_instance_id=None, priority=None:
                         {track: f"token-{track}" for track in ids})
     recorded = []
-    monkeypatch.setattr(mod, "mark_profiles_deferred",
+    monkeypatch.setattr(mod, "mark_profiles_waiting",
                         lambda db, catalog, tokens: recorded.append(dict(tokens)))
     response = plugin_client(mod).post("/api/analyze", json={
         "catalog_instance_id": SOURCE, "ids": ["t1", "t2", "t3", "t4", "t5", "t6"]})
@@ -74,14 +72,14 @@ def test_edges_asked_for_are_recorded_for_the_runner(runners_on, monkeypatch):
     monkeypatch.setattr(mod, "claim_edge_requests",
                         lambda db, catalog, ids, priority: (jobs, ["t2"], [], []))
     marked = []
-    monkeypatch.setattr(mod, "mark_edge_jobs_deferred",
+    monkeypatch.setattr(mod, "mark_edge_jobs_waiting",
                         lambda db, catalog, jobs, marker: marked.append((catalog, jobs, marker)))
     response = plugin_client(mod).post("/api/profiles/edges/analyze", json={
         "catalog_instance_id": SOURCE, "ids": ["t1", "t2"]})
     assert response.status_code == 202
     body = response.get_json()
     assert (body["accepted"], body["already_ready"], body["deferred"]) == (["t1"], ["t2"], [])
-    assert marked == [(SOURCE, jobs, mod.DEFERRED_MARKER)]
+    assert marked == [(SOURCE, jobs, mod.RUNNER_WAITING_MARKER)]
     assert "interactive_edges" in _notified(listener)
 
 
@@ -133,23 +131,20 @@ def test_a_relationship_build_and_a_waveform_pass_are_claimed_not_queued(runners
     assert mod.start_relationship_preparation(SOURCE, SERVER, force=True)["deferred"] is True
 
 
-def test_arming_wakes_the_runners_and_leaves_the_watchdog_idle(runners_on):
+def test_recorded_work_wakes_the_runners_with_its_commit(runners_on):
     _mod, db, listener = runners_on
     before = _rows(db, f"SELECT mode, cron_expr FROM {P}reconcile_control")
-    reconcile.arm_reconcile(db, "credits_requested", commit=True)
+    reconcile.wake_runners(db, "credits_requested")
+    assert _notified(listener, timeout=0.3) == []  # not before the commit
+    db.commit()
     assert "credits_requested" in _notified(listener)
+    # 1.8.0's control row stays as it was, for a downgrade.
     assert _rows(db, f"SELECT mode, cron_expr FROM {P}reconcile_control") == before
 
 
-def test_a_queued_tick_does_nothing_while_the_runners_work(runners_on, monkeypatch):
-    mod, _db, _listener = runners_on
-    monkeypatch.setattr(mod, "_run_reconcile_actions", lambda *a, **k: pytest.fail("no work"))
+def test_a_tick_queued_by_an_older_version_only_wakes_the_runners(runners_on):
+    mod, _db, listener = runners_on
     assert mod.catalog_reconcile_task()["status"] == "runner"
+    assert "queued_tick" in _notified(listener)
 
 
-def test_with_the_runners_off_a_route_still_queues(plugin, monkeypatch):
-    mod, _db = plugin
-    queued = []
-    monkeypatch.setattr(mod, "enqueue", lambda *a, **k: queued.append(a[0].__name__))
-    assert _refresh(plugin_client(mod)).get_json()["status"] == "queued"
-    assert queued == ["catalog_refresh_task"]

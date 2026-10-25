@@ -329,25 +329,30 @@ def test_a_receipt_touched_after_selection_is_not_deleted(migrated_db):
         assert _count(cur, manager.collection_mutations_table()) == 1
 
 
-def test_migration_schedules_the_retention_task_and_keeps_an_admin_change(
-        migrated_db, run_plugin_migration):
+def test_migration_leaves_retention_to_the_server_runner(migrated_db, run_plugin_migration):
+    # Retention runs daily in the server runner (R8): no AudioMuse schedule
+    # holds the queue for it, and a 1.8.0 row is removed on install.
     task_type = "plugin.lumae_analysis.collection_retention"
     with migrated_db.cursor() as cur:
-        cur.execute("SELECT cron_expr, enabled FROM cron WHERE task_type=%s", (task_type,))
-        assert cur.fetchall() == [("23 3 * * *", True)]
-        cur.execute("UPDATE cron SET enabled=FALSE WHERE task_type=%s", (task_type,))
+        cur.execute("SELECT count(*) FROM cron WHERE task_type=%s", (task_type,))
+        assert cur.fetchone()[0] == 0
+        cur.execute(
+            "INSERT INTO cron (name, task_type, cron_expr, enabled) "
+            "VALUES (%s, %s, '23 3 * * *', FALSE)",
+            (task_type, task_type),
+        )
     migrated_db.commit()
     run_plugin_migration(migrated_db)
     with migrated_db.cursor() as cur:
-        cur.execute("SELECT enabled FROM cron WHERE task_type=%s", (task_type,))
-        assert cur.fetchall() == [(False,)]
+        cur.execute("SELECT count(*) FROM cron WHERE task_type=%s", (task_type,))
+        assert cur.fetchone()[0] == 0
 
 
-def test_migration_removes_schedule_rows_for_unschedulable_tasks(
-        migrated_db, run_plugin_migration):
-    retired = "plugin.lumae_analysis.prepare"
+def test_migration_removes_every_lumae_schedule_row(migrated_db, run_plugin_migration):
     with migrated_db.cursor() as cur:
-        for task_type in (retired, "plugin.lumae_analysis.loudness_backfill"):
+        for task_type in ("plugin.lumae_analysis.prepare",
+                          "plugin.lumae_analysis.loudness_backfill",
+                          "plugin.lumae_analysis.catalog_reconcile"):
             cur.execute(
                 "INSERT INTO cron (name, task_type, cron_expr, enabled) "
                 "VALUES (%s, %s, '0 1 * * *', TRUE)",
@@ -356,12 +361,5 @@ def test_migration_removes_schedule_rows_for_unschedulable_tasks(
     migrated_db.commit()
     run_plugin_migration(migrated_db)
     with migrated_db.cursor() as cur:
-        cur.execute("SELECT task_type FROM cron ORDER BY task_type")
-        assert [row[0] for row in cur.fetchall()
-                if row[0].startswith("plugin.lumae_analysis.")] == [
-            "plugin.lumae_analysis.analysis_projection",
-            "plugin.lumae_analysis.catalog_reconcile",
-            "plugin.lumae_analysis.catalog_refresh",
-            "plugin.lumae_analysis.collection_retention",
-            "plugin.lumae_analysis.provider_identity_recheck",
-        ]
+        cur.execute("SELECT count(*) FROM cron WHERE task_type LIKE 'plugin.lumae_analysis.%%'")
+        assert cur.fetchone()[0] == 0

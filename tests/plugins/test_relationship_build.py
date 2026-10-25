@@ -381,7 +381,7 @@ def test_rebuild_requests_are_spaced_after_the_last_generation(relationship_db, 
     watchdog's pick honours it."""
     db = relationship_db
     mod = load_plugin()
-    monkeypatch.setattr(e, 'arm_reconcile', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(e, 'wake_runners', lambda *_args, **_kwargs: None)
     assert e.claim_relationship_preparation(db, 'catalog-a') is True
     assert scalar(db, "SELECT next_retry_at FROM plugin_lumae_analysis__relationship_state") is None
     assert mod.next_relationship_run(db=db) is not None
@@ -414,7 +414,7 @@ def test_a_forced_rebuild_starts_now_and_pulls_a_waiting_one_in(relationship_db,
     db = relationship_db
     mod = load_plugin()
     woken = []
-    monkeypatch.setattr(e, 'arm_reconcile', lambda _db, reason, **_kwargs: woken.append(reason))
+    monkeypatch.setattr(e, 'wake_runners', lambda _db, reason, **_kwargs: woken.append(reason))
     finish(db)
     assert e.claim_relationship_preparation(db, 'catalog-a') is True
     assert _wait_seconds(db) > 0

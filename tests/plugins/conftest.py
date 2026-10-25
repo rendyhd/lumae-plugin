@@ -42,14 +42,11 @@ What is stubbed
 Only work that reaches outside the schema or the host: provider source
 discovery (``ensure_catalog_sources``), the post-install preparation request
 (``enqueue_required_catalog_preparations``, which resolves sources through
-the host) and the adaptive reconcile schedule update
-(``_safe_reconcile_schedule``, which reads host settings). The stubs apply only while the migration runs, so the
-test body calls the production functions. The schedule installers
-(``ensure_*_schedule``, ``music_metadata.retire_schedule``,
-``disable_legacy_backfill_schedule``) run for real against a per-schema
-stand-in for the host ``cron`` table (``name``, ``task_type`` UNIQUE,
-``cron_expr``, ``enabled``); ``ensure_catalog_reconcile_schedule`` also owns
-schema work (``migrate_reconcile``), so stubbing it would hide tables.
+the host). The stubs apply only while the migration runs, so the test body
+calls the production functions. The removal of Lumae's schedules
+(``retire_lumae_schedules``) runs for real
+against a per-schema stand-in for the host ``cron`` table (``name``,
+``task_type`` UNIQUE, ``cron_expr``, ``enabled``).
 
 Caveats
 -------
@@ -137,7 +134,6 @@ def _run_plugin_migration(db):
         patch.setattr(
             mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0
         )
-        patch.setattr(mod, "_safe_reconcile_schedule", lambda *_args, **_kw: None)
         mod.migrate(db)
     db.commit()
 

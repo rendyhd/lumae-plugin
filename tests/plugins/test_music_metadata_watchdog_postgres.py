@@ -1,26 +1,24 @@
-"""MusicBrainz lookups run on the catalogue watchdog, not an every-minute cron.
+"""MusicBrainz lookups run in the server runner, not an every-minute cron.
 
 1.2.2-1.5.0 installed ``plugin.lumae_analysis.music_metadata`` at ``* * * * *``.
 It fired 1,440 times a day, nearly always on an empty queue, and AudioMuse
 recorded every firing in its ten-row "Recent tasks" history. Since then:
 
-* the migration deletes that cron row (and only that row);
-* an accepted lookup arms the watchdog's minute cadence in its own
-  transaction, and the cadence drops back to the hourly sweep once the
-  queue is empty;
-* a deferred lookup is a retry, and a retry an hour away waits on the hourly
-  sweep instead of ticking every minute until it is due.
+* the migration deletes that cron row, with Lumae's other schedules (runner
+  plan R8), and leaves other plugins' rows alone;
+* an accepted lookup wakes the runners when its transaction commits, and
+  counts as pending until it is served;
+* a deferred lookup is a retry: an idle runner sleeps until it is due.
 """
 import importlib
+import select
 import uuid
+
+import psycopg2
 
 from test_lumae_analysis import load_plugin
 
 LEGACY = "plugin.lumae_analysis.music_metadata"
-RECONCILE = "plugin.lumae_analysis.catalog_reconcile"
-# Minute cadence leaves out the minutes of the installed identity recheck
-# (2 4 * * *, W1) and collection retention (23 3 * * *) rows (plan S1).
-EVERY_MINUTE = "0,1,3-22,24-59 * * * *"
 
 
 def _rows(db, sql, params=()):
@@ -41,15 +39,22 @@ def _host_task_status(db):
     db.commit()
 
 
-def _schedule(db):
-    reconcile = importlib.import_module("plugins.LumaeAnalysis.reconcile")
-    result = reconcile.reconcile_schedule_from_state(db)
-    cron = _rows(db, "SELECT cron_expr FROM cron WHERE task_type=%s", (RECONCILE,))
-    assert cron == [(result["cron_expr"],)]
-    return result["mode"], result["cron_expr"]
+def _notified(listener, timeout=2.0):
+    """The runner wakes ``listener`` has received (LISTEN lumae_runner)."""
+    if select.select([listener], [], [], timeout) != ([], [], []):
+        listener.poll()
+    payloads = [notify.payload for notify in listener.notifies]
+    del listener.notifies[:]
+    return payloads
 
 
-def test_migration_deletes_only_the_every_minute_metadata_schedule(
+def _pending_lookups(db):
+    status = importlib.import_module("plugins.LumaeAnalysis.reconcile").read_reconcile_status(db)
+    db.commit()
+    return status["pending"].get("MusicBrainz lookups", 0)
+
+
+def test_migration_deletes_the_metadata_schedule_and_leaves_other_plugins_rows(
     migrated_db, run_plugin_migration
 ):
     db = migrated_db
@@ -65,28 +70,34 @@ def test_migration_deletes_only_the_every_minute_metadata_schedule(
 
     run_plugin_migration(db)
 
-    task_types = {row[0] for row in _rows(db, "SELECT task_type FROM cron")}
-    assert LEGACY not in task_types
-    assert {"plugin.other.music_metadata", RECONCILE} <= task_types
+    assert {row[0] for row in _rows(db, "SELECT task_type FROM cron")} == {
+        "plugin.other.music_metadata"}
 
 
-def test_lookups_arm_the_watchdog_and_let_it_idle_once_served(migrated_db, monkeypatch):
-    load_plugin()
+def test_a_lookup_wakes_the_runners_on_commit_and_is_pending_until_served(
+    migrated_db, monkeypatch
+):
+    mod = load_plugin()
     meta = importlib.import_module("plugins.LumaeAnalysis.music_metadata")
     db = migrated_db
     _host_task_status(db)
-    assert _schedule(db) == ("idle", "11 * * * *")
+    # Nothing due: an idle runner sleeps until a wake or its sweep, never
+    # 0 s (GREATEST skips a NULL retry time).
+    assert mod._runner_next_due_seconds(db) is None
 
-    entity = {"id": str(uuid.uuid4()), "kind": "artist", "title": "Artist"}
-    assert meta.submit(db, "user:alice", [entity])[1] == 202
-    db.commit()
-    assert _rows(db, "SELECT cron_expr FROM cron WHERE task_type=%s", (RECONCILE,)) == [
-        (EVERY_MINUTE,)
-    ]
-    assert _schedule(db) == ("active", EVERY_MINUTE)
-    status = importlib.import_module("plugins.LumaeAnalysis.reconcile").read_reconcile_status(db)
-    db.commit()
-    assert status["pending"]["MusicBrainz lookups"] == 1
+    listener = psycopg2.connect(db.dsn)
+    listener.autocommit = True
+    try:
+        with listener.cursor() as cur:
+            cur.execute("LISTEN lumae_runner")
+        entity = {"id": str(uuid.uuid4()), "kind": "artist", "title": "Artist"}
+        assert meta.submit(db, "user:alice", [entity])[1] == 202
+        assert _notified(listener, timeout=0.2) == []  # not before the commit (R2)
+        db.commit()
+        assert _notified(listener) == ["metadata_requested"]
+    finally:
+        listener.close()
+    assert _pending_lookups(db) == 1
 
     class FakeClient:
         def __init__(self, db, **kwargs):
@@ -101,11 +112,12 @@ def test_lookups_arm_the_watchdog_and_let_it_idle_once_served(migrated_db, monke
         lambda db: run_one(db=db, client_factory=FakeClient, critical=lambda db: False),
     )
     assert meta.reconcile(db)["status"] == "unresolved"
-    assert _schedule(db) == ("idle", "11 * * * *")
+    assert _pending_lookups(db) == 0
+    assert mod._runner_next_due_seconds(db) is None
 
 
-def test_a_deferred_lookup_backs_off_by_how_far_away_its_retry_is(migrated_db):
-    load_plugin()
+def test_an_idle_runner_sleeps_until_a_deferred_lookup_is_due(migrated_db):
+    mod = load_plugin()
     meta = importlib.import_module("plugins.LumaeAnalysis.music_metadata")
     db = migrated_db
     _host_task_status(db)
@@ -122,12 +134,12 @@ def test_a_deferred_lookup_backs_off_by_how_far_away_its_retry_is(migrated_db):
                 (minutes,),
             )
         db.commit()
-        return _schedule(db)
+        return mod._runner_next_due_seconds(db)
 
-    # The daily allowance defers for an hour: the hourly sweep still ticks
-    # before then, and the cadence tightens as the retry nears.
-    assert defer(61) == ("backoff", "11 * * * *")
-    assert defer(20) == ("backoff", "*/15 * * * *")
-    assert defer(6) == ("backoff", "*/5 * * * *")
-    assert defer(0.5) == ("backoff", EVERY_MINUTE)
-    assert defer(0) == ("active", EVERY_MINUTE)
+    # The daily allowance defers for an hour: the runner sleeps that long
+    # (or until a wake), not a minute at a time.
+    assert 3600 < defer(61) <= 3660
+    assert 1140 < defer(20) <= 1200
+    assert 0 < defer(0.5) <= 30
+    # Due now: a turn serves it, so there is no retry to sleep until.
+    assert defer(0) is None

@@ -3,13 +3,15 @@
 Plan: docs/plan/EDGE_PRIORITY_AND_VECTORS_PLAN.md (Phases 1-3).
 
 * An on-demand edge request promotes a job a background batch already holds.
-* A request the host refuses (``ERR_TASK_IN_PROGRESS``) is saved, reported as
-  ``deferred`` and served by the next worker task; other errors still fail.
+* An on-demand request is recorded as waiting for the runners, wakes them and
+  is served first in their next pass (runner plan R6); 1.8.0's refused
+  requests are served the same way. A background request makes the library
+  pass due.
 * A queued background batch yields after its budget; unsupported media is
   terminal for its revision.
 * Workers report their edge runtime, which decides ``analyzable``; the web
   process no longer needs PyAV to queue work.
-* The server walks the library in small resumable ticks.
+* The library pass walks in small resumable slices.
 * Credits and metadata yield to source-scoped on-demand work.
 """
 import time
@@ -28,12 +30,6 @@ PROFILES = "plugin_lumae_analysis__source_profiles"
 STATE = "plugin_lumae_analysis__edge_backfill_state"
 
 
-class HostBusy(Exception):
-    """AudioMuse's refusal: another root task is running."""
-
-    code = 1201
-
-
 def _q(db, sql, params=()):
     cur = db.cursor()
     cur.execute(sql, params)
@@ -49,8 +45,16 @@ def _store():
     return edge_profile_store
 
 
-def _refuse(*_args, **_kwargs):
-    raise HostBusy("Another queue job (plugin.x) is still running.")
+def _wakes(mod, monkeypatch):
+    """The reasons the plugin wakes the runners with; the wake still runs."""
+    woken, real = [], mod.wake_runners
+
+    def wake(db, reason="work_admitted", commit=False):
+        woken.append(reason)
+        real(db, reason, commit=commit)
+
+    monkeypatch.setattr(mod, "wake_runners", wake)
+    return woken
 
 
 def test_interactive_request_promotes_a_queued_background_job(edge_publication_db):
@@ -69,10 +73,10 @@ def test_interactive_request_promotes_a_queued_background_job(edge_publication_d
     assert store.claim_edge_requests(db, "catalog-a", ["track-a"])[0] == []
 
 
-def test_refused_on_demand_edge_request_is_saved_and_served_next(edge_publication_db, monkeypatch):
+def test_on_demand_edge_request_waits_for_the_runner_and_is_served_next(edge_publication_db, monkeypatch):
     mod, db = load_plugin(), edge_publication_db
     monkeypatch.setattr(mod, "edge_scheduling_allowed", lambda: True)
-    monkeypatch.setattr(mod, "enqueue_bounded", _refuse)
+    woken = _wakes(mod, monkeypatch)
 
     response = plugin_client(mod).post(
         "/api/profiles/edges/analyze", json={"catalog_instance_id": "catalog-a", "ids": ["track-a"]}
@@ -80,9 +84,10 @@ def test_refused_on_demand_edge_request_is_saved_and_served_next(edge_publicatio
 
     assert response.status_code == 202
     body = response.get_json()
-    assert body["deferred"] == ["track-a"] and body["accepted"] == []
+    assert body["accepted"] == ["track-a"] and body["deferred"] == []
+    assert woken == ["interactive_edges"]
     assert _q(db, f"SELECT status, priority, last_error FROM {JOBS}") == [
-        ("pending", "interactive", mod.DEFERRED_MARKER)
+        ("pending", "interactive", mod.RUNNER_WAITING_MARKER)
     ]
 
     served = []
@@ -92,50 +97,60 @@ def test_refused_on_demand_edge_request_is_saved_and_served_next(edge_publicatio
         lambda jobs, source, server, priority="background", **_kw:
             served.append((source, server, priority, [job["track_id"] for job in jobs])) or [],
     )
-    assert mod.serve_deferred_interactive() == 1
+    assert mod.serve_interactive() == 1
     assert served == [("catalog-a", "server-a", "interactive", ["track-a"])]
     assert _q(db, f"SELECT last_error FROM {JOBS}") == [(None,)]
-    assert mod.serve_deferred_interactive() == 0
+    assert mod.serve_interactive() == 0
 
 
-def test_refused_background_edge_request_is_released_for_retry(edge_publication_db, monkeypatch):
-    mod, db = load_plugin(), edge_publication_db
+@pytest.mark.parametrize("status", ["complete", "waiting_runtime", "queued"])
+def test_background_edge_request_makes_the_library_pass_due(edge_publication_db, monkeypatch, status):
+    mod, db, store = load_plugin(), edge_publication_db, _store()
     monkeypatch.setattr(mod, "edge_scheduling_allowed", lambda: True)
-    monkeypatch.setattr(mod, "enqueue_bounded", _refuse)
+    store.ensure_edge_backfill_sources(db)
+    _q(db, f"UPDATE {STATE} SET status=%s, next_retry_at=now() + interval '6 hours'", (status,))
+    woken = _wakes(mod, monkeypatch)
 
-    result = mod.enqueue_edge_profiles(["track-a"], "catalog-a", "server-a")
+    result = mod.request_edge_profiles(["track-a"], "catalog-a")
 
-    assert result["deferred"] == ["track-a"]
-    assert _q(db, f"SELECT status, last_error FROM {JOBS}") == [("failed", "edge-enqueue-failed")]
-    # Due again at once, for the library pass and for a later request.
-    assert _store().edge_backfill_candidates(db, "catalog-a") == ["track-a"]
+    # No job per track: the pass covers them (R6).
+    assert result["already_pending"] == ["track-a"] and result["deferred"] == []
+    assert _q(db, f"SELECT count(*) FROM {JOBS}") == [(0,)]
+    assert woken == ([] if status == "queued" else ["edge_backfill_ready"])
+    if status != "queued":
+        assert _q(db, f"SELECT status, next_retry_at FROM {STATE}") == [("queued", None)]
+    assert store.edge_backfill_candidates(db, "catalog-a") == ["track-a"]
 
 
-def test_other_enqueue_errors_still_fail_the_request(edge_publication_db, monkeypatch):
+def test_requests_saved_by_1_8_0_are_served(edge_publication_db, monkeypatch):
+    # 1.8.0 saved work AudioMuse refused to queue under its own marker.
     mod, db = load_plugin(), edge_publication_db
-    monkeypatch.setattr(mod, "edge_scheduling_allowed", lambda: True)
+    _store().claim_edge_requests(db, "catalog-a", ["track-a"], "interactive")
+    _q(db, f"UPDATE {JOBS} SET last_error=%s", (mod.WAITING_MARKERS[1],))
+    _q(db, f"UPDATE {PROFILES} SET status='pending_interactive', attempt_token='tok-a', last_error=%s",
+       (mod.WAITING_MARKERS[1],))
+    runs, served = [], []
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
+    monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **kw: runs.append((ids, kw["attempt_tokens"])))
+    monkeypatch.setattr(mod, "analyze_edges_task", lambda jobs, *_a, **_k: served.extend(
+        job["track_id"] for job in jobs) or [])
 
-    def broken(*_args, **_kwargs):
-        raise RuntimeError("queue database unavailable")
-
-    monkeypatch.setattr(mod, "enqueue_bounded", broken)
-    with pytest.raises(RuntimeError):
-        mod.enqueue_edge_profiles(["track-a"], "catalog-a", "server-a", priority="interactive")
-    assert _q(db, f"SELECT status, last_error FROM {JOBS}") == [("failed", "edge-enqueue-failed")]
+    assert mod.serve_interactive() == 2
+    assert runs == [(["track-a"], {"track-a": "tok-a"})] and served == ["track-a"]
+    assert mod.serve_interactive() == 0
 
 
-def test_refused_on_demand_waveform_request_is_saved_and_served_next(edge_publication_db, monkeypatch):
+def test_on_demand_waveform_request_waits_for_the_runner_and_is_served_next(edge_publication_db, monkeypatch):
     mod, db = load_plugin(), edge_publication_db
     _q(db, f"UPDATE {PROFILES} SET status='pending_interactive', attempt_token='tok-a'")
     monkeypatch.setattr(mod, "mark_pending", lambda *_args, **_kwargs: {"track-a": "tok-a"})
-    monkeypatch.setattr(mod, "enqueue_bounded", _refuse)
+    woken = _wakes(mod, monkeypatch)
 
-    assert mod.enqueue_profile_analysis(
-        ["track-a"], "catalog-a", "server-a", priority="interactive"
-    ) == mod.DEFERRED
-    # Still pending on demand, not released.
+    assert mod.record_interactive_profiles(["track-a"], "catalog-a") == {"track-a": "tok-a"}
+    assert woken == ["interactive_profiles"]
+    # Still pending on demand, marked for the runner.
     assert _q(db, f"SELECT status, attempt_token, last_error FROM {PROFILES}") == [
-        ("pending_interactive", "tok-a", mod.DEFERRED_MARKER)
+        ("pending_interactive", "tok-a", mod.RUNNER_WAITING_MARKER)
     ]
 
     runs = []
@@ -144,20 +159,9 @@ def test_refused_on_demand_waveform_request_is_saved_and_served_next(edge_public
         lambda ids, catalog_instance_id=None, server_id=None, priority="background",
         attempt_tokens=None: runs.append((ids, catalog_instance_id, server_id, priority, attempt_tokens)),
     )
-    assert mod.serve_deferred_interactive() == 1
+    assert mod.serve_interactive() == 1
     assert runs == [(["track-a"], "catalog-a", "server-a", "interactive", {"track-a": "tok-a"})]
-
-
-def test_background_waveform_refusal_keeps_the_old_release(edge_publication_db, monkeypatch):
-    mod = load_plugin()
-    released = []
-    monkeypatch.setattr(mod, "mark_pending", lambda *_args, **_kwargs: {"track-a": "tok-a"})
-    monkeypatch.setattr(mod, "enqueue_bounded", _refuse)
-    monkeypatch.setattr(mod, "release_pending", lambda ids, **_kwargs: released.extend(ids))
-
-    with pytest.raises(HostBusy):
-        mod.enqueue_profile_analysis(["track-a"], "catalog-a", "server-a")
-    assert released == ["track-a"]
+    assert mod.serve_interactive() == 0
 
 
 def test_queued_background_edge_batch_yields_after_its_budget(edge_publication_db, monkeypatch):
@@ -165,7 +169,7 @@ def test_queued_background_edge_batch_yields_after_its_budget(edge_publication_d
     jobs, _ready = _store().claim_edge_jobs(db, "catalog-a", ["track-a"])
     served = []
     monkeypatch.setattr(mod, "report_edge_runtime", lambda *_a, **_k: None)
-    monkeypatch.setattr(mod, "serve_deferred_interactive", lambda *_a, **_k: served.append(1) or 0)
+    monkeypatch.setattr(mod, "serve_interactive", lambda *_a, **_k: served.append(1) or 0)
 
     outcomes = mod.analyze_edges_task(jobs, "catalog-a", "server-a", budget_seconds=-1)
 
@@ -292,10 +296,8 @@ def test_worker_reports_decide_analyzable_for_a_web_process_without_pyav(edge_pu
     store.record_edge_runtime(db, "worker-2", {"available": True, "pyav": "17.1.0", "reason": None})
     assert mod.edge_profiles_analyzable() is True
 
-    submitted = []
-    monkeypatch.setattr(mod, "enqueue_bounded", lambda *a, **k: submitted.append(k["queue"]))
-    result = mod.enqueue_edge_profiles(["track-a"], "catalog-a", "server-a", priority="interactive")
-    assert result["accepted"] == ["track-a"] and submitted == ["high"]
+    result = mod.request_edge_profiles(["track-a"], "catalog-a", priority="interactive")
+    assert result["accepted"] == ["track-a"]
 
     capability = mod.edge_profiles_capability()
     assert capability["analyzable"] is True and capability["available"] is False
@@ -310,24 +312,24 @@ def test_worker_reports_decide_analyzable_for_a_web_process_without_pyav(edge_pu
     assert mod.edge_profiles_analyzable() is False
 
 
-def test_first_qualified_report_starts_the_pass_and_wakes_the_watchdog(edge_publication_db, monkeypatch):
+def test_first_qualified_report_starts_the_pass_and_wakes_the_runners(edge_publication_db, monkeypatch):
     mod, db = load_plugin(), edge_publication_db
     woken = []
-    monkeypatch.setattr(mod, "arm_reconcile", lambda _db, reason, commit=False: woken.append(reason))
+    monkeypatch.setattr(mod, "wake_runners", lambda _db, reason, commit=False: woken.append(reason))
     monkeypatch.setattr(mod, "edge_runtime_status", lambda: {"available": True, "reason": None})
 
     mod.report_edge_runtime(force=True)
 
     assert _q(db, f"SELECT status FROM {STATE}") == [("queued",)]
     assert woken == ["edge_backfill_ready"]
-    # Nothing new to start: later reports do not wake the watchdog.
+    # Nothing new to start: later reports do not wake the runners.
     mod.report_edge_runtime(force=True)
     assert woken == ["edge_backfill_ready"]
 
 
 def test_periodic_report_keeps_a_finished_pass_resweep_delay(edge_publication_db, monkeypatch):
     mod, db, store = load_plugin(), edge_publication_db, _store()
-    monkeypatch.setattr(mod, "arm_reconcile", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "wake_runners", lambda *_a, **_k: None)
     monkeypatch.setattr(mod, "edge_runtime_status", lambda: {"available": True, "reason": None})
     store.ensure_edge_backfill_sources(db)
     store.update_edge_backfill(db, "catalog-a", "complete", cursor="", next_retry_hours=6, completed=True)
@@ -344,7 +346,7 @@ def test_periodic_report_keeps_a_finished_pass_resweep_delay(edge_publication_db
 
 def test_runtime_report_parks_and_arms_the_library_pass(edge_publication_db, monkeypatch):
     mod, db, store = load_plugin(), edge_publication_db, _store()
-    monkeypatch.setattr(mod, "arm_reconcile", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "wake_runners", lambda *_a, **_k: None)
     assert store.next_edge_backfill(db) == ("server-a", "catalog-a", "")
 
     monkeypatch.setattr(mod, "edge_runtime_status", lambda: {"available": False, "reason": "pyav_missing"})
@@ -360,7 +362,7 @@ def test_runtime_report_parks_and_arms_the_library_pass(edge_publication_db, mon
     ]
 
 
-def test_library_pass_walks_in_ticks_completes_and_resweeps(edge_publication_db, monkeypatch):
+def test_library_pass_walks_in_slices_completes_and_resweeps(edge_publication_db, monkeypatch):
     mod, db, store = load_plugin(), edge_publication_db, _store()
     runs = []
     monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
@@ -375,7 +377,7 @@ def test_library_pass_walks_in_ticks_completes_and_resweeps(edge_publication_db,
     first = mod.edge_backfill_task("server-a", "catalog-a", deadline=time.monotonic() + 60)
     # The library fits in the turn (WP1a): the pass reaches its end and finishes.
     assert first["status"] == "complete" and first["processed"] == 1
-    # The track gets what is left of the tick (plan S2, WP1a), never None.
+    # The track gets what is left of the slice (plan S2, WP1a), never None.
     [(tracks, priority, budget)] = runs
     assert (tracks, priority) == (["track-a"], "background")
     assert 55 < budget <= 60
@@ -454,26 +456,8 @@ def test_edge_timestamps_are_real_utc_whatever_the_session_time_zone(edge_public
     assert abs(parse(row["next_retry_at"]) - (now + timedelta(hours=6))) < timedelta(minutes=1)
 
 
-def test_refused_requests_wake_the_watchdog(edge_publication_db, monkeypatch):
-    mod, db = load_plugin(), edge_publication_db
-    woken = []
-    monkeypatch.setattr(mod, "arm_reconcile", lambda _db, reason, commit=False: woken.append(reason))
-    monkeypatch.setattr(mod, "edge_scheduling_allowed", lambda: True)
-    monkeypatch.setattr(mod, "enqueue_bounded", _refuse)
-    mod.enqueue_edge_profiles(["track-a"], "catalog-a", "server-a", priority="interactive")
-    assert woken == ["deferred_on_demand"]
-
-    _q(db, f"UPDATE {PROFILES} SET status='pending_interactive', attempt_token='tok-a'")
-    monkeypatch.setattr(mod, "mark_pending", lambda *_args, **_kwargs: {"track-a": "tok-a"})
-    assert mod.enqueue_profile_analysis(["track-a"], "catalog-a", "server-a", priority="interactive") == mod.DEFERRED
-    assert woken == ["deferred_on_demand", "deferred_on_demand"]
-
-    # A background refusal is retried by the library pass; it does not wake.
-    mod.enqueue_edge_profiles(["track-a"], "catalog-a", "server-a")
-    assert len(woken) == 2
-
-
-def test_deferred_on_demand_work_keeps_the_watchdog_active(migrated_db):
+@pytest.mark.parametrize("marker", ["RUNNER_WAITING_MARKER", "DEFERRED_MARKER"])
+def test_waiting_on_demand_work_counts_as_ready(migrated_db, marker):
     from plugins.LumaeAnalysis import reconcile
 
     db = migrated_db
@@ -496,6 +480,6 @@ def test_deferred_on_demand_work_keeps_the_watchdog_active(migrated_db):
         cur.execute(f"""INSERT INTO {PROFILES} (catalog_instance_id, track_id, sample_rate, duration_ms,
             ref_lufs, start_ramp, end_ramp, analyzer_ver, profile_schema_ver, analyzed_at, status,
             last_error) VALUES ('any', 't', 0, 0, 0, '', '', 1, 1, now(), 'pending_interactive', %s)""",
-                    (reconcile.DEFERRED_MARKER,))
+                    (getattr(reconcile, marker),))
     db.commit()
     assert summary() == baseline + 1

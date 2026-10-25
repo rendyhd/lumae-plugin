@@ -1446,8 +1446,8 @@ def migrate_catalog(db):
         "catalog_builder_version INTEGER NOT NULL DEFAULT 0",
         "refresh_required BOOLEAN NOT NULL DEFAULT TRUE",
         "refresh_reason TEXT",
-        # SQ.1: a refresh an app asked for while AudioMuse's queue refused it
-        # (want_catalog_refresh); the watchdog runs it.
+        # SQ.1: a refresh an app asked for (want_catalog_refresh); the server
+        # runner runs it (R6).
         "refresh_wanted_at TIMESTAMPTZ",
     )
     # 1.6.0 (JF.8): the Jellyfin server Id bound to a catalogue.
@@ -1940,7 +1940,7 @@ def want_catalog_refresh(db, catalog_instance_id):
     """Keep a refresh AudioMuse refused to queue (SQ.1).
 
     The earliest request is kept: any scan that starts after it serves it.
-    The caller arms the watchdog and commits."""
+    The caller wakes the runners and commits."""
     cur = db.cursor()
     cur.execute(
         f"UPDATE {t('catalog_state')} "
