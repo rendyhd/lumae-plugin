@@ -44,6 +44,18 @@ Less repeated work (runner plan 2026-10-25, W2).
   rebuild every album and artist (24 Oct on the owner's server: 55 slices over
   32 minutes). A source's first generation starts at once, and the settings
   page's rebuild still starts one now.
+- A song longer than the loudness meter can measure (6,553.6 s) is no longer
+  downloaded to find that out. A file that cannot be measured stops being
+  retried until it changes: at once when the analyzer calls it unsupported,
+  after its second decode error, and after the fifth failure of any other
+  kind. It was downloaded whole and retried every 72 hours, forever (four
+  1–2 GB files on the owner's server). Ramps and fades treat a second decode
+  error of the same file as unsupported too; they retried every 6 hours.
+- MusicBrainz credits re-check an album it could not match, or that had no
+  credits, after 30, then 90, then 180 days (was 7, 30, 90). Each expiry is
+  spread ±25 %, so albums first checked together no longer come due together,
+  and re-checks run only when nothing else waits, at most 60 an hour. The
+  re-checks already due spread over the next 14 days.
 
 ## 1.9.0 (2026-10-24)
 

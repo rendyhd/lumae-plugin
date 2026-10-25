@@ -1,9 +1,11 @@
 """Performance plan WP4: less host blocking while idle (scheduler plan S7, S8).
 
 S7 (AUD-16): an album not found (unresolved) or without credits (empty) is
-re-checked after 7 days, then 30, then 90, not every week; a re-check of an
-unchanged album is idle work and never moves the watchdog off its idle
-cadence. A changed album still does.
+re-checked after 30 days, then 90, then 180 (W4 of the runner plan; S7 had 7,
+30, 90), each ±25 %, not every week; a re-check of an unchanged album is idle
+work and never moves the watchdog off its idle cadence. A changed album still
+does. W4: background re-checks run only after background work, at most 60 an
+hour, and the ones due at upgrade spread over 14 days.
 
 S8 (AUD-19): an idle tick does almost nothing: the credits walk rests an
 hour after it reaches the end (or until a new catalogue generation), and a
@@ -51,28 +53,123 @@ def _expire(db, name):
 
 
 def _ttl_days(db, name):
-    [(days,)] = _q(db, f"SELECT round(EXTRACT(EPOCH FROM expires_at-now())/86400) FROM {JOBS} "
+    [(days,)] = _q(db, f"SELECT EXTRACT(EPOCH FROM expires_at-now())/86400 FROM {JOBS} "
                        "WHERE catalog_instance_id='c' AND album_id=%s", (name,))
-    return int(days)
+    return float(days)
+
+
+def _about(days, ttl):
+    """W4: ``days`` is ``ttl`` with its ±25 % jitter."""
+    return 0.75 * ttl - 0.01 <= days <= 1.25 * ttl + 0.01
 
 
 # ------------------------------------------------------------------ S7
 
 
-def test_an_unresolved_album_is_rechecked_after_7_then_30_then_90_days(credits_db):
+def test_an_unresolved_album_is_rechecked_after_30_then_90_then_180_days(credits_db):
     db = credits_db
     store.request_album(db, "c", "a")
     _run(db, "a", _unresolved(db, "a"))
-    assert _ttl_days(db, "a") == 7
-    for expected in (30, 90, 90):
+    assert _about(_ttl_days(db, "a"), 30)
+    for expected in (90, 180, 180):
         _expire(db, "a")
         store.request_album(db, "c", "a")  # the sweep finds it expired: a re-check
         _run(db, "a", _unresolved(db, "a"))
-        assert _ttl_days(db, "a") == expected
+        assert _about(_ttl_days(db, "a"), expected)
     # A found album keeps 30 days.
     store.request_album(db, "c", "b")
     _run(db, "b", payload(db, "b"))
-    assert _ttl_days(db, "b") == 30
+    assert _about(_ttl_days(db, "b"), 30)
+
+
+# ------------------------------------------------------------------ W4
+
+
+def test_albums_checked_together_do_not_expire_together(credits_db):
+    db = credits_db
+    expiries = set()
+    for _ in range(12):
+        store.request_album(db, "c", "a")
+        _run(db, "a", _unresolved(db, "a"))
+        expiries.add(round(_ttl_days(db, "a"), 3))
+        assert _about(_ttl_days(db, "a"), 30)
+        _q(db, f"DELETE FROM {JOBS}")
+    assert len(expiries) > 6
+
+
+def _recheck(db, name):
+    """``name`` checked unresolved, expired and found again by the sweep: a re-check."""
+    store.request_album(db, "c", name)
+    _run(db, name, _unresolved(db, name))
+    _expire(db, name)
+    store.request_album(db, "c", name)
+
+
+def test_a_recheck_waits_for_background_work_and_an_app_request_does_not(credits_db):
+    db = credits_db
+    _recheck(db, "a")
+    assert store.claim(db, "c", rechecks=False) is None
+    job = store.claim(db, "c")
+    assert job["album_id"] == "a"
+    store.finish(db, job, _unresolved(db, "a"))
+    _expire(db, "a")
+    store.request_album(db, "c", "a", priority=10)  # the phone asks for it
+    assert store.claim(db, "c", rechecks=False)["album_id"] == "a"
+
+
+def test_new_work_goes_before_a_recheck(credits_db):
+    db = credits_db
+    _recheck(db, "a")
+    store.request_album(db, "c", "b")
+    assert store.claim(db, "c")["album_id"] == "b"
+
+
+def test_at_most_60_rechecks_start_an_hour(credits_db, monkeypatch):
+    db = credits_db
+    _recheck(db, "a")
+    _recheck(db, "b")
+    monkeypatch.setattr(store, "RECHECKS_PER_HOUR", 1)
+    job = store.claim(db, "c")
+    assert job is not None
+    assert store.claim(db, "c") is None  # the hour's one re-check started
+    store.finish(db, job, _unresolved(db, job["album_id"]))
+    assert store.claim(db, "c") is None  # finished, it still counts this hour
+    _q(db, f"UPDATE {JOBS} SET rechecked_at=now()-interval '61 minutes'")
+    assert store.claim(db, "c") is not None
+    monkeypatch.undo()
+    assert store.RECHECKS_PER_HOUR == 60
+
+
+def test_reconcile_offers_a_recheck_only_after_background_work(credits_db, monkeypatch):
+    db = credits_db
+    _recheck(db, "a")
+    monkeypatch.setattr(credits_service, "resolve_catalog_source", lambda db, server_id=None: [
+        {"catalog_instance_id": "c", "rebind_status": "active"}])
+    monkeypatch.setattr(store, "sweep", lambda db, catalog_id, limit=32: 0)
+    turns = []
+    monkeypatch.setattr(credits_service, "run_one",
+                        lambda catalog_id, **kwargs: turns.append(kwargs["rechecks"]) or {"status": "x"})
+    _q(db, "UPDATE plugin_lumae_analysis__credits_stream SET last_work_at=now()-interval '1 day'")
+    assert credits_service.reconcile(db, before_background=True) is None
+    assert credits_service.reconcile(db, before_background=False) == {"status": "x"}
+    assert turns == [True]
+
+
+def test_the_upgrade_spreads_due_rechecks_over_14_days(credits_db):
+    db = credits_db
+    _recheck(db, "a")  # a pending re-check, due now
+    store.request_album(db, "c", "b")
+    _run(db, "b", _unresolved(db, "b"))
+    _expire(db, "b")  # an expired result the sweep has not reached
+    _q(db, "DROP INDEX plugin_lumae_analysis__credits_jobs_rechecked")
+    _q(db, f"ALTER TABLE {JOBS} DROP COLUMN rechecked_at")
+    store.migrate(db)
+    [(not_before,)] = _q(db, f"SELECT EXTRACT(EPOCH FROM not_before-now())/86400 FROM {JOBS} WHERE album_id='a' AND catalog_instance_id='c'")
+    assert 0 <= not_before <= 14
+    assert 0 <= _ttl_days(db, "b") <= 14
+    _q(db, f"UPDATE {JOBS} SET not_before=now()")
+    store.migrate(db)  # once: the column is there now
+    assert _q(db, f"SELECT not_before<=now() FROM {JOBS} WHERE album_id='a' AND catalog_instance_id='c'") == [(True,)]
 
 
 def test_a_recheck_is_counted_once_however_often_the_sweep_sees_it(credits_db):

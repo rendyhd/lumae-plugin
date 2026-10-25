@@ -51,15 +51,16 @@ def playback_pending(db):
 
 
 def run_one(catalog_id, *, db=None, client_factory=Client, critical=playback_pending,
-            deadline=None):
+            deadline=None, rechecks=True):
     """One album's turn. ``deadline`` bounds its uncached MusicBrainz requests
     (a watchdog tick's); the final allowed() check never uses it, so a
-    finished album is published."""
+    finished album is published. ``rechecks`` lets it take a background
+    re-check (W4)."""
     db = db or get_db()
     store.source(db, catalog_id)
     if paused() or critical(db):
         return {"status": "deferred", "reason": "maintenance_or_playback_priority"}
-    job = store.claim(db, catalog_id)
+    job = store.claim(db, catalog_id, rechecks=rechecks)
     if not job:
         return {"status": "current"}
     try:
@@ -113,8 +114,9 @@ def reconcile(db, server_id=None, before_background=False, deadline=None):
     """One credits album per turn, with time sharing alongside existing background work.
 
     Before background work a turn waits 300 s (120 s for a requested album)
-    after the last one ended. Each source's next page of albums is requested
-    first, once per reconcile tick (``begin_tick``).
+    after the last one ended, and takes no background re-check: those run only
+    after background work, when nothing else is ready (W4). Each source's next
+    page of albums is requested first, once per reconcile tick (``begin_tick``).
     """
     if paused():
         return None
@@ -132,20 +134,21 @@ def reconcile(db, server_id=None, before_background=False, deadline=None):
             if _tick_sweeps is not None:
                 _tick_sweeps.add(catalog_id)
             store.sweep(db, catalog_id)
+        ready, params = store.ready_sql("j", rechecks=not before_background)
         cur = db.cursor()
         cur.execute(f"""SELECT EXISTS(SELECT 1 FROM {table('credits_jobs')} j WHERE j.catalog_instance_id=s.catalog_instance_id
-            AND j.not_before<=now() AND (j.status IN('pending','failed') OR (j.status='running' AND j.lease_until<now()))),
+            AND {ready}),
             EXTRACT(EPOCH FROM(now()-COALESCE(s.last_work_at,now()-interval '1 day'))),
             EXISTS(SELECT 1 FROM {table('credits_jobs')} j WHERE j.catalog_instance_id=s.catalog_instance_id
                    AND j.priority>0 AND j.status IN('pending','failed'))
-            FROM {table('credits_stream')} s WHERE s.catalog_instance_id=%s""", (catalog_id,))
+            FROM {table('credits_stream')} s WHERE s.catalog_instance_id=%s""", (*params, catalog_id))
         row = cur.fetchone()
         cur.close()
         db.commit()
         if row and row[0] and (not before_background or float(row[1]) >= (120 if row[2] else 300)):
             if deadline is None:
-                return run_one(catalog_id, db=db)
-            return run_one(catalog_id, db=db, deadline=deadline)
+                return run_one(catalog_id, db=db, rechecks=not before_background)
+            return run_one(catalog_id, db=db, deadline=deadline, rechecks=not before_background)
     return None
 
 

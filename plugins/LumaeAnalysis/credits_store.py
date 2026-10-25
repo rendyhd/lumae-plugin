@@ -23,11 +23,20 @@ MAX_RECORD_BYTES = 2 * 1024 * 1024
 HTTP_CACHE_TTL_DAYS = 3
 HTTP_CACHE_PURGE_BATCH = 500
 # A found album is matched again after 30 days. One not found (unresolved) or
-# without credits (empty) after 7, then 30, then 90 days as its re-checks of
-# the same input go by (scheduler plan S7, AUD-16): weekly re-checks of every
-# unmatched album woke the watchdog to minute cadence once a week.
+# without credits (empty) after 30, then 90, then 180 days as its re-checks of
+# the same input go by (scheduler plan S7, AUD-16, lengthened from 7, 30, 90 by
+# W4 of the runner plan 2026-10-25): weekly re-checks of every unmatched album
+# woke the watchdog to minute cadence once a week.
 COMPLETE_TTL_DAYS = 30
-RECHECK_TTL_DAYS = (7, 30, 90)
+RECHECK_TTL_DAYS = (30, 90, 180)
+# W4: each expiry lands up to this fraction either side of its TTL, so albums
+# first checked together do not come due together (they did, as waves).
+EXPIRY_JITTER = 0.25
+# W4: background re-checks (an unchanged album's, no app asking) that may start
+# in an hour, across catalogues; they also wait until nothing else is ready.
+RECHECKS_PER_HOUR = 60
+# W4: the re-checks already due when the cap arrives spread over this many days.
+RECHECK_SPREAD_DAYS = 14
 # A finished walk of the catalogue's albums starts again after an hour, or
 # at once when a new catalogue generation was published (S8, AUD-19).
 SWEEP_REST_SECONDS = 3600
@@ -52,6 +61,8 @@ def migrate(db):
         lambda cur: migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS {table('credits_jobs_ready')} ON {table('credits_jobs')}(not_before,priority DESC,requested_at)"),
         # S7: re-checks of the same input since its last change; S8: when the last walk ended.
         lambda cur: migrations.ensure_columns(cur, table('credits_jobs'), "rechecks INTEGER NOT NULL DEFAULT 0"),
+        _migrate_recheck_cap,
+        lambda cur: migrations.ensure_index(cur, f"CREATE INDEX IF NOT EXISTS {table('credits_jobs_rechecked')} ON {table('credits_jobs')}(rechecked_at)"),
         lambda cur: migrations.ensure_columns(cur, table('credits_stream'), "swept_at TIMESTAMPTZ",
                                               "swept_generation BIGINT"),
         f"""CREATE TABLE IF NOT EXISTS {table('credits_results')} (
@@ -72,6 +83,33 @@ def migrate(db):
     ]
     migrations.apply(cur, statements)
     cur.close()
+
+
+def _migrate_recheck_cap(cur):
+    """W4: ``rechecked_at`` (when a re-check of the job last started, for
+    RECHECKS_PER_HOUR). Added once, with a one-off spread over RECHECK_SPREAD_DAYS of
+    the re-checks due by then: those waiting to run and those whose result expires."""
+    if not migrations.ensure_columns(cur, table('credits_jobs'), "rechecked_at TIMESTAMPTZ"):
+        return
+    jobs = table('credits_jobs')
+    cur.execute(f"""UPDATE {jobs} SET not_before=now()+random()*(%s*interval '1 day')
+        WHERE rechecks>0 AND priority=0 AND status IN('pending','failed')""", (RECHECK_SPREAD_DAYS,))
+    cur.execute(f"""UPDATE {jobs} SET expires_at=now()+random()*(%s*interval '1 day')
+        WHERE status IN('complete','unresolved','empty')
+          AND expires_at<now()+(%s*interval '1 day')""", (RECHECK_SPREAD_DAYS, RECHECK_SPREAD_DAYS))
+
+
+def ready_sql(alias="", rechecks=True):
+    """The SQL condition, and its parameters, of a job ready to claim. A background
+    re-check (W4: an unchanged album's, no app asking) is ready only when ``rechecks``
+    allows it and fewer than RECHECKS_PER_HOUR started in the past hour."""
+    a = f"{alias}." if alias else ""
+    return (f"""{a}not_before<=now()
+          AND ({a}status IN('pending','failed') OR ({a}status='running' AND {a}lease_until<now()))
+          AND ({a}rechecks=0 OR {a}priority>0 OR (%s AND (
+               SELECT count(*) FROM {table('credits_jobs')} recent
+                WHERE recent.rechecked_at>now()-interval '1 hour')<%s))""",
+            (bool(rechecks), RECHECKS_PER_HOUR))
 
 
 def source(db, catalog_id):
@@ -238,18 +276,20 @@ def sweep(db, catalog_id, limit=32):
     return len(ids)
 
 
-def claim(db, catalog_id):
+def claim(db, catalog_id, rechecks=True):
+    """The next ready job, leased; background re-checks only when ``rechecks`` (W4)."""
     token = str(uuid.uuid4())
+    ready, params = ready_sql(rechecks=rechecks)
     cur = db.cursor()
     cur.execute(f"""WITH candidate AS (
         SELECT catalog_instance_id,album_id FROM {table('credits_jobs')}
-        WHERE catalog_instance_id=%s AND not_before<=now() AND
-          (status IN('pending','failed') OR (status='running' AND lease_until<now()))
-        ORDER BY priority DESC,requested_at,album_id FOR UPDATE SKIP LOCKED LIMIT 1)
+        WHERE catalog_instance_id=%s AND {ready}
+        ORDER BY priority DESC,rechecks=0 DESC,requested_at,album_id FOR UPDATE SKIP LOCKED LIMIT 1)
         UPDATE {table('credits_jobs')} j SET status='running',lease_token=%s,
-        lease_until=now()+interval '20 minutes',attempts=attempts+1,last_error=NULL
+        lease_until=now()+interval '20 minutes',attempts=attempts+1,last_error=NULL,
+        rechecked_at=CASE WHEN j.rechecks>0 THEN now() ELSE j.rechecked_at END
         FROM candidate c WHERE j.catalog_instance_id=c.catalog_instance_id AND j.album_id=c.album_id
-        RETURNING j.album_id,j.input_fp,j.attempts""", (catalog_id, token))
+        RETURNING j.album_id,j.input_fp,j.attempts""", (catalog_id, *params, token))
     row = cur.fetchone()
     cur.close()
     db.commit()
@@ -301,9 +341,10 @@ def finish(db, job, payload=None, error=None, retry_seconds=60):
         ttl_days = (COMPLETE_TTL_DAYS if status == "complete"
                     else RECHECK_TTL_DAYS[min(rechecks, len(RECHECK_TTL_DAYS) - 1)])
         cur.execute(f"""UPDATE {table('credits_jobs')} SET status=%s,lease_token=NULL,lease_until=NULL,
-            priority=0,last_error=NULL,expires_at=now()+(%s*interval '1 day')
+            priority=0,last_error=NULL,
+            expires_at=now()+(%s*(1+%s*(2*random()-1))*interval '1 day')
             WHERE catalog_instance_id=%s AND album_id=%s""",
-                    (status, ttl_days, job["catalog_id"], job["album_id"]))
+                    (status, ttl_days, EXPIRY_JITTER, job["catalog_id"], job["album_id"]))
     cur.close()
     db.commit()
     return True
