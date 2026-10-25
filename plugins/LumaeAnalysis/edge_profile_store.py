@@ -288,7 +288,12 @@ def claim_edge_requests(db, catalog_id, ids, priority='background'):
             VALUES (%s, %s, %s, %s, 'pending', %s)
             ON CONFLICT (catalog_instance_id, track_id) DO UPDATE SET
                 media_revision=EXCLUDED.media_revision, job_token=EXCLUDED.job_token,
-                status='pending', last_error=NULL, priority=EXCLUDED.priority, updated_at=now()
+                status='pending',
+                -- W3: a retry of the same media keeps the last failure, so a
+                -- second decode error can retire the job (fail_edge_job).
+                last_error=CASE WHEN job.media_revision<>EXCLUDED.media_revision
+                                  OR job.status<>'failed' THEN NULL ELSE job.last_error END,
+                priority=EXCLUDED.priority, updated_at=now()
             WHERE job.media_revision<>EXCLUDED.media_revision
                OR (job.status IN ('pending', 'running') AND job.updated_at < now()-interval '30 minutes')
                OR (job.status='failed' AND job.last_error='edge-enqueue-failed'
@@ -370,16 +375,42 @@ def interactive_edge_demand(db):
 
 def update_edge_job(db, catalog_id, job, status, reason=None):
     cur = db.cursor()
-    cur.execute(f"""UPDATE {table('edge_profile_jobs')} SET status=%s, last_error=%s, updated_at=now()
+    # Starting a job keeps the last failure of its media (W3, ``fail_edge_job``).
+    cur.execute(f"""UPDATE {table('edge_profile_jobs')}
+        SET status=%s, last_error=CASE WHEN %s THEN last_error ELSE %s END, updated_at=now()
         WHERE catalog_instance_id=%s AND track_id=%s AND media_revision=%s AND job_token=%s
           AND status=ANY(%s)
-        RETURNING job_token""", (status, str(reason)[:160] if reason else None, catalog_id,
-                                  job['track_id'], job['media_revision'], job['job_token'],
+        RETURNING job_token""", (status, status == 'running', str(reason)[:160] if reason else None,
+                                  catalog_id, job['track_id'], job['media_revision'], job['job_token'],
                                   ['pending'] if status == 'running' else ['pending', 'running']))
     applied = cur.fetchone() is not None
     db.commit()
     cur.close()
     return applied
+
+
+# W3: the reason of a decoder data error (``analysis_isolation.EDGE_FAILURE_REASONS``).
+EDGE_DECODE_ERROR = 'edge-media-error'
+
+
+def fail_edge_job(db, catalog_id, job, reason):
+    """Mark a running job failed, or unsupported (terminal for its media) when it
+    is a decode error that already failed the same media once (W3): those were
+    downloaded whole and retried every six hours."""
+    reason = str(reason)[:160] if reason else None
+    decode = bool(reason and reason.startswith(EDGE_DECODE_ERROR))
+    cur = db.cursor()
+    cur.execute(f"""UPDATE {table('edge_profile_jobs')}
+        SET status=CASE WHEN %s AND last_error LIKE %s THEN %s ELSE 'failed' END,
+            last_error=%s, updated_at=now()
+        WHERE catalog_instance_id=%s AND track_id=%s AND media_revision=%s AND job_token=%s
+          AND status IN ('pending', 'running')
+        RETURNING status""", (decode, EDGE_DECODE_ERROR + '%', UNSUPPORTED, reason, catalog_id,
+                              job['track_id'], job['media_revision'], job['job_token']))
+    row = cur.fetchone()
+    db.commit()
+    cur.close()
+    return row[0] if row else None
 
 
 def publish_edge_profile(db, catalog_id, job, payload, signature):

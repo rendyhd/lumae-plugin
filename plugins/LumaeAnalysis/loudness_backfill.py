@@ -16,17 +16,29 @@ measurements together, so clients see few large pages rather than many small one
 Each turn first follows the published catalogue (``loudness_stream.reconcile``) when its generation
 moved since the last turn: records of tracks that left it are withdrawn, album records pooled again.
 A failed track backs off (``RETRY_HOURS``); a finished pass sweeps again after ``RESWEEP_HOURS``.
+
+W3 (runner plan 2026-10-25): a track the catalogue says is longer than the meter's limit
+(``loudness_v1.MAX_SECONDS``) is never downloaded; a failure the analyzer calls unsupported parks
+at once, a decode error after its second attempt, any other after the last step of
+``RETRY_HOURS``. A parked track is due again only when its media changes (a new revision).
+Before, each was downloaded whole and retried every 72 hours forever (four 1–2 GB FLACs on the
+owner's server).
 """
 
 from plugin.api import table
 
 from . import migrations
-from .loudness_v1 import VERSION
+from .loudness_v1 import MAX_SECONDS, VERSION
 
 # A turn works until the reconcile tick's deadline, a page of the admin batch size at a time.
 RESWEEP_HOURS = 6
-# Back-off after the 1st, 2nd, 3rd and later failure of the same media.
+# Back-off after the 1st, 2nd, 3rd and 4th failure of the same media; the next one parks.
 RETRY_HOURS = (1, 6, 24, 72)
+# W3: a decode error (``InvalidDataError``) parks after this many attempts.
+DECODE_ERROR_ATTEMPTS = 2
+DECODE_ERROR_HINTS = ("edge-media-error", "InvalidDataError")
+# The catalogue's duration above which the meter cannot measure a file (W3).
+MAX_DURATION_MS = int(MAX_SECONDS * 1000)
 
 
 _RUNTIME = None
@@ -110,6 +122,7 @@ def _due_sql(edges_enabled):
           ON m.catalog_instance_id=c.catalog_instance_id AND m.published_generation=c.published_generation
        WHERE c.catalog_instance_id=%s AND m.available AND m.analysis_eligible IS TRUE
          AND m.media_fp IS NOT NULL AND m.media_fp <> ''
+         AND (m.duration_ms IS NULL OR m.duration_ms <= {MAX_DURATION_MS})
          AND NOT EXISTS (SELECT 1 FROM {t('loudness_tracks')} l
                           WHERE l.catalog_instance_id=m.catalog_instance_id AND l.track_id=m.track_id
                             AND l.version={int(VERSION)} AND l.media_revision={_REVISION})
@@ -224,22 +237,53 @@ def park(db, catalog_instance_id):
     update(db, catalog_instance_id, "waiting_runtime")
 
 
-def record_failure(db, catalog_instance_id, track_id, media_revision, error):
-    """Back the track off; the same media's next failure waits longer."""
+def record_failure(db, catalog_instance_id, track_id, media_revision, error, *, unsupported=False):
+    """Back the track off; the same media's next failure waits longer, and W3 parks it
+    (``next_attempt_at`` infinity) once it cannot succeed: ``unsupported`` at once, a decode
+    error after DECODE_ERROR_ATTEMPTS, any failure after the last step of RETRY_HOURS."""
+    reason = str(error)[:300]
+    decode = any(hint in reason for hint in DECODE_ERROR_HINTS)
+    attempts = "CASE WHEN a.media_revision=EXCLUDED.media_revision THEN a.attempts + 1 ELSE 1 END"
     cur = db.cursor()
     cur.execute(f"""
         INSERT INTO {t('loudness_attempts')} AS a
             (catalog_instance_id, track_id, media_revision, attempts, last_error, next_attempt_at)
-        VALUES (%s, %s, %s, 1, %s, now() + make_interval(hours => %s))
+        VALUES (%(source)s, %(track)s, %(revision)s, 1, %(reason)s,
+                CASE WHEN %(unsupported)s THEN 'infinity'::timestamp
+                     ELSE now() + make_interval(hours => %(first)s) END)
         ON CONFLICT (catalog_instance_id, track_id) DO UPDATE SET
-            attempts=CASE WHEN a.media_revision=EXCLUDED.media_revision THEN a.attempts + 1 ELSE 1 END,
+            attempts={attempts},
             media_revision=EXCLUDED.media_revision, last_error=EXCLUDED.last_error, updated_at=now(),
-            next_attempt_at=now() + make_interval(hours => (%s::int[])[
-                LEAST(CASE WHEN a.media_revision=EXCLUDED.media_revision THEN a.attempts + 1 ELSE 1 END, %s)])
-        """, (catalog_instance_id, track_id, media_revision, str(error)[:300], RETRY_HOURS[0],
-              list(RETRY_HOURS), len(RETRY_HOURS)))
+            next_attempt_at=CASE
+                WHEN %(unsupported)s OR {attempts} > %(steps)s
+                     OR (%(decode)s AND {attempts} >= %(decode_attempts)s)
+                    THEN 'infinity'::timestamp
+                ELSE now() + make_interval(hours => (%(hours)s::int[])[LEAST({attempts}, %(steps)s)])
+            END
+        """, {"source": catalog_instance_id, "track": track_id, "revision": media_revision,
+              "reason": reason, "unsupported": bool(unsupported), "first": RETRY_HOURS[0],
+              "steps": len(RETRY_HOURS), "decode": decode,
+              "decode_attempts": DECODE_ERROR_ATTEMPTS, "hours": list(RETRY_HOURS)})
     db.commit()
     cur.close()
+
+
+def parked_counts(db, catalog_instance_id):
+    """W3's parked work for the status page: ``too_long`` (never downloaded) and ``parked``
+    (failed for good on its current media)."""
+    cur = db.cursor()
+    cur.execute(f"""
+        SELECT (SELECT count(*) FROM {t('catalog_state')} c
+                  JOIN {t('catalog_tracks')} m ON m.catalog_instance_id=c.catalog_instance_id
+                   AND m.published_generation=c.published_generation
+                 WHERE c.catalog_instance_id=%s AND m.available AND m.analysis_eligible IS TRUE
+                   AND m.duration_ms > {MAX_DURATION_MS}),
+               (SELECT count(*) FROM {t('loudness_attempts')}
+                 WHERE catalog_instance_id=%s AND next_attempt_at='infinity'::timestamp)
+        """, (catalog_instance_id, catalog_instance_id))
+    too_long, parked = cur.fetchone()
+    cur.close()
+    return {"too_long": int(too_long or 0), "parked": int(parked or 0)}
 
 
 def clear_failures(cur, catalog_instance_id, track_ids):

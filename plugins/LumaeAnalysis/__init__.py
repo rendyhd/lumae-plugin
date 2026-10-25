@@ -25,7 +25,7 @@ from .edge_profiles import (
     METHOD as EDGE_METHOD, SCHEMA_VERSION as EDGE_SCHEMA_VERSION,
 )
 from .edge_profile_store import (
-    migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job,
+    migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job, fail_edge_job,
     publish_edge_profile, edge_backfill_candidates, edge_profile_status,
     claim_edge_requests, record_edge_runtime, edge_worker_runtime, is_unsupported_failure,
     UNSUPPORTED as EDGE_UNSUPPORTED, mark_edge_jobs_deferred, claim_deferred_edge_jobs,
@@ -4518,9 +4518,10 @@ def _finish_edge(state, payload, error):
             update_edge_job(get_db(), catalog_instance_id, job, EDGE_UNSUPPORTED,
                             analysis_isolation.edge_failure_reason(exc))
             return {"track_id": job["track_id"], "status": EDGE_UNSUPPORTED}
-        update_edge_job(get_db(), catalog_instance_id, job, "failed",
-                        analysis_isolation.edge_failure_reason(exc))
-        return {"track_id": job["track_id"], "status": "failed"}
+        status = fail_edge_job(get_db(), catalog_instance_id, job,
+                               analysis_isolation.edge_failure_reason(exc))
+        return {"track_id": job["track_id"],
+                "status": EDGE_UNSUPPORTED if status == EDGE_UNSUPPORTED else "failed"}
     finally:
         if info:
             remove_downloaded_file(info.get("cleanup_path"))
@@ -4783,7 +4784,8 @@ def _finish_loudness(state, record, error, measured):
     except Exception as exc:
         _rollback_if_possible(db)
         loudness_backfill.record_failure(db, state["catalog_instance_id"], state["track_id"],
-                                         state["media_revision"], analysis_isolation.edge_failure_reason(exc))
+                                         state["media_revision"], analysis_isolation.edge_failure_reason(exc),
+                                         unsupported=is_unsupported_failure(exc))
         return "failed"
     finally:
         if info:

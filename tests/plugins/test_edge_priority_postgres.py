@@ -202,6 +202,64 @@ def test_unsupported_media_is_terminal_for_its_revision(edge_publication_db, mon
     assert store.edge_statuses(db, "catalog-a", ["track-a"]) == {"track-a": {"status": "unsupported"}}
 
 
+def test_a_decode_error_twice_on_the_same_media_is_terminal(edge_publication_db, monkeypatch):
+    """W3: the first decode error backs off as before; the retry keeps it, and a
+    second one on the same media retires the job (it was downloaded whole and
+    retried every six hours). Other failures keep backing off."""
+    mod, db, store = load_plugin(), edge_publication_db, _store()
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
+    monkeypatch.setattr(
+        mod, "load_track_file",
+        lambda *_a, **_k: {"file_path": "x.flac", "media_signature": "private/path:123:456",
+                           "cleanup_path": None},
+    )
+    failure = {"exc": None}
+
+    def fail(*_args, **_kwargs):
+        raise failure["exc"]
+
+    monkeypatch.setattr(mod, "run_file_analysis", fail)
+    from plugins.LumaeAnalysis.analysis_isolation import IsolatedAnalysisError
+
+    failure["exc"] = IsolatedAnalysisError("media_error", "InvalidDataError")
+    jobs, _ready = store.claim_edge_jobs(db, "catalog-a", ["track-a"])
+    assert mod.analyze_edges_task(jobs, "catalog-a", "server-a", "background") == [
+        {"track_id": "track-a", "status": "failed"}]
+    assert _q(db, f"SELECT status, left(last_error, 16) FROM {JOBS}") == [("failed", "edge-media-error")]
+
+    _q(db, f"UPDATE {JOBS} SET updated_at=now()-interval '7 hours'")
+    jobs, _ready = store.claim_edge_jobs(db, "catalog-a", ["track-a"])
+    assert len(jobs) == 1
+    # The retry keeps the last failure of the same media.
+    assert _q(db, f"SELECT status, left(last_error, 16) FROM {JOBS}") == [("pending", "edge-media-error")]
+    assert mod.analyze_edges_task(jobs, "catalog-a", "server-a", "background") == [
+        {"track_id": "track-a", "status": "unsupported"}]
+    assert store.edge_statuses(db, "catalog-a", ["track-a"]) == {"track-a": {"status": "unsupported"}}
+
+
+def test_other_edge_failures_keep_backing_off(edge_publication_db, monkeypatch):
+    mod, db, store = load_plugin(), edge_publication_db, _store()
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda *_a, **_k: None)
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
+    monkeypatch.setattr(
+        mod, "load_track_file",
+        lambda *_a, **_k: {"file_path": "x.flac", "media_signature": "private/path:123:456",
+                           "cleanup_path": None},
+    )
+    from plugins.LumaeAnalysis.analysis_isolation import IsolatedAnalysisError
+
+    def timeout(*_args, **_kwargs):
+        raise IsolatedAnalysisError("analysis_timeout", "slow")
+
+    monkeypatch.setattr(mod, "run_file_analysis", timeout)
+    for _ in range(3):
+        jobs, _ready = store.claim_edge_jobs(db, "catalog-a", ["track-a"])
+        assert mod.analyze_edges_task(jobs, "catalog-a", "server-a", "background") == [
+            {"track_id": "track-a", "status": "failed"}]
+        _q(db, f"UPDATE {JOBS} SET updated_at=now()-interval '7 hours'")
+
+
 def test_edge_statuses_report_absent_pending_and_failed(edge_publication_db):
     store, db = _store(), edge_publication_db
     assert store.edge_statuses(db, "catalog-a", ["track-a", "unknown"]) == {

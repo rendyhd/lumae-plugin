@@ -141,9 +141,12 @@ def test_failures_back_off_per_media(migrated_db):
     assert attempt() == (1, 1)
     loudness_backfill.record_failure(db, SOURCE, "t1", revision("m1"), "boom")
     assert attempt() == (2, 6)
-    for _ in range(4):
+    for _ in range(2):
         loudness_backfill.record_failure(db, SOURCE, "t1", revision("m1"), "boom")
-    assert attempt() == (6, 72)
+    assert attempt() == (4, 72)
+    # W3: the failure after the last step parks the track for its media.
+    loudness_backfill.record_failure(db, SOURCE, "t1", revision("m1"), "boom")
+    assert parked(db, "t1") and due(db) == []
     # New media starts over, and is due at once until it fails.
     with db.cursor() as cur:
         cur.execute(f"UPDATE {P}catalog_tracks SET media_fp='m1b' WHERE track_id='t1'")
@@ -155,6 +158,55 @@ def test_failures_back_off_per_media(migrated_db):
         loudness_backfill.clear_failures(cur, SOURCE, ["t1"])
     db.commit()
     assert due(db) == ["t1"]
+
+
+def parked(db, track_id):
+    with db.cursor() as cur:
+        cur.execute(f"SELECT next_attempt_at = 'infinity'::timestamp FROM {P}loudness_attempts "
+                    "WHERE track_id=%s", (track_id,))
+        row = cur.fetchone()
+    db.commit()
+    return bool(row and row[0])
+
+
+def test_a_file_too_long_to_measure_is_never_downloaded(migrated_db):
+    """W3: the catalogue's duration keeps a file over the meter's limit out of the pass."""
+    db = migrated_db
+    _source(db, [("t1", "al", "m1"), ("t2", "al", "m2"), ("t3", "al", "m3")])
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {P}catalog_tracks SET duration_ms=%s WHERE track_id='t1'",
+                    (loudness_backfill.MAX_DURATION_MS + 1,))
+        cur.execute(f"UPDATE {P}catalog_tracks SET duration_ms=%s WHERE track_id='t2'",
+                    (loudness_backfill.MAX_DURATION_MS,))
+    db.commit()
+    assert due(db) == ["t2", "t3"]
+    assert loudness_backfill.parked_counts(db, SOURCE) == {"too_long": 1, "parked": 0}
+
+
+def test_failures_that_cannot_succeed_park_until_the_media_changes(migrated_db):
+    """W3: unsupported parks at once, a decode error at its second attempt."""
+    db = migrated_db
+    _source(db, [("t1", "al", "m1"), ("t2", "al", "m2"), ("t3", "al", "m3")])
+    loudness_backfill.record_failure(db, SOURCE, "t1", revision("m1"),
+                                     "edge-analysis-unavailable fmt=dsf", unsupported=True)
+    assert parked(db, "t1")
+    decode = "edge-media-error fmt=flac phase=decode err=InvalidDataError"
+    loudness_backfill.record_failure(db, SOURCE, "t2", revision("m2"), decode)
+    assert not parked(db, "t2")
+    loudness_backfill.record_failure(db, SOURCE, "t2", revision("m2"), decode)
+    assert parked(db, "t2")
+    loudness_backfill.record_failure(db, SOURCE, "t3", revision("m3"), "boom")
+    assert not parked(db, "t3")
+    assert loudness_backfill.parked_counts(db, SOURCE) == {"too_long": 0, "parked": 2}
+    assert due(db) == []
+
+    # A new revision of a parked file is due again and starts over.
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {P}catalog_tracks SET media_fp='m2b' WHERE track_id='t2'")
+    db.commit()
+    assert due(db) == ["t2"]
+    loudness_backfill.record_failure(db, SOURCE, "t2", revision("m2b"), decode)
+    assert not parked(db, "t2")
 
 
 def wav(path, seconds=4.0, gain=0.3, rate=44100):
