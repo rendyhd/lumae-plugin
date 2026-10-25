@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased
+## 1.9.0 (2026-10-25)
 
 Lumae no longer holds AudioMuse's task queue (runner plan 2026-10-25,
 R1–R9; contract §3.6).
@@ -127,8 +127,6 @@ Less repeated work (runner plan 2026-10-25, W2).
   track IDs are changing (or AudioMuse still has to catch up with a change),
   at most every 30 minutes, instead of an AudioMuse task every half hour on
   every server: 48 tasks a day with nothing to check.
-
-## 1.9.0 (2026-10-24)
 
 Journeys (contract §5.7; Auralscape JN.10). Clients that don't know them never
 read them.

@@ -146,6 +146,8 @@ def test_current_release_contains_supported_source_only():
         assert {"jellyfin_provider.py", "jellyfin_continuity.py", "file_tags.py"} <= set(names)
         # 1.9.0: journey sync.
         assert "journeys.py" in names
+        # 1.9.0: Lumae's own runners, catalogue work in a child process.
+        assert {"runner.py", "action_isolation.py"} <= set(names)
         assert "edge_qualification_v2.json" in names
         if _lumae_release_policy()["mode"] == "source":
             # Only a source-mode release must match the working source.

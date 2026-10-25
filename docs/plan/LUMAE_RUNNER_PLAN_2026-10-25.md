@@ -622,6 +622,16 @@ a relationship step in a child of the worker, and a child died with its killed w
 whose successor finished the kept refresh. The perf scratch stand-in and probe are not
 committed. The full suite after RN.8b: 1,899 passed, 1 skipped, the 8 known local failures.
 
+**RN.9.** 1.9.0 re-cut from source (`dist/lumae_analysis/lumae_analysis_1.9.0.zip`, 57
+files, `runner.py` and `action_isolation.py` among them); it replaces the journeys-only
+archive, which was never published. The archive, unpacked onto the stock host with its
+catalogue entry and registered: both runners took the lead after their start-up delays,
+AudioMuse's queue and Scheduled Tasks held no Lumae row, `/api/health` reported 1.9.0
+with `journeys` and `pending_requests`, and a phone refresh ran in a child of the web
+process (about 130 MB, 1.3 s). The full suite: 1,898 passed, 2 skipped (the pinned-release
+check skips in source mode), the 8 known local failures. Not published: that, and the
+owner's server canary, wait for the owner.
+
 ## Tests
 
 - **Runner unit tests** (fake clock and database): start is idempotent; standby without
