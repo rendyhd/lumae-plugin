@@ -255,6 +255,7 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
                 "server_backfill": True,
                 "edge_status": True,
                 "deferred_requests": True,
+                "pending_requests": False,
                 "queue": None,
                 # No database: v3 is not offered (SF.3).
                 "schema_versions": [2],

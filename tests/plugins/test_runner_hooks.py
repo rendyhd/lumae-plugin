@@ -18,8 +18,7 @@ def test_the_runners_stay_off_by_default(monkeypatch):
 def test_an_enabled_runner_starts_with_the_hosts_connection(monkeypatch):
     mod = load_plugin()
     started = {}
-    monkeypatch.setattr(mod, "get_setting",
-                        lambda key, default=None: True if key == "runner_enabled" else default)
+    monkeypatch.setattr(mod.runner, "enabled", lambda: True)
     monkeypatch.setattr(mod.runner, "start", lambda role, **kwargs: started.update(role=role, **kwargs))
     monkeypatch.setitem(sys.modules, "database", types.SimpleNamespace(
         connect_raw=lambda application_name=None: ("connection", application_name)))
@@ -37,8 +36,7 @@ def test_an_enabled_runner_starts_with_the_hosts_connection(monkeypatch):
 
 def test_without_an_application_the_runner_does_not_start(monkeypatch):
     mod = load_plugin()
-    monkeypatch.setattr(mod, "get_setting",
-                        lambda key, default=None: True if key == "runner_enabled" else default)
+    monkeypatch.setattr(mod.runner, "enabled", lambda: True)
     monkeypatch.setattr(mod.runner, "start", lambda role, **kwargs: (_ for _ in ()).throw(AssertionError))
     assert mod.start_runner(mod.runner.ROLE_SERVER) is None  # outside an app context
 

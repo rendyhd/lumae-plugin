@@ -1323,6 +1323,9 @@ def catalog_reconcile_task():
     first, task_id = _reconcile_dispatch()
     if not first:
         return report.result("same_dispatch", **versions)
+    if runner_enabled():
+        # Runner plan: the runners do this work; a queued tick does none.
+        return report.result("runner", **versions)
     db = get_db()
     if maintenance_paused():
         try:
@@ -2437,6 +2440,12 @@ def enqueue_profile_analysis(
     if catalog_instance_id and not tokens:
         return None
     admitted_ids = [track_id for track_id in ids if not catalog_instance_id or track_id in tokens]
+    if priority == "interactive" and catalog_instance_id and runner_enabled():
+        # R6: recorded for the runner, which serves on-demand work first.
+        db = get_db()
+        mark_profiles_deferred(db, catalog_instance_id, tokens)
+        wake_runner(db, "interactive_profiles")
+        return RECORDED
     try:
         return enqueue_bounded(
             analyze_tracks_task,
@@ -2958,6 +2967,9 @@ def edge_profiles_capability():
             "analyzable": analyzable, "worker_runtime": worker,
             "served": True, "stored": edge_profiles_stored(),
             "server_backfill": True, "edge_status": True, "deferred_requests": True,
+            # Runner plan R6: on-demand requests are recorded and served by
+            # the runners; the deferred lists stay, empty.
+            "pending_requests": runner_enabled(),
             "queue": queue, "schema_versions": edge_schema_versions()}
 
 
@@ -3502,7 +3514,8 @@ def catalog_prepare_api():
         if initial["publication_current"]:
             return _private_json(initial, 200)
         if not preparation_is_active(preparation_state(source["catalog_instance_id"])):
-            if claim_preparation(source):
+            # R6: the claim records the work and wakes the runners.
+            if claim_preparation(source) and not runner_enabled():
                 try:
                     enqueue_bounded(
                         prepare_lumae_task,
@@ -3606,6 +3619,13 @@ def catalog_refresh_api():
             "catalog_instance_id": source["catalog_instance_id"],
         }
         db = get_db()
+        if runner_enabled():
+            # R6: the request is kept, and the runner's next pass refreshes;
+            # a scan that starts after it serves it (SQ.1).
+            want_catalog_refresh(db, source["catalog_instance_id"])
+            arm_reconcile(db, "catalog_refresh_wanted")
+            db.commit()
+            return _private_json(queued, 202)
         if catalog_refresh_task_live(db):
             # One refresh on the queue serves every request made before it scans.
             return _private_json({**queued, "coalesced": True}, 202)
@@ -4251,6 +4271,11 @@ def analyze():
     # default task re-checks readiness before each track and becomes a no-op.
     interactive_ids = accepted + already_pending
     deferred = []
+    if runner_enabled():
+        # R6: one record for the runner, however many ids; nothing is deferred.
+        enqueue_profile_analysis(interactive_ids, catalog_instance_id, server_id,
+                                 priority="interactive")
+        interactive_ids = []
     for start in range(0, len(interactive_ids), INTERACTIVE_PROFILE_CHUNK_SIZE):
         chunk = interactive_ids[start : start + INTERACTIVE_PROFILE_CHUNK_SIZE]
         if enqueue_profile_analysis(
@@ -4405,9 +4430,22 @@ def enqueue_edge_profiles(ids, catalog_instance_id, server_id, *, priority="back
     if not edge_scheduling_allowed():
         return empty
     db = get_db()
+    if priority != "interactive" and runner_enabled():
+        # R6: the server's library pass covers the tracks; nothing is queued.
+        if arm_edge_backfill(db, catalog_instance_id, include_complete=False):
+            arm_reconcile(db, "edge_backfill_ready")
+        db.commit()
+        return {**empty, "available": True, "already_pending": list(ids)}
     jobs, ready, pending, unsupported = claim_edge_requests(db, catalog_instance_id, ids, priority)
     deferred = []
-    if jobs:
+    if jobs and runner_enabled():
+        # R6: recorded for the runner, which serves on-demand work first.
+        mark_edge_jobs_deferred(db, catalog_instance_id, jobs, DEFERRED_MARKER)
+        wake_runner(db, "interactive_edges")
+        jobs_recorded = True
+    else:
+        jobs_recorded = False
+    if jobs and not jobs_recorded:
         try:
             # AudioMuse admits one root task per plugin. Submit the bounded
             # source-bound batch as one task; per-track tasks would make the
@@ -6437,7 +6475,7 @@ def start_profile_backfill(catalog_instance_id=None, server_id=None, enqueue_job
     )
     if not claim_profile_backfill(source):
         return {"queued": False, "coalesced": True, "batch_size": configured_backfill_limit()}
-    if not enqueue_job:
+    if not enqueue_job or runner_enabled():
         return {
             "queued": True,
             "coalesced": False,
@@ -6703,7 +6741,7 @@ def start_relationship_preparation(
             "coalesced": True,
             "reason": "already_running",
         }
-    if not enqueue_job:
+    if not enqueue_job or runner_enabled():
         return {
             "queued": True,
             "coalesced": False,
@@ -7214,6 +7252,8 @@ def settings():
                         message = f"Preparation is already running for {source['name']}."
                     else:
                         try:
+                            if runner_enabled():
+                                raise _RecordedForRunner()
                             enqueue_bounded(
                                 prepare_lumae_task,
                                 server_id,
@@ -7221,6 +7261,8 @@ def settings():
                                 queue="default",
                                 timeout=CATALOG_JOB_TIMEOUT_SECONDS,
                             )
+                        except _RecordedForRunner:
+                            pass
                         except Exception:
                             logger.exception(
                                 "lumae_analysis could not queue catalogue preparation; "
@@ -7366,8 +7408,7 @@ RUNNER_PRELOAD_MODULES = (
 
 def runner_enabled():
     """RN.1–RN.4: the runners start only with this setting on (off by default)."""
-    value = get_setting("runner_enabled", False)
-    return value is True or str(value).strip().lower() in {"1", "true", "yes", "on"}
+    return runner.enabled()
 
 
 def _runner_code_current():
@@ -7428,6 +7469,24 @@ def start_runner(role):
         connect=lambda name: connect_raw(application_name=name),
         still_installed=_runner_code_current,
     )
+
+
+# What enqueue_profile_analysis answers when the runners take the request.
+RECORDED = "recorded"
+
+
+class _RecordedForRunner(Exception):
+    """A settings action's work is recorded; the runners do it (R6)."""
+
+
+def wake_runner(db, reason):
+    """Wake the runners for work just recorded, and commit it (R2, R6)."""
+    cur = db.cursor()
+    try:
+        runner.notify(cur, reason)
+    finally:
+        cur.close()
+    db.commit()
 
 
 def flask_start():

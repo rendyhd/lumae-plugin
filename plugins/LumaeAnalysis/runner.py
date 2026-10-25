@@ -65,6 +65,18 @@ Turn = namedtuple("Turn", "worked mode reason next_due_seconds action")
 ROLE = ContextVar("lumae_runner_role", default=None)
 
 
+def enabled():
+    """The setting ``runner_enabled`` (RN.1–RN.4: off by default). With it on,
+    the runners do the background work and nothing is queued or armed."""
+    try:
+        from plugin.api import get_setting
+
+        value = get_setting("runner_enabled", False)
+    except Exception:
+        return False
+    return value is True or str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
 def idle_turn(next_due_seconds=None, reason="nothing_due"):
     return Turn(False, "idle", reason, next_due_seconds, None)
 

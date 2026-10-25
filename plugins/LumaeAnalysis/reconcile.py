@@ -304,10 +304,14 @@ def arm_reconcile(db, reason="work_admitted", commit=False):
     A yield (plan S1) holds: the work is durable, and the tick that finds
     nothing to yield to takes it. Minute cadence here put a fire back on every
     minute, ahead of the host's retry pass, whenever a song was analysed or
-    the app asked for work."""
+    the app asked for work.
+
+    Runner plan R2: it also wakes the runners (``pg_notify``, delivered with
+    the caller's commit). With the runners on, the watchdog is not armed."""
     cur = db.cursor()
-    if not _yielding(_lock_control(cur)):
+    if not runner.enabled() and not _yielding(_lock_control(cur)):
         _set_schedule_locked(cur, "active", ACTIVE_CRON, reason)
+    runner.notify(cur, reason)
     cur.close()
     if commit:
         db.commit()
