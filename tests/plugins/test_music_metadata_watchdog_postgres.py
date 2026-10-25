@@ -19,8 +19,8 @@ from test_lumae_analysis import load_plugin
 LEGACY = "plugin.lumae_analysis.music_metadata"
 RECONCILE = "plugin.lumae_analysis.catalog_reconcile"
 # Minute cadence leaves out the minutes of the installed identity recheck
-# (2,32) and collection retention (23 3 * * *) rows (plan S1).
-EVERY_MINUTE = "0,1,3-22,24-31,33-59 * * * *"
+# (2 4 * * *, W1) and collection retention (23 3 * * *) rows (plan S1).
+EVERY_MINUTE = "0,1,3-22,24-59 * * * *"
 
 
 def _rows(db, sql, params=()):

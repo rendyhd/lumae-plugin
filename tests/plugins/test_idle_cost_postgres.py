@@ -344,7 +344,9 @@ class _Counting:
 # albums, both current). Before WP4 it ran 59: a page of the credits walk and
 # an upsert per album twice a tick, and the settings snapshot counted every
 # tick. SQ.1 added one indexed read: a catalogue refresh kept for the tick.
-IDLE_TICK_STATEMENTS = 27
+# W1 one more: the identity recheck's look for a transition that needs it,
+# which replaced 48 recheck tasks a day.
+IDLE_TICK_STATEMENTS = 28
 
 
 def test_an_idle_tick_runs_few_statements(tick, monkeypatch):

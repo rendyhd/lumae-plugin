@@ -56,6 +56,11 @@ Less repeated work (runner plan 2026-10-25, W2).
   spread ±25 %, so albums first checked together no longer come due together,
   and re-checks run only when nothing else waits, at most 60 an hour. The
   re-checks already due spread over the next 14 days.
+- The provider identity recheck runs while a server's track IDs are changing
+  (or AudioMuse still has to catch up with a change), at most every 30
+  minutes, instead of every half hour on every server: 48 AudioMuse tasks a
+  day with nothing to check. Its schedule moves to once a day; one an
+  administrator changed is kept.
 
 ## 1.9.0 (2026-10-24)
 

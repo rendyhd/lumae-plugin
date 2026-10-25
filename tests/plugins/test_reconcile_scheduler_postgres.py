@@ -33,8 +33,8 @@ RECONCILE = "plugin.lumae_analysis.catalog_reconcile"
 RECHECK = "plugin.lumae_analysis.provider_identity_recheck"
 COLLECTION_RETENTION = "plugin.lumae_analysis.collection_retention"
 # Minute cadence on the migrated schema: without the minutes of the installed
-# identity recheck (2,32) and collection retention (23 3 * * *) rows (S1).
-EVERY_MINUTE = "0,1,3-22,24-31,33-59 * * * *"
+# identity recheck (2 4 * * *, W1) and collection retention (23 3 * * *) rows (S1).
+EVERY_MINUTE = "0,1,3-22,24-59 * * * *"
 
 
 def _rows(db, sql, params=()):
@@ -237,7 +237,14 @@ def test_the_identity_recheck_is_installed_enabled_and_keeps_a_later_change(
 ):
     db = migrated_db
     assert _rows(db, "SELECT cron_expr, enabled FROM cron WHERE task_type=%s", (RECHECK,)) == [
-        ("2,32 * * * *", True)]
+        ("2 4 * * *", True)]
+    # W1: the half-hourly row earlier releases installed moves to daily.
+    with db.cursor() as cur:
+        cur.execute("UPDATE cron SET cron_expr='2,32 * * * *' WHERE task_type=%s", (RECHECK,))
+    db.commit()
+    run_plugin_migration(db)
+    assert _rows(db, "SELECT cron_expr, enabled FROM cron WHERE task_type=%s", (RECHECK,)) == [
+        ("2 4 * * *", True)]
     with db.cursor() as cur:
         cur.execute("UPDATE cron SET enabled=FALSE, cron_expr='5 * * * *' WHERE task_type=%s",
                     (RECHECK,))
@@ -656,11 +663,11 @@ def test_minute_cadence_skips_only_enabled_lumae_rows(tick):
                     ("plugin.lumae_analysis.catalog_refresh",
                      "plugin.lumae_analysis.analysis_projection"))
     db.commit()
-    assert armed() == "0,1,3-16,18-22,24-31,33-46,48-59 * * * *"
+    assert armed() == "0,1,3-16,18-22,24-46,48-59 * * * *"
     for task_type in ("plugin.lumae_analysis.catalog_refresh",
                       "plugin.lumae_analysis.analysis_projection", COLLECTION_RETENTION):
         _disable(db, task_type)
-    assert armed() == "0,1,3-31,33-59 * * * *"
+    assert armed() == "0,1,3-59 * * * *"
     _disable(db, RECHECK)
     assert armed() == "* * * * *"
     # Another plugin's rows are not Lumae's to avoid.
@@ -669,3 +676,35 @@ def test_minute_cadence_skips_only_enabled_lumae_rows(tick):
                     "VALUES ('other', 'plugin.other.sync', '7 * * * *', TRUE)")
     db.commit()
     assert armed() == "* * * * *"
+
+
+def test_the_identity_recheck_runs_while_a_transition_needs_it(tick, monkeypatch):
+    """W1: a watchdog action while a transition needs it, at most every 30 minutes."""
+    mod, db = tick
+    runs = []
+    monkeypatch.setattr(mod, "provider_identity_recheck_task",
+                        lambda server_id=None: runs.append(server_id) or {"checked": 1, "results": []})
+
+    def transition(sql, params=()):
+        with db.cursor() as cur:
+            cur.execute(sql.format(table=f"{P}provider_identity_transitions"), params)
+        db.commit()
+
+    mod.catalog_reconcile_task()
+    assert runs == []  # no transition
+    transition("INSERT INTO {table} (catalog_instance_id, state) VALUES (%s, 'transition_pending')",
+               (SOURCE,))
+    mod.catalog_reconcile_task()
+    assert runs == [SERVER]
+    mod.catalog_reconcile_task()
+    assert runs == [SERVER]  # not again within 30 minutes
+    transition("UPDATE {table} SET recheck_attempted_at=now()-interval '31 minutes'")
+    mod.catalog_reconcile_task()
+    assert runs == [SERVER, SERVER]
+    transition("UPDATE {table} SET state='applied', audiomuse_health='ready', "
+               "recheck_attempted_at=NULL")
+    mod.catalog_reconcile_task()
+    assert len(runs) == 2  # applied, AudioMuse ready: nothing to do
+    transition("UPDATE {table} SET projection_reconcile_required=TRUE")
+    mod.catalog_reconcile_task()
+    assert len(runs) == 3  # a projection owed

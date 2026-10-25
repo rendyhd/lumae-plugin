@@ -174,6 +174,8 @@ def migrate_provider_identity(db):
         "applied_at TIMESTAMPTZ",
         # P3-4c: principals whose collection rekey was deferred, with why.
         "collection_deferrals JSONB NOT NULL DEFAULT '[]'::jsonb",
+        # W1 (runner plan 2026-10-25): when the recheck last took this source.
+        "recheck_attempted_at TIMESTAMPTZ",
     )
     cur.execute(
         f"""
@@ -250,6 +252,38 @@ def require_projection_reconcile(db):
     changed = max(int(getattr(cur, "rowcount", 0) or 0), 0)
     cur.close()
     return changed
+
+
+def claim_identity_recheck(db, spacing_seconds, server_id=None):
+    """W1: the server of a source whose transition needs the identity recheck
+    (``transition_pending``, or ``applied`` with AudioMuse not ready or a
+    projection owed: what ``provider_identity_recheck_task`` acts on) and that
+    it has not taken in the last ``spacing_seconds``, marked taken; None when
+    no source needs it. The caller commits."""
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        UPDATE {t('provider_identity_transitions')} tr SET recheck_attempted_at=now()
+          FROM (SELECT pending.catalog_instance_id, s.current_core_server_id
+                  FROM {t('provider_identity_transitions')} pending
+                  JOIN {t('catalog_sources')} s USING (catalog_instance_id)
+                 WHERE (pending.state='transition_pending'
+                        OR (pending.state='applied'
+                            AND (COALESCE(pending.audiomuse_health, '')<>'ready'
+                                 OR pending.projection_reconcile_required)))
+                   AND (pending.recheck_attempted_at IS NULL
+                        OR pending.recheck_attempted_at <= now() - make_interval(secs => %s))
+                   AND (%s::text IS NULL OR s.current_core_server_id=%s)
+                 ORDER BY pending.recheck_attempted_at NULLS FIRST, pending.catalog_instance_id
+                 LIMIT 1 FOR UPDATE OF pending SKIP LOCKED) due
+         WHERE tr.catalog_instance_id=due.catalog_instance_id
+        RETURNING due.current_core_server_id
+        """,
+        (int(spacing_seconds), server_id, server_id),
+    )
+    row = cur.fetchone()
+    cur.close()
+    return str(row[0]) if row and row[0] else None
 
 
 def projection_reconcile_required(db, catalog_instance_id):

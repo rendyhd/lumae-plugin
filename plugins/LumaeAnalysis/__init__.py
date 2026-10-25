@@ -121,6 +121,7 @@ from .database_state import (
 from .settings_ui import SETTINGS_STATUS_SCRIPT
 from .provider_identity_guard import (
     TRANSITION_BLOCKER,
+    claim_identity_recheck,
     complete_projection_reconcile,
     migrate_provider_identity,
     observe_provider_version,
@@ -262,6 +263,13 @@ BACKFILL_TASK_TYPE = "plugin.lumae_analysis.backfill"
 CATALOG_REFRESH_TASK_TYPE = "plugin.lumae_analysis.catalog_refresh"
 CATALOG_RECONCILE_TASK_TYPE = "plugin.lumae_analysis.catalog_reconcile"
 PROVIDER_IDENTITY_RECHECK_TASK_TYPE = "plugin.lumae_analysis.provider_identity_recheck"
+# W1 (runner plan 2026-10-25): the recheck runs as a watchdog action while a
+# provider transition needs it, each source at most every
+# IDENTITY_RECHECK_SPACING_SECONDS; its schedule is a daily backstop. It ran
+# half-hourly: 48 root tasks a day on a server with nothing pending.
+IDENTITY_RECHECK_CRON = "2 4 * * *"
+SHIPPED_IDENTITY_RECHECK_CRON = "2,32 * * * *"
+IDENTITY_RECHECK_SPACING_SECONDS = 30 * 60
 ANALYSIS_PROJECTION_TASK_TYPE = "plugin.lumae_analysis.analysis_projection"
 COLLECTION_RETENTION_TASK_TYPE = "plugin.lumae_analysis.collection_retention"
 DEFAULT_BACKFILL_BATCH_SIZE = 3
@@ -634,7 +642,8 @@ def ensure_catalog_reconcile_schedule(db):
 
 def ensure_provider_identity_recheck_schedule(db):
     """Enabled on install; an administrator's later change to the row is kept
-    (1.6.1 re-enabled it on every install, AUD-18)."""
+    (1.6.1 re-enabled it on every install, AUD-18). Daily (W1): a row still at
+    the half-hourly expression earlier releases installed moves to daily."""
     cur = db.cursor()
     cur.execute(
         "INSERT INTO cron (name, task_type, cron_expr, enabled) "
@@ -642,8 +651,13 @@ def ensure_provider_identity_recheck_schedule(db):
         (
             PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
             PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
-            "2,32 * * * *",
+            IDENTITY_RECHECK_CRON,
         ),
+    )
+    cur.execute(
+        "UPDATE cron SET cron_expr=%s WHERE task_type=%s AND cron_expr=%s",
+        (IDENTITY_RECHECK_CRON, PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
+         SHIPPED_IDENTITY_RECHECK_CRON),
     )
     cur.close()
 
@@ -1172,6 +1186,18 @@ def _safe_edge_v3_upgrade(db, budget_seconds=None):
         return None
 
 
+def _safe_claim_identity_recheck(db, server_id):
+    """W1: the server whose identity recheck is due, taken; None on any error."""
+    try:
+        server = claim_identity_recheck(db, IDENTITY_RECHECK_SPACING_SECONDS, server_id)
+        db.commit()
+        return server
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis could not check for a provider identity recheck")
+        return None
+
+
 def _safe_credits_reconcile(db, server_id, before_background, deadline=None):
     try:
         return credits_service.reconcile(db, server_id, before_background=before_background,
@@ -1465,6 +1491,16 @@ def _next_reconcile_action(db, report, budget, server_id, done):
             result = wanted_catalog_refresh_task(*wanted)
             _record_turn(db, report, "catalog_refresh", wanted[0], wanted[1], result, start)
             return "catalog_refresh", result
+    # W1: the provider identity recheck, while a transition needs it.
+    if due("identity_recheck"):
+        done.add("identity_recheck")
+        recheck_server = _safe_claim_identity_recheck(db, server_id)
+        if recheck_server:
+            budget.start()
+            start = time.monotonic()
+            result = provider_identity_recheck_task(recheck_server)
+            _record_turn(db, report, "identity_recheck", recheck_server, None, result, start)
+            return "identity_recheck", result
     # A share-gated turn each, checked once a tick: the check sweeps.
     for action, call in (("credits", _safe_credits_reconcile),
                          ("music_metadata", _safe_metadata_reconcile)):

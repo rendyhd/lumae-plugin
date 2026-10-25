@@ -4794,7 +4794,7 @@ def test_migrate_disables_legacy_backfill_schedule(monkeypatch):
         (
             mod.PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
             mod.PROVIDER_IDENTITY_RECHECK_TASK_TYPE,
-            "2,32 * * * *",
+            "2 4 * * *",
         ),
         (
             mod.ANALYSIS_PROJECTION_TASK_TYPE,
