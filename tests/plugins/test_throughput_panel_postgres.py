@@ -106,6 +106,8 @@ def test_the_panel_renders_throughput_and_eta(tick, monkeypatch):
     ("idle", "<strong>Server</strong>: idle: nothing due."),
     ("paused", "<strong>Server</strong>: paused by the administrator."),
     ("stopped", "<strong>Server</strong>: not running (last seen 10 minutes ago)."),
+    ("unavailable", "<strong>Server</strong>: cannot run: this AudioMuse has no "
+                    "database.connect_raw (AudioMuse 3.2.0 or newer)."),
 ])
 def test_the_panel_renders_in_every_state_and_stays_accessible(tick, monkeypatch, state, server_line):
     from test_lumae_analysis import _a11y_lint
@@ -119,8 +121,9 @@ def test_the_panel_renders_in_every_state_and_stays_accessible(tick, monkeypatch
         "idle": ("idle", "nothing_due", None),
         "paused": ("paused", "maintenance_paused", None),
         "stopped": ("idle", "nothing_due", None),
+        "unavailable": ("unavailable", "host_without_connect_raw", None),
     }[state]
-    seen = "now() - interval '10 minutes'" if state == "stopped" else "now()"
+    seen = {"stopped": "now() - interval '10 minutes'", "unavailable": "NULL"}.get(state, "now()")
     with db.cursor() as cur:
         cur.execute(f"INSERT INTO {P}runner_state (role, host, pid, mode, reason, current_action, "
                     f"actions, heartbeat_at) VALUES ('server', 'web-1', 7, %s, %s, %s, 3, {seen})",
@@ -139,3 +142,35 @@ def test_the_panel_renders_in_every_state_and_stays_accessible(tick, monkeypatch
     assert f'data-lumae-active="{str(state == "working").lower()}"' in body
     # The page's live region is elsewhere; the panel adds no other violation.
     assert [v for v in _a11y_lint(body) if "aria-live" not in v] == []
+
+
+def test_the_panel_lists_the_files_lumae_stopped_trying(tick, monkeypatch):
+    """W3: too long to measure, loudness failed for good, edges unsupported."""
+    mod, db = tick
+    monkeypatch.setattr(mod, "_parked_files", None)
+    assert "Files Lumae stopped trying" not in settings_render.render_reconcile_status_panel()
+    monkeypatch.setattr(mod, "_parked_files", None)
+    with db.cursor() as cur:
+        for track, duration in (("long-a", 7_000_000), ("long-b", 6_600_000), ("short", 200_000)):
+            cur.execute(
+                f"INSERT INTO {P}catalog_tracks (catalog_instance_id, published_generation, "
+                "track_id, title, metadata_fp, media_fp, analysis_eligible, duration_ms, payload, "
+                "first_seen_at, last_seen_at) VALUES (%s, 1, %s, %s, 'm', 'r', TRUE, %s, '{}'::jsonb, "
+                "now(), now())", (SOURCE, track, track, duration))
+        cur.execute(f"INSERT INTO {P}loudness_attempts (catalog_instance_id, track_id, media_revision, "
+                    "attempts, next_attempt_at) VALUES (%s, 'short', 'r', 5, 'infinity')", (SOURCE,))
+        cur.execute(f"INSERT INTO {P}edge_profile_jobs (catalog_instance_id, track_id, media_revision, "
+                    "job_token, status) VALUES (%s, 'short', 'r', 't', 'unsupported')", (SOURCE,))
+    db.commit()
+
+    text = " ".join(settings_render.render_reconcile_status_panel().split())
+
+    assert ("Files Lumae stopped trying: 2 too long to measure (over 109 minutes; never "
+            "downloaded); 1 whose loudness failed for good on the current file; 1 without an edge "
+            "profile (an unsupported format or layout, or a file that failed to decode twice). "
+            "Each is tried again when its file changes.") in text
+    # Counted at most every five minutes: the settings panel is polled.
+    with db.cursor() as cur:
+        cur.execute(f"DELETE FROM {P}edge_profile_jobs")
+    db.commit()
+    assert "1 without an edge profile" in settings_render.render_reconcile_status_panel()

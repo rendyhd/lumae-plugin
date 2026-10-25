@@ -106,3 +106,18 @@ def test_the_web_process_reports_its_runtime_without_parking_the_passes(monkeypa
     assert recorded and parked == []
     mod.report_edge_runtime(force=True)
     assert parked == [True]  # a worker without a runtime still parks
+
+
+def test_a_host_without_connect_raw_says_so_on_the_status_page(monkeypatch):
+    # R10: the runner cannot start; the status row and a log line say why.
+    mod = load_plugin()
+    recorded = []
+    monkeypatch.setattr(mod.runner, "start", lambda role, **kwargs: (_ for _ in ()).throw(AssertionError))
+    monkeypatch.setitem(sys.modules, "database", types.SimpleNamespace())
+    monkeypatch.setattr(mod, "_record_runner_unavailable",
+                        lambda role, reason: recorded.append((role, reason)))
+    from flask import Flask
+
+    with Flask(__name__).app_context():
+        assert mod.start_runner(mod.runner.ROLE_SERVER) is None
+    assert recorded == [("server", "host_without_connect_raw")]

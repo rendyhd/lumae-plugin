@@ -35,11 +35,13 @@ a running 1.2.5 installation — no 1.2.5 process may keep running once the
   evidence, embeddings, Chromaprint, journals and waveform coverage.
 * **Waveform and edge profiles.** Per-track loudness/MixRamp profiles reuse
   AudioMuse's own analysis audio; edge (SmoothFade) profiles are a separate,
-  source-bound analysis. One durable background-enrichment workflow per
-  source uses small batches and a time-boxed watchdog that steps aside for
-  AudioMuse's own jobs instead of flooding the queue, with high-priority idempotent promotion for the current
-  playback window so a requested track is never trapped behind a library
-  backfill. Both profile kinds are delivered as a cursor stream, so a phone
+  source-bound analysis. From 1.9.0 Lumae's own two runners do the
+  background work outside AudioMuse's task queue (a server runner in
+  AudioMuse's web process, a worker runner in an AudioMuse worker; the
+  `heavy_work` setting says which does the heavy lane): small resumable
+  slices that step aside for AudioMuse's own jobs, with on-demand requests
+  served first so a requested track for the current playback window is
+  never trapped behind a library backfill. Both profile kinds are delivered as a cursor stream, so a phone
   installs only newly ready or removed profiles after its first bootstrap,
   and server-owned album/artist relationship generations use Lumae's native
   scoring model, published as resumable snapshots and deltas. A complete
@@ -84,17 +86,17 @@ a running 1.2.5 installation — no 1.2.5 process may keep running once the
   (unpublished/orphaned profile counts, collections-feed health, fence
   installation) and stored diagnostic error text is shown through
   redaction, never raw (LUM-021, §2).
-* **Analysis time limits.** AudioMuse runs plugin tasks without enforcing
-  any timeout of its own. From 1.3.0, each waveform or edge analysis instead
-  runs in its own process with a killable wall-clock limit, so a stuck
-  decoder cannot hang a worker (LUM-018; see Settings below).
+* **Analysis time limits.** Each waveform or edge analysis runs in its own
+  process with a killable wall-clock limit (from 1.3.0), so a stuck decoder
+  cannot hang a runner or an AudioMuse worker (LUM-018; see Settings below).
 
 ### Execution limits for file analysis in 1.3.0
 
 AudioMuse runs plugin tasks without a time limit. RQ-era hosts enqueued them
 with an RQ `job_timeout` of -1 (no timeout), and the database task queue that
-replaced RQ in August 2026 has no per-task timeout. The `timeout` the plugin
-passes when it queues work is not enforced by anyone.
+replaced RQ in August 2026 has no per-task timeout. From 1.9.0 Lumae queues no
+tasks: its runners call the analysis directly (AudioMuse's own analysis jobs
+still call Lumae's song hook), and the limit below is the only one.
 
 Each waveform and edge analysis therefore runs in a separate process with a
 wall-clock limit. The limit is also the analyzers' own deadline, checked
@@ -115,8 +117,8 @@ started in one of two ways:
   its database connection. It never uses or closes them and exits without
   running exit handlers, so the job's connection is unaffected.
 * **A separate interpreter (processes with more threads).** Forking a process
-  with more than one Python thread is unsafe, so there a worker is started with
-  `python -c`. Starting it takes 1.1–1.4 seconds, mostly `import scipy.signal`.
+  with more than one Python thread is unsafe, so there (Lumae's runners from
+  1.9.0, and AudioMuse's web process) a worker is started with `python -c`. Starting it takes 1.1–1.4 seconds, mostly `import scipy.signal`.
   It is then reused for later files from the same thread. In the same job model
   it adds 1.1–1.5 seconds per job (+41–46%). A killed or crashed worker is
   replaced, and a worker killed while idle is replaced without counting a
@@ -170,6 +172,9 @@ the whole object back — the POST replaces every stored setting.
 | `diagnostic_statement_timeout_ms` | 5000 | 1000–30000 | `SET LOCAL statement_timeout` for each read behind the settings-page diagnostics and `/database-state`; a section whose read timed out is reported as "unavailable", never as zero. |
 | `edge_profiles_enabled` | `true` | — | Turns edge (SmoothFade) analysis off without touching already-published waveform profiles. Also gated by the PyAV runtime (any PyAV >= 16.0 that passes the built-in qualification check); see `capabilities.edge_profiles.available` in health. |
 | `collection_manager_enabled` | `false` | — | Enables Living Collections and Personal Shelves sync (Collections, above). |
+| `heavy_work` | `auto` | `auto`, `server`, `worker` | From 1.9.0, which runner does the heavy lane (waveform, edge and loudness passes, on-demand tracks, relationships): `auto` an AudioMuse worker while one is online, and the server only for on-demand tracks while none is; `server` the web process, with or without a worker; `worker` never the web process. Also on the settings page. |
+| `catalog_refresh_hours` | `0` | 0–720 | From 1.9.0, refresh each catalogue this often on the server runner's own (0: only when an app or an analysis asks). An install that had enabled 1.8.0's `catalog_refresh` schedule gets 6. |
+| `analysis_projection_hours` | `0` | 0–720 | From 1.9.0, project AudioMuse's analysis this often on the server runner's own, besides after every analysis run and catalogue change. An install that had enabled 1.8.0's `analysis_projection` schedule gets 6. |
 
 ## Compatibility
 

@@ -149,6 +149,21 @@ def worker_online(cur, seconds=WORKER_ONLINE_SECONDS):
     return bool(row and row[0])
 
 
+def record_unavailable(cur, role, reason):
+    """R10: this host cannot run ``role``'s runner; the status page says why.
+    A leader elsewhere overwrites the row with its next heartbeat."""
+    cur.execute(
+        f"""
+        INSERT INTO {state_table()} AS s (role, host, pid, mode, reason, heartbeat_at)
+        VALUES (%s, %s, %s, 'unavailable', %s, NULL)
+        ON CONFLICT (role) DO UPDATE SET host=EXCLUDED.host, pid=EXCLUDED.pid,
+            mode='unavailable', reason=EXCLUDED.reason, current_action=NULL,
+            heartbeat_at=NULL
+        """,
+        (role, socket.gethostname(), os.getpid(), str(reason)[:200]),
+    )
+
+
 def read_states(cur):
     """Every role's row, for the status page and health."""
     cur.execute(

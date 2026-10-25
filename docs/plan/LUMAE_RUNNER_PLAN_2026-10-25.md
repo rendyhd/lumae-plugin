@@ -521,6 +521,40 @@ is measured in RN.8. The same stack reproduced the bug: with no worker, the boot
   - `tests/plugins/test_release_channels.py`: the archive contains the runner module.
 - Then the owner's server canary (Verification, below).
 
+### Results (2026-10-25)
+
+Local commits on `main`, none pushed: WC.1 `5fa7175`, WC.2 `3cba046`, WC.3 `9923808`, WC.4
+`9536d18`, RN.1 `d2b666c`, RN.2 `90fa048`, RN.3 `e054ead`, RN.4 `496cdc9`, RN.5–RN.6
+`2b8347c`, RN.7 the commit that adds this section. The full suite after RN.6: 1,859 passed,
+1 skipped, and the 8 known local failures (`test_profile_bootstrap_edge_refs_postgres`,
+`test_profile_bootstrap_sql_capture_postgres`, one in `test_profile_retry_gaps_postgres`).
+
+Where the code differs from the steps above:
+- **RN.5 and RN.6 are one commit.** The switch and the removal change the same functions;
+  switching first would have converted every queue path twice.
+- **Kept, though listed for removal:** 1.8.0's `DEFERRED_MARKER`, read beside the runner's
+  own `waiting_runner` marker for one release, so on-demand work 1.8.0 saved is served;
+  `task_message` and its sentences, for the queue tasks an older version left, which still
+  run once; the preparation worker attestation, because a job 1.8.0 queued can still run in
+  a worker that has not restarted onto 1.9.0.
+- **Removed, though listed as kept:** `action_averages` and `remaining_work`; nothing
+  reads them once `TickBudget` and the tick's report are gone.
+- **Added:** `catalog_refresh_hours` and `analysis_projection_hours` (an enabled
+  `catalog_refresh` or `analysis_projection` schedule, both shipped off, becomes 6 hours, so
+  an administrator's choice survives R8); `runner_marks` for once-a-day work
+  (collection retention); the server runner's bookkeeping (at most once a minute: interrupted
+  events, required preparations, publication summaries and the waveform snapshot, which
+  1.8.0's tick did every tick); the per-source server binding of R3 in
+  `_run_reconcile_action`; an AudioMuse analysis run wakes the runners once, not once a
+  song; a background edge request makes the library pass due, including a finished one; R10's
+  `unavailable` row when a host has no `database.connect_raw`; W3's parked-file line, counted
+  at most every 5 minutes because the settings panel is polled; the **Heavy work** form on
+  the settings page.
+- **Found and fixed in RN.6:** with no retry pending, `_work_summary`'s `GREATEST(0, NULL)`
+  answered 0 seconds, so an idle runner would have turned every second.
+- **Measured:** an idle server turn runs 17 statements, 22 with the bookkeeping (1.8.0's idle
+  tick: 28).
+
 ## Tests
 
 - **Runner unit tests** (fake clock and database): start is idempotent; standby without

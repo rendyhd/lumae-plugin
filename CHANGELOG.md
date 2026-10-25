@@ -33,10 +33,13 @@ R1–R9; contract §3.6).
 - Lumae's schedules (`catalog_reconcile`, `catalog_refresh`,
   `provider_identity_recheck`, `analysis_projection`, `collection_retention`)
   and their pending retries are removed on install, and none is registered.
-  An enabled catalogue refresh schedule becomes the setting
-  `catalog_refresh_hours` = 6; without it a catalogue is refreshed when an
-  app or an analysis asks. A job 1.8.0 queued before the upgrade still runs;
-  its watchdog tick only wakes the runners.
+  An enabled catalogue refresh or analysis projection schedule (both shipped
+  off) becomes the setting `catalog_refresh_hours` or
+  `analysis_projection_hours` = 6, which the server runner keeps; without
+  them a catalogue is refreshed when an app or an analysis asks, and the
+  analysis is projected after every analysis run and catalogue change. A job
+  1.8.0 queued before the upgrade still runs; its watchdog tick only wakes
+  the runners.
 - On-demand requests (`/api/analyze`, `/api/profiles/edges/analyze`) are
   recorded and served first in the next pass, between files of a library
   pass. Their `deferred` lists stay, always empty, and the edge capability in
@@ -45,8 +48,10 @@ R1–R9; contract §3.6).
   library pass due now. An AudioMuse analysis run wakes the runners once,
   not once a song.
 - The settings page's Background work panel shows each runner (working,
-  idle, stepping aside or not running), its host and its last action,
-  instead of AudioMuse schedules.
+  idle, stepping aside, not running, or unable to run on a host without
+  `database.connect_raw`), its host and its last action, instead of
+  AudioMuse schedules, and counts the files Lumae stopped trying (W3). The
+  Heavy work choice is on the page too.
 - In the web process `background_workers` `auto` analyses at most 2 files at
   once, and a file a runner downloads through AudioMuse goes to Lumae's
   download directory, not AudioMuse's temporary directory, which every

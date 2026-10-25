@@ -538,6 +538,22 @@ def test_a_catalogue_refresh_cadence_wants_old_catalogues_refreshed(tick, monkey
     assert refreshed == [SOURCE]
 
 
+def test_a_projection_cadence_projects_each_server_once_a_period(tick, monkeypatch):
+    mod, db = tick
+    projected = []
+    monkeypatch.setattr(mod, "analysis_projection_task",
+                        lambda server_id=None: projected.append(server_id) or {"status": "published"})
+    turn(mod)
+    assert projected == []  # off by default: analysis runs and catalogue changes project
+    monkeypatch.setattr(mod, "analysis_projection_hours", lambda: 6.0)
+    _result, actions = turn(mod)
+    assert projected == [SERVER]
+    [entry] = [entry for entry in actions if entry["action"] == "analysis_projection"]
+    assert entry["status"] == "complete"
+    turn(mod)
+    assert projected == [SERVER]  # once per period, whichever runner asks first
+
+
 def test_the_install_leaves_no_lumae_schedule_and_keeps_a_refresh_cadence(
     migrated_db, run_plugin_migration, monkeypatch,
 ):
@@ -547,6 +563,7 @@ def test_the_install_leaves_no_lumae_schedule_and_keeps_a_refresh_cadence(
         cur.execute("INSERT INTO cron (name, task_type, cron_expr, enabled) VALUES "
                     "('r', 'plugin.lumae_analysis.catalog_reconcile', '* * * * *', TRUE), "
                     "('c', 'plugin.lumae_analysis.catalog_refresh', '17 */6 * * *', TRUE), "
+                    "('p', 'plugin.lumae_analysis.analysis_projection', '47 */6 * * *', TRUE), "
                     "('o', 'plugin.other.sync', '7 * * * *', TRUE)")
         cur.execute("CREATE TABLE cron_retry (task_type TEXT PRIMARY KEY)")
         cur.execute("INSERT INTO cron_retry VALUES ('plugin.lumae_analysis.catalog_refresh'), "
@@ -557,4 +574,4 @@ def test_the_install_leaves_no_lumae_schedule_and_keeps_a_refresh_cadence(
     run_plugin_migration(db)
     assert _rows(db, "SELECT task_type FROM cron ORDER BY task_type") == [("plugin.other.sync",)]
     assert _rows(db, "SELECT task_type FROM cron_retry") == [("plugin.other.sync",)]
-    assert saved == {"catalog_refresh_hours": 6}
+    assert saved == {"catalog_refresh_hours": 6, "analysis_projection_hours": 6}

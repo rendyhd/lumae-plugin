@@ -75,9 +75,10 @@ snapshot, and no-change analysis projections retain their current generation.
 An install only schedules preparation for a missing, stale, or unattested
 catalogue; it does not automatically rebuild an otherwise current projection.
 
-In 1.0.1, every heavy RQ job received a finite timeout. In current releases,
-AudioMuse owns queue implementation and execution limits through its public
-plugin API. One waveform analysis still has a
+In 1.0.1, every heavy RQ job received a finite timeout. Up to 1.8.0 AudioMuse
+owned queue implementation and execution limits through its public plugin
+API; from 1.9.0 Lumae queues nothing and its own runners do the work (the
+runner plan, `docs/plan/LUMAE_RUNNER_PLAN_2026-10-25.md`). One waveform analysis still has a
 15-minute deadline and accepts at most eight channels, 384 kHz, and the roughly
 109-minute duration representable by the v1 100 ms/uint16 ramp contract.
 Out-of-contract media remains playable but does not receive a waveform profile.
@@ -174,8 +175,10 @@ a write. While the gate is closed, the last complete catalogue and analysis
 generations remain published and provider-ID mutations are denied. A ping that
 fails closes the gate for its own call only and stores just its error.
 
-The plugin scans a pending source at minutes 2 and 32 of every hour. The
-scheduled analysis projection remains at minute 47 of every sixth hour. A
+Up to 1.8.0 the plugin scanned a pending source at minutes 2 and 32 of every
+hour, and the scheduled analysis projection ran at minute 47 of every sixth
+hour. From 1.9.0 the server runner rechecks a pending source at most every 30
+minutes, and projections follow analysis runs and catalogue changes. A
 recheck performs a provider scan only when a transition is pending. Publication
 requires two independently fetched, byte-canonically equivalent normalized
 targets and the exact Navidrome ID codec.

@@ -574,20 +574,26 @@ def track_count_label(value):
 # Runner plan R8: Lumae's rows under AudioMuse's Scheduled Tasks, all gone
 # with the runners (a downgrade's install recreates its own).
 LUMAE_CRON_PREFIX = "plugin.lumae_analysis."
-# An administrator's enabled catalogue refresh carries over as this cadence.
+# An administrator's enabled catalogue refresh or analysis projection
+# schedule (both shipped off, every six hours) carries over as this cadence.
 CATALOG_REFRESH_HOURS_DEFAULT = 6
+CADENCE_SETTINGS = (
+    (CATALOG_REFRESH_TASK_TYPE, "catalog_refresh_hours"),
+    (ANALYSIS_PROJECTION_TASK_TYPE, "analysis_projection_hours"),
+)
 
 
 def retire_lumae_schedules(db):
     """Delete Lumae's cron rows and their pending retries (R8). An enabled
-    catalogue refresh row becomes the setting ``catalog_refresh_hours``, so
-    the runner keeps refreshing on its own; an administrator's setting
-    stands."""
+    catalogue refresh or analysis projection row becomes the setting
+    ``catalog_refresh_hours`` or ``analysis_projection_hours``, so the server
+    runner keeps doing it on its own; an administrator's setting stands."""
     cur = db.cursor()
-    cur.execute("SELECT enabled FROM cron WHERE task_type=%s", (CATALOG_REFRESH_TASK_TYPE,))
-    row = cur.fetchone()
-    if row and row[0] and get_setting("catalog_refresh_hours", None) in (None, ""):
-        set_setting("catalog_refresh_hours", CATALOG_REFRESH_HOURS_DEFAULT)
+    for task_type, setting in CADENCE_SETTINGS:
+        cur.execute("SELECT enabled FROM cron WHERE task_type=%s", (task_type,))
+        row = cur.fetchone()
+        if row and row[0] and get_setting(setting, None) in (None, ""):
+            set_setting(setting, CATALOG_REFRESH_HOURS_DEFAULT)
     cur.execute("DELETE FROM cron WHERE task_type LIKE %s", (LUMAE_CRON_PREFIX + "%",))
     cur.execute("SELECT to_regclass('cron_retry') IS NOT NULL")
     exists = cur.fetchone()
@@ -596,14 +602,50 @@ def retire_lumae_schedules(db):
     cur.close()
 
 
-def catalog_refresh_hours():
-    """``catalog_refresh_hours``: refresh each catalogue this often on the
-    runner's own (0: only when asked, the default)."""
+def _cadence_hours(setting):
+    """A cadence setting in hours (0: off, the default; at most 30 days)."""
     try:
-        value = float(get_setting("catalog_refresh_hours", 0) or 0)
+        value = float(get_setting(setting, 0) or 0)
     except (TypeError, ValueError):
         return 0.0
     return value if 0 < value <= 24 * 30 else 0.0
+
+
+def catalog_refresh_hours():
+    """``catalog_refresh_hours``: refresh each catalogue this often on the
+    runner's own (0: only when asked, the default)."""
+    return _cadence_hours("catalog_refresh_hours")
+
+
+def analysis_projection_hours():
+    """``analysis_projection_hours``: project AudioMuse's analysis this often
+    on the server runner's own, besides after every analysis run and
+    catalogue change (0: the default)."""
+    return _cadence_hours("analysis_projection_hours")
+
+
+def scheduled_projection_task(db):
+    """R8: the projection cadence, once per period across the runners: each
+    active source's server, bound as the schedule's task was."""
+    hours = analysis_projection_hours()
+    if not hours or runner.ROLE.get() is None:
+        return None
+    with db.cursor() as cur:
+        claimed = runner.claim_mark(cur, "analysis_projection", hours * 3600)
+        if claimed:
+            cur.execute(f"SELECT DISTINCT current_core_server_id FROM {table('catalog_sources')} "
+                        "WHERE rebind_status='active' AND current_core_server_id IS NOT NULL "
+                        "ORDER BY 1")
+            servers = [row[0] for row in cur.fetchall()]
+    db.commit()
+    if not claimed:
+        return None
+    statuses = {}
+    for server_id in servers:
+        with _source_binding(server_id):
+            result = analysis_projection_task(server_id) or {}
+        statuses[server_id] = str(result.get("status") or "complete")
+    return {"status": "complete", "projected": len(servers), "servers": statuses}
 
 
 def want_scheduled_catalog_refreshes(db):
@@ -1334,6 +1376,20 @@ def _next_reconcile_action(db, report, budget, server_id, done):
             result = collection_retention_task()
             _record_turn(db, report, "collection_retention", None, None, result, start)
             return "collection_retention", result
+    # R8: the projection cadence an administrator kept.
+    if due("analysis_projection"):
+        done.add("analysis_projection")
+        start = time.monotonic()
+        try:
+            result = scheduled_projection_task(db)
+        except Exception as exc:
+            _rollback_if_possible(db)
+            logger.warning("lumae_analysis scheduled projection failed", exc_info=True)
+            result = {"status": "failed", "error": str(exc)}
+        if result is not None:
+            budget.start()
+            _record_turn(db, report, "analysis_projection", None, None, result, start)
+            return "analysis_projection", result
     # W1: the provider identity recheck, while a transition needs it.
     if due("identity_recheck"):
         done.add("identity_recheck")
@@ -6813,6 +6869,14 @@ def settings():
                     if paused
                     else "Background maintenance resumed."
                 )
+            elif action == "save_heavy_work":
+                value = save_heavy_work(request.form.get("heavy_work"))
+                wake_runners(get_db(), "heavy_work_changed", commit=True)
+                message = {
+                    "auto": "Heavy work runs in an AudioMuse worker while one is online.",
+                    "server": "Heavy work runs on this server, with or without a worker.",
+                    "worker": "Heavy work runs only in an AudioMuse worker.",
+                }[value]
             elif action == "save_collections":
                 enabled = request.form.get("collection_manager_enabled") == "on"
                 set_setting("collection_manager_enabled", enabled)
@@ -7018,12 +7082,17 @@ def start_runner(role):
         from flask import current_app
 
         app = current_app._get_current_object()
+    except Exception:
+        logger.warning("lumae_analysis cannot start its %s runner outside an application", role)
+        return None
+    try:
         import database
 
         connect_raw = database.connect_raw
     except Exception:
-        logger.warning("lumae_analysis cannot start its %s runner on this AudioMuse: "
-                       "no application or no connect_raw", role)
+        logger.warning("lumae_analysis cannot start its %s runner: this AudioMuse has no "
+                       "database.connect_raw", role)
+        _record_runner_unavailable(role, "host_without_connect_raw")
         return None
     _preload_runner_modules()
     return runner.start(
@@ -7031,6 +7100,18 @@ def start_runner(role):
         connect=lambda name: connect_raw(application_name=name),
         still_installed=_runner_code_current,
     )
+
+
+def _record_runner_unavailable(role, reason):
+    db = None
+    try:
+        db = get_db()
+        with db.cursor() as cur:
+            runner.record_unavailable(cur, role, reason)
+        db.commit()
+    except Exception:
+        if db is not None:
+            _rollback_if_possible(db)
 
 
 def flask_start():
@@ -7059,7 +7140,8 @@ def worker_start():
 # the worker's heartbeat allow.
 LIGHT_ACTIONS = frozenset((
     "edge_schema_v3", "analysis_run", "catalog_preparation", "catalog_refresh",
-    "identity_recheck", "collection_retention", "credits", "music_metadata",
+    "identity_recheck", "collection_retention", "analysis_projection", "credits",
+    "music_metadata",
 ))
 # R8: the retention schedule's replacement, once a day.
 COLLECTION_RETENTION_SECONDS = 24 * 60 * 60
@@ -7111,6 +7193,50 @@ def heavy_work_setting():
     ``server`` all of it on the server; ``worker`` none on the server."""
     value = str(get_setting("heavy_work", "auto") or "auto").strip().lower()
     return value if value in HEAVY_WORK_SETTINGS else "auto"
+
+
+def save_heavy_work(value):
+    """The settings form's ``heavy_work``; returns the stored value."""
+    value = str(value or "").strip().lower()
+    if value not in HEAVY_WORK_SETTINGS:
+        raise ValueError("Heavy work must be auto, server or worker.")
+    set_setting("heavy_work", value)
+    return value
+
+
+# W3: the status page's count of files Lumae has stopped trying, counted at
+# most this often (the panel is polled).
+PARKED_FILES_SECONDS = 300
+_parked_files = None
+
+
+def parked_files(db):
+    """W3's parked files over the active sources: loudness ``too_long``
+    (never downloaded) and ``parked`` (failed for good on the current file),
+    and edges ``unsupported`` on the current file. ``None`` when unreadable."""
+    global _parked_files
+    now = time.monotonic()
+    if _parked_files is not None and now - _parked_files[0] < PARKED_FILES_SECONDS:
+        return _parked_files[1]
+    try:
+        with db.cursor() as cur:
+            cur.execute(f"SELECT catalog_instance_id FROM {table('catalog_sources')} "
+                        "WHERE rebind_status='active'")
+            sources = [row[0] for row in cur.fetchall()]
+            cur.execute(f"SELECT count(*) FROM {table('edge_profile_jobs')} "
+                        "WHERE status='unsupported' AND catalog_instance_id = ANY(%s)", (sources,))
+            edges = int(cur.fetchone()[0] or 0)
+        db.commit()
+        totals = {"too_long": 0, "parked": 0, "edge_unsupported": edges}
+        for source in sources:
+            for key, count in loudness_backfill.parked_counts(db, source).items():
+                totals[key] += count
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not count the files it stopped trying", exc_info=True)
+        return None
+    _parked_files = (now, totals)
+    return totals
 
 
 def runner_lane(db, role):

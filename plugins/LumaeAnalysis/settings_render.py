@@ -582,8 +582,8 @@ def render_source_preparation_sections(batch_size):
                   <input name="background_workers" value="{_pkg.escape(str(workers))}">
                 </label>
                 <p class="lumae-help">Auto analyzes up to {_pkg.parallel_analysis.MAX_AUTO_WORKERS}
-                  files at once on the AudioMuse worker, fewer when it has few cores or little
-                  memory, at a low priority. With more than one, a batch claims that many times
+                  files at once in an AudioMuse worker ({_pkg.WEB_AUTO_WORKERS} in the web
+                  process), fewer when it has few cores or little memory, at a low priority. With more than one, a batch claims that many times
                   {_pkg.MAX_BACKFILL_BATCH_SIZE} tracks.</p>
                 <div class="lumae-actions">
                   <button class="lumae-button-secondary" type="submit" name="action"
@@ -1172,6 +1172,7 @@ _RUNNER_REASONS = {
     "heavy_lane": "analysis passes, on-demand tracks and relationships",
     "no_worker_online": "catalogue, credits and lookups, and on-demand tracks while no worker is online",
     "nothing_due": "nothing due",
+    "host_without_connect_raw": "this AudioMuse has no database.connect_raw (AudioMuse 3.2.0 or newer)",
 }
 _RUNNER_MODES = {"waiting_host": "stepping aside", "standby": "standing by"}
 _RUNNER_ROLES = (
@@ -1198,7 +1199,9 @@ def _runner_row_html(role, label, purpose, row):
                 f"<div class=\"lumae-help\">{_pkg.escape(purpose)}</div></li>")
     age = row.get("heartbeat_age_seconds")
     online = age is not None and float(age) < _pkg.runner.WORKER_ONLINE_SECONDS
-    if not online:
+    if row.get("mode") == "unavailable":
+        state = f"cannot run: {_runner_reason(row)}"
+    elif not online:
         state = f"not running (last seen {_age_text(float(age) if age is not None else None)})"
     elif row.get("current_action"):
         state = f"working: {str(row['current_action']).replace('_', ' ')}"
@@ -1214,6 +1217,23 @@ def _runner_row_html(role, label, purpose, row):
         detail += f", last {str(row['last_action']).replace('_', ' ')}"
     return (f"<li><strong>{_pkg.escape(label)}</strong>: {_pkg.escape(state)}."
             f"<div class=\"lumae-help\">{_pkg.escape(detail)}.</div></li>")
+
+
+def _parked_files_html():
+    """W3: the files Lumae stopped trying, and why."""
+    counts = _pkg.parked_files(_pkg.get_db())
+    if not counts or not any(counts.values()):
+        return ""
+    parts = []
+    if counts["too_long"]:
+        parts.append(f"{counts['too_long']:,} too long to measure (over 109 minutes; never downloaded)")
+    if counts["parked"]:
+        parts.append(f"{counts['parked']:,} whose loudness failed for good on the current file")
+    if counts["edge_unsupported"]:
+        parts.append(f"{counts['edge_unsupported']:,} without an edge profile (an unsupported "
+                     "format or layout, or a file that failed to decode twice)")
+    return (f'<p class="lumae-help">Files Lumae stopped trying: {_pkg.escape("; ".join(parts))}. '
+            "Each is tried again when its file changes.</p>")
 
 
 def render_reconcile_status_panel():
@@ -1241,6 +1261,7 @@ def render_reconcile_status_panel():
         f"<li><strong>{int(count):,}</strong> {_pkg.escape(str(label))}</li>"
         for label, count in pending.items()
     ) or "<li><strong>0</strong> pending actions</li>"
+    parked_html = _parked_files_html()
     events = snapshot.get("events") or []
     running = next((event for event in events if event.get("status") == "running"), None)
     running_html = ""
@@ -1299,6 +1320,7 @@ def render_reconcile_status_panel():
         <ul class="lumae-help">{runners_html}</ul>
         {running_html}
         <ul class="lumae-help">{pending_html}</ul>
+        {parked_html}
         {_throughput_html()}
         <details>
           <summary>Recent meaningful background actions</summary>
@@ -1354,6 +1376,37 @@ def render_publication_repair_form():
     """
 
 
+_HEAVY_WORK_CHOICES = (
+    ("auto", "In a worker while one is online (default)"),
+    ("server", "On this server, with or without a worker"),
+    ("worker", "Only in a worker"),
+)
+
+
+def _heavy_work_form():
+    """R1: where the heavy lane runs."""
+    current = _pkg.heavy_work_setting()
+    options = "".join(
+        f'<option value="{value}"{" selected" if value == current else ""}>{_pkg.escape(label)}</option>'
+        for value, label in _HEAVY_WORK_CHOICES
+    )
+    return f"""
+        <form class="lumae-form" method="post">
+          <label class="lumae-field">
+            <span>Heavy work: volume and ramp, edge and loudness passes, on-demand tracks and
+              relationships</span>
+            <select name="heavy_work">{options}</select>
+          </label>
+          <p class="lumae-help">By default an AudioMuse worker does the heavy work, and this
+            server analyzes only the tracks the app asks for while no worker is online. Choose
+            this server for an AudioMuse without a worker; choose a worker to keep the server
+            light even when no worker is running.</p>
+          <button class="lumae-button-secondary" type="submit" name="action"
+            value="save_heavy_work">Save heavy work</button>
+        </form>
+    """
+
+
 def render_settings(message=None, error=None):
     batch_size = _pkg.configured_backfill_limit()
     paused = _pkg.maintenance_paused()
@@ -1394,6 +1447,7 @@ def render_settings(message=None, error=None):
             {'Resume background maintenance' if paused else 'Pause background maintenance'}
           </button>
         </form>
+        {_heavy_work_form()}
         {_pkg.render_publication_repair_form()}
       </section>
     """

@@ -8778,6 +8778,36 @@ def test_database_state_marks_a_completed_empty_catalogue_not_ready():
     assert compact.index("1. Navidrome catalogue") < compact.index("4. Loudness &amp; SmoothFade")
 
 
+@pytest.mark.parametrize(("value", "stored", "sentence"), [
+    ("server", "server", "Heavy work runs on this server, with or without a worker."),
+    ("Worker", "worker", "Heavy work runs only in an AudioMuse worker."),
+    ("gpu", None, "Heavy work must be auto, server or worker."),
+])
+def test_the_heavy_work_setting_is_saved_and_wakes_the_runners(monkeypatch, value, stored, sentence):
+    mod = load_plugin()
+    saved, woken = [], []
+    monkeypatch.setattr(mod, "set_setting", lambda key, value: saved.append((key, value)))
+    monkeypatch.setattr(mod, "get_db", lambda: object())
+    monkeypatch.setattr(mod, "wake_runners", lambda _db, reason, commit=False: woken.append(reason))
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 25)
+    monkeypatch.setattr(mod, "render_settings_status_panels", lambda _batch_size: dict.fromkeys((
+        "readiness", "relationships", "catalogue", "waveform", "reconcile", "identity",
+        "stream_status"), ""))
+    monkeypatch.setattr(mod, "render_publication_repair_form", lambda: "")
+    monkeypatch.setattr(mod, "get_setting", lambda key, default=None: (
+        stored if key == "heavy_work" and stored else default))
+    monkeypatch.setattr(mod, "render_page", lambda body, title=None: body)
+
+    response = plugin_client(mod).post("/settings", data={"action": "save_heavy_work", "heavy_work": value})
+
+    body = response.get_data(as_text=True)
+    assert response.status_code == 200 and sentence in body
+    assert saved == ([("heavy_work", stored)] if stored else [])
+    assert woken == (["heavy_work_changed"] if stored else [])
+    # The form shows the stored choice.
+    assert f'<option value="{stored or "auto"}" selected>' in body
+
+
 def test_collection_setting_must_be_enabled_before_manager_is_available(monkeypatch):
     mod = load_plugin()
     collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")

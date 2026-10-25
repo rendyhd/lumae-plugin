@@ -42,8 +42,8 @@ The additive migration creates three plugin-owned tables:
 A session advisory lock serializes workers for the same source across checkpoint
 commits. It does not lock published relationship rows while computing. A competing
 worker coalesces immediately; a disconnected worker releases its lock through
-PostgreSQL. The watchdog can reclaim interrupted relationship work after two
-minutes without a heartbeat, with the advisory lock still preventing overlap
+PostgreSQL. A runner (the watchdog up to 1.8.0) can reclaim interrupted
+relationship work after two minutes without a heartbeat, with the advisory lock still preventing overlap
 when a slow worker remains alive.
 
 The first run reads and stages a complete normalized input snapshot. Subsequent
@@ -53,20 +53,24 @@ Completed scoring is committed per entity. Fingerprints checkpoint every 16
 entities and at each normal yield.
 
 The default run budget is 128 fingerprint/scoring entities or approximately 20
-seconds. It is a cooperative budget: an input statement, checkpoint load or single
+seconds; a runner step (SQ.2, 1.9.0) takes up to 1,024 entities
+(`RELATIONSHIP_STEP_ENTITIES`) in what is left of its 15-second slice. It is a cooperative budget: an input statement, checkpoint load or single
 bounded entity computation is allowed to finish. After loading checkpoints, a
 worker always advances at least one entity, so expensive loading cannot cause
 an endless sequence of empty retries. PostgreSQL's existing statement timeout
 remains in effect; the plugin does not raise or disable it.
 
-A checkpoint returns `queued`, records a deferred reconciliation event, and keeps
-the normal active cadence without adding failure backoff. An unavailable index
+A checkpoint returns `queued` and the runner continues the build in its next
+slice, without failure backoff (up to 1.8.0 it recorded a deferred
+reconciliation event and kept the watchdog's active cadence). An unavailable index
 retains the input/fingerprint checkpoints and uses the existing deferred-index
 retry policy. Ordinary failures retain saved work and use existing failure backoff.
 
 Checkpoints are pinned to source identity, both input generations, both epochs,
 algorithm version and checkpoint format version. A changed identity discards the
-old scratch build and starts a new one. Partially completed work never becomes
+old scratch build and starts a new one; from SQ.2 (1.9.0) a build that has staged
+its inputs keeps them when only the catalogue or analysis generation changes, and
+a changed epoch, server or algorithm still restarts it. Partially completed work never becomes
 a public relationship generation.
 
 ## Publication and cleanup
@@ -78,8 +82,12 @@ deletions, cursor, generation and build completion marker commit together.
 
 Candidate lookup, fingerprinting and ranking are outside this transaction. A
 two-second transaction-local lock timeout defers publication on contention; the
-next run retries the saved results. A generation change also defers publication
-and causes the next run to start from the new inputs.
+next run retries the saved results. Up to 1.8.0 a generation change also deferred
+publication and made the next run start from the new inputs; from SQ.2 the build
+publishes the generation it started and leaves the state `queued`, so the next
+build starts from the newer inputs. From W2 a build starts no sooner than 15
+minutes after the change that asked for it and at most every 6 hours after the
+last publication.
 
 The last complete generation remains readable during preparation or failure.
 Existing bootstrap generation checks still reject pages raced by publication.

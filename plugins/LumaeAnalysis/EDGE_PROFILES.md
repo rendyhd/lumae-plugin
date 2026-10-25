@@ -27,7 +27,9 @@ downloads models. If the runtime is absent or unqualified, health reports
 `capabilities.edge_profiles.available=false`; normal analysis remains available.
 The setting `edge_profiles_enabled=false` disables scheduling.
 
-Successful legacy analysis schedules a separate optional upgrade. A failed V2
+With edges on, one analysis call makes a track's waveform, edge and loudness
+from one download; a waveform analysed without its edge leaves it to the
+library pass. A failed V2
 job never changes a ready legacy row. An opaque media revision and unique job
 token protect publication from source replacement, duplicate workers and stale
 retries. Edge data, job readiness and the profile cursor commit atomically.
@@ -40,10 +42,12 @@ Authenticated endpoints:
   track ID and `limit` (1–100)
 
 On-demand requests (`analyze`) run at high priority and promote a track a
-background batch already holds. A request AudioMuse refuses because another
-task runs is saved and served by the next worker task (`deferred`). The server
-walks the library itself at low priority from the reconcile watchdog; the
-`backfill` route remains for older clients. Media the analyzer can never
+background batch already holds. From 1.9.0 a request is recorded for Lumae's
+runners and served first in their next pass, between the files of a library
+pass; nothing is refused, so `deferred` is always empty. The worker runner (the
+web process with `heavy_work=server`) walks the library itself at low
+priority; the `backfill` route remains for older clients and makes that pass
+due. Media the analyzer can never
 measure (more than two channels, unsupported rate, duration limit, no audio)
 is marked `unsupported` and not retried until it changes. Workers report their
 runtime so health's `analyzable` is true even when the web process has no PyAV.
@@ -86,7 +90,7 @@ How it is built:
   and `v3_recheck`. Every transfer builds v3 from these in SQL
   (`edge_payload_sql`); an edge reference in v3 names the v3 digest.
 - **Upgrade.** Edges stored before 1.7.0 get their v3 digest after the
-  migration and on reconcile ticks, in short batches. Health lists schema 3 only
+  migration and in runner turns (reconcile ticks up to 1.8.0), in short batches. Health lists schema 3 only
   once none is missing. The same pass flags an edge whose tail window opens
   under the excerpt floor (`v3_recheck`); the library pass measures those again
   (about 0.1% of a library), so their music end is found, and the new edge
