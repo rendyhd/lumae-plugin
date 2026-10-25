@@ -33,6 +33,7 @@ import socket
 import threading
 import time
 from collections import namedtuple
+from contextvars import ContextVar
 
 logger = logging.getLogger("lumae_analysis.runner")
 
@@ -58,6 +59,10 @@ PAUSE_SECONDS = 1.0
 RESTART_DELAYS = (30, 60, 120, 240, 480, 900)
 
 Turn = namedtuple("Turn", "worked mode reason next_due_seconds action")
+# The role whose turn this thread runs; None outside a runner (a queued task,
+# a request, the song hook). R5: the web process sizes its analysis smaller and
+# downloads outside AudioMuse's TEMP_DIR.
+ROLE = ContextVar("lumae_runner_role", default=None)
 
 
 def idle_turn(next_due_seconds=None, reason="nothing_due"):
@@ -268,10 +273,12 @@ class Runner:
 
     def _turn(self):
         self.mode, self.reason = "working", "turn"
+        token = ROLE.set(self.role)
         try:
             with self.app.app_context():
                 turn = self.turn(self)
         finally:
+            ROLE.reset(token)
             if self.action:
                 self.end_action()
         self.mode, self.reason = turn.mode, turn.reason

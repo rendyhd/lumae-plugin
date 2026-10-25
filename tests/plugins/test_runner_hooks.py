@@ -86,8 +86,3 @@ def test_the_hooks_still_do_their_old_work_when_the_runner_fails(monkeypatch):
     mod.worker_start()
     assert calls == ["observe", "server", "report", "worker"]
 
-
-def test_the_skeleton_turn_reports_a_pause(monkeypatch):
-    mod = load_plugin()
-    monkeypatch.setattr(mod, "maintenance_paused", lambda: True)
-    assert mod.run_runner_turn(None).mode == "paused"

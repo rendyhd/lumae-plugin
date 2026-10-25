@@ -578,6 +578,26 @@ def _suspect_analysis_ids(tracks, links, policy=None, provider_type=None):
     return suspect
 
 
+def _id_rewrite_in_progress(cur):
+    """reconcile.id_rewrite_in_progress inside a runner turn, failing open on
+    a host without ``task_status`` or ``pg_locks`` access (the publication
+    goes ahead). A queued task holds AudioMuse's gate, so those jobs cannot
+    start meanwhile and it is not asked."""
+    from . import runner
+    from .reconcile import id_rewrite_in_progress
+
+    if runner.ROLE.get() is None:
+        return None
+    cur.execute("SAVEPOINT lumae_r4_check")
+    try:
+        found = id_rewrite_in_progress(cur)
+        cur.execute("RELEASE SAVEPOINT lumae_r4_check")
+        return found
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT lumae_r4_check")
+        return None
+
+
 def _changed_during_projection(cur, db, what):
     """Release the analysis_state row lock and return a retryable error."""
     cur.close()
@@ -1134,6 +1154,16 @@ def _project_analysis(server_id=None, db=None, adapter=None):
     # which is quadratic in the library size. Refresh the statistics with the
     # publication; they commit together.
     _analyze_generation_keys(cur)
+    # Runner plan R4: a job that rewrites AudioMuse's track IDs started
+    # while this projection read them; the next pass projects again.
+    rewriting = _id_rewrite_in_progress(cur)
+    if rewriting:
+        cur.close()
+        db.rollback()
+        raise AnalysisProjectionDeferred(
+            f"AudioMuse's {rewriting} job is rewriting track IDs; the projection waits for it",
+            "audiomuse_id_rewrite",
+        )
     cur.close()
     db.commit()
     refresh_status_summary(db, catalog_instance_id, adapter)  # P2-1, after commit

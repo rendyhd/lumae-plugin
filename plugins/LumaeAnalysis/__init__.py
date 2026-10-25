@@ -469,7 +469,7 @@ def media_server_item(item_id, file_path=None, title=None, author=None):
 def download_track_to_temp(item):
     from tasks.mediaserver import download_track
 
-    return download_track(config.TEMP_DIR, item)
+    return download_track(_host_download_directory(), item)
 
 
 def remove_downloaded_file(path):
@@ -531,7 +531,12 @@ def background_workers():
     ``background_workers``; ``auto`` sized from this process's cores and
     memory). One when it cannot be read."""
     try:
-        return parallel_analysis.resolve_workers(configured_background_workers())
+        setting = configured_background_workers()
+        workers = parallel_analysis.resolve_workers(setting)
+        if runner.ROLE.get() == runner.ROLE_SERVER and setting == parallel_analysis.DEFAULT_SETTING:
+            # R5: AudioMuse's web process serves requests from the same machine.
+            workers = min(workers, WEB_AUTO_WORKERS)
+        return workers
     except Exception:
         logger.warning("lumae_analysis could not size the parallel analysis; analysing one file at a time")
         return 1
@@ -2534,7 +2539,7 @@ def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=Fa
     try:
         item = media_server_item(item_id, None, title, author)
         downloaded_path = ProviderCatalogBridge(adapter).download_track(
-            source_server_id, config.TEMP_DIR, item
+            source_server_id, _host_download_directory(), item
         )
     except Exception as exc:
         logger.warning("lumae_analysis could not download %s for analysis: %s", track_id, exc)
@@ -2550,17 +2555,37 @@ def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=Fa
     }
 
 
-# WP2: sources whose own download failed in this task; the host downloads for
-# them until the task ends (each AudioMuse job is a fresh process, and every
-# reconcile tick starts over).
-_own_download_refused = set()
+# WP2: sources whose own download failed, with when; the host downloads for
+# them for OWN_DOWNLOAD_RETRY_SECONDS (each AudioMuse job is a fresh process,
+# every reconcile tick starts over, and a runner lives for days: R8).
+_own_download_refused = {}
+OWN_DOWNLOAD_RETRY_SECONDS = 600
+
+
+def _host_download_directory():
+    """Where AudioMuse's own download puts a file: its TEMP_DIR in its jobs,
+    Lumae's download directory in a runner (R5): every analysis run empties
+    TEMP_DIR at its start, and the web process never downloads there."""
+    if runner.ROLE.get() is None:
+        return config.TEMP_DIR
+    return analysis_download.task_directory(getattr(config, "TEMP_DIR", None))
 
 
 def _refuse_own_download(catalog_instance_id, reason):
-    if catalog_instance_id not in _own_download_refused:
-        _own_download_refused.add(catalog_instance_id)
+    if not _own_download_refused_now(catalog_instance_id):
         logger.warning("lumae_analysis downloads %s through AudioMuse for now: %s",
                        catalog_instance_id, reason)
+    _own_download_refused[catalog_instance_id] = time.monotonic()
+
+
+def _own_download_refused_now(catalog_instance_id):
+    refused_at = _own_download_refused.get(catalog_instance_id)
+    if refused_at is None:
+        return False
+    if time.monotonic() - refused_at >= OWN_DOWNLOAD_RETRY_SECONDS:
+        _own_download_refused.pop(catalog_instance_id, None)
+        return False
+    return True
 
 
 def _own_download(item_id, catalog_instance_id, server_id, provider_type, media_fp, defer):
@@ -2572,7 +2597,7 @@ def _own_download(item_id, catalog_instance_id, server_id, provider_type, media_
     ``format=raw``). The file goes to this task's directory outside
     ``TEMP_DIR``. A failure falls back to the host for the rest of the task.
     """
-    if not catalog_instance_id or catalog_instance_id in _own_download_refused:
+    if not catalog_instance_id or _own_download_refused_now(catalog_instance_id):
         return None
     from . import collection_library
 
@@ -7410,6 +7435,12 @@ def flask_start():
     try:
         observe_provider_identities_on_start()
     finally:
+        if runner_enabled():
+            try:
+                # The server runner's downloads of a process that is gone.
+                analysis_download.remove_leftovers(getattr(config, "TEMP_DIR", None))
+            except Exception:
+                logger.warning("lumae_analysis could not remove leftover analysis downloads")
         start_runner(runner.ROLE_SERVER)
 
 
@@ -7421,12 +7452,178 @@ def worker_start():
         start_runner(runner.ROLE_WORKER)
 
 
+# Runner plan R1: the lanes. The server runner does the light lane, the worker
+# runner the heavy lane; the server takes heavy actions only as heavy_work and
+# the worker's heartbeat allow.
+LIGHT_ACTIONS = frozenset((
+    "edge_schema_v3", "analysis_run", "catalog_preparation", "catalog_refresh",
+    "identity_recheck", "credits", "music_metadata",
+))
+HEAVY_ACTIONS = frozenset((
+    "interactive", "relationships", "profile_backfill", "edge_backfill", "loudness_backfill",
+))
+# R4: these wait while AudioMuse analyses (its song hook does the run's songs).
+PER_TRACK_ACTIONS = frozenset(("profile_backfill", "edge_backfill", "loudness_backfill"))
+HEAVY_WORK_SETTINGS = ("auto", "server", "worker")
+# R4: the worker runner steps aside for every AudioMuse job (they need the
+# worker's CPU and GPU); the server runner for those that rewrite track IDs.
+WORKER_YIELD_TASK_TYPES = (
+    "main_analysis", "main_clustering", "cleaning", "provider_migration", "server_sweep",
+    "naming_preview",
+)
+# R3: each action gets this long from when it is chosen; a turn chooses
+# actions for up to RUNNER_TURN_SECONDS, then the runner heartbeats and looks
+# for a change of plugin before the next.
+RUNNER_SLICE_SECONDS = 15
+RUNNER_TURN_SECONDS = 300
+# While an AudioMuse job holds a runner back it looks again this often.
+RUNNER_HOST_WAIT_SECONDS = 60
+# An analysis run in its settling grace is due again within this.
+RUNNER_WAITING_SECONDS = 60
+# R5: ``background_workers`` ``auto`` in the web process.
+WEB_AUTO_WORKERS = 2
+
+
+class SliceBudget:
+    """The budget ``_next_reconcile_action`` reads, for one runner action:
+    every action fits, and it has RUNNER_SLICE_SECONDS from now."""
+
+    def __init__(self, seconds=None):
+        self.deadline = time.monotonic() + (RUNNER_SLICE_SECONDS if seconds is None else seconds)
+
+    def remaining(self):
+        return max(0.0, self.deadline - time.monotonic())
+
+    def fits(self, _action):
+        return True
+
+    def start(self):
+        pass
+
+
+def heavy_work_setting():
+    """``heavy_work``: where heavy work runs while no worker is online (R1)."""
+    value = str(get_setting("heavy_work", "auto") or "auto").strip().lower()
+    return value if value in HEAVY_WORK_SETTINGS else "auto"
+
+
+def runner_lane(db, role):
+    """``(actions, reason)``: what ``role`` may run now (R1)."""
+    setting = heavy_work_setting()
+    if role == runner.ROLE_WORKER:
+        if setting == "server":
+            return frozenset(), "heavy_work_on_server"
+        return HEAVY_ACTIONS, "heavy_lane"
+    if setting == "server":
+        return LIGHT_ACTIONS | HEAVY_ACTIONS, "heavy_work_on_server"
+    if setting == "worker":
+        return LIGHT_ACTIONS, "light_lane"
+    try:
+        with db.cursor() as cur:
+            online = runner.worker_online(cur)
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        online = False
+    if online:
+        return LIGHT_ACTIONS, "light_lane"
+    return LIGHT_ACTIONS | {"interactive"}, "no_worker_online"
+
+
+def _runner_blocker(db, role):
+    types = (WORKER_YIELD_TASK_TYPES if role == runner.ROLE_WORKER
+             else reconcile.ID_REWRITING_TASK_TYPES)
+    return reconcile.live_host_task(db, types)
+
+
+def _runner_next_due_seconds(db):
+    """Seconds until the soonest retry in the work tables, or None (R2's sleep)."""
+    try:
+        with db.cursor() as cur:
+            summary = reconcile._work_summary(cur)
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        return None
+    due = summary.get("retry_in_seconds")
+    if summary.get("waiting"):
+        due = RUNNER_WAITING_SECONDS if due is None else min(due, RUNNER_WAITING_SECONDS)
+    return due
+
+
 def run_runner_turn(active):
-    """One turn of ``active`` (runner.Runner). RN.1: the skeleton reports why
-    it does nothing; RN.2 runs the actions."""
+    """One turn of ``active`` (runner.Runner): today's actions in today's order
+    (``_next_reconcile_action``) for every source, within the runner's lane,
+    each in a slice of its own, until none is due or RUNNER_TURN_SECONDS
+    pass, stepping aside for AudioMuse before each (R3, R4)."""
+    db = get_db()
+    role = active.role
     if maintenance_paused():
         return runner.Turn(False, "paused", "maintenance_paused", None, None)
-    return runner.idle_turn(None, "skeleton")
+    blocker = _runner_blocker(db, role)
+    if blocker:
+        return runner.Turn(False, "waiting_host", f"audiomuse:{blocker}",
+                           RUNNER_HOST_WAIT_SECONDS, None)
+    allowed, lane = runner_lane(db, role)
+    if not allowed:
+        return runner.idle_turn(None, lane)
+    if role == runner.ROLE_WORKER:
+        report_edge_runtime()
+    done = {action for action in LIGHT_ACTIONS | HEAVY_ACTIONS if action not in allowed}
+    if "credits" in done:
+        done.update(("credits:before_background", "music_metadata:before_background"))
+    if PER_TRACK_ACTIONS & allowed and reconcile.live_host_task(db, ("main_analysis",)):
+        done.update(PER_TRACK_ACTIONS)
+    report = TickReport()
+    started = time.monotonic()
+    worked = None
+    credits_service.begin_tick()
+    try:
+        while time.monotonic() - started < RUNNER_TURN_SECONDS and not active.stopped.is_set():
+            action, result = _next_runner_action(db, report, active, done)
+            if action is None:
+                break
+            worked = action
+            status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
+            if status in _SETTLED_STATUSES or (status == "complete" and action in _COMPLETE_SETTLES):
+                done.add(action)
+            blocker = _runner_blocker(db, role)
+            if blocker:
+                return runner.Turn(True, "waiting_host", f"audiomuse:{blocker}",
+                                   RUNNER_HOST_WAIT_SECONDS, worked)
+            if active.stopped.wait(runner.PAUSE_SECONDS):
+                break
+    finally:
+        credits_service.end_tick()
+    if worked:
+        return runner.Turn(True, "working", lane, None, worked)
+    return runner.idle_turn(_runner_next_due_seconds(db))
+
+
+def _next_runner_action(db, report, active, done):
+    """One action of the turn in a slice of its own; ``active`` shows it
+    from when it is chosen (``budget.start``)."""
+
+    class Budget(SliceBudget):
+        last = None
+
+        def fits(self, action):
+            self.last = action
+            return True
+
+        def start(self):
+            active.begin_action(self.last)
+
+    budget = Budget()
+    try:
+        return _next_reconcile_action(db, report, budget, None, done)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis runner action %s failed", budget.last)
+        done.add(budget.last)
+        return budget.last, {"status": "failed"}
+    finally:
+        active.end_action()
 
 
 def register(ctx):

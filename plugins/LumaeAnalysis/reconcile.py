@@ -1152,6 +1152,71 @@ def collection_retention_sentence(result):
     return f"Lumae: removed {_plural(removed, 'expired collection entry', 'expired collection entries')}"
 
 
+# Runner plan R4. AudioMuse jobs that rewrite or delete track IDs and mappings
+# (cleaning prunes track_server_map and may delete score rows, a provider
+# migration repoints the default server's mappings, the sweep writes and prunes
+# track_server_map): every runner waits for them.
+ID_REWRITING_TASK_TYPES = ("cleaning", "provider_migration", "server_sweep")
+# AudioMuse's provider migration holds this advisory lock while it executes
+# (tasks/provider_migration_tasks.py, the same key since 3.2.0).
+PROVIDER_MIGRATION_LOCK_KEY = 7421536190082003
+LIVE_TASK_STATUSES = ("NEW", "QUEUED", "PENDING", "STARTED", "RUNNING", "PROGRESS")
+
+
+def live_host_task(db, task_types):
+    """The first live AudioMuse root task among ``task_types``, or None. Fails
+    open: a raising query is rolled back and reads as none."""
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                "SELECT task_type FROM task_status WHERE parent_task_id IS NULL "
+                "AND task_type = ANY(%s) AND status = ANY(%s) ORDER BY task_type LIMIT 1",
+                (list(task_types), list(LIVE_TASK_STATUSES)),
+            )
+            row = cur.fetchone()
+        db.commit()
+        return str(row[0]) if row else None
+    except Exception:
+        _rollback_quietly(db)
+        logger.debug("lumae_analysis could not read AudioMuse's live jobs", exc_info=True)
+        return None
+
+
+def id_rewrite_in_progress(cur):
+    """R4's check inside a publishing transaction, just before its commit: an
+    AudioMuse job that rewrites track IDs is live, or a provider migration
+    holds its lock. The lock is looked up in ``pg_locks``, never taken: a
+    probe that took it could refuse the owner's migration click for those
+    milliseconds."""
+    cur.execute(
+        """
+        SELECT EXISTS (SELECT 1 FROM pg_locks
+                        WHERE locktype='advisory' AND granted AND objsubid=1
+                          AND pid <> pg_backend_pid()
+                          AND ((classid::bigint << 32) | objid::bigint) = %s)
+        """,
+        (PROVIDER_MIGRATION_LOCK_KEY,),
+    )
+    if cur.fetchone()[0]:
+        return "provider_migration"
+    cur.execute(
+        "SELECT task_type FROM task_status WHERE parent_task_id IS NULL "
+        "AND task_type = ANY(%s) AND status = ANY(%s) ORDER BY task_type LIMIT 1",
+        (list(ID_REWRITING_TASK_TYPES), list(LIVE_TASK_STATUSES)),
+    )
+    row = cur.fetchone()
+    return str(row[0]) if row else None
+
+
+def _rollback_quietly(db):
+    rollback = getattr(db, "rollback", None)
+    if callable(rollback):
+        try:
+            rollback()
+        except Exception:
+            pass
+
+
 def host_blocking_task_types():
     """The root task types AudioMuse's cron gate waits for, besides plugins."""
     types = set(HOST_BLOCKING_TASK_TYPES)
