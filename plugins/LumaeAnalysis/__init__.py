@@ -920,7 +920,8 @@ def next_relationship_run(db=None, server_id=None):
           FROM {table('relationship_state')} r
           JOIN {table('catalog_sources')} s USING (catalog_instance_id)
          WHERE s.rebind_status='active'
-           AND (r.status='queued'
+           AND ((r.status='queued'
+                 AND (r.next_retry_at IS NULL OR r.next_retry_at <= now()))
                 OR (r.status IN ('failed', 'waiting_for_index')
                     AND (r.next_retry_at IS NULL OR r.next_retry_at <= now()))
                 OR (r.status='running' AND r.updated_at
@@ -1106,8 +1107,11 @@ def _run_reconcile_action(
                 # none); clearing it made the row due at once and held
                 # minute cadence after the backfill (AUD-15).
                 keep_next_retry=(
-                    action == "profile_backfill"
-                    and result_status in ("waiting_retry", "complete")
+                    (action == "profile_backfill"
+                     and result_status in ("waiting_retry", "complete"))
+                    # W2: a published generation stores when the next build
+                    # of newer inputs may start.
+                    or action == "relationships"
                 ),
             )
             finish_event(
@@ -6597,9 +6601,10 @@ def relationship_preparation_task(server_id, catalog_instance_id, time_budget_se
 
 
 def start_relationship_preparation(
-    catalog_instance_id=None, server_id=None, enqueue_job=True
+    catalog_instance_id=None, server_id=None, enqueue_job=True, force=False
 ):
-    """Request one coalesced relationship build without delaying readiness."""
+    """Request one coalesced relationship build without delaying readiness.
+    ``force`` (the settings page's rebuild) skips W2's spacing."""
     if maintenance_paused():
         return {
             "queued": False,
@@ -6627,7 +6632,7 @@ def start_relationship_preparation(
             "coalesced": True,
             "reason": "already_current",
         }
-    if not claim_relationship_preparation(get_db(), source["catalog_instance_id"]):
+    if not claim_relationship_preparation(get_db(), source["catalog_instance_id"], force=force):
         return {
             "queued": False,
             "coalesced": True,
@@ -7206,6 +7211,7 @@ def settings():
                 result = start_relationship_preparation(
                     catalog_instance_id=source["catalog_instance_id"],
                     server_id=source["server_id"],
+                    force=True,
                 )
                 if result.get("coalesced"):
                     message = (

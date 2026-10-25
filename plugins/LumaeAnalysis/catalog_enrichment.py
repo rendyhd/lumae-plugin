@@ -50,6 +50,13 @@ RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR = 96
 RELATIONSHIP_MAX_CANDIDATE_ENTITIES = 384
 RELATIONSHIP_ENTITY_SAMPLE_LIMIT = 160
 ENRICHMENT_STALE_HOURS = 2
+# W2 (runner plan 2026-10-25): a change asks for a rebuild, which waits until
+# this long after the request and this long after the last published
+# generation. One analysed song rebuilt every album and artist before (24 Oct:
+# 55 slices over 32 minutes). The first generation of a source never waits,
+# and the settings page's rebuild forces one now.
+RELATIONSHIP_QUIET_SECONDS = 15 * 60
+RELATIONSHIP_MIN_GAP_SECONDS = 6 * 60 * 60
 # Minimum profile journal retention per source. The effective limit is
 # profile_change_retention_limit(library size), persisted per source in
 # profile_stream_state.retention_limit by compact_enrichment_storage.
@@ -629,6 +636,13 @@ def migrate_enrichment(db):
         """,
     ]
     migrations.apply(cur, statements)
+    # The retry columns the watchdog added (reconcile.migrate_reconcile); W2's
+    # spacing writes next_retry_at from the build itself.
+    migrations.ensure_columns(
+        cur, t("relationship_state"),
+        "retry_count INTEGER NOT NULL DEFAULT 0",
+        "next_retry_at TIMESTAMPTZ",
+    )
 
     from .relationship_build import migrate_relationship_builds
     migrate_relationship_builds(cur)
@@ -2048,21 +2062,45 @@ def relationship_status(db, catalog_instance_id):
     }
 
 
-def claim_relationship_preparation(db, catalog_instance_id):
+def claim_relationship_preparation(db, catalog_instance_id, force=False):
+    """Queue a rebuild, spaced by W2 unless ``force``: it starts no sooner
+    than RELATIONSHIP_QUIET_SECONDS after this request and
+    RELATIONSHIP_MIN_GAP_SECONDS after the last published generation (the old
+    ``completed_at``, which the claim clears). A forced claim also pulls a
+    queued build's wait in."""
     cur = db.cursor()
     cur.execute(
         f"""
         UPDATE {t("relationship_state")}
            SET status='queued', last_error=NULL, started_at=now(),
-               completed_at=NULL, retry_count=0, next_retry_at=NULL, updated_at=now()
+               completed_at=NULL, retry_count=0,
+               next_retry_at=CASE
+                   WHEN %s OR COALESCE(result_generation, 0) = 0 THEN NULL
+                   ELSE GREATEST(
+                       now() + make_interval(secs => %s),
+                       COALESCE(completed_at, '-infinity'::timestamptz)
+                           + make_interval(secs => %s))
+               END,
+               updated_at=now()
          WHERE catalog_instance_id=%s
            AND (status NOT IN ('queued', 'running')
                 OR updated_at < now() - interval '{ENRICHMENT_STALE_HOURS} hours')
         RETURNING catalog_instance_id
         """,
-        (catalog_instance_id,),
+        (bool(force), RELATIONSHIP_QUIET_SECONDS, RELATIONSHIP_MIN_GAP_SECONDS,
+         catalog_instance_id),
     )
     claimed = cur.fetchone() is not None
+    if not claimed and force:
+        cur.execute(
+            f"""
+            UPDATE {t("relationship_state")} SET next_retry_at=NULL, updated_at=now()
+             WHERE catalog_instance_id=%s AND status='queued' AND next_retry_at > now()
+            RETURNING catalog_instance_id
+            """,
+            (catalog_instance_id,),
+        )
+        claimed = cur.fetchone() is not None
     if claimed:
         arm_reconcile(db, "relationship_preparation_admitted")
     db.commit()

@@ -37,6 +37,14 @@ Similar albums and artists get published on a library that keeps changing
   20-second step and was refused, with an error in the log, at every sync
   while AudioMuse analysed.
 
+Less repeated work (runner plan 2026-10-25, W2).
+
+- Similar albums and artists are rebuilt at most every 6 hours, and no sooner
+  than 15 minutes after the change that asked for it: one analysed song used to
+  rebuild every album and artist (24 Oct on the owner's server: 55 slices over
+  32 minutes). A source's first generation starts at once, and the settings
+  page's rebuild still starts one now.
+
 ## 1.9.0 (2026-10-24)
 
 Journeys (contract §5.7; Auralscape JN.10). Clients that don't know them never

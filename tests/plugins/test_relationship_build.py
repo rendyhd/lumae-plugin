@@ -357,11 +357,73 @@ def test_a_staged_build_finishes_its_inputs_and_queues_the_next(relationship_db,
     assert (status['source_catalog_generation'], status['source_analysis_generation']) == (1, 1)
     assert len(published(db)) == 4
 
+    # W2: the next build waits the minimum gap after this generation.
+    wait = scalar(db, "SELECT EXTRACT(EPOCH FROM next_retry_at - now()) "
+                      "FROM plugin_lumae_analysis__relationship_state")
+    assert e.RELATIONSHIP_MIN_GAP_SECONDS - 60 < wait <= e.RELATIONSHIP_MIN_GAP_SECONDS
+
     second = finish(db)
 
     assert second['generation'] == 2
     assert scalar(db, 'SELECT build_id FROM plugin_lumae_analysis__relationship_builds') != old_id
     assert e.relationship_status(db, 'catalog-a')['status'] == 'complete'
+    assert scalar(db, "SELECT next_retry_at FROM plugin_lumae_analysis__relationship_state") is None
+
+
+def _wait_seconds(db):
+    return scalar(db, "SELECT EXTRACT(EPOCH FROM next_retry_at - now()) "
+                      "FROM plugin_lumae_analysis__relationship_state")
+
+
+def test_rebuild_requests_are_spaced_after_the_last_generation(relationship_db, monkeypatch):
+    """W2: the first generation starts at once; later requests wait 15 minutes
+    after the request and 6 hours after the last published generation, and the
+    watchdog's pick honours it."""
+    db = relationship_db
+    mod = load_plugin()
+    monkeypatch.setattr(e, 'arm_reconcile', lambda *_args, **_kwargs: None)
+    assert e.claim_relationship_preparation(db, 'catalog-a') is True
+    assert scalar(db, "SELECT next_retry_at FROM plugin_lumae_analysis__relationship_state") is None
+    assert mod.next_relationship_run(db=db) is not None
+    finish(db)
+
+    # Published an hour ago: the gap leaves five more hours.
+    with db.cursor() as cur:
+        cur.execute("UPDATE plugin_lumae_analysis__relationship_state "
+                    "SET completed_at=now() - interval '1 hour'")
+    db.commit()
+    assert e.claim_relationship_preparation(db, 'catalog-a') is True
+    assert 5 * 3600 - 60 < _wait_seconds(db) <= 5 * 3600
+    assert mod.next_relationship_run(db=db) is None
+    # A second request while queued neither claims again nor moves the wait.
+    assert e.claim_relationship_preparation(db, 'catalog-a') is False
+    assert 5 * 3600 - 60 < _wait_seconds(db) <= 5 * 3600
+
+    # Published a day ago: only the quiet period applies.
+    finish(db)
+    with db.cursor() as cur:
+        cur.execute("UPDATE plugin_lumae_analysis__relationship_state "
+                    "SET completed_at=now() - interval '1 day'")
+    db.commit()
+    assert e.claim_relationship_preparation(db, 'catalog-a') is True
+    assert e.RELATIONSHIP_QUIET_SECONDS - 60 < _wait_seconds(db) <= e.RELATIONSHIP_QUIET_SECONDS
+    assert mod.next_relationship_run(db=db) is None
+
+
+def test_a_forced_rebuild_starts_now_and_pulls_a_waiting_one_in(relationship_db, monkeypatch):
+    db = relationship_db
+    mod = load_plugin()
+    woken = []
+    monkeypatch.setattr(e, 'arm_reconcile', lambda _db, reason, **_kwargs: woken.append(reason))
+    finish(db)
+    assert e.claim_relationship_preparation(db, 'catalog-a') is True
+    assert _wait_seconds(db) > 0
+
+    assert e.claim_relationship_preparation(db, 'catalog-a', force=True) is True
+
+    assert scalar(db, "SELECT next_retry_at FROM plugin_lumae_analysis__relationship_state") is None
+    assert mod.next_relationship_run(db=db) is not None
+    assert woken == ["relationship_preparation_admitted"] * 2
 
 
 def test_inputs_changing_before_they_are_staged_still_restart(relationship_db, monkeypatch):
@@ -630,6 +692,20 @@ def test_reconcile_checkpoint_is_deferred_without_failure_backoff(monkeypatch):
     assert result == {'status': 'queued'}
     assert retries == [{'failed': False}]
     assert events[0][0][2] == 'deferred'
+
+
+def test_reconcile_keeps_the_wait_a_published_generation_stored(monkeypatch):
+    """W2: a generation published from older inputs leaves the next build's
+    wait in place; the watchdog's success bookkeeping must not clear it."""
+    mod = load_plugin()
+    retries = []
+    monkeypatch.setattr(mod, 'begin_event', lambda *_args, **_kwargs: 1)
+    monkeypatch.setattr(mod, '_safe_progress', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, 'finish_event', lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, 'update_work_retry', lambda *args, **kwargs: retries.append(kwargs))
+    mod._run_reconcile_action(object(), 'relationships', 'server-a', 'catalog-a',
+                              'catalog-a', 0, lambda: {'status': 'complete', 'generation': 2})
+    assert retries == [{'work_key': 'catalog-a', 'failed': False, 'keep_next_retry': True}]
 
 
 def test_settings_shows_saved_progress(monkeypatch):

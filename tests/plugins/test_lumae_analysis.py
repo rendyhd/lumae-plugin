@@ -4330,7 +4330,8 @@ def test_start_relationship_preparation_can_only_record_durable_work(monkeypatch
     monkeypatch.setattr(
         mod,
         "claim_relationship_preparation",
-        lambda selected_db, catalog_id: selected_db is db and catalog_id == "catalog-a",
+        lambda selected_db, catalog_id, force=False: (
+            selected_db is db and catalog_id == "catalog-a" and not force),
     )
     monkeypatch.setattr(
         mod,

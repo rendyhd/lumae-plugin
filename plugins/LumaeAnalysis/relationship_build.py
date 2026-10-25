@@ -571,10 +571,14 @@ def run_relationship_build(source_id, *, db, candidate_lookup, progress=None,
             # instead of recomputing identical relationships. One that
             # finished its staged inputs after newer ones arrived (SQ.2) stays
             # queued: its generation is published, and the next build starts.
+            # W2: the next build of newer inputs waits the minimum gap after
+            # the generation just published.
             cur.execute(f"UPDATE {t('relationship_state')} SET status=%s, "
-                        "source_analysis_generation=%s WHERE catalog_instance_id=%s",
+                        "source_analysis_generation=%s, next_retry_at=CASE WHEN %s THEN NULL "
+                        "ELSE now() + make_interval(secs => %s) END WHERE catalog_instance_id=%s",
                         ('complete' if build.inputs_current else 'queued',
-                         build.analysis_generation, source_id))
+                         build.analysis_generation, build.inputs_current,
+                         e.RELATIONSHIP_MIN_GAP_SECONDS, source_id))
             db.commit()
             try:
                 cur.execute(f"DELETE FROM {t('relationship_build_entities')} WHERE catalog_instance_id=%s", (source_id,))
