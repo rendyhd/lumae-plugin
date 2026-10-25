@@ -555,6 +555,47 @@ Where the code differs from the steps above:
 - **Measured:** an idle server turn runs 17 statements, 22 with the bookkeeping (1.8.0's idle
   tick: 28).
 
+**RN.8 ([report](../perf/RUNNER-E2E-2026-10-25.md)).** Verification items 1–5 and 7 pass on
+the pinned stock host, including the upgrade from the journeys-only 1.9.0 (`a0272e7`), a
+worker killed mid-track and the web container recreated mid-action. Found and fixed, in the
+RN.8 commit:
+- **A queued AudioMuse job held the runners.** R4 counted `NEW` jobs as live, so *Start
+  analysis* with no worker paused the per-track passes until a worker came. Runners step
+  aside only for jobs a worker started (`RUNNING_TASK_STATUSES`), the commit check too.
+- **A Lumae job an older version left queued still blocked AudioMuse** (1201 with no
+  worker, from 1.8.0 and the journeys-only build alike). The install hook and the web
+  process's start revoke `NEW` Lumae root tasks (`revoke_stranded_tasks`).
+- **A runner that went away kept its on-demand work for an hour** (half an hour for edges),
+  until the stale-claim rule freed it. Claims name the runner's role
+  (`claimed_server_runner`, `claimed_worker_runner`); a role's new leader puts its role's
+  claims back to waiting on its first turn, and the server's bookkeeping does so for a
+  worker whose heartbeat is older than 90 s; a held claim makes the server look again
+  within a minute.
+- **An action that found nothing to do still counted as work.** With MusicBrainz
+  unreachable the server runner deferred one album about every 2 s, forever, with a journal
+  event each. A turn whose actions moved nothing on sleeps until the soonest retry
+  (`_moved_on`).
+- **The status page showed some actions only after they ran** (on-demand, credits, lookups,
+  the projection, the v3 upgrade). The turn shows each action while it looks for its work
+  and does it, and counts the one that ran.
+- **The first preparation's by-design hold logged a traceback**; it is a warning.
+- **The perf harness** still stubbed `_safe_reconcile_schedule` (`scripts/perf/stub_host.py`).
+- **Measured:** an idle server turn with the bookkeeping runs 23 statements. The full suite
+  after RN.8: 1,883 passed, 1 skipped, and the same 8 known local failures.
+
+**R5's gate does not pass at scale.** The catalogue refresh runs in the web process (R1),
+and at 132k tracks a refresh with no changes took 71 s with `/api/active_tasks` p95 at
+421 ms (idle 37) and RSS from 289 MB to 1.36 GB; one that changed every track took 309 s,
+the phone's bootstrap page p95 at 334 ms (idle 95) with an 11 s stall, and RSS to 3 GB. At
+the owner's 37.5k tracks the everyday refresh passes (16 s; +68 ms, +42 MB), but one that
+changes every track (a first install, a rescan that changes every file) does not (77 s;
+page p95 395 ms against 94, RSS 239 MB to 992 MB). Relationship builds could not be
+measured on the fixture (they wait for AudioMuse's IVF index); their staging pass was over
+the gate too. R5's fallback names only relationship builds. RN.9 waits for the owner's
+choice: release with the refresh in the web process and the numbers documented, or first
+move the in-thread catalogue work (refresh, preparation, identity recheck, projection,
+relationship staging) into a child process, as decoding already is.
+
 ## Tests
 
 - **Runner unit tests** (fake clock and database): start is idempotent; standby without

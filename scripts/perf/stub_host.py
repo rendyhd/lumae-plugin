@@ -240,18 +240,17 @@ def load_plugin():
     return importlib.import_module("plugins.LumaeAnalysis")
 
 
-# Only queued work is stubbed while migrating. Every schedule helper runs for
-# real, because several also create production tables and columns (e.g.
-# ensure_catalog_reconcile_schedule -> migrate_reconcile -> reconcile_control);
-# they write to the host ``cron`` table that host_schema.sql creates. Source
-# discovery also stays real; it reads the stubbed ``api.list_servers``.
-# Stubbed: ``enqueue_required_catalog_preparations`` (would enqueue jobs) and
-# ``_safe_reconcile_schedule`` (adaptive reschedule from live state).
-_MIGRATION_STUBS = ("_safe_reconcile_schedule",)
+# Only the preparation claim is stubbed while migrating. Everything else runs
+# for real, because it also creates production tables and columns (e.g.
+# migrate_reconcile -> reconcile_control); since 1.9.0 the migration retires
+# Lumae's rows in the host ``cron`` table that host_schema.sql creates instead
+# of scheduling (runner plan R8). Source discovery also stays real; it reads
+# the stubbed ``api.list_servers``. Stubbed:
+# ``enqueue_required_catalog_preparations`` (would claim a first preparation).
 
 
 def run_plugin_migration(db):
-    """Run the real ``plugins.LumaeAnalysis.migrate(db)`` with queued work stubbed."""
+    """Run the real ``plugins.LumaeAnalysis.migrate(db)`` with the preparation claim stubbed."""
     mod = load_plugin()
     saved = []
 
@@ -261,8 +260,6 @@ def run_plugin_migration(db):
 
     try:
         patch(mod, "enqueue_required_catalog_preparations", lambda **_kwargs: 0)
-        for name in _MIGRATION_STUBS:
-            patch(mod, name, lambda *_args, **_kwargs: None)
         mod.migrate(db)
         db.commit()
     finally:

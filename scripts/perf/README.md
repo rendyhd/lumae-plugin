@@ -38,11 +38,10 @@ python3 scripts/perf/run_baseline.py --out perf.json    # measure and report eve
 
 `seed.py` loads `host_schema.sql` (the AudioMuse host tables, including
 `cron`), then runs the real `plugins.LumaeAnalysis.migrate(db)`. Only
-`enqueue_required_catalog_preparations` (it would queue jobs) and
-`_safe_reconcile_schedule` (an adaptive reschedule from live state) are
-stubbed. Every other schedule helper runs for real, because several of them
-also create production tables and columns, for example
-`ensure_catalog_reconcile_schedule` → `migrate_reconcile` → `reconcile_control`.
+`enqueue_required_catalog_preparations` (it would claim a first preparation)
+is stubbed. Everything else runs for real, because it also creates production
+tables and columns, for example `migrate_reconcile` → `reconcile_control`;
+since 1.9.0 the migration retires Lumae's `cron` rows instead of scheduling.
 Source discovery is real too; it reads the host stub's `list_servers`. This is
 fewer stubs than the `migrated_db` test fixture uses, so the benches see the
 full production schema. After migrating, `seed.py` bulk-loads the following:

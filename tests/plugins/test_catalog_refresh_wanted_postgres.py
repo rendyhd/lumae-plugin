@@ -309,3 +309,18 @@ def test_the_runner_waits_out_a_cleaning_before_a_kept_refresh(tick, refresh_tas
     result, _actions = turn(mod)
     assert (result.mode, result.reason) == ("waiting_host", "audiomuse:cleaning")
     assert calls["refresh"] == 0 and _wanted_at(db) is not None
+
+
+@pytest.mark.parametrize("task_type", ["cleaning", "main_analysis"])
+def test_a_queued_audiomuse_job_holds_nothing(tick, refresh_task, task_type):
+    # Without a worker a queued job never starts; waiting for it would stop
+    # the runner for good (runner plan R4: only a running job conflicts).
+    mod, db, calls = refresh_task
+    _want(db, age_minutes=5)
+    with db.cursor() as cur:
+        cur.execute("INSERT INTO task_status VALUES ('queued', NULL, %s, 'NEW')", (task_type,))
+    db.commit()
+
+    result, _actions = turn(mod)
+
+    assert result.worked and calls["refresh"] == 1 and _wanted_at(db) is None

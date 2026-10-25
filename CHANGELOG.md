@@ -19,12 +19,15 @@ R1–R9; contract §3.6).
   relationships). One process leads each role (a PostgreSQL advisory lock).
   A runner wakes when work is recorded (`NOTIFY`) and otherwise sleeps until
   its next retry, at most 15 minutes; an idle turn runs about 17 statements.
+  A turn whose actions moved nothing on (MusicBrainz unreachable, say) sleeps
+  until the soonest retry too, instead of taking the next album at once.
 - AudioMuse starts no task while a plugin task runs, so an analysis the
   administrator started waited behind Lumae's tasks, and AudioMuse refused
   Lumae's schedules while it analysed. An analysis now starts at once, and
   Lumae steps aside instead: the worker runner while any AudioMuse job runs,
   the server runner while AudioMuse cleans, migrates or sweeps, and the
-  per-track passes while AudioMuse analyses.
+  per-track passes while AudioMuse analyses. A job that is only queued holds
+  nothing back: it can wait days for a worker.
 - The setting **Heavy work** (`heavy_work`) says where the heavy lane runs:
   `auto` (the default) gives it to the worker runner while a worker is
   online, and has the server serve on-demand tracks while none is; `server`
@@ -37,9 +40,11 @@ R1–R9; contract §3.6).
   off) becomes the setting `catalog_refresh_hours` or
   `analysis_projection_hours` = 6, which the server runner keeps; without
   them a catalogue is refreshed when an app or an analysis asks, and the
-  analysis is projected after every analysis run and catalogue change. A job
-  1.8.0 queued before the upgrade still runs; its watchdog tick only wakes
-  the runners.
+  analysis is projected after every analysis run and catalogue change. A
+  Lumae job an older version left queued is revoked on install and when the
+  web process starts: with no worker up it held every AudioMuse start (error
+  1201). A job already running finishes; a 1.8.0 watchdog tick only wakes the
+  runners.
 - On-demand requests (`/api/analyze`, `/api/profiles/edges/analyze`) are
   recorded and served first in the next pass, between files of a library
   pass. Their `deferred` lists stay, always empty, and the edge capability in
@@ -47,11 +52,17 @@ R1–R9; contract §3.6).
   (`/api/profiles/edges/backfill`, the settings page's retry) makes the
   library pass due now. An AudioMuse analysis run wakes the runners once,
   not once a song.
+- On-demand work a runner took and could not finish, because its process
+  restarted or its worker was switched off, waits again at once for whichever
+  runner serves on-demand work: when the role's next leader starts, or about
+  two minutes after a worker's heartbeat stops. It waited an hour (half an
+  hour for edges) for the stale-claim rule, which stays as the backstop.
 - The settings page's Background work panel shows each runner (working,
   idle, stepping aside, not running, or unable to run on a host without
   `database.connect_raw`), its host and its last action, instead of
   AudioMuse schedules, and counts the files Lumae stopped trying (W3). The
-  Heavy work choice is on the page too.
+  Heavy work choice is on the page too. A runner's current action shows while
+  it runs, on-demand tracks and credits included.
 - In the web process `background_workers` `auto` analyses at most 2 files at
   once, and a file a runner downloads through AudioMuse goes to Lumae's
   download directory, not AudioMuse's temporary directory, which every

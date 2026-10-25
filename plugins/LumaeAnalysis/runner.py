@@ -205,6 +205,9 @@ class Runner:
         self._conn_lock = threading.Lock()
         self._beating = None
         self.leading = False
+        # Until its first turn as leader ends: the turn releases what the
+        # role's previous leader took (R6).
+        self.new_leader = False
         self.mode = "starting"
         self.reason = None
         self.action = None
@@ -255,12 +258,13 @@ class Runner:
 
     # -- what the turn reports ---------------------------------------------
     def begin_action(self, action):
-        """The turn starts ``action``: the status page shows it."""
+        """The turn looks for ``action``'s work or does it: the status page shows it."""
         self.action = action
         self._action_changed = True
 
-    def end_action(self):
-        if self.action:
+    def end_action(self, ran=True):
+        """The action ends; one that ran is the last action and counted."""
+        if self.action and ran:
             self.last_action = self.action
             self.actions += 1
         self.action = None
@@ -280,6 +284,7 @@ class Runner:
             self._wait(STANDBY_SECONDS)
             return
         self.leading = True
+        self.new_leader = True
         cur.execute(f"LISTEN {NOTIFY_CHANNEL}")
         cur.close()
         self.mode, self.reason = "working", "leader"
@@ -321,6 +326,7 @@ class Runner:
         try:
             with self.app.app_context():
                 turn = self.turn(self)
+            self.new_leader = False
         finally:
             ROLE.reset(token)
             if self.action:

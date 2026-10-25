@@ -159,8 +159,10 @@ from .collection_manager import (
 )
 from . import reconcile
 from .reconcile import (
+    RUNNER_CLAIM_MARKERS,
     RUNNER_WAITING_MARKER,
     WAITING_MARKERS,
+    runner_claim_marker,
     TurnReport,
     analysis_projection_sentence,
     begin_event,
@@ -600,6 +602,44 @@ def retire_lumae_schedules(db):
     if exists and exists[0]:
         cur.execute("DELETE FROM cron_retry WHERE task_type LIKE %s", (LUMAE_CRON_PREFIX + "%",))
     cur.close()
+
+
+def revoke_stranded_tasks(db):
+    """R8: a Lumae root task an older version queued, and no worker started,
+    blocks every AudioMuse start (its gate counts a queued plugin task as
+    live) until a worker comes. Lumae queues nothing now, so it is revoked: a
+    worker no longer picks it up, and on a host that keeps the job elsewhere
+    its shim only wakes the runners. Only ``NEW`` root rows: a running task
+    finishes. The caller commits; returns how many."""
+    cur = db.cursor()
+    try:
+        cur.execute("SELECT to_regclass('task_status') IS NOT NULL")
+        exists = cur.fetchone()
+        if not (exists and exists[0]):
+            return 0
+        cur.execute(
+            "UPDATE task_status SET status='REVOKED' "
+            "WHERE parent_task_id IS NULL AND status='NEW' AND task_type LIKE %s",
+            (LUMAE_CRON_PREFIX + "%",),
+        )
+        return max(0, cur.rowcount or 0)
+    finally:
+        cur.close()
+
+
+def _revoke_stranded_tasks_on_start():
+    db = None
+    try:
+        db = get_db()
+        revoked = revoke_stranded_tasks(db)
+        db.commit()
+        if revoked:
+            logger.warning("lumae_analysis revoked %d task(s) an older version left on "
+                           "AudioMuse's queue", revoked)
+    except Exception:
+        if db is not None:
+            _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not look for tasks an older version left queued")
 
 
 def _cadence_hours(setting):
@@ -1294,6 +1334,26 @@ _SETTLED_STATUSES = frozenset((
 # "complete" is one run of several).
 _COMPLETE_SETTLES = frozenset(("catalog_preparation", "relationships", "profile_backfill",
                                "edge_backfill", "loudness_backfill"))
+# Results that moved nothing on. A turn of only these sleeps until the soonest
+# retry instead of turning again at once: with MusicBrainz unreachable, credits
+# deferred one album, the next turn took the next album, every 2 s, forever.
+_NO_PROGRESS_STATUSES = _SETTLED_STATUSES - {"superseded"}
+
+
+def _moved_on(status, result):
+    """Whether an action's result moved its work on: a status that does not
+    say otherwise, or tracks done on the way (a batch that analysed songs and
+    then waits for a retry)."""
+    if status not in _NO_PROGRESS_STATUSES:
+        return True
+    counts = result if isinstance(result, dict) else {}
+    for key in ("processed", "ready", "served", "upgraded"):
+        try:
+            if int(counts.get(key) or 0) > 0:
+                return True
+        except (TypeError, ValueError):
+            continue
+    return False
 
 
 # Actions whose work changes the waveform counts the settings page shows.
@@ -2072,6 +2132,7 @@ def migrate(db):
     # retry columns); R8: no schedule of Lumae's stays.
     migrate_reconcile(db)
     retire_lumae_schedules(db)
+    revoke_stranded_tasks(db)
     db.commit()
     # Installation is schema work, not a reason to rebuild the full analysis
     # and relationship projections. Only a missing/stale catalogue publication
@@ -4764,7 +4825,7 @@ def serve_interactive(limit=None):
             served += len(tokens)
         if edge_profiles_enabled():
             by_source = {}
-            for job in claim_waiting_edge_jobs(db, WAITING_MARKERS, limit):
+            for job in claim_waiting_edge_jobs(db, WAITING_MARKERS, limit, runner_claim_marker()):
                 by_source.setdefault(job.pop("catalog_instance_id"), []).append(job)
             for source, jobs in by_source.items():
                 server = resolve_profile_source(catalog_instance_id=source)["server_id"]
@@ -4784,17 +4845,17 @@ _serving_interactive = False
 
 def claim_waiting_profiles(db, limit):
     """Take on-demand waveform attempts waiting for a runner, oldest first:
-    (source, track, token)."""
+    (source, track, token), marked with the runner's claim marker."""
     cur = db.cursor()
     cur.execute(
-        f"""UPDATE {source_profiles_table()} p SET last_error=NULL
+        f"""UPDATE {source_profiles_table()} p SET last_error=%s
               FROM (SELECT catalog_instance_id, track_id FROM {source_profiles_table()}
                      WHERE status='pending_interactive' AND last_error IN (%s, %s)
                        AND attempt_token IS NOT NULL
                      ORDER BY analyzed_at, track_id LIMIT %s FOR UPDATE SKIP LOCKED) d
              WHERE p.catalog_instance_id=d.catalog_instance_id AND p.track_id=d.track_id
          RETURNING p.catalog_instance_id, p.track_id, p.attempt_token""",
-        (*WAITING_MARKERS, int(limit)),
+        (runner_claim_marker(), *WAITING_MARKERS, int(limit)),
     )
     rows = cur.fetchall()
     db.commit()
@@ -4814,6 +4875,61 @@ def mark_profiles_waiting(db, catalog_instance_id, tokens):
         )
     db.commit()
     cur.close()
+
+
+def release_runner_claims(db, role, gone_for_seconds=None):
+    """The on-demand work ``role``'s runner took, waveform attempts and edge
+    jobs, started or not, waits again for whichever runner serves on-demand
+    work now: that runner went away before finishing it (R6). With
+    ``gone_for_seconds``, only while the role's heartbeat is older. One
+    statement; returns how many."""
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""
+            WITH gone AS (
+                SELECT 1 WHERE %(seconds)s::float IS NULL OR NOT EXISTS (
+                    SELECT 1 FROM {runner.state_table()}
+                     WHERE role=%(role)s
+                       AND heartbeat_at > now() - make_interval(secs => %(seconds)s::float))
+            ), profiles AS (
+                UPDATE {source_profiles_table()} SET last_error=%(waiting)s
+                 WHERE status='pending_interactive' AND attempt_token IS NOT NULL
+                   AND last_error=%(claimed)s AND EXISTS (SELECT 1 FROM gone)
+                RETURNING 1
+            ), edges AS (
+                UPDATE {table('edge_profile_jobs')}
+                   SET status='pending', last_error=%(waiting)s, updated_at=now()
+                 WHERE status IN ('pending', 'running') AND priority='interactive'
+                   AND last_error=%(claimed)s AND EXISTS (SELECT 1 FROM gone)
+                RETURNING 1
+            )
+            SELECT (SELECT count(*) FROM profiles) + (SELECT count(*) FROM edges)
+            """,
+            {"seconds": gone_for_seconds, "role": role, "waiting": RUNNER_WAITING_MARKER,
+             "claimed": RUNNER_CLAIM_MARKERS[role]},
+        )
+        released = int(cur.fetchone()[0] or 0)
+    finally:
+        cur.close()
+    if released:
+        wake_runners(db, "runner_claims_released")
+    db.commit()
+    return released
+
+
+def _safe_release_runner_claims(db, role, gone_for_seconds=None):
+    try:
+        released = release_runner_claims(db, role, gone_for_seconds)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not release the on-demand work of a runner "
+                       "that went away", exc_info=True)
+        return 0
+    if released:
+        logger.info("lumae_analysis: %d on-demand items the %s runner took wait again",
+                    released, role)
+    return released
 
 
 def interactive_demand_pending(db):
@@ -7119,6 +7235,7 @@ def flask_start():
     try:
         observe_provider_identities_on_start()
     finally:
+        _revoke_stranded_tasks_on_start()
         try:
             # The server runner's downloads of a process that is gone.
             analysis_download.remove_leftovers(getattr(config, "TEMP_DIR", None))
@@ -7290,6 +7407,10 @@ def run_runner_turn(active):
     pass, stepping aside for AudioMuse before each (R3, R4)."""
     db = get_db()
     role = active.role
+    if active.new_leader:
+        # The role's previous leader went away mid-work, or this one starts
+        # again after a failure: the on-demand work it took waits again.
+        _safe_release_runner_claims(db, role)
     if maintenance_paused():
         return runner.Turn(False, "paused", "maintenance_paused", None, None)
     blocker = _runner_blocker(db, role)
@@ -7323,8 +7444,9 @@ def run_runner_turn(active):
                 action, result = _next_runner_action(db, report, active, done)
                 if action is None:
                     break
-                worked = action
                 status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
+                if _moved_on(status, result):
+                    worked = action
                 if status in _SETTLED_STATUSES or (status == "complete" and action in _COMPLETE_SETTLES):
                     done.add(action)
                 blocker = _runner_blocker(db, role)
@@ -7348,7 +7470,8 @@ _runner_bookkeeping_at = None
 
 
 def _runner_bookkeeping(db):
-    """Events whose process went away become ``interrupted``, catalogues
+    """Events whose process went away become ``interrupted``, the on-demand
+    work a worker runner that went away had taken waits again, catalogues
     that need a publication (first run, a builder upgrade) are claimed for
     preparation, and a publication left without a summary gets one, with the
     waveform counts at most every STATUS_SNAPSHOT_IDLE_SECONDS, as each 1.8.0
@@ -7361,6 +7484,7 @@ def _runner_bookkeeping(db):
     try:
         recover_interrupted_events(db)
         enqueue_required_catalog_preparations(db=db)
+        _safe_release_runner_claims(db, runner.ROLE_WORKER, runner.WORKER_ONLINE_SECONDS)
     except Exception:
         _rollback_if_possible(db)
         logger.exception("lumae_analysis runner bookkeeping failed")
@@ -7383,29 +7507,40 @@ def _refresh_status_after_turn(db, report):
 
 
 def _next_runner_action(db, report, active, done):
-    """One action of the turn in a slice of its own; ``active`` shows it
-    from when it is chosen (``budget.start``)."""
+    """One action of the turn in a slice of its own; ``active`` shows each
+    action while the turn looks for its work and does it (``fits``), and
+    counts the one that ran (``start``)."""
 
     class Budget(SliceBudget):
         last = None
+        ran = False
 
         def fits(self, action):
             self.last = action
+            active.begin_action(action)
             return True
 
         def start(self):
-            active.begin_action(self.last)
+            self.ran = True
 
     budget = Budget()
     try:
         return _next_reconcile_action(db, report, budget, None, done)
+    except AnalysisProjectionDeferred as exc:
+        # Held back by design (an unresolved provider identity, say): the
+        # journal keeps the retry, and the log needs no traceback (R9).
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis runner action %s waits: %s", budget.last, exc)
+        done.add(budget.last)
+        return budget.last, {"status": "failed"}
     except Exception:
         _rollback_if_possible(db)
-        logger.exception("lumae_analysis runner action %s failed", budget.last)
+        logger.warning("lumae_analysis runner action %s failed; it is retried",
+                       budget.last, exc_info=True)
         done.add(budget.last)
         return budget.last, {"status": "failed"}
     finally:
-        active.end_action()
+        active.end_action(ran=budget.ran)
 
 
 def register(ctx):

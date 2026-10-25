@@ -8,13 +8,19 @@ class Active:
     def __init__(self, role="server"):
         self.role = role
         self.stopped = threading.Event()
-        self.begun = []
+        self.new_leader = False
+        self.begun = []  # every action shown
+        self.ran = []  # the ones that ran
+        self.action = None
 
     def begin_action(self, action):
         self.begun.append(action)
+        self.action = action
 
-    def end_action(self):
-        pass
+    def end_action(self, ran=True):
+        if ran and self.action:
+            self.ran.append(self.action)
+        self.action = None
 
 
 def turn(mod, role="server"):

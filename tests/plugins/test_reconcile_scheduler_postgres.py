@@ -575,3 +575,35 @@ def test_the_install_leaves_no_lumae_schedule_and_keeps_a_refresh_cadence(
     assert _rows(db, "SELECT task_type FROM cron ORDER BY task_type") == [("plugin.other.sync",)]
     assert _rows(db, "SELECT task_type FROM cron_retry") == [("plugin.other.sync",)]
     assert saved == {"catalog_refresh_hours": 6, "analysis_projection_hours": 6}
+
+
+def test_the_install_revokes_lumae_tasks_an_older_version_left_queued(
+    migrated_db, run_plugin_migration,
+):
+    # A queued 1.8.0 tick that no worker started blocked every AudioMuse start.
+    db = migrated_db
+    with db.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS task_status")
+        cur.execute("CREATE TABLE task_status (task_id TEXT PRIMARY KEY, parent_task_id TEXT, "
+                    "task_type TEXT, status TEXT)")
+        cur.execute("INSERT INTO task_status VALUES "
+                    "('queued', NULL, 'plugin.lumae_analysis.catalog_reconcile', 'NEW'), "
+                    "('running', NULL, 'plugin.lumae_analysis.catalog_refresh', 'RUNNING'), "
+                    "('child', 'running', 'plugin.lumae_analysis.analyze', 'NEW'), "
+                    "('other', NULL, 'plugin.other.sync', 'NEW'), "
+                    "('analysis', NULL, 'main_analysis', 'NEW')")
+    db.commit()
+    run_plugin_migration(db)
+    assert _rows(db, "SELECT task_id, status FROM task_status ORDER BY task_id") == [
+        ("analysis", "NEW"), ("child", "NEW"), ("other", "NEW"), ("queued", "REVOKED"),
+        ("running", "RUNNING")]
+
+
+def test_the_web_start_revokes_them_too(tick, monkeypatch):
+    mod, db = tick
+    _rows(db, "INSERT INTO task_status VALUES "
+              "('queued', NULL, 'plugin.lumae_analysis.catalog_reconcile', 'NEW')")
+    monkeypatch.setattr(mod, "observe_provider_identities_on_start", lambda: None)
+    monkeypatch.setattr(mod, "start_runner", lambda role: None)
+    mod.flask_start()
+    assert _rows(db, "SELECT status FROM task_status") == [("REVOKED",)]

@@ -23,6 +23,22 @@ LUMAE_TASK_TYPE_PREFIX = "plugin.lumae_analysis."
 RUNNER_WAITING_MARKER = "waiting_runner"
 DEFERRED_MARKER = "deferred_host_busy"
 WAITING_MARKERS = (RUNNER_WAITING_MARKER, DEFERRED_MARKER)
+# What a runner writes there instead when it takes the work, by role: the
+# claims of a runner that went away wait again at once, not for the stale
+# rules' hour (waveforms) or half hour (edges).
+RUNNER_CLAIM_MARKERS = {runner.ROLE_SERVER: "claimed_server_runner",
+                        runner.ROLE_WORKER: "claimed_worker_runner"}
+
+
+def runner_claim_marker():
+    """This thread's runner's claim marker; None outside a runner."""
+    return RUNNER_CLAIM_MARKERS.get(runner.ROLE.get())
+
+
+def _claim_markers_sql():
+    return ", ".join(f"'{marker}'" for marker in RUNNER_CLAIM_MARKERS.values())
+
+
 # The control row 1.8.0's watchdog reads; kept as it is so a downgrade finds it.
 LEGACY_IDLE_CRON = "11 * * * *"
 # The journal keeps a day of events per source, at least the latest
@@ -206,6 +222,16 @@ def _work_summary(cur):
                 OR EXISTS (SELECT 1 FROM {_work_table('edge_profile_jobs')}
                             WHERE status='pending' AND priority='interactive'
                               AND last_error IN ('{WAITING_MARKERS[0]}', '{WAITING_MARKERS[1]}'))
+            UNION ALL
+            -- On-demand work a runner holds: the server looks again soon, so
+            -- a worker that went away holding it hands it on (R6).
+            SELECT 'waiting', 0, NULL::timestamp
+             WHERE EXISTS (SELECT 1 FROM {_work_table('source_profiles')}
+                            WHERE status='pending_interactive'
+                              AND last_error IN ({_claim_markers_sql()}))
+                OR EXISTS (SELECT 1 FROM {_work_table('edge_profile_jobs')}
+                            WHERE status IN ('pending', 'running') AND priority='interactive'
+                              AND last_error IN ({_claim_markers_sql()}))
             UNION ALL
             -- A re-check of an unchanged album (S7) is idle work: it never
             -- makes a runner due; a sweep takes it.
@@ -736,18 +762,21 @@ ID_REWRITING_TASK_TYPES = ("cleaning", "provider_migration", "server_sweep")
 # AudioMuse's provider migration holds this advisory lock while it executes
 # (tasks/provider_migration_tasks.py, the same key since 3.2.0).
 PROVIDER_MIGRATION_LOCK_KEY = 7421536190082003
-LIVE_TASK_STATUSES = ("NEW", "QUEUED", "PENDING", "STARTED", "RUNNING", "PROGRESS")
+# A job a worker has started. A queued one (NEW) conflicts with nothing yet,
+# and without a worker it never starts: a runner that waited for it would stop
+# for good, as AudioMuse's own gate does behind a queued plugin task.
+RUNNING_TASK_STATUSES = ("STARTED", "RUNNING", "PROGRESS")
 
 
 def live_host_task(db, task_types):
-    """The first live AudioMuse root task among ``task_types``, or None. Fails
-    open: a raising query is rolled back and reads as none."""
+    """The first running AudioMuse root task among ``task_types``, or None.
+    Fails open: a raising query is rolled back and reads as none."""
     try:
         with db.cursor() as cur:
             cur.execute(
                 "SELECT task_type FROM task_status WHERE parent_task_id IS NULL "
                 "AND task_type = ANY(%s) AND status = ANY(%s) ORDER BY task_type LIMIT 1",
-                (list(task_types), list(LIVE_TASK_STATUSES)),
+                (list(task_types), list(RUNNING_TASK_STATUSES)),
             )
             row = cur.fetchone()
         db.commit()
@@ -778,7 +807,7 @@ def id_rewrite_in_progress(cur):
     cur.execute(
         "SELECT task_type FROM task_status WHERE parent_task_id IS NULL "
         "AND task_type = ANY(%s) AND status = ANY(%s) ORDER BY task_type LIMIT 1",
-        (list(ID_REWRITING_TASK_TYPES), list(LIVE_TASK_STATUSES)),
+        (list(ID_REWRITING_TASK_TYPES), list(RUNNING_TASK_STATUSES)),
     )
     row = cur.fetchone()
     return str(row[0]) if row else None

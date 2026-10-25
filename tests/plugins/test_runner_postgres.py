@@ -169,6 +169,34 @@ def test_the_heartbeat_row_shows_the_action_and_counts_a_worker_online(schema):
     assert states[0]["role"] == "worker" and states[0]["heartbeat_age_seconds"] >= 119
 
 
+def test_an_action_is_shown_while_it_looks_and_counted_only_when_it_ran():
+    active = runner.Runner("server", app=App(), turn=idle, connect=None)
+    active.begin_action("credits")
+    assert active.action == "credits"
+    active.end_action(ran=False)  # it found nothing to do
+    assert (active.action, active.last_action, active.actions) == (None, None, 0)
+    active.begin_action("loudness_backfill")
+    active.end_action()
+    assert (active.action, active.last_action, active.actions) == (None, "loudness_backfill", 1)
+
+
+def test_a_leader_is_new_until_its_first_turn_ends(schema):
+    seen = []
+
+    def turn(active):
+        seen.append(active.new_leader)
+        if len(seen) < 3:
+            return runner.Turn(True, "working", "runnable_work", None, "credits")
+        return runner.idle_turn(None)
+
+    active = make(schema, "server", turn)
+    active.start()
+    assert until(lambda: len(seen) >= 3)
+    active.stop()
+    active.thread.join(timeout=5)
+    assert seen[:3] == [True, False, False]
+
+
 def test_a_changed_plugin_stops_the_runner_and_frees_its_lock(schema):
     installed = {"current": True}
     active = make(schema, "server", idle, still_installed=lambda: installed["current"])

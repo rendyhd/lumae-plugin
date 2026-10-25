@@ -8,28 +8,13 @@ projection checks again at its commit. R5: the web process analyses at most
 two files at once and downloads outside TEMP_DIR. R8: the own-download
 refusal expires.
 """
-import threading
 import time
 
 import pytest
 
+from runner_helpers import Active
 from test_reconcile_scheduler_postgres import P, SERVER, SOURCE, _rows, tick  # noqa: F401
 from plugins.LumaeAnalysis import reconcile, runner
-
-
-class Active:
-    """What a turn reads of its runner."""
-
-    def __init__(self, role):
-        self.role = role
-        self.stopped = threading.Event()
-        self.begun = []
-
-    def begin_action(self, action):
-        self.begun.append(action)
-
-    def end_action(self):
-        pass
 
 
 @pytest.fixture
@@ -168,11 +153,13 @@ def test_an_idle_turn_sleeps_until_the_soonest_retry(turn, monkeypatch):
     assert mod.run_runner_turn(Active("server")).next_due_seconds == mod.RUNNER_WAITING_SECONDS
 
 
-def test_the_turn_shows_the_action_it_runs(turn):
+def test_the_turn_shows_each_action_it_looks_at_and_counts_the_one_that_ran(turn):
     mod, _db, _calls, _settings = turn
     active = Active("server")
     mod.run_runner_turn(active)
-    assert active.begun == ["credits"]
+    # The status page shows on-demand work while it is served, not after.
+    assert active.begun[0] == "interactive" and "credits" in active.begun
+    assert active.ran == ["credits"]
 
 
 def test_a_failing_action_does_not_stop_the_turn(turn, monkeypatch):
@@ -185,6 +172,18 @@ def test_a_failing_action_does_not_stop_the_turn(turn, monkeypatch):
     monkeypatch.setattr(mod, "wanted_catalog_refresh_task", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
     result = mod.run_runner_turn(Active("server"))
     assert result.worked and "credits" in calls  # the refresh failed, the rest ran
+
+
+def test_a_turn_that_only_deferred_sleeps_until_the_retry(turn, monkeypatch):
+    mod, _db, calls, _settings = turn
+    monkeypatch.setattr(mod, "_safe_credits_reconcile", lambda db, server_id, before_background,
+                        deadline=None: None if before_background else (
+                            calls.append("credits") or {"status": "deferred", "retry_seconds": 60}))
+    monkeypatch.setattr(mod, "_runner_next_due_seconds", lambda db: 60.0)
+    result = mod.run_runner_turn(Active("server"))
+    # MusicBrainz unreachable: one album tried, then sleep, not the next album at once.
+    assert calls.count("credits") == 1
+    assert (result.worked, result.mode, result.next_due_seconds) == (False, "idle", 60.0)
 
 
 def test_the_web_process_analyses_two_files_at_most(monkeypatch):
@@ -247,6 +246,8 @@ def test_the_commit_check_sees_a_live_job_and_a_held_migration_lock(migrated_db,
                     "task_type TEXT, status TEXT)")
         assert reconcile.id_rewrite_in_progress(cur) is None
         cur.execute("INSERT INTO task_status VALUES ('t', NULL, 'cleaning', 'NEW')")
+        assert reconcile.id_rewrite_in_progress(cur) is None  # queued: nothing runs yet
+        cur.execute("UPDATE task_status SET status='RUNNING'")
         assert reconcile.id_rewrite_in_progress(cur) == "cleaning"
         cur.execute("DELETE FROM task_status")
     db.commit()

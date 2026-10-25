@@ -334,16 +334,17 @@ def mark_edge_jobs_waiting(db, catalog_id, jobs, marker):
     cur.close()
 
 
-def claim_waiting_edge_jobs(db, markers, limit):
-    """Take up to ``limit`` on-demand jobs waiting for a runner, oldest first."""
+def claim_waiting_edge_jobs(db, markers, limit, claimed=None):
+    """Take up to ``limit`` on-demand jobs waiting for a runner, oldest first,
+    marked ``claimed`` (the runner's claim marker)."""
     cur = db.cursor()
-    cur.execute(f"""UPDATE {table('edge_profile_jobs')} j SET last_error=NULL, updated_at=now()
+    cur.execute(f"""UPDATE {table('edge_profile_jobs')} j SET last_error=%s, updated_at=now()
         FROM (SELECT catalog_instance_id, track_id FROM {table('edge_profile_jobs')}
                WHERE status='pending' AND priority='interactive' AND last_error = ANY(%s)
                ORDER BY updated_at, track_id LIMIT %s FOR UPDATE SKIP LOCKED) d
         WHERE j.catalog_instance_id=d.catalog_instance_id AND j.track_id=d.track_id
         RETURNING j.catalog_instance_id, j.track_id, j.media_revision, j.job_token""",
-                (list(markers), int(limit)))
+                (claimed, list(markers), int(limit)))
     rows = cur.fetchall()
     db.commit()
     cur.close()

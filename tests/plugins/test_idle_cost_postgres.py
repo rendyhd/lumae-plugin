@@ -347,9 +347,10 @@ class _Counting:
 # credits walk and an upsert per album twice a tick, and the settings snapshot
 # counted every tick; 1.8.0's idle tick ran 28. A runner turn has no schedule
 # to keep and no cron_retry to read (R2, R4); the server's bookkeeping (events,
-# preparations, the snapshot's age) adds five at most once a minute.
+# preparations, a gone worker's claims, the snapshot's age) adds six at most
+# once a minute.
 IDLE_TURN_STATEMENTS = 17
-IDLE_BOOKKEEPING_STATEMENTS = 22
+IDLE_BOOKKEEPING_STATEMENTS = 23
 
 
 def test_an_idle_turn_runs_few_statements(tick, monkeypatch):
