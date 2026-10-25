@@ -20,9 +20,14 @@ the two remaining failures, because the plugin cannot see either:
   AudioMuse until a worker returns or someone cancels it.
 - **A person's click.** A refused *Start* leaves no trace, so the yield (S1) never sees it.
 
-**Decision (owner, 2026-10-25).** No AudioMuse change or upstream PR. Plan the full
-implementation: move Lumae's background work off AudioMuse's queue, plus the waste cuts
-found in the 2026-10-25 audit.
+**Decisions (owner, 2026-10-25).**
+- No AudioMuse change or upstream PR. Plan the full implementation: move Lumae's
+  background work off AudioMuse's queue, plus the waste cuts found in the 2026-10-25
+  audit.
+- **One release, 1.9.0.** 1.9.0 is not published, so it carries everything: journeys
+  (JN.10), SQ.1, SQ.2, the waste cuts and the runner. The local release commit `a0272e7`
+  (1.9.0 — journeys) stays in history; the last step re-cuts 1.9.0 under the same version,
+  as 1.8.0's first test build was replaced (`docs/STATUS.md`, release policy row).
 
 This plan supersedes the cadence and yield parts of the scheduler plan (S1, S2, S5's
 cadence reporting) and WP1's tick budget. Its host-compatibility rules still apply: floor
@@ -281,7 +286,7 @@ runner (R2) and answers at once. The seven `enqueue_bounded` call sites (invento
   `collection_retention`) and their `cron_retry` rows, and no longer registers cron tasks.
   `collection_retention` and the identity recheck become runner actions (W1): retention
   daily, the recheck when a transition is pending.
-- **In-flight jobs from the old version.** A job queued by 1.9.x and run after the upgrade
+- **In-flight jobs from the old version.** A job queued by 1.8.0 and run after the upgrade
   calls its dotted function. Each removed task function stays one release as a shim that
   notifies the runner and returns.
 - **Removed** (inventory §2–§4):
@@ -343,13 +348,13 @@ runner (R2) and answers at once. The seven `enqueue_bounded` call sites (invento
   one stops the runner with a status-page reason and a log line, never a crash.
 - **App**: no change needed (R6). Verified by Auralscape's journey suite against the
   end-to-end host.
-- **Downgrade** to 1.9.x: its install hook recreates its cron rows (`ON CONFLICT DO
+- **Downgrade** to 1.8.0: its install hook recreates its cron rows (`ON CONFLICT DO
   NOTHING`) and its watchdog reads the old `reconcile_control` columns.
 
 ## Waste cuts (either way)
 
-They do not depend on the runner. Shipped first, they cut the churn while the PC is on;
-they do not stop stranding.
+They do not depend on the runner, so they land first (Phase 1), each worth having even if
+the runner slipped. All of them ship in 1.9.0 with the runner.
 
 ### W1 — Identity recheck without a schedule
 
@@ -405,14 +410,16 @@ server, downloads and analyzes one file through the exec path, runs one relation
 and one catalogue refresh. Measure R5's gate. Exit: the numbers in this plan and a go or
 no-go.
 
-### Phase 1 — Waste cuts (can ship as 1.9.1 with 1.9.0, SQ.1 and SQ.2)
+### Phase 1 — Waste cuts (in 1.9.0)
 
 - **WC.1** — W2, relationship rebuild spacing.
 - **WC.2** — W3, files that cannot be analyzed.
 - **WC.3** — W4, credits re-checks.
-- **WC.4** — W1 interim, identity recheck only while a transition is pending.
+- **WC.4** — W1 interim, identity recheck only while a transition is pending. Its
+  interim cron change never ships on its own (RN.5 deletes the row in the same release);
+  it keeps the step independent and testable.
 
-### Phase 2 — The runner (1.10.0)
+### Phase 2 — The runner (in 1.9.0)
 
 - **RN.1** — Runner skeleton: lifecycle, lock, wake, sleep, pause, status row, journal.
   Off by default (setting `runner_enabled`), so RN.2–RN.4 can land and be tested.
@@ -428,8 +435,21 @@ no-go.
   `docs/relationship-build-recovery.md`, CHANGELOG; a "superseded by" note at the top of
   the scheduler plan, its handoff, the AudioMuse plugin-tasks plan and the performance
   plan's WP1; this plan's results.
-- **RN.8** — End-to-end verification and R5's gate (below); release commit 1.10.0 when the
-  owner approves.
+- **RN.8** — End-to-end verification and R5's gate (below).
+
+### Phase 3 — Re-cut 1.9.0
+
+- **RN.9** — `release(lumae_analysis): 1.9.0 — journeys and the runner`, made when RN.8
+  passes; published only with the owner's go-ahead:
+  - `release-sources.json` back to `{"mode": "source", "version": "1.9.0"}` (SQ.1 pinned
+    it to the journeys archive so unreleased work could land);
+  - `python scripts/build_catalog.py`, then `--check`: a new
+    `dist/lumae_analysis/lumae_analysis_1.9.0.zip` and its checksum in the 1.9.0 entry of
+    `plugin.json`, whose changelog now covers journeys, SQ.1, SQ.2, W1–W4 and the runner;
+  - `CHANGELOG.md`: the Unreleased entries fold into `## 1.9.0 (date)`;
+  - `docs/STATUS.md` release-policy row, the contract's "unreleased" markers;
+  - `tests/plugins/test_release_channels.py`: the archive contains the runner module.
+- Then the owner's server canary (Verification, below).
 
 ## Tests
 
@@ -465,7 +485,8 @@ no-go.
 ## Verification (end to end)
 
 On the end-to-end host, with the release archive mounted:
-1. Upgrade from 1.9.x: Lumae's cron rows and `cron_retry` rows are gone; no
+1. Upgrade from 1.8.0 (the published version) and from the local journeys-only 1.9.0
+   build: Lumae's cron rows and `cron_retry` rows are gone; no
    `plugin.lumae_analysis.*` row appears in `task_status` during a full day of runner work.
 2. With the worker container stopped: a phone refresh adds a new song; credits and
    relationships progress; *Start analysis* is accepted at any moment.
@@ -487,9 +508,7 @@ work; a new song reaches the phone with the PC off as soon as Navidrome has it.
 - **D2** — Relationship spacing: 15-minute quiet period, 6 hours between builds.
 - **D3** — Credits re-checks: 30/90/180 days, 60 an hour.
 - **D4** — The web tier's default analysis workers: 2.
-- **D5** — Ship Phase 1 as 1.9.1 before the runner (recommended).
-- **D6** — The runner release's number: 1.10.0 (recommended; the wire contract stays
-  compatible) or 2.0.0.
+- **Decided 2026-10-25:** one 1.9.0 release with everything (was D5, D6).
 
 ## Risks
 
