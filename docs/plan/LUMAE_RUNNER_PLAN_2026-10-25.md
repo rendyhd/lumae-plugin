@@ -72,28 +72,50 @@ specifics beyond keeping them working.
 
 ### R1 — Where the work runs
 
-A **runner**: one loop thread in AudioMuse's web process, started from the plugin's
-`on_flask_start` hook, which the plugin already uses unconditionally
-(`__init__.py:7288`).
+Two **runners**, one loop implementation in two roles, neither touching AudioMuse's queue:
 
-Why the web process:
-- It is always up (on the owner's server, `media`), so G2 holds without the GPU PC.
-- It never touches the queue, so G1 holds by construction.
-- The plugin's analysis isolation already has an exec path for a threaded process "the web
-  tier" (`analysis_isolation.py:34`).
-- Checked 2026-10-25 in the owner's web container: Python 3.12.3, PyAV 17.1.0 (the workers'
-  version, libswresample 6.3.101 per `edge_runtime_state`), numpy 2.4.6, scipy 1.16.3,
-  8 CPUs and no cgroup CPU or memory limit, `TEMP_DIR` with 167 GB free. Navidrome runs on
-  the same host, so downloads stay local.
+| Runner | Started from | Lives | Does |
+|---|---|---|---|
+| **Server runner** | `on_flask_start` (already used unconditionally, `__init__.py:7288`) | AudioMuse's web process: always up | the light lane: catalogue refresh and preparation, analysis-run finalization and projection, credits, MusicBrainz, the identity recheck, retention, the stored-edge v3 upgrade, taking phone requests |
+| **Worker runner** | `on_worker_start` (already used, `__init__.py:7289`) | a worker process: up while a worker is | the heavy lane: the waveform, edge and loudness passes, on-demand track analysis, relationship builds |
+
+Why split (owner, 2026-10-25): many users run AudioMuse's web side on a light server and
+the worker on a heavier machine, so heavy analysis stays where the worker is. Both runners
+keep G1 (no `task_status` row, so nothing holds the gate) and G2 (nothing is queued, so
+nothing strands: with the worker off, heavy work simply waits).
+
+**Where heavy work runs when no worker is online** (setting `heavy_work`, Settings →
+Background work):
+- `auto` (default): the server runner does on-demand tracks only (a phone is waiting on
+  that song; one file at a time); passes and relationship builds wait for a worker.
+- `server`: the server runner does all heavy work too, for a server that can take it
+  (the owner's `media`: 8 cores, Navidrome local).
+- `worker`: never on the server, on-demand included.
+
+A worker counts as online while its runner's heartbeat is under 90 s old (R2).
+
+Checked 2026-10-25 in the owner's web container, for the `server` setting: Python 3.12.3,
+PyAV 17.1.0 (the workers' version, libswresample 6.3.101 per `edge_runtime_state`), numpy
+2.4.6, scipy 1.16.3, 8 CPUs and no cgroup CPU or memory limit, `TEMP_DIR` with 167 GB free.
+The plugin's analysis isolation already has an exec path for a threaded process "the web
+tier" (`analysis_isolation.py:34`).
 
 Rejected:
-- **A thread in the worker** (`on_worker_start`). Also ends gate holding and stranding, but
-  work happens only while the PC is on, and it shares processes with AudioMuse's analysis.
+- **One runner in the web process only.** Fine on the owner's server, but it puts heavy
+  analysis on light servers.
+- **One runner in the worker only.** No catalogue, credits or phone requests while the
+  worker is off.
+- **Heavy work as short queue tasks when a worker is idle.** A task still holds the gate
+  while it runs, so a *Start* during it is refused: the problem this plan removes.
 - **A Lumae service container.** A deployment burden for every user of a public plugin.
 - **Keep the queue and patch** (the audit's P2–P4). More of the same; P2 needs AudioMuse's
   cancel internals.
 
-What stays on the worker: the per-song hook (R7).
+What also stays on the worker: the per-song hook (R7).
+
+**Both runners use the same durable work tables and claims** (`claim_profile_backfill_batch`,
+`claim_edge_jobs`, the relationship session lock and the rest): which runner picks a unit
+up is a matter of lane and setting, not of separate queues.
 
 ### R2 — Lifecycle
 
@@ -125,12 +147,23 @@ Host facts below are from AudioMuse v3.6.4, each checked against v3.2.0 (researc
     `idle_in_transaction_session_timeout`, its blob VACUUM stands down while any
     transaction is older than 30 s (`maintenance.py:347-354`), and an uninstall's
     `DROP TABLE … CASCADE` waits on the runner's locks (`database.py:2636-2653`).
-- **One runner.** On its raw connection the thread takes `pg_try_advisory_lock(<lumae
-  runner key>)`, a key of its own outside the host's (host keys: `database.py:2657`,
-  `provider_migration_tasks.py:73`, `duplicate_repair.py:58-61`, `sql.py:49-51`). Without
-  it, the thread stands by and tries again every 60 s. AudioMuse starts one web process
-  (`supervisord.conf:19`: 1 worker, 4 threads, no `--preload`), but the hook runs once per
-  process, so the lock is the guarantee. It dies with the connection.
+- **One runner per role.** On its raw connection the thread takes
+  `pg_try_advisory_lock(<role key>)`, one key for the server runner and one for the worker
+  runner, outside the host's keys (`database.py:2657`, `provider_migration_tasks.py:73`,
+  `duplicate_repair.py:58-61`, `sql.py:49-51`). Without it, the thread stands by and tries
+  again every 60 s. AudioMuse starts one web process (`supervisord.conf:19`: 1 worker, 4
+  threads, no `--preload`) but the hook runs once per process; a worker container runs a
+  worker process per queue, and a site may run several worker containers (the owner runs
+  two). The lock is the guarantee. It dies with the connection.
+- **Heartbeat.** Each leader writes its row in `runner_state` (role, host, pid, mode,
+  reason, current action, `heartbeat_at`) every 30 s and at each action. The server runner
+  reads the worker row to decide where heavy work runs (R1); the settings page shows both.
+- **Worker process.** `on_worker_start` runs in each queue worker's main process
+  (`taskqueue/worker.py:1286-1288`), which forks a single-threaded child for every AudioMuse
+  job. The worker runner's thread keeps no lock across a blocking call and decodes only in
+  exec children (`analysis_isolation._Worker`), so a fork while it runs inherits nothing
+  held. The worker process already has threads of its own (its listener session,
+  `worker.py:139-150`). RN.8 runs AudioMuse analysis jobs while the worker runner works.
 - **Wake.** Work is recorded in the existing durable tables; whoever records it also runs
   `pg_notify('lumae_runner', <reason>)` in the same transaction. The runner `LISTEN`s on
   its raw connection, so a wake from a web route, the worker's song hook (which has an app
@@ -141,11 +174,12 @@ Host facts below are from AudioMuse v3.6.4, each checked against v3.2.0 (researc
   first. A sweep is a few statements (S8's idle-cost test stays and is re-pinned).
 - **Pause.** Maintenance pause (`maintenance_paused()`) and a conflicting AudioMuse job
   (R4) stop new actions; the runner reports why.
-- **Restore.** AudioMuse has no in-process restore signal: a restore stops the whole web
-  process (`supervisorctl stop flask`: TERM, then KILL of the process group after 5 s,
-  `app_backup.py:450`, `supervisord.conf:20-24`), replaces the schema, and starts it again,
-  which runs the hook again. The runner needs no pause for it, only R2's rule that every
-  action is idempotent and resumable.
+- **Restore.** AudioMuse has no in-process restore signal: a restore stops the workers
+  (a `worker_control` stop, `app_backup.py:1142`) and the whole web process
+  (`supervisorctl stop flask`: TERM, then KILL of the process group after 5 s,
+  `app_backup.py:450`, `supervisord.conf:20-24`), replaces the schema, and starts them
+  again, which runs both hooks again. The runners need no pause for it, only R2's rule
+  that every action is idempotent and resumable.
 - **Plugin disabled, uninstalled or upgraded.** No hot reload: each needs a web restart
   (`restart_required`, `plugin/blueprint.py:488-538`), and *Apply* restarts the web process
   (`:584-600`). Meanwhile the old thread would keep running old code. Before each pass the
@@ -170,7 +204,9 @@ One pass runs the actions in today's priority order (`_next_reconcile_action`,
 `__init__.py:1405`): on-demand work, the stored-edge v3 upgrade, analysis-run
 finalization, catalogue preparation, a wanted catalogue refresh, the credits and
 MusicBrainz share turns, relationships, waveform, edge and loudness passes, then credits
-and MusicBrainz lookups. After each action it starts again from the top, as today.
+and MusicBrainz lookups. After each action it starts again from the top, as today. Each
+runner skips the actions outside its lane (R1); the server runner takes heavy actions only
+as `heavy_work` and the worker's heartbeat allow.
 
 - **Slices.** Each action gets at most `SLICE_SECONDS` (15 s) and stops at its deadline, as
   the elastic actions already do. Actions that today run past the tick (`analysis_run`
@@ -208,6 +244,11 @@ runner; the runner waits for them:
   twice and avoids racing the hook's writes. Everything else (catalogue, credits,
   relationships of settled data) runs on. Finalization already waits for the run to
   settle (`_work_summary`, 2-minute grace).
+- **The worker runner pauses for every AudioMuse job** (`main_analysis`,
+  `main_clustering`, `cleaning`, `provider_migration`, `server_sweep`, `naming_preview`):
+  those jobs need the worker's CPU and GPU. It checks before each action and between files,
+  so a job that starts meanwhile waits at most one file's analysis for the CPU, never for a
+  start (no task row, so AudioMuse admits it at once).
 - **Check twice.** Before an action starts, and again inside each publishing transaction
   just before commit; a conflicting job found at commit rolls the publication back and
   the action retries later. In the same transaction the runner also tries the provider
@@ -219,10 +260,11 @@ runner; the runner waits for them:
 
 ### R5 — The web process
 
-- **Decoding** runs in exec children (`analysis_isolation._Worker`), `NICE` 10, as today in
-  a threaded process. The web tier's default `background_workers` becomes 2 (auto still
-  available); the hook does new songs on the PC, so the runner's audio work is a trickle
-  after the backfill.
+- **By default the server runner does light work only** (R1); heavy work reaches the web
+  process only with `heavy_work=server`, or as on-demand tracks while no worker is online.
+- **Decoding** runs in exec children (`analysis_isolation._Worker`), `NICE` 10, in both
+  runners (both processes are threaded). In the web process `background_workers` `auto`
+  means at most 2; on the worker it keeps today's `auto` (cores less 2, at most 4).
 - **Downloads.** `tasks.mediaserver.download_track` has no role guard and works in the web
   process with the server bound (`tasks/mediaserver/__init__.py:122-155`; AudioMuse
   itself never downloads audio there). The runner downloads into a plugin-owned temporary
@@ -234,14 +276,15 @@ runner; the runner waits for them:
   metadata) shares the interpreter with AudioMuse's 4 request threads (gunicorn: 1
   process, 4 gthreads, `deployment/supervisord.conf:19`).
 - **Gate (RN.0 and RN.8).** On the end-to-end host, the p95 latency of the phone's
-  bootstrap page and of AudioMuse's `/api/active_tasks` during a relationship build and a
-  full catalogue refresh stays within 100 ms of idle, and the web process's RSS within
-  300 MB of idle. If relationship scoring misses it, its scoring moves into an exec child
-  (inputs in, scores out; the parent writes), the pattern the audio analysis uses.
-- **Expect relationship scoring to need that child.** It is Python loops over per-pair
-  `np.dot` (`catalog_enrichment.py:1204`): about 15 minutes of interpreter time per full
-  build on the owner's PC (24 Oct: 55 slices, avg 16.5 s). W2 caps it at four builds a
-  day.
+  bootstrap page and of AudioMuse's `/api/active_tasks` during a full catalogue refresh
+  (default settings), and during a relationship build with `heavy_work=server`, stays
+  within 100 ms of idle, and the web process's RSS within 300 MB of idle. If the build
+  misses it, `heavy_work=server` keeps relationship builds on the worker lane (they wait
+  for a worker), and the settings page says so.
+- **Relationship scoring is the heaviest in-thread work**: Python loops over per-pair
+  `np.dot` (`catalog_enrichment.py:1204`), about 15 minutes of interpreter time per full
+  build on the owner's PC (24 Oct: 55 slices, avg 16.5 s). It is in the heavy lane, and W2
+  caps it at four builds a day.
 
 ### R6 — On-demand requests
 
@@ -275,9 +318,10 @@ runner (R2) and answers at once. The seven `enqueue_bounded` call sites (invento
   while AudioMuse has its file. It records the analysis run and notifies the runner. It no
   longer serves deferred on-demand work (`serve_deferred_interactive(limit=1)`): the
   runner serves it, analysis or not.
-- **`on_worker_start`** keeps reporting the worker's edge runtime (the hook needs it) and
-  removing leftover downloads. The runner qualifies the web process's own runtime at start
-  and records it under the web host's id, which is what gates the passes.
+- **`on_worker_start`** keeps reporting the worker's edge runtime and removing leftover
+  downloads, and starts the worker runner (R1, R2). The server runner qualifies the web
+  process's own edge runtime before it takes any heavy action. A runner whose own process
+  is not qualified leaves the passes to the other.
 
 ### R8 — Leaving the queue
 
@@ -324,10 +368,10 @@ runner (R2) and answers at once. The seven `enqueue_bounded` call sites (invento
   `inspect_audiomuse_health`, `jellyfin_continuity.audiomuse_busy`), which R4 reuses.
 - **Not in scope**: `plugins/FederatedAlbums` has its own queue use (`__init__.py:502`,
   `:1138`, `:1466`, `:1516-1521`); it is a separate plugin.
-- **`reconcile_control`** becomes the runner's row: `mode` (`working`, `idle`, `paused`,
-  `waiting_host`, `standby`), `reason`, `next_wake_at`, `leader`, `heartbeat_at`. The
-  `mode` CHECK constraint is replaced in an additive migration; `cron_expr` stays, unused,
-  for a downgrade.
+- **`runner_state`**, a new table keyed by role (`server`, `worker`): host, pid, mode
+  (`working`, `idle`, `paused`, `waiting_host`), reason, current action, `next_wake_at`,
+  `heartbeat_at`. `reconcile_control` stays as it is, unused, so a downgrade to 1.8.0 finds
+  what it expects.
 
 ### R9 — What people see
 
@@ -346,6 +390,8 @@ runner (R2) and answers at once. The seven `enqueue_bounded` call sites (invento
   names its types itself. Two of these are not in `plugin.api.__all__` (`database.connect_raw`,
   `tasks.mediaserver.download_track`); each is imported at runner start, and a missing
   one stops the runner with a status-page reason and a log line, never a crash.
+- **A host without `on_worker_start`**: no worker runner; heavy work follows `heavy_work`
+  as if no worker were online.
 - **App**: no change needed (R6). Verified by Auralscape's journey suite against the
   end-to-end host.
 - **Downgrade** to 1.8.0: its install hook recreates its cron rows (`ON CONFLICT DO
@@ -421,9 +467,11 @@ no-go.
 
 ### Phase 2 — The runner (in 1.9.0)
 
-- **RN.1** — Runner skeleton: lifecycle, lock, wake, sleep, pause, status row, journal.
-  Off by default (setting `runner_enabled`), so RN.2–RN.4 can land and be tested.
-- **RN.2** — The loop (R3) over today's action functions, R4's conflict check, slices.
+- **RN.1** — Runner skeleton for both roles: lifecycle, lock, heartbeat, wake, sleep,
+  pause, `runner_state`, journal. Off by default (setting `runner_enabled`), so RN.2–RN.4
+  can land and be tested.
+- **RN.2** — The loop (R3) over today's action functions, lanes and `heavy_work`, R4's
+  conflict checks, slices.
 - **RN.3** — Web routes record and notify (R6); contract §2.5 and §2.6.
 - **RN.4** — Song hook: notify, no deferred serving (R7); the runner's edge runtime.
 - **RN.5** — Switch: runner on; the install hook deletes the cron rows; shims for
@@ -456,9 +504,13 @@ no-go.
 - **Runner unit tests** (fake clock and database): start is idempotent; standby without
   the lock and takeover when it frees; a notify wakes within a second; sleep until the
   soonest due time; pause for each conflicting job type and for maintenance; per-track
-  pause during `main_analysis`; on-demand work first; slice deadlines; a raising action is
-  journalled and backed off; the loop restarts after a crash; an interrupted action
-  recovers.
+  pause during `main_analysis`; the worker runner's pause for every AudioMuse job;
+  on-demand work first; slice deadlines; a raising action is journalled and backed off; the
+  loop restarts after a crash; an interrupted action recovers.
+- **Lanes**: each role runs only its lane; with the worker's heartbeat fresh the server
+  runner takes no heavy action; with it stale, `auto` takes on-demand tracks only,
+  `server` takes every heavy action, `worker` none; a stale heartbeat older than 90 s
+  counts as offline.
 - **PostgreSQL tests**: two runners, one lock; `LISTEN`/`NOTIFY` across connections; the
   publication check rolls back when a conflicting job appears; the idle sweep's statement
   count pinned; migrations of `reconcile_control` up and down.
@@ -488,10 +540,15 @@ On the end-to-end host, with the release archive mounted:
 1. Upgrade from 1.8.0 (the published version) and from the local journeys-only 1.9.0
    build: Lumae's cron rows and `cron_retry` rows are gone; no
    `plugin.lumae_analysis.*` row appears in `task_status` during a full day of runner work.
-2. With the worker container stopped: a phone refresh adds a new song; credits and
-   relationships progress; *Start analysis* is accepted at any moment.
-3. With the worker running: *Start analysis* is accepted while the runner works; the
-   runner pauses per-track work until the run settles, then finalizes it.
+2. With the worker container stopped: a phone refresh adds a new song; credits progress;
+   an on-demand track is analyzed by the server runner (`auto`); passes and relationship
+   builds wait, and run on the server with `heavy_work=server`; *Start analysis* is
+   accepted at any moment and stays queued until a worker comes.
+3. With the worker running: heavy work runs in the worker runner (its heartbeat and
+   journal say so); *Start analysis* is accepted while it works; the worker runner pauses
+   for the run, the song hook analyzes the new songs, and the server runner finalizes the
+   run; AudioMuse's album jobs fork and finish normally while the worker runner's thread is
+   alive.
 4. A cleaning job: the runner pauses, then resumes.
 5. Restarting the web container mid-action: the runner resumes, nothing is lost or done
    twice.
@@ -508,7 +565,9 @@ work; a new song reaches the phone with the PC off as soon as Navidrome has it.
 - **D2** — Relationship spacing: 15-minute quiet period, 6 hours between builds.
 - **D3** — Credits re-checks: 30/90/180 days, 60 an hour.
 - **D4** — The web tier's default analysis workers: 2.
-- **Decided 2026-10-25:** one 1.9.0 release with everything (was D5, D6).
+- **Decided 2026-10-25:** one 1.9.0 release with everything (was D5, D6); D1–D4 as
+  recommended; heavy analysis stays on the worker, with the server doing it only as
+  `heavy_work` allows (default `auto`; R1).
 
 ## Risks
 
