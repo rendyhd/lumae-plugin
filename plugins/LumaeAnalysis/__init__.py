@@ -4345,8 +4345,9 @@ EDGE_RUNTIME_REPORT_SECONDS = 600
 _edge_runtime_reported_at = None
 
 
-def report_edge_runtime(force=False):
-    """Record this worker's edge runtime verdict; worker processes only.
+def report_edge_runtime(force=False, park=True):
+    """Record this process's edge runtime verdict: a worker's, or the web
+    process's before its runner takes heavy work (R7, ``park=False``).
 
     Called at worker start, by every edge task and by the reconcile tick. A
     qualified worker creates missing pass rows and resumes parked passes, and
@@ -4374,7 +4375,9 @@ def report_edge_runtime(force=False):
         if status.get("available") and edge_setting_enabled():
             if ensure_edge_backfill_sources(db) + arm_edge_backfill(db, include_complete=False):
                 arm_reconcile(db, "edge_backfill_ready", commit=True)
-        else:
+        elif park:
+            # The web process without a runtime leaves the passes to a
+            # worker that has one, and parks nothing of theirs.
             park_edge_backfill(db)
         # A worker with PyAV reports: loudness passes parked for want of it resume (LN.4c).
         if status.get("pyav") and loudness_backfill.arm(db, include_complete=False):
@@ -5522,12 +5525,14 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
 
 
 def analyze_song_hook(song):
-    """AudioMuse per-song hook; while AudioMuse's own analysis runs no plugin
-    task can start, so each song also serves one deferred on-demand track."""
+    """AudioMuse per-song hook. It records the analysis run, which wakes the
+    runners (R7). Without them no plugin task can start while AudioMuse
+    analyses, so each song also serves one deferred on-demand track."""
     try:
         return _analyze_song_hook(song)
     finally:
-        serve_deferred_interactive(limit=1)
+        if not runner_enabled():
+            serve_deferred_interactive(limit=1)
 
 
 def _analyze_song_hook(song):
@@ -7628,6 +7633,9 @@ def run_runner_turn(active):
         return runner.idle_turn(None, lane)
     if role == runner.ROLE_WORKER:
         report_edge_runtime()
+    elif allowed & HEAVY_ACTIONS:
+        # R7: the web process qualifies its own runtime before heavy work.
+        report_edge_runtime(park=False)
     done = {action for action in LIGHT_ACTIONS | HEAVY_ACTIONS if action not in allowed}
     if "credits" in done:
         done.update(("credits:before_background", "music_metadata:before_background"))

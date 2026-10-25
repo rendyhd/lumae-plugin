@@ -95,7 +95,10 @@ def test_each_runner_runs_its_lane(turn, role, setting, worker_online, heavy, li
     assert {"interactive", "relationships"} & set(calls) == heavy
     assert ("credits" in calls) is light
     assert result.worked is light
-    assert ("report_edge_runtime" in calls) is (role == "worker" and setting != "server")
+    # R7: the worker reports its runtime; the server qualifies its own
+    # before heavy work, parking nothing.
+    assert ("report_edge_runtime" in calls) is ((role == "worker" and setting != "server")
+                                                or (role == "server" and bool(heavy)))
 
 
 def test_a_stale_worker_heartbeat_is_no_worker(turn):

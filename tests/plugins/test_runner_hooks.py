@@ -84,3 +84,40 @@ def test_the_hooks_still_do_their_old_work_when_the_runner_fails(monkeypatch):
     mod.worker_start()
     assert calls == ["observe", "server", "report", "worker"]
 
+
+def test_the_song_hook_leaves_on_demand_work_to_the_runners(monkeypatch):
+    mod = load_plugin()
+    served = []
+    monkeypatch.setattr(mod, "_analyze_song_hook", lambda song: {"status": "ok"})
+    monkeypatch.setattr(mod, "serve_deferred_interactive", lambda limit=None: served.append(limit))
+    monkeypatch.setattr(mod.runner, "enabled", lambda: True)
+    assert mod.analyze_song_hook({}) == {"status": "ok"}
+    assert served == []
+    monkeypatch.setattr(mod.runner, "enabled", lambda: False)
+    mod.analyze_song_hook({})
+    assert served == [1]  # without the runners, each song serves one
+
+
+def test_the_web_process_reports_its_runtime_without_parking_the_passes(monkeypatch):
+    mod = load_plugin()
+
+    class Db:
+        def commit(self):
+            pass
+
+        def rollback(self):
+            pass
+
+        def cursor(self):
+            raise AssertionError("no query")
+
+    parked, recorded = [], []
+    monkeypatch.setattr(mod, "get_db", lambda: Db())
+    monkeypatch.setattr(mod, "edge_runtime_reported_within", lambda *a: False)
+    monkeypatch.setattr(mod, "edge_runtime_status", lambda: {"available": False, "pyav": False})
+    monkeypatch.setattr(mod, "record_edge_runtime", lambda db, host, status: recorded.append(status))
+    monkeypatch.setattr(mod, "park_edge_backfill", lambda db: parked.append(True))
+    mod.report_edge_runtime(force=True, park=False)
+    assert recorded and parked == []
+    mod.report_edge_runtime(force=True)
+    assert parked == [True]  # a worker without a runtime still parks
