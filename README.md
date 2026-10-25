@@ -41,7 +41,11 @@ a running 1.2.5 installation — no 1.2.5 process may keep running once the
   `heavy_work` setting says which does the heavy lane): small resumable
   slices that step aside for AudioMuse's own jobs, with on-demand requests
   served first so a requested track for the current playback window is
-  never trapped behind a library backfill. Both profile kinds are delivered as a cursor stream, so a phone
+  never trapped behind a library backfill. The catalogue work (refreshes,
+  preparation, an analysis run's finalization, the projection, the identity
+  recheck, relationship build steps) runs in a child process the runner
+  starts for it and that exits when it ends, so AudioMuse's web process keeps
+  its memory and answers at its usual speed. Both profile kinds are delivered as a cursor stream, so a phone
   installs only newly ready or removed profiles after its first bootstrap,
   and server-owned album/artist relationship generations use Lumae's native
   scoring model, published as resumable snapshots and deltas. A complete

@@ -274,7 +274,10 @@ runner; the runner waits for them:
   `task-<pid>` naming and `remove_leftovers` move with it.
 - **In-thread work** (catalogue refresh, projection, relationship scoring, credits,
   metadata) shares the interpreter with AudioMuse's 4 request threads (gunicorn: 1
-  process, 4 gthreads, `deployment/supervisord.conf:19`).
+  process, 4 gthreads, `deployment/supervisord.conf:19`). **Changed in RN.8b** (owner,
+  2026-10-25, after RN.8 measured the gate): the catalogue actions and relationship build
+  steps run in a child process per action (`action_isolation`), as decoding does;
+  credits and lookups stay in the thread.
 - **Gate (RN.0 and RN.8).** On the end-to-end host, the p95 latency of the phone's
   bootstrap page and of AudioMuse's `/api/active_tasks` during a full catalogue refresh
   (default settings), and during a relationship build with `heavy_work=server`, stays
@@ -506,6 +509,9 @@ is measured in RN.8. The same stack reproduced the bug: with no worker, the boot
   the scheduler plan, its handoff, the AudioMuse plugin-tasks plan and the performance
   plan's WP1; this plan's results.
 - **RN.8** — End-to-end verification and R5's gate (below).
+- **RN.8b** (added 2026-10-25, owner's choice after RN.8's gate) — The catalogue actions
+  and relationship build steps run in a child process per action (`action_isolation`);
+  R5 measured again.
 
 ### Phase 3 — Re-cut 1.9.0
 
@@ -591,10 +597,30 @@ the owner's 37.5k tracks the everyday refresh passes (16 s; +68 ms, +42 MB), but
 changes every track (a first install, a rescan that changes every file) does not (77 s;
 page p95 395 ms against 94, RSS 239 MB to 992 MB). Relationship builds could not be
 measured on the fixture (they wait for AudioMuse's IVF index); their staging pass was over
-the gate too. R5's fallback names only relationship builds. RN.9 waits for the owner's
+the gate too. R5's fallback names only relationship builds. RN.9 waited for the owner's
 choice: release with the refresh in the web process and the numbers documented, or first
 move the in-thread catalogue work (refresh, preparation, identity recheck, projection,
-relationship staging) into a child process, as decoding already is.
+relationship staging) into a child process, as decoding already is. The owner chose the
+child process.
+
+**RN.8b.** In a runner turn under AudioMuse, `_call_action` runs the refresh, the
+preparation, the finalization, the projection (the parent keeps the cadence claim), the
+identity recheck and each relationship build step through `action_isolation.run`: a
+fresh `sys.executable` (exec, as the decoding workers, so safe in the threaded web
+process), bound to the parent thread's death, at nice 10, which imports the installed
+plugin as AudioMuse does (the `audiomuse_plugins` namespace, AudioMuse's `config`,
+`database` and provider modules, a bare Flask application context) and calls
+`child_action` with the parent's role, journal event and server binding. A child that
+cannot start leaves the action to the thread; one that dies or runs past 2 hours fails
+it. Credits, lookups, the v3 upgrade and the passes stay in the thread (the passes
+already decode in children). R5 now passes at both scales: at 132k a refresh that changed
+every track kept the bootstrap page p95 at 88 ms (idle 87) and the web process at
+273–293 MB (the child peaked at 2.8 GB), and one that changed nothing kept `active_tasks`
+at 23 ms and the web process at 293–301 MB; at 37.5k the web process did not grow at all.
+On the stock host the refresh and the finalization ran in children of the web process and
+a relationship step in a child of the worker, and a child died with its killed worker,
+whose successor finished the kept refresh. The perf scratch stand-in and probe are not
+committed. The full suite after RN.8b: 1,899 passed, 1 skipped, the 8 known local failures.
 
 ## Tests
 

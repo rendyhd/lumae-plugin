@@ -35,6 +35,7 @@ from .edge_profile_store import (
     ensure_edge_backfill_sources, rewind_edge_backfill, edge_runtime_reported_within,
     edge_payload_sql, edge_schema_v3_ready, upgrade_stored_edges,
 )
+from . import action_isolation
 from . import analysis_bundle
 from . import analysis_download
 from . import analysis_isolation
@@ -680,6 +681,12 @@ def scheduled_projection_task(db):
     db.commit()
     if not claimed:
         return None
+    return _call_action(project_servers_task, None, servers)
+
+
+def project_servers_task(servers):
+    """The projection of each server in ``servers``, bound as the schedule's
+    task was."""
     statuses = {}
     for server_id in servers:
         with _source_binding(server_id):
@@ -1061,6 +1068,69 @@ def _source_binding(server_id):
         return nullcontext()
 
 
+# R5: the catalogue actions, which load whole catalogues, run in a child
+# process in a runner turn (action_isolation); everything else in the runner's
+# thread. Names of this module's functions; child_action runs no other.
+ISOLATED_ACTIONS = frozenset((
+    "wanted_catalog_refresh_task", "prepare_lumae_task", "finalize_analysis_run_task",
+    "project_servers_task", "provider_identity_recheck_task", "relationship_preparation_task",
+))
+# A child that cannot start is logged at most this often.
+CHILD_UNAVAILABLE_LOG_SECONDS = 15 * 60
+_child_unavailable_logged_at = None
+
+
+def _call_action(function, server_id, *args):
+    """``function(*args)`` bound to ``server_id``'s server (R3). In a runner
+    turn under AudioMuse a catalogue action (``ISOLATED_ACTIONS``) runs in a
+    child process (R5): in AudioMuse's web process it held the interpreter for
+    seconds and kept up to 3 GB after (RN.8). A child that cannot start leaves
+    the action to this thread; one that died or ran too long fails it."""
+    role = runner.ROLE.get()
+    name = getattr(function, "__name__", "")
+    if role is not None and name in ISOLATED_ACTIONS and action_isolation.available():
+        call = {"name": name, "args": list(args), "role": role, "server_id": server_id,
+                "event_id": reconcile._current_event_id.get()}
+        try:
+            return action_isolation.run("child_action", call)
+        except action_isolation.ChildRaised as exc:
+            if exc.type_name == "AnalysisProjectionDeferred":
+                raise AnalysisProjectionDeferred(exc.message, exc.reason) from None
+            raise
+        except action_isolation.ChildUnavailable as exc:
+            _note_child_unavailable(name, exc)
+    with _source_binding(server_id):
+        return function(*args)
+
+
+def _note_child_unavailable(name, exc):
+    global _child_unavailable_logged_at
+    now = time.monotonic()
+    if (_child_unavailable_logged_at is not None
+            and now - _child_unavailable_logged_at < CHILD_UNAVAILABLE_LOG_SECONDS):
+        return
+    _child_unavailable_logged_at = now
+    logger.warning("lumae_analysis runs %s in the runner's thread: no child process (%s)",
+                   name, exc)
+
+
+def child_action(name, args, role, server_id=None, event_id=None):
+    """A catalogue action in its child process (``_call_action``): the
+    parent's runner role, journal event and server binding, then
+    ``name(*args)``."""
+    if name not in ISOLATED_ACTIONS:
+        raise ValueError(f"{name} does not run in a child process")
+    function = globals()[name]
+    role_token = runner.ROLE.set(role)
+    event_token = reconcile._current_event_id.set(event_id)
+    try:
+        with _source_binding(server_id):
+            return function(*args)
+    finally:
+        reconcile._current_event_id.reset(event_token)
+        runner.ROLE.reset(role_token)
+
+
 def _run_reconcile_action(
     db,
     action,
@@ -1086,8 +1156,7 @@ def _run_reconcile_action(
         logger.exception("lumae_analysis could not start the reconcile status event")
     try:
         _safe_progress("starting")
-        with _source_binding(server_id):
-            result = function(*args)
+        result = _call_action(function, server_id, *args)
         result_status = str((result or {}).get("status") or "complete")
         if result_status in ("coalesced", "already_finalized", "paused"):
             try:
@@ -1424,7 +1493,7 @@ def _next_reconcile_action(db, report, budget, server_id, done):
         if wanted:
             budget.start()
             start = time.monotonic()
-            result = wanted_catalog_refresh_task(*wanted)
+            result = _call_action(wanted_catalog_refresh_task, None, *wanted)
             _record_turn(db, report, "catalog_refresh", wanted[0], wanted[1], result, start)
             return "catalog_refresh", result
     # R8: expired collection receipts, once a day.
@@ -1457,7 +1526,7 @@ def _next_reconcile_action(db, report, budget, server_id, done):
         if recheck_server:
             budget.start()
             start = time.monotonic()
-            result = provider_identity_recheck_task(recheck_server)
+            result = _call_action(provider_identity_recheck_task, None, recheck_server)
             _record_turn(db, report, "identity_recheck", recheck_server, None, result, start)
             return "identity_recheck", result
     # A share-gated turn each, checked once a turn: the check sweeps.

@@ -63,6 +63,16 @@ R1–R9; contract §3.6).
   AudioMuse schedules, and counts the files Lumae stopped trying (W3). The
   Heavy work choice is on the page too. A runner's current action shows while
   it runs, on-demand tracks and credits included.
+- A runner does its catalogue work (a catalogue refresh, the first
+  preparation, an analysis run's finalization, the projection, the identity
+  recheck and each relationship build step) in a child process started for
+  it, at a lower CPU priority, which exits when the work ends. In AudioMuse's
+  web process a 132k-track refresh held the interpreter for over a minute
+  (requests 400 ms slower at the 95th percentile, stalls up to 11 s) and left
+  the process 1–3 GB larger; with the child, requests keep their speed and the
+  web process its size. A child that cannot start leaves the work to the
+  runner's thread; one that dies (out of memory, say) fails the work, which
+  retries with its own back-off.
 - In the web process `background_workers` `auto` analyses at most 2 files at
   once, and a file a runner downloads through AudioMuse goes to Lumae's
   download directory, not AudioMuse's temporary directory, which every
