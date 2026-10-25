@@ -71,10 +71,10 @@ EXPECTED_DOTTED_PATHS = {
     "cron:collection_retention": "plugins.LumaeAnalysis.collection_retention_task",
     "cron:catalog_refresh": "plugins.LumaeAnalysis.catalog_refresh_task",
     "cron:provider_identity_recheck": "plugins.LumaeAnalysis.provider_identity_recheck_task",
-    "on_flask_start": "plugins.LumaeAnalysis.observe_provider_identities_on_start",
+    "on_flask_start": "plugins.LumaeAnalysis.flask_start",
     "on_install": "plugins.LumaeAnalysis.migrate",
     "on_song_analyzed": "plugins.LumaeAnalysis.analyze_song_hook",
-    "on_worker_start": "plugins.LumaeAnalysis.report_edge_runtime_on_start",
+    "on_worker_start": "plugins.LumaeAnalysis.worker_start",
 }
 
 # Jobs queued with ``enqueue`` (not registered: AudioMuse would list them as

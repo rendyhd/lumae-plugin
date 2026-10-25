@@ -1,5 +1,6 @@
 import base64
 import gzip
+import importlib
 import inspect
 import json
 import os
@@ -50,6 +51,7 @@ from .shelves import (
 from . import covers, journeys, vibes
 from . import file_tags
 from . import loudness_backfill, loudness_stream, loudness_v1
+from . import runner
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -7323,15 +7325,119 @@ def database_state_page():
     )
 
 
+# Runner plan R2: modules the actions import inside functions, imported before
+# the first action. An upgrade replaces the plugin's files under a running
+# process; the runner stops at its next turn (``_runner_code_current``), and a
+# lazy import meanwhile would mix versions. Decoders run in exec children,
+# which import from disk anyway.
+RUNNER_PRELOAD_MODULES = (
+    "catalog", "catalog_analysis", "catalog_enrichment", "collection_manager", "covers",
+    "credits_store", "file_tags", "jellyfin_continuity", "jellyfin_provider", "journeys",
+    "loudness_backfill", "loudness_stream", "music_metadata", "profile_publication",
+    "provider_identity_rekey", "redaction", "relationship_build", "shelves", "status_model",
+    "vibes",
+)
+
+
+def runner_enabled():
+    """RN.1–RN.4: the runners start only with this setting on (off by default)."""
+    value = get_setting("runner_enabled", False)
+    return value is True or str(value).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _runner_code_current():
+    """R2: this process still runs the installed plugin. AudioMuse has no hot
+    reload: an upgrade, a disable or an uninstall waits for a restart, and
+    the runner must not go on with the old code meanwhile. True when the
+    host does not say (older hosts, tests)."""
+    try:
+        from plugin.manager import plugin_manager
+    except Exception:
+        return True
+    record = (getattr(plugin_manager, "records", None) or {}).get("lumae_analysis")
+    if record is not None and not record.get("enabled", True):
+        return False
+    snapshot = (getattr(plugin_manager, "_boot_snapshot", None) or {}).get("lumae_analysis")
+    if snapshot is None:
+        return True
+    db = get_db()
+    try:
+        import database
+
+        row = database.get_plugin("lumae_analysis", conn=db)
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        return True
+    if not row:
+        return False
+    return (row.get("checksum"), bool(row.get("enabled"))) == tuple(snapshot)
+
+
+def _preload_runner_modules():
+    for name in RUNNER_PRELOAD_MODULES:
+        try:
+            importlib.import_module(f"{__name__}.{name}")
+        except Exception:
+            logger.warning("lumae_analysis could not preload %s for the runner", name)
+
+
+def start_runner(role):
+    """Start this process's ``role`` runner (R1, R2); never raises, never blocks."""
+    if not runner_enabled():
+        return None
+    try:
+        from flask import current_app
+
+        app = current_app._get_current_object()
+        import database
+
+        connect_raw = database.connect_raw
+    except Exception:
+        logger.warning("lumae_analysis cannot start its %s runner on this AudioMuse: "
+                       "no application or no connect_raw", role)
+        return None
+    _preload_runner_modules()
+    return runner.start(
+        role, app=app, turn=run_runner_turn,
+        connect=lambda name: connect_raw(application_name=name),
+        still_installed=_runner_code_current,
+    )
+
+
+def flask_start():
+    """``on_flask_start``: observe provider identities, start the server runner."""
+    try:
+        observe_provider_identities_on_start()
+    finally:
+        start_runner(runner.ROLE_SERVER)
+
+
+def worker_start():
+    """``on_worker_start``: report the edge runtime, start the worker runner."""
+    try:
+        report_edge_runtime_on_start()
+    finally:
+        start_runner(runner.ROLE_WORKER)
+
+
+def run_runner_turn(active):
+    """One turn of ``active`` (runner.Runner). RN.1: the skeleton reports why
+    it does nothing; RN.2 runs the actions."""
+    if maintenance_paused():
+        return runner.Turn(False, "paused", "maintenance_paused", None, None)
+    return runner.idle_turn(None, "skeleton")
+
+
 def register(ctx):
     ctx.add_blueprint(bp)
     ctx.set_settings_page("lumae_analysis.settings")
     if collections_enabled():
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
     ctx.on_install(migrate)
-    ctx.on_flask_start(observe_provider_identities_on_start)
+    ctx.on_flask_start(flask_start)
     if hasattr(ctx, "on_worker_start"):
-        ctx.on_worker_start(report_edge_runtime_on_start)
+        ctx.on_worker_start(worker_start)
     ctx.on_song_analyzed(analyze_song_hook)
     # Only schedulable tasks are registered. AudioMuse lists every add_task
     # name under Scheduled Tasks > Plugin tasks with an Enable box, and the

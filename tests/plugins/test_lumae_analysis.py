@@ -8617,8 +8617,8 @@ def test_register_uses_analysis_hook_and_catalog_refresh_worker(monkeypatch):
     assert ctx.blueprints == [mod.bp]
     assert ctx.settings_endpoint == "lumae_analysis.settings"
     assert ctx.install_hooks == [mod.migrate]
-    assert ctx.flask_hooks == [mod.observe_provider_identities_on_start]
-    assert ctx.worker_hooks == [mod.report_edge_runtime_on_start]
+    assert ctx.flask_hooks == [mod.flask_start]
+    assert ctx.worker_hooks == [mod.worker_start]
     assert ctx.song_hooks == [mod.analyze_song_hook]
     # Queued jobs are not registered: AudioMuse would list them as schedulable.
     assert ctx.tasks == []

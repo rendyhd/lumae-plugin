@@ -9,7 +9,7 @@ import time
 
 from plugin.api import get_db, logger, table
 
-from . import migrations
+from . import migrations, runner
 
 
 LUMAE_TASK_TYPE_PREFIX = "plugin.lumae_analysis."
@@ -89,6 +89,8 @@ def migrate_reconcile(db):
     # _work_summary and read_reconcile_status read both job tables.
     migrate_credits(db)
     migrate_metadata(db)
+    with db.cursor() as runner_cur:
+        runner.migrate_runner_state(runner_cur)
     cur = db.cursor()
     for name in ("analysis_runs", "preparation_state", "profile_backfill_state", "relationship_state"):
         migrations.ensure_columns(
