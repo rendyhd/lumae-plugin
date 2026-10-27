@@ -123,6 +123,33 @@ def test_a_notify_wakes_an_idle_leader_within_a_second(schema):
     active.thread.join(timeout=5)
 
 
+def test_a_notify_from_another_process_during_a_turn_still_wakes_the_leader(schema, monkeypatch):
+    """Work another process records while the turn runs (the worker's song
+    hook for the server, a web route for the worker) wakes the leader when the
+    turn ends idle. The heartbeat before the wait shares the LISTEN connection
+    and reads the NOTIFY off it into ``notifies``: on the owner's server a
+    forced rebuild waited 35 s, until the next heartbeat's query made the
+    socket readable, instead of a second."""
+    monkeypatch.setattr(runner, "HEARTBEAT_SECONDS", 30)  # the shipped interval
+    _dsn, _name, db = schema
+    turns = []
+
+    def turn(_active):
+        turns.append(time.monotonic())
+        if len(turns) == 1:
+            with db.cursor() as cur:  # another process: no local wake
+                cur.execute("SELECT pg_notify(%s, 'request')", (runner.NOTIFY_CHANNEL,))
+            time.sleep(0.2)  # it reaches the leader's connection during the turn
+        return runner.idle_turn(None)
+
+    active = make(schema, "server", turn)
+    active.start()
+    assert until(lambda: len(turns) == 2, 3)
+    assert turns[1] - turns[0] < 1.5
+    active.stop()
+    active.thread.join(timeout=5)
+
+
 def test_a_turn_that_worked_runs_the_next_at_once(schema):
     turns = []
 

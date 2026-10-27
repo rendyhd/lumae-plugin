@@ -344,7 +344,10 @@ class Runner:
         self._wake.clear()
 
     def _wait_for_wake(self, seconds):
-        """Until a NOTIFY, a local wake, a stop or ``seconds``."""
+        """Until a NOTIFY, a local wake, a stop or ``seconds``. A heartbeat
+        shares the LISTEN connection, and its query reads a NOTIFY off the
+        socket into ``notifies``: the socket is then not readable, so those
+        are looked at before each wait on it."""
         deadline = self.clock() + seconds
         while not self.stopped.is_set():
             remaining = deadline - self.clock()
@@ -353,15 +356,20 @@ class Runner:
             if self._wake.is_set():
                 self._wake.clear()
                 return "wake"
+            if self._take_notifies(poll=False):
+                return "notify"
             readable, _, _ = select.select([self._conn], [], [], min(1.0, remaining))
-            if readable:
-                with self._conn_lock:
-                    self._conn.poll()
-                    notified = bool(self._conn.notifies)
-                    del self._conn.notifies[:]
-                if notified:
-                    return "notify"
+            if readable and self._take_notifies(poll=True):
+                return "notify"
         return "stopped"
+
+    def _take_notifies(self, poll):
+        with self._conn_lock:
+            if poll:
+                self._conn.poll()
+            notified = bool(self._conn.notifies)
+            del self._conn.notifies[:]
+        return notified
 
     def _beat(self, done):
         """The heartbeat thread: every HEARTBEAT_SECONDS, and soon after the
