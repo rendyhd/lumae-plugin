@@ -4,6 +4,7 @@ an ETA; for the analysis queues the ETA at the current number of files
 analysed at once and at a higher one. Since the runners (R9) the panel shows
 each runner's state, not a schedule's or a refused AudioMuse schedule's.
 """
+import psycopg2
 import pytest
 
 from test_lumae_analysis import load_plugin, plugin_client  # noqa: F401
@@ -67,6 +68,76 @@ def test_no_throughput_means_no_eta(tick):
     _summary(db, ready=1000, total=1500)
     [waveforms] = [q for q in reconcile.queue_throughput(db) if q["action"] == "profile_backfill"]
     assert waveforms["remaining"] == 500 and waveforms["eta_hours"] is None
+
+
+def _eligible(db, tracks):
+    with db.cursor() as cur:
+        cur.execute(f"INSERT INTO {P}status_summary (catalog_instance_id, eligible_track_count) "
+                    "VALUES (%s, %s)", (SOURCE, tracks))
+    db.commit()
+
+
+def _flush_statistics(db):
+    """A backend hands its row counts to the statistics system when it goes
+    idle, at most once a second: force it, or an ANALYZE that follows counts
+    the rows and the late hand-over counts them again."""
+    with db.cursor() as cur:
+        cur.execute("SELECT pg_stat_force_next_flush()")
+    db.commit()
+
+
+def _loudness_rows(db, start, stop):
+    with db.cursor() as cur:
+        cur.execute(f"INSERT INTO {P}loudness_tracks (catalog_instance_id, track_id, media_revision, "
+                    "version, record, histogram) SELECT %s, 't-'||i, 'r', 1, '{}'::jsonb, '\\x00'::bytea "
+                    "FROM generate_series(%s, %s - 1) i", (SOURCE, start, stop))
+    db.commit()
+    _flush_statistics(db)
+
+
+def _analyze_loudness(db):
+    with db.cursor() as cur:
+        cur.execute(f"ANALYZE {P}loudness_tracks")
+    db.commit()
+
+
+def _loudness_left(db):
+    [loudness] = [q for q in reconcile.queue_throughput(db) if q["action"] == "loudness_backfill"]
+    return loudness["remaining"]
+
+
+def test_what_is_left_follows_rows_added_since_the_last_analyze(tick):
+    """Loudness and edges count what is left against the live row count. The
+    planner's reltuples waits for an ANALYZE, which autovacuum skips until a
+    tenth of the table has changed: on the owner's 38k-track library the panel
+    said about 2,890 loudness records were left for nine days while 14 were."""
+    mod, db = tick
+    _eligible(db, 100)
+    _loudness_rows(db, 0, 90)
+    _analyze_loudness(db)
+    _loudness_rows(db, 90, 95)
+
+    assert _loudness_left(db) == 5
+
+
+def test_after_a_statistics_reset_what_is_left_uses_the_larger_count(tick):
+    """A crash or pg_stat_reset zeroes the live count until the table's next
+    vacuum or analyze: the planner's figure stands in meanwhile."""
+    mod, db = tick
+    _eligible(db, 100)
+    _loudness_rows(db, 0, 90)
+    _analyze_loudness(db)
+    try:
+        with db.cursor() as cur:
+            cur.execute(f"SELECT pg_stat_reset_single_table_counters('{P}loudness_tracks'::regclass)")
+        db.commit()
+    except psycopg2.errors.InsufficientPrivilege:
+        db.rollback()
+        pytest.skip("resetting table statistics needs a superuser")
+    _loudness_rows(db, 90, 92)
+
+    # The live count says 2; the planner's 90 stands in.
+    assert _loudness_left(db) == 10
 
 
 @pytest.mark.parametrize("hours,text", [

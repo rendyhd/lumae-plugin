@@ -591,10 +591,20 @@ ANALYSIS_QUEUES = ("profile_backfill", "edge_backfill", "loudness_backfill")
 
 
 def _estimated_rows(name):
-    """SQL for the planner's row estimate of a table: the status route is
-    polled, and counting 100k+ rows each time is not worth an "about"."""
-    return (f"(SELECT GREATEST(0, COALESCE(max(reltuples), 0))::bigint FROM pg_class "
-            f"WHERE oid=to_regclass('{_work_table(name)}'))")
+    """SQL for a table's live row count from the statistics system: the status
+    route is polled, and counting 100k+ rows each time is not worth an "about".
+    The planner's reltuples only moves at an ANALYZE, which autovacuum skips
+    until a tenth of the table has changed (a 38k-track library read 2,900
+    loudness records short for nine days). A crash or a statistics reset zeroes
+    the live count until the table's next vacuum or analyze: until then the
+    larger of the two stands."""
+    return (f"(SELECT GREATEST(0, COALESCE(max(CASE "
+            f"WHEN COALESCE(pg_stat_get_last_vacuum_time(oid), "
+            f"pg_stat_get_last_autovacuum_time(oid), pg_stat_get_last_analyze_time(oid), "
+            f"pg_stat_get_last_autoanalyze_time(oid)) IS NOT NULL "
+            f"THEN pg_stat_get_live_tuples(oid) "
+            f"ELSE GREATEST(pg_stat_get_live_tuples(oid), reltuples::bigint) END), 0))::bigint "
+            f"FROM pg_class WHERE oid=to_regclass('{_work_table(name)}'))")
 
 
 def queue_throughput(db):
@@ -602,7 +612,7 @@ def queue_throughput(db):
     journal, which keeps a day), units left and the ETA at the last hour's
     rate (S12). What is left is approximate for edges and loudness: published
     waveforms without an edge, the summary's eligible tracks without a
-    loudness record, from the planner's row estimates. Read-only, and it never scans the library: the settings
+    loudness record, from the tables' live row counts. Read-only, and it never scans the library: the settings
     status route renders it (P2-1)."""
     cur = db.cursor()
     cur.execute(
