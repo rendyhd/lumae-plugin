@@ -2067,7 +2067,9 @@ def claim_relationship_preparation(db, catalog_instance_id, force=False):
     than RELATIONSHIP_QUIET_SECONDS after this request and
     RELATIONSHIP_MIN_GAP_SECONDS after the last published generation (the old
     ``completed_at``, which the claim clears). A forced claim also pulls a
-    queued build's wait in."""
+    queued build's wait in. A queued build is never claimed again: the runner
+    takes it when its wait ends, and a second claim, without the cleared
+    ``completed_at``, would space it by the quiet period alone."""
     cur = db.cursor()
     cur.execute(
         f"""
@@ -2084,7 +2086,8 @@ def claim_relationship_preparation(db, catalog_instance_id, force=False):
                updated_at=now()
          WHERE catalog_instance_id=%s
            AND (status NOT IN ('queued', 'running')
-                OR updated_at < now() - interval '{ENRICHMENT_STALE_HOURS} hours')
+                OR (status='running'
+                    AND updated_at < now() - interval '{ENRICHMENT_STALE_HOURS} hours'))
         RETURNING catalog_instance_id
         """,
         (bool(force), RELATIONSHIP_QUIET_SECONDS, RELATIONSHIP_MIN_GAP_SECONDS,

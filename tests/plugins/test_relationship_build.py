@@ -426,6 +426,40 @@ def test_a_forced_rebuild_starts_now_and_pulls_a_waiting_one_in(relationship_db,
     assert woken == ["relationship_preparation_admitted"] * 2
 
 
+def test_a_request_late_in_the_wait_keeps_it(relationship_db, monkeypatch):
+    """W2: a queued build is not claimed again however long it has waited. The
+    claim clears completed_at, so a claim more than ENRICHMENT_STALE_HOURS into
+    the wait spaced the build by the quiet period alone: a library that kept
+    changing was rebuilt every 2¼ hours instead of every 6."""
+    db = relationship_db
+    mod = load_plugin()
+    monkeypatch.setattr(e, 'wake_runners', lambda *_args, **_kwargs: None)
+    finish(db)
+    with db.cursor() as cur:
+        cur.execute("UPDATE plugin_lumae_analysis__relationship_state "
+                    "SET completed_at=now() - interval '1 hour'")
+    db.commit()
+    assert e.claim_relationship_preparation(db, 'catalog-a') is True
+
+    # Three hours into the five-hour wait.
+    with db.cursor() as cur:
+        cur.execute("UPDATE plugin_lumae_analysis__relationship_state "
+                    "SET started_at=started_at - interval '3 hours', "
+                    "    updated_at=updated_at - interval '3 hours', "
+                    "    next_retry_at=next_retry_at - interval '3 hours'")
+    db.commit()
+    assert e.claim_relationship_preparation(db, 'catalog-a') is False
+    assert 2 * 3600 - 60 < _wait_seconds(db) <= 2 * 3600
+    assert mod.next_relationship_run(db=db) is None
+
+    # A build whose runner went away is still claimed again.
+    with db.cursor() as cur:
+        cur.execute("UPDATE plugin_lumae_analysis__relationship_state "
+                    "SET status='running', next_retry_at=NULL")
+    db.commit()
+    assert e.claim_relationship_preparation(db, 'catalog-a') is True
+
+
 def test_inputs_changing_before_they_are_staged_still_restart(relationship_db, monkeypatch):
     db = relationship_db
     original = e._load_relationship_inputs
