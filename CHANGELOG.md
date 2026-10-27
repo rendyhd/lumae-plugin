@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## 1.9.0 (2026-10-25)
+## 1.9.0 (2026-10-27)
 
 Lumae no longer holds AudioMuse's task queue (runner plan 2026-10-25,
 R1–R9; contract §3.6).
@@ -63,6 +63,10 @@ R1–R9; contract §3.6).
   AudioMuse schedules, and counts the files Lumae stopped trying (W3). The
   Heavy work choice is on the page too. A runner's current action shows while
   it runs, on-demand tracks and credits included.
+- What is left for edges and loudness follows the tables' live row counts. The
+  planner's estimate it read moved only at an ANALYZE, which autovacuum skips
+  until a tenth of a table has changed: on the owner's server the panel said
+  about 2,890 loudness records were left for nine days while 14 were.
 - A runner does its catalogue work (a catalogue refresh, the first
   preparation, an analysis run's finalization, the projection, the identity
   recheck and each relationship build step) in a child process started for
@@ -110,7 +114,8 @@ Less repeated work (runner plan 2026-10-25, W2).
   than 15 minutes after the change that asked for it: one analysed song used to
   rebuild every album and artist (24 Oct on the owner's server: 55 slices over
   32 minutes). A source's first generation starts at once, and the settings
-  page's rebuild still starts one now.
+  page's rebuild still starts one now. A request while a build waits never
+  moves the wait, however long it has waited.
 - A song longer than the loudness meter can measure (6,553.6 s) is no longer
   downloaded to find that out. A file that cannot be measured stops being
   retried until it changes: at once when the analyzer calls it unsupported,
