@@ -17,8 +17,10 @@ R1–R9; contract §3.6).
   credits, MusicBrainz lookups, collection retention) and a worker runner in
   an AudioMuse worker (waveform, edge and loudness passes, on-demand tracks,
   relationships). One process leads each role (a PostgreSQL advisory lock).
-  A runner wakes when work is recorded (`NOTIFY`) and otherwise sleeps until
-  its next retry, at most 15 minutes; an idle turn runs about 17 statements.
+  A runner wakes when work is recorded (`NOTIFY`), within a second even when
+  another process records it while the runner is busy, and otherwise sleeps
+  until its next retry, at most 15 minutes; an idle turn runs about 17
+  statements.
   A turn whose actions moved nothing on (MusicBrainz unreachable, say) sleeps
   until the soonest retry too, instead of taking the next album at once.
 - AudioMuse starts no task while a plugin task runs, so an analysis the
@@ -41,10 +43,11 @@ R1–R9; contract §3.6).
   `analysis_projection_hours` = 6, which the server runner keeps; without
   them a catalogue is refreshed when an app or an analysis asks, and the
   analysis is projected after every analysis run and catalogue change. A
-  Lumae job an older version left queued is revoked on install and when the
-  web process starts: with no worker up it held every AudioMuse start (error
-  1201). A job already running finishes; a 1.8.0 watchdog tick only wakes the
-  runners.
+  Lumae job an older version left queued, a scheduled tick or work queued
+  through the plugin API (a phone refresh, an on-demand request, a
+  preparation), is revoked on install and when the web process starts: with
+  no worker up it held every AudioMuse start (error 1201). A job already
+  running finishes; a 1.8.0 watchdog tick only wakes the runners.
 - On-demand requests (`/api/analyze`, `/api/profiles/edges/analyze`) are
   recorded and served first in the next pass, between files of a library
   pass. Their `deferred` lists stay, always empty, and the edge capability in
@@ -103,6 +106,9 @@ Similar albums and artists get published on a library that keeps changing
   more often than a build took never got a generation.
 - A build step does as much as its runner slice allows (up to 1,024 albums
   and artists, was 128).
+- A build logs its start and each new phase at INFO and its checkpoints
+  between at DEBUG. Every checkpoint was INFO: 3,115 lines in one build on
+  the owner's server, up to 41 a second, 13 % of the web log.
 - `POST /api/catalog/relationships/prepare` records the request and leaves
   the build to a runner; it no longer queues a task that did one 20-second
   step and was refused, with an error in the log, at every sync while

@@ -117,7 +117,7 @@
       "changelog": "Lumae leaves AudioMuse's task queue: two runners of its own, one in AudioMuse's web process and one in a worker (the Heavy work setting says which does the heavy analysis), do the background work. An analysis you start runs at once, a worker that is switched off no longer blocks AudioMuse, and Lumae steps aside while AudioMuse analyses, cleans or migrates. Catalogue work runs in a short-lived child process, so the web process keeps its memory and speed. Lumae's schedules, and any task an older version left queued, are removed on install. New songs reach the phone without waiting for a busy AudioMuse: a refresh request is kept and served (contract \u00a72.5), and a changed catalogue projects its analysis at once. Similar albums and artists are published on a library that keeps changing (\u00a72.6) and rebuilt at most every 6 hours. Less repeated work: files that cannot be analyzed stop being retried, credits re-checks are spread out, and the identity recheck runs only while needed. Journeys: Lumae's listening journeys are kept on the server, so they survive a reinstall and follow you to another phone (capabilities.journeys, \u00a75.7), gated by Living Collections. The settings page's counts of loudness and edges left are current. Includes every 1.8.0 change. AudioMuse 3.2.0 is still the minimum.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.9.0.zip",
-      "checksum": "17c68beb70c63796b7ced4479aaad25f"
+      "checksum": "f6756477efa896218b1db080e6469d67"
     },
     {
       "version": "1.8.0",
