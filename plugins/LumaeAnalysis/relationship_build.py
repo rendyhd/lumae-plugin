@@ -216,6 +216,9 @@ class Build:
         # identity last read; a staged build finishes on its own inputs.
         self.inputs_staged = False
         self.live_identity = None
+        # The phase a checkpoint last logged at INFO: a build's start and each
+        # new phase; the checkpoints between are DEBUG (thousands a build).
+        self.logged_phase = None
 
     @contextmanager
     def timed(self, phase):
@@ -252,9 +255,11 @@ class Build:
         cur.execute(f"UPDATE {t('relationship_state')} SET updated_at=now() "
                     "WHERE catalog_instance_id=%s", (self.source_id,))
         self.db.commit()
-        log.info("relationship checkpoint source=%s build=%s phase=%s timings_ms=%s counts=%s",
-                 self.source_id, self.build_id, self.phase,
-                 self.diagnostics['timings_ms'], self.diagnostics['counts'])
+        level = logging.DEBUG if self.phase == self.logged_phase else logging.INFO
+        self.logged_phase = self.phase
+        log.log(level, "relationship checkpoint source=%s build=%s phase=%s timings_ms=%s counts=%s",
+                self.source_id, self.build_id, self.phase,
+                self.diagnostics['timings_ms'], self.diagnostics['counts'])
 
     def verify_inputs(self, cur, lock=False):
         identity, analysis_generation = input_state(cur, self.source_id, lock=lock)
@@ -287,6 +292,7 @@ class Build:
         )
         if old and (old[1] == self.identity or finish_staged):
             self.build_id, self.phase = old[0], old[2]
+            self.logged_phase = self.phase  # a later step goes on in it
             self.diagnostics = old[3]
             self.diagnostics.pop("error", None)
             self.inputs_staged = bool(old[4])

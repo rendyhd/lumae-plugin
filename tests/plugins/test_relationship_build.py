@@ -1,6 +1,7 @@
 """Actual PostgreSQL regressions for generation-safe, resumable relationships."""
 
 import json
+import logging
 import os
 from pathlib import Path
 
@@ -204,6 +205,18 @@ def test_relationship_builder_publishes_only_bounded_shortlist_candidates(relati
     assert all(len(row[2]['candidates']) == 1 for row in rows)
     assert scalar(relationship_db, 'SELECT count(*) FROM plugin_lumae_analysis__relationship_build_entities') == 0
     assert scalar(relationship_db, 'SELECT count(*) FROM plugin_lumae_analysis__relationship_build_tracks') == 0
+
+
+def test_a_build_logs_its_start_and_each_phase_once_at_info(relationship_db, caplog):
+    # The owner's server logged a checkpoint line at INFO 3,115 times in one
+    # build, 41 a second at its peak, 13% of the web log.
+    caplog.set_level(logging.DEBUG, logger="lumae.relationships")
+    finish(relationship_db, batch_size=1)  # a step per entity, as many builds' steps
+    checkpoints = [r for r in caplog.records if r.getMessage().startswith("relationship checkpoint")]
+    info = [r.getMessage().split(" phase=")[1].split()[0]
+            for r in checkpoints if r.levelno == logging.INFO]
+    assert info == ["fingerprints", "scoring", "publishing", "complete"]
+    assert len(checkpoints) > len(info)  # the rest are DEBUG
 
 
 def test_scoring_resumes_after_worker_interruption_without_repeating_completed_work(relationship_db, monkeypatch):
