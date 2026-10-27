@@ -599,6 +599,29 @@ def test_the_install_revokes_lumae_tasks_an_older_version_left_queued(
         ("running", "RUNNING")]
 
 
+def test_the_install_revokes_work_an_older_version_queued_through_the_plugin_api(
+    migrated_db, run_plugin_migration,
+):
+    # 1.8.0 queued a phone refresh with plugin.api.enqueue, and the host names
+    # that task after the plugin's module: with no worker it kept *Start
+    # analysis* refused (1201) after the upgrade.
+    db = migrated_db
+    with db.cursor() as cur:
+        cur.execute("DROP TABLE IF EXISTS task_status")
+        cur.execute("CREATE TABLE task_status (task_id TEXT PRIMARY KEY, parent_task_id TEXT, "
+                    "task_type TEXT, status TEXT)")
+        cur.execute("INSERT INTO task_status VALUES "
+                    "('refresh', NULL, "
+                    "'plugin.audiomuse_plugins.lumae_analysis.catalog_refresh_task', 'NEW'), "
+                    "('prepare', NULL, "
+                    "'plugin.audiomuse_plugins.lumae_analysis.prepare_lumae_task', 'STARTED'), "
+                    "('other', NULL, 'plugin.audiomuse_plugins.other.sync_task', 'NEW')")
+    db.commit()
+    run_plugin_migration(db)
+    assert _rows(db, "SELECT task_id, status FROM task_status ORDER BY task_id") == [
+        ("other", "NEW"), ("prepare", "STARTED"), ("refresh", "REVOKED")]
+
+
 def test_the_web_start_revokes_them_too(tick, monkeypatch):
     mod, db = tick
     _rows(db, "INSERT INTO task_status VALUES "

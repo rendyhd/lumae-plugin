@@ -577,6 +577,9 @@ def track_count_label(value):
 # Runner plan R8: Lumae's rows under AudioMuse's Scheduled Tasks, all gone
 # with the runners (a downgrade's install recreates its own).
 LUMAE_CRON_PREFIX = "plugin.lumae_analysis."
+# The name the host gives work an older version queued through
+# ``plugin.api.enqueue`` (a phone refresh, an on-demand request, a preparation).
+LUMAE_API_TASK_PREFIX = "plugin.audiomuse_plugins.lumae_analysis."
 # An administrator's enabled catalogue refresh or analysis projection
 # schedule (both shipped off, every six hours) carries over as this cadence.
 CATALOG_REFRESH_HOURS_DEFAULT = 6
@@ -608,10 +611,11 @@ def retire_lumae_schedules(db):
 def revoke_stranded_tasks(db):
     """R8: a Lumae root task an older version queued, and no worker started,
     blocks every AudioMuse start (its gate counts a queued plugin task as
-    live) until a worker comes. Lumae queues nothing now, so it is revoked: a
-    worker no longer picks it up, and on a host that keeps the job elsewhere
-    its shim only wakes the runners. Only ``NEW`` root rows: a running task
-    finishes. The caller commits; returns how many."""
+    live) until a worker comes: a cron tick, or work queued through the
+    plugin API, each under its own name. Lumae queues nothing now, so it is
+    revoked: a worker no longer picks it up, and on a host that keeps the job
+    elsewhere its shim only wakes the runners. Only ``NEW`` root rows: a
+    running task finishes. The caller commits; returns how many."""
     cur = db.cursor()
     try:
         cur.execute("SELECT to_regclass('task_status') IS NOT NULL")
@@ -620,8 +624,9 @@ def revoke_stranded_tasks(db):
             return 0
         cur.execute(
             "UPDATE task_status SET status='REVOKED' "
-            "WHERE parent_task_id IS NULL AND status='NEW' AND task_type LIKE %s",
-            (LUMAE_CRON_PREFIX + "%",),
+            "WHERE parent_task_id IS NULL AND status='NEW' "
+            "AND (task_type LIKE %s OR task_type LIKE %s)",
+            (LUMAE_CRON_PREFIX + "%", LUMAE_API_TASK_PREFIX + "%"),
         )
         return max(0, cur.rowcount or 0)
     finally:
