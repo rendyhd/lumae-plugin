@@ -14,8 +14,6 @@ import importlib
 import select
 import uuid
 
-import psycopg2
-
 from test_lumae_analysis import load_plugin
 
 LEGACY = "plugin.lumae_analysis.music_metadata"
@@ -75,7 +73,7 @@ def test_migration_deletes_the_metadata_schedule_and_leaves_other_plugins_rows(
 
 
 def test_a_lookup_wakes_the_runners_on_commit_and_is_pending_until_served(
-    migrated_db, monkeypatch
+    migrated_db, second_connection, monkeypatch
 ):
     mod = load_plugin()
     meta = importlib.import_module("plugins.LumaeAnalysis.music_metadata")
@@ -85,7 +83,9 @@ def test_a_lookup_wakes_the_runners_on_commit_and_is_pending_until_served(
     # 0 s (GREATEST skips a NULL retry time).
     assert mod._runner_next_due_seconds(db) is None
 
-    listener = psycopg2.connect(db.dsn)
+    # Not psycopg2.connect(db.dsn): connection.dsn masks the password, so it
+    # fails wherever PostgreSQL asks for one (CI).
+    listener = second_connection
     listener.autocommit = True
     try:
         with listener.cursor() as cur:
