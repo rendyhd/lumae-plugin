@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## 1.9.0 (2026-10-27)
+## 1.9.0 (2026-10-29)
 
 Lumae no longer holds AudioMuse's task queue (runner plan 2026-10-25,
 R1–R9; contract §3.6).
