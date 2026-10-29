@@ -7,6 +7,30 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.9.1 (2026-10-29)
+
+Analysis workers. A report had a waveform pass make Jellyfin 12.4 spawn
+processes until memory ran out. It was not reproduced: with 1.8.0 and 1.9.0
+Jellyfin started no process for any Lumae request, and Lumae's own analysis
+workers stayed bounded (about 250–290 MB each, four at once on the auto
+setting, all stopped when their turn ends except one kept for reuse). This
+release closes the one gap found on the way and makes such a report
+answerable from AudioMuse's log.
+
+- A file cancelled while its analysis worker was still starting found no
+  worker to kill and was sent anyway, running to its own time limit in a
+  thread its turn had given up on. A file cancelled while a worker failed to
+  start ran in AudioMuse's process without the hard limit. Both now stop
+  before the file is analysed.
+- A runner turn that analyses files logs two lines at INFO. At its first
+  file: how many files it analyses at once and why (the setting; cores,
+  memory, a container's limit and the memory available, reclaimable page
+  cache not counted as used). At its end: the analysis workers it used
+  (pids), the largest peak memory among them, the one kept for reuse and any
+  left running. Logging never fails a file or a turn.
+
+Nothing on the wire changes. AudioMuse 3.2.0 is still the minimum.
+
 ## 1.9.0 (2026-10-29)
 
 Lumae no longer holds AudioMuse's task queue (runner plan 2026-10-25,
