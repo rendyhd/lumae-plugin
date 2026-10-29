@@ -1,9 +1,11 @@
 # P2-6 end-to-end gate: the stock AudioMuse-AI host with the Lumae plugin mounted.
 #
-# The host image is pinned by digest. It is the image published for
-# NeptuneHub/AudioMuse-AI PR #927 (tag pr-927), whose tree is identical to the
-# merge commit 8aa1639c (v3.6.3); the 112 Python modules and supervisord.conf
-# in the image match that commit byte for byte. The Flask service runs the
+# The host image is pinned by digest. It is the image published as
+# ghcr.io/neptunehub/audiomuse-ai:3.7.0 (also `latest` on 2026-10-29) for
+# NeptuneHub/AudioMuse-AI v3.7.0 (commit 63436f41); the 160 Python modules and
+# the supervisord.conf it runs match that commit byte for byte. Until
+# 2026-10-29 the pin was the PR #927 image, the tree of v3.6.3 (8aa1639c,
+# sha256:b91af8d0...). The Flask service runs the
 # image's own supervisord [program:flask]:
 #   gunicorn --workers 1 --threads 4 --worker-class gthread --keep-alive 5 --timeout 300 app:app
 #
@@ -29,7 +31,7 @@
 # (--auth-token) to run the gate authenticated.
 name: lumae-e2e
 
-x-audiomuse-image: &audiomuse-image ghcr.io/neptunehub/audiomuse-ai@sha256:b91af8d05cb37f6fbc89a3c6e6f31d805f851fd650faf414f0cec7d03e9f05e8
+x-audiomuse-image: &audiomuse-image ghcr.io/neptunehub/audiomuse-ai@sha256:38ac3c2cdb1a82e89c1bd405e5865e2efe5ad924a53b8373f5989f964a7de110
 
 x-host-environment: &host-environment
   TZ: "UTC"

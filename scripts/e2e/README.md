@@ -15,7 +15,7 @@ These are harness scripts, not tests: pytest never collects `scripts/`.
 | `host_app.py` | A minimal host: the real plugin blueprint on the `scripts/perf/stub_host.py` stub, with per-request connections (like AudioMuse `database.get_db`), optional bearer auth and a harness-only `X-E2E-User` account header. |
 | `run_server_matrix.py` | Starts gunicorn (`gthread`, 1 worker x 4 threads, the stock supervisord topology) with `host_app`, or targets the stock host (`--host docker`), runs the scenarios and writes JSON. |
 | `client_sim.py` | The client: capability detection, v2 bootstrap (sliding expiry, `client_request_id`, `page_size` 50, gzip), catch-up, release, `/profiles/changes`, the legacy path, `Retry-After`, a SQLite "phone" with per-page checkpoints, edge digest and `boundaries` verification. Also a CLI (`sync`, `digest`). |
-| `docker-compose.yml` | The stock AudioMuse-AI host pinned by digest (tree of 8aa1639c), PostgreSQL 15, the plugin bind-mounted, a Navidrome ping stub. `docker-compose.pg17.yml`: PostgreSQL 17. `docker-compose.external-db.yml`: an existing database, host network. |
+| `docker-compose.yml` | The stock AudioMuse-AI host pinned by digest (v3.7.0, tree of 63436f41), PostgreSQL 15, the plugin bind-mounted, a Navidrome ping stub. `docker-compose.pg17.yml`: PostgreSQL 17. `docker-compose.external-db.yml`: an existing database, host network. |
 | `host/install_plugin.py` | Runs in the host image: `init` creates the host schema, `register` adds the plugin row and runs its install hooks. |
 | `host/navidrome_stub.py` | Answers the provider ping of `/api/catalog/health` like a LAN Navidrome. |
 | `requirements-e2e.txt` | `gunicorn==25.3.0` (the image's release). |
