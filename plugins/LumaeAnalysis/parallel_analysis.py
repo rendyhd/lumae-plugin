@@ -29,7 +29,9 @@ K is the setting ``background_workers``: ``auto`` (the default) takes the
 cores this process may use minus ``CPU_RESERVE``, the memory a quarter of
 the host's (or the container's) memory gives children of ``CHILD_RAM_BYTES``
 each, and at most ``MAX_AUTO_WORKERS``; a number from 1 to ``MAX_WORKERS``
-fixes it. This module has no database or host imports.
+fixes it. A turn that analyses logs K and why at its first file, and the
+workers it used (pids, peak memory, any left running) at its end
+(``tick_scope``). This module has no database or host imports.
 """
 
 import logging
@@ -95,21 +97,82 @@ def available_cpus():
     return max(1, count)
 
 
-def memory_bytes():
-    """The host's memory, or the container's limit when lower; None if unknown."""
-    total = None
+def _host_memory_bytes():
     try:
-        total = os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (AttributeError, OSError, ValueError):
-        total = None
+        return None
+
+
+def _container_memory_limit():
+    """The cgroup's memory limit (v2, then v1), or None without one."""
+    found = None
     for path in ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory/memory.limit_in_bytes"):
         raw = _read(path)
         if raw and raw.isdigit():
             limit = int(raw)
             # cgroup v1 reports "no limit" as a number near 2**63.
-            if limit < (1 << 60) and (total is None or limit < total):
-                total = limit
+            if limit < (1 << 60) and (found is None or limit < found):
+                found = limit
+    return found
+
+
+def memory_bytes():
+    """The host's memory, or the container's limit when lower; None if unknown."""
+    total = _host_memory_bytes()
+    limit = _container_memory_limit()
+    if limit is not None and (total is None or limit < total):
+        total = limit
     return total if total and total > 0 else None
+
+
+def _field(text, name):
+    """The number after ``name`` on its own line of ``text`` (``/proc/meminfo``,
+    cgroup ``memory.stat``), or None."""
+    for line in (text or "").splitlines():
+        parts = line.split()
+        if len(parts) > 1 and parts[0].rstrip(":") == name and parts[1].isdigit():
+            return int(parts[1])
+    return None
+
+
+def available_memory_bytes():
+    """Memory free for new work now: the host's ``MemAvailable``, or the
+    container's limit minus its usage when lower; None if unknown. Page cache
+    the kernel can reclaim (``inactive_file``) does not count as used, as in
+    ``docker stats``."""
+    available = _field(_read("/proc/meminfo"), "MemAvailable")
+    free = None if available is None else available * 1024
+    for limit_path, usage_path, stat_path, inactive in (
+        ("/sys/fs/cgroup/memory.max", "/sys/fs/cgroup/memory.current",
+         "/sys/fs/cgroup/memory.stat", "inactive_file"),
+        ("/sys/fs/cgroup/memory/memory.limit_in_bytes", "/sys/fs/cgroup/memory/memory.usage_in_bytes",
+         "/sys/fs/cgroup/memory/memory.stat", "total_inactive_file"),
+    ):
+        limit, usage = _read(limit_path), _read(usage_path)
+        if limit and usage and limit.isdigit() and usage.isdigit() and int(limit) < (1 << 60):
+            used = max(0, int(usage) - (_field(_read(stat_path), inactive) or 0))
+            headroom = max(0, int(limit) - used)
+            free = headroom if free is None else min(free, headroom)
+    return free
+
+
+def _size(value):
+    if value is None:
+        return "unknown"
+    if value >= 1 << 30:
+        return f"{value / (1 << 30):.1f} GB"
+    return f"{value / (1 << 20):.0f} MB"
+
+
+def describe_host():
+    """The cores and memory ``auto`` sizes from, and the memory free now,
+    for a runner turn's log line."""
+    host, limit = _host_memory_bytes(), _container_memory_limit()
+    memory = f"{_size(host)} memory"
+    if limit is not None and (host is None or limit < host):
+        memory += f" (container limit {_size(limit)})"
+    return f"{available_cpus()} cores, {memory}, {_size(available_memory_bytes())} available"
 
 
 def auto_workers(cpus=None, memory=None):
@@ -193,9 +256,10 @@ class Pool:
     is started once a turn and reused across files and actions.
     """
 
-    def __init__(self, workers, nice=NICE):
+    def __init__(self, workers, nice=NICE, usage=None):
         self.workers = max(1, int(workers))
         self.nice = nice
+        self.usage = usage
         self._jobs = queue.Queue()
         self._done = queue.Queue()
         self._threads = []
@@ -217,7 +281,8 @@ class Pool:
                 self._threads.append(thread)
 
     def _loop(self):
-        with analysis_isolation.dedicated_worker(nice=self.nice) as slot:
+        with analysis_isolation.dedicated_worker(nice=self.nice) as slot, \
+                analysis_isolation.recording(self.usage):
             while True:
                 job = self._jobs.get()
                 if job is None:
@@ -272,20 +337,59 @@ _scope = threading.local()
 
 
 class tick_scope:
-    """A runner turn's pool: ``current()`` inside, closed on leaving."""
+    """A runner turn's pool: ``current()`` inside, closed on leaving.
 
-    def __init__(self, workers):
-        self.pool = Pool(workers)
+    A turn that analyses a file logs two lines. At its first file: how many
+    files it analyses at once, ``reason`` (the setting behind it) and this
+    host's cores and memory. At its end: the analysis workers its files went
+    to, the largest peak memory among them (each worker's since it started;
+    the pooled worker's can predate the turn), the one kept for reuse and
+    any left running.
+    """
+
+    def __init__(self, workers, reason=None):
+        self.reason = reason
+        self.usage = analysis_isolation.WorkerUsage(first_use=self._log_start)
+        self.pool = Pool(workers, usage=self.usage)
+        self._recording = analysis_isolation.recording(self.usage)
 
     def __enter__(self):
         self.previous = getattr(_scope, "pool", None)
         _scope.pool = self.pool
+        self._recording.__enter__()
         return self.pool
 
     def __exit__(self, *_exc):
         _scope.pool = self.previous
+        self._recording.__exit__()
         self.pool.close()
+        try:
+            self._log_end()
+        except Exception:  # noqa: BLE001 - a log line never fails a turn
+            logger.debug("lumae_analysis could not log the turn's analysis workers", exc_info=True)
         return False
+
+    def _log_start(self):
+        facts = "; ".join(part for part in (self.reason, describe_host()) if part)
+        logger.info("lumae_analysis analysis turn: up to %d file(s) at once (%s)", self.pool.workers, facts)
+
+    def _log_end(self):
+        if self.usage.started is None:
+            return  # no file was analysed
+        pids, kept, left, peak = self.usage.summary()
+        logger.info(
+            "lumae_analysis analysis turn ended after %ds: %d analysis worker(s) (pids %s), "
+            "largest peak memory %s (each since it started); kept for reuse: %s; left running: %s",
+            round(time.monotonic() - self.usage.started), len(pids), _pids(pids),
+            _size(peak), _pids(kept), _pids(left),
+        )
+
+
+def _pids(pids, shown=12):
+    if not pids:
+        return "none"
+    text = ", ".join(str(pid) for pid in pids[:shown])
+    return text + (f" and {len(pids) - shown} more" if len(pids) > shown else "")
 
 
 def current():

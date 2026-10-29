@@ -8,6 +8,7 @@ deadline, serving on-demand work meanwhile; only a pass that raises cancels
 them (their children killed). One worker runs everything on the calling
 thread, as before WP1b.
 """
+import logging
 import os
 import threading
 import time
@@ -94,6 +95,36 @@ def test_the_setting_is_auto_or_a_bounded_count(raw, expected):
 def test_auto_resolves_from_this_host():
     assert 1 <= par.resolve_workers("auto") <= par.MAX_AUTO_WORKERS
     assert par.resolve_workers(5) == 5
+
+
+def test_available_memory_is_the_lower_of_the_hosts_and_the_containers_headroom(monkeypatch):
+    files = {"/proc/meminfo": "MemTotal: 16777216 kB\nMemAvailable: 8388608 kB"}
+    monkeypatch.setattr(par, "_read", files.get)
+    assert par.available_memory_bytes() == 8 << 30
+    files.update({"/sys/fs/cgroup/memory.max": str(3 << 30), "/sys/fs/cgroup/memory.current": str(1 << 30)})
+    assert par.available_memory_bytes() == 2 << 30
+    # Reclaimable page cache (media files read) is not in use.
+    files["/sys/fs/cgroup/memory.stat"] = f"anon {512 << 20}\ninactive_file {512 << 20}\nactive_file 0"
+    assert par.available_memory_bytes() == (2 << 30) + (512 << 20)
+    files["/sys/fs/cgroup/memory.max"] = "max"
+    assert par.available_memory_bytes() == 8 << 30
+    files.clear()
+    assert par.available_memory_bytes() is None
+
+
+def test_the_host_is_described_as_auto_sizes_it(monkeypatch):
+    files = {"/proc/meminfo": "MemAvailable: 20971520 kB",
+             "/sys/fs/cgroup/memory.max": str(4 << 30), "/sys/fs/cgroup/memory.current": str(1 << 30)}
+    monkeypatch.setattr(par, "_read", files.get)
+    monkeypatch.setattr(par, "available_cpus", lambda: 6)
+    monkeypatch.setattr(par, "_host_memory_bytes", lambda: 32 << 30)
+    assert par.describe_host() == "6 cores, 32.0 GB memory (container limit 4.0 GB), 3.0 GB available"
+    assert par.memory_bytes() == 4 << 30  # auto sizes from the limit
+    del files["/sys/fs/cgroup/memory.max"]
+    assert par.describe_host() == "6 cores, 32.0 GB memory, 20.0 GB available"
+    monkeypatch.setattr(par, "_host_memory_bytes", lambda: None)
+    files.clear()
+    assert par.describe_host() == "6 cores, unknown memory, unknown available"
 
 
 # ---------------------------------------------------------------- serial
@@ -184,6 +215,57 @@ def test_threads_keep_their_exec_worker_across_files_and_passes(pool, tmp_path):
     assert len(pids[0]) <= 3 and pids[1] <= pids[0]
     pool.close()
     assert all(_gone(pid) for pid in pids[0])
+
+
+def _turn_lines(caplog):
+    return [record.getMessage() for record in caplog.records if record.name == par.logger.name]
+
+
+def test_a_turn_logs_k_and_why_at_its_first_file_and_its_workers_at_its_end(tmp_path, caplog):
+    caplog.set_level(logging.INFO, logger=par.logger.name)
+    media = tmp_path / "a.flac"
+    media.write_bytes(b"\0")
+    recorder = Recorder(lambda _unit: lambda: iso.run_isolated(fakes.describe_process, str(media),
+                                                               limit_seconds=60))
+    with par.tick_scope(2, reason="setting auto") as pool:
+        assert _turn_lines(caplog) == []  # nothing analysed yet
+        par.run(range(4), recorder.prepare, recorder.finish, pool=pool)
+        assert len(_turn_lines(caplog)) == 1
+    pids = {result["pid"] for _u, result, _e in recorder.finished}
+    start, end = _turn_lines(caplog)
+    assert start.startswith("lumae_analysis analysis turn: up to 2 file(s) at once (setting auto; ")
+    assert " cores, " in start and start.endswith(" available)")
+    assert f"{len(pids)} analysis worker(s) (pids " in end
+    assert all(str(pid) in end for pid in pids) and all(_gone(pid) for pid in pids)
+    assert "(each since it started); kept for reuse: none; left running: none" in end
+    assert "largest peak memory unknown" not in end or not os.path.isdir("/proc/self")
+
+
+def test_a_turn_that_analyses_nothing_logs_nothing(caplog):
+    caplog.set_level(logging.INFO, logger=par.logger.name)
+    with par.tick_scope(3, reason="setting auto") as pool:
+        par.run(range(3), lambda _unit: None, lambda *_args: None, pool=pool)
+    assert _turn_lines(caplog) == []
+
+
+def test_a_one_file_turn_logs_the_pooled_worker_as_kept(tmp_path, caplog, monkeypatch):
+    # A runner turn is never alone on its process: the exec path, as in production.
+    monkeypatch.setattr(iso, "FORK_FAST_PATH", False)
+    caplog.set_level(logging.INFO, logger=par.logger.name)
+    media = tmp_path / "a.flac"
+    media.write_bytes(b"\0")
+    recorder = Recorder(lambda _unit: lambda: iso.run_isolated(fakes.describe_process, str(media),
+                                                               limit_seconds=60))
+    try:
+        with par.tick_scope(1, reason="setting 1") as pool:
+            par.run(range(2), recorder.prepare, recorder.finish, pool=pool)
+        (pid,) = {result["pid"] for _u, result, _e in recorder.finished}
+        start, end = _turn_lines(caplog)
+        assert start.startswith("lumae_analysis analysis turn: up to 1 file(s) at once (setting 1; ")
+        assert f"1 analysis worker(s) (pids {pid})" in end
+        assert f"kept for reuse: {pid}; left running: none" in end
+    finally:
+        iso.shutdown()
 
 
 def test_no_file_starts_once_the_deadline_is_nearer_than_the_average(pool):

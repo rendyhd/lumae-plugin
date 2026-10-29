@@ -59,6 +59,25 @@ def test_the_tick_reads_it_and_falls_back_to_one(monkeypatch):
     assert mod.background_workers() == 1
 
 
+def test_the_turn_is_told_the_setting_behind_k(monkeypatch):
+    mod = load_plugin()
+    stored = {"background_workers": 3}
+    monkeypatch.setattr(mod, "get_setting", lambda key, default=None: stored.get(key, default))
+    assert mod.background_sizing() == (3, "setting 3")
+    stored["background_workers"] = "auto"
+    monkeypatch.setattr(par, "available_cpus", lambda: 16)
+    monkeypatch.setattr(par, "memory_bytes", lambda: 64 << 30)
+    assert mod.background_sizing() == (par.MAX_AUTO_WORKERS, "setting auto")
+    token = mod.runner.ROLE.set(mod.runner.ROLE_SERVER)
+    try:
+        assert mod.background_sizing() == (
+            mod.WEB_AUTO_WORKERS, f"setting auto, at most {mod.WEB_AUTO_WORKERS} in AudioMuse's web process")
+    finally:
+        mod.runner.ROLE.reset(token)
+    monkeypatch.setattr(mod, "get_setting", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("db")))
+    assert mod.background_sizing() == (1, "the setting could not be read")
+
+
 def test_a_parallel_tick_claims_k_times_the_batch(monkeypatch):
     mod = load_plugin()
     monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 3)

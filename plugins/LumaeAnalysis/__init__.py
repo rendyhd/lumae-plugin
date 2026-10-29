@@ -502,20 +502,28 @@ def save_background_workers(form):
         set_setting("background_workers", parallel_analysis.normalize_setting(raw))
 
 
-def background_workers():
-    """K, the parallel analysis threads of a runner turn (setting
-    ``background_workers``; ``auto`` sized from this process's cores and
-    memory). One when it cannot be read."""
+def background_sizing():
+    """``(K, reason)``: K, the parallel analysis threads of a runner turn
+    (setting ``background_workers``; ``auto`` sized from this process's cores
+    and memory), and the setting behind it for the turn's log line. One when
+    it cannot be read."""
     try:
         setting = configured_background_workers()
         workers = parallel_analysis.resolve_workers(setting)
+        reason = f"setting {setting}"
         if runner.ROLE.get() == runner.ROLE_SERVER and setting == parallel_analysis.DEFAULT_SETTING:
             # R5: AudioMuse's web process serves requests from the same machine.
             workers = min(workers, WEB_AUTO_WORKERS)
-        return workers
+            reason += f", at most {WEB_AUTO_WORKERS} in AudioMuse's web process"
+        return workers, reason
     except Exception:
         logger.warning("lumae_analysis could not size the parallel analysis; analysing one file at a time")
-        return 1
+        return 1, "the setting could not be read"
+
+
+def background_workers():
+    """K, the parallel analysis threads of a runner turn (``background_sizing``)."""
+    return background_sizing()[0]
 
 
 def background_batch_limit():
@@ -7513,7 +7521,7 @@ def run_runner_turn(active):
     # first use and stop, with their analysis workers, when the turn ends.
     credits_service.begin_tick()
     try:
-        with parallel_analysis.tick_scope(background_workers()):
+        with parallel_analysis.tick_scope(*background_sizing()):
             while time.monotonic() - started < RUNNER_TURN_SECONDS and not active.stopped.is_set():
                 action, result = _next_runner_action(db, report, active, done)
                 if action is None:

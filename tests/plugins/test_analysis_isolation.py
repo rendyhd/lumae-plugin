@@ -414,6 +414,115 @@ def test_a_cancelled_file_that_has_not_started_raises_before_any_worker_starts(t
     assert _gone(_in_thread(run))
 
 
+def test_a_cancel_while_the_worker_starts_stops_the_file_before_it_is_sent(tmp_path, monkeypatch):
+    """The cancel lands while the thread's first worker starts, so the slot
+    holds no worker to kill yet; sent anyway, the file would run to its own
+    limit in a thread its turn already gave up on."""
+    media = _media(tmp_path)
+    pid_file = tmp_path / "pid"
+    token, slots, started = object(), [], []
+    real_init = iso._Worker.__init__
+
+    def starting(worker, *args, **kwargs):
+        real_init(worker, *args, **kwargs)
+        started.append(worker.pid)
+        assert slots[0].worker is None  # the slot gets it only once it has started
+        assert slots[0].cancel(token)   # as the runner thread does when its pass raises
+
+    monkeypatch.setattr(iso._Worker, "__init__", starting)
+
+    def run():
+        with iso.dedicated_worker() as slot:
+            slots.append(slot)
+            slot.begin(token)
+            began = time.monotonic()
+            with pytest.raises(iso.AnalysisCancelled):
+                iso.run_isolated(fakes.sleep_forever, media, limit_seconds=20, headroom_seconds=0,
+                                 pid_file=str(pid_file))
+            slot.end()
+            assert slot.worker is None
+            return time.monotonic() - began
+
+    assert _in_thread(run) < 10
+    assert not pid_file.exists()  # the file never reached the worker
+    assert len(started) == 1 and _gone(started[0])
+
+
+def test_a_cancel_while_a_worker_fails_to_start_does_not_analyse_in_process(tmp_path, monkeypatch):
+    """A worker that cannot start sends files in-process, without the hard
+    limit; a file cancelled meanwhile must not be one of them."""
+    media = _media(tmp_path)
+    token, slots = object(), []
+
+    def failing(_worker, *_args, **_kwargs):
+        assert slots[0].cancel(token)
+        raise iso._WorkerUnavailable("worker did not start in time")
+
+    monkeypatch.setattr(iso._Worker, "__init__", failing)
+
+    def run():
+        with iso.dedicated_worker() as slot:
+            slots.append(slot)
+            slot.begin(token)
+            with pytest.raises(iso.AnalysisCancelled):
+                iso.run_isolated(fakes.describe_process, media, limit_seconds=60)
+            slot.end()
+
+    try:
+        _in_thread(run)
+    finally:
+        iso.shutdown()  # forgets the start failure
+
+
+def _a_peak(peak):
+    """A worker's peak memory, read from /proc (None without one)."""
+    return peak > 10 << 20 if os.path.isdir("/proc/self") else peak is None
+
+
+def test_a_workers_peak_keeps_its_highest_reading(monkeypatch):
+    # The kernel updates VmHWM lazily: a later reading can be lower.
+    readings = iter([300 << 20, 290 << 20, None])
+    monkeypatch.setattr(iso, "peak_rss_bytes", lambda _pid: next(readings))
+    worker = iso._Worker.__new__(iso._Worker)  # no process: only the bookkeeping
+    worker.pid, worker.owner_pid, worker.peak_rss = 1, os.getpid(), None
+    for _ in range(3):
+        worker.note_peak()
+    assert worker.peak_rss == 300 << 20
+
+
+def test_recording_notes_each_worker_once_and_its_peak_memory(tmp_path):
+    media = _media(tmp_path)
+    first_use = []
+    usage = iso.WorkerUsage(first_use=lambda: first_use.append(1))
+
+    def run():
+        with iso.dedicated_worker(), iso.recording(usage):
+            return {iso.run_isolated(fakes.describe_process, media, limit_seconds=60)["pid"] for _ in range(3)}
+
+    pids = _in_thread(run)
+    pids, (seen, kept, left, peak) = sorted(pids), usage.summary()
+    assert len(pids) == 1 and seen == pids and first_use == [1]
+    assert kept == [] and left == []  # stopped when its thread left dedicated_worker
+    assert _a_peak(peak)  # read before it stopped
+
+
+def test_the_pooled_worker_is_recorded_as_kept_and_a_failing_first_use_fails_nothing(tmp_path, monkeypatch):
+    monkeypatch.setattr(iso, "FORK_FAST_PATH", False)
+    media = _media(tmp_path)
+    usage = iso.WorkerUsage(first_use=lambda: 1 / 0)
+
+    def run():
+        with iso.recording(usage):
+            pid = iso.run_isolated(fakes.describe_process, media, limit_seconds=60)["pid"]
+        # The pooled worker dies with the thread that started it: read it here.
+        return pid, usage.summary()
+
+    pid, (seen, kept, left, peak) = _in_thread(run)
+    assert seen == kept == [pid] and left == [] and _a_peak(peak)
+    iso.shutdown()
+    assert _gone(pid)
+
+
 def test_shutdown_stops_the_dedicated_workers(tmp_path):
     media = _media(tmp_path)
     started, release, pids = threading.Event(), threading.Event(), []

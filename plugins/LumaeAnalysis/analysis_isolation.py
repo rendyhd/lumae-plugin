@@ -47,7 +47,10 @@ diagnostics:
   (the parallel analysis threads of a runner turn, performance plan WP1b)
   has its own worker instead, reused for every file it analyses until it
   leaves, at a lower CPU priority; another thread can ``cancel`` its file,
-  which kills the worker and raises ``AnalysisCancelled`` in the thread. Its
+  which kills the worker and raises ``AnalysisCancelled`` in the thread (a
+  cancel while the worker starts stops the file before it is sent). A thread
+  inside ``recording`` notes in a ``WorkerUsage`` each worker its files go to
+  and the worker's peak memory, for the runner turn's log lines. A worker's
   environment omits credential-like variables. That is hygiene, not a security boundary: it runs as the same
   user and could read the parent's ``/proc/<pid>/environ``.
 * Only the path and keyword arguments go to the child, and only the result
@@ -782,6 +785,8 @@ class _Worker:
         # PR_SET_PDEATHSIG fires when this thread exits, not the process.
         self.creator = threading.get_ident()
         self.healthy = False
+        # Its peak resident memory, kept when it is stopped (WorkerUsage).
+        self.peak_rss = None
         self._reader = _LineReader(self.proc.stdout.fileno())
         path = [os.getcwd() if entry == "" else entry for entry in sys.path]
         try:
@@ -812,6 +817,16 @@ class _Worker:
     def read(self, deadline):
         return self._reader.read(deadline)
 
+    def note_peak(self):
+        """Keep the worker's peak resident memory before it is stopped.
+
+        The highest reading wins: the kernel updates ``VmHWM`` lazily, so a
+        later reading can be lower than an earlier one.
+        """
+        peak = peak_rss_bytes(self.pid) if self.owner_pid == os.getpid() else None
+        if peak:
+            self.peak_rss = max(self.peak_rss or 0, peak)
+
     def exit_facts(self, wait_seconds=5.0):
         """Reap the exited worker (killing it if it lingers); exit code or signal."""
         try:
@@ -827,6 +842,7 @@ class _Worker:
         if self.owner_pid != os.getpid():
             return
         if self.proc.poll() is None:
+            self.note_peak()
             try:
                 self.proc.terminate()
                 self.proc.wait(timeout=max(0.0, grace))
@@ -841,6 +857,7 @@ class _Worker:
         """Ask an idle worker to exit (EOF on stdin); kill it if it does not."""
         if self.owner_pid != os.getpid():
             return
+        self.note_peak()
         try:
             self.proc.stdin.close()
         except OSError:
@@ -1036,6 +1053,7 @@ class DedicatedWorker:
             self._cancelled = token
             worker = self.worker
         if worker is not None and worker.owner_pid == os.getpid():
+            worker.note_peak()
             try:
                 os.kill(worker.pid, signal.SIGKILL)
             except (ProcessLookupError, PermissionError):
@@ -1086,6 +1104,80 @@ def dedicated_worker(nice=0):
     The worker runs at ``nice`` (0: the parent's priority). Leaving stops it.
     """
     return _dedicated_worker(nice)
+
+
+def peak_rss_bytes(pid):
+    """A running process's peak resident memory (Linux ``VmHWM``), or None."""
+    try:
+        with open(f"/proc/{int(pid)}/status", encoding="ascii", errors="replace") as handle:
+            for line in handle:
+                if line.startswith("VmHWM:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, ValueError, IndexError):
+        pass
+    return None
+
+
+class WorkerUsage:
+    """The exec workers a runner turn sent files to, for its log lines.
+
+    ``first_use`` is called once, on the turn's first file. The fork path is
+    not recorded: a runner turn always has more than one thread.
+    """
+
+    def __init__(self, first_use=None):
+        self.started = None
+        self._first_use = first_use
+        self._workers = []
+        self._lock = threading.Lock()
+
+    def used(self, worker):
+        with self._lock:
+            first = self.started is None
+            if first:
+                self.started = time.monotonic()
+            if all(seen is not worker for seen in self._workers):
+                self._workers.append(worker)
+        if first and self._first_use is not None:
+            try:
+                self._first_use()
+            except Exception:  # noqa: BLE001 - a log line never fails a file
+                logger.debug("lumae_analysis could not log the turn's first analysis", exc_info=True)
+
+    def summary(self):
+        """``(pids, kept, left, peak)``: every worker's pid; the running
+        pooled worker, kept for this process's next file; the others still
+        running; the largest peak resident memory in bytes (or None), each
+        worker's since it started (the pooled worker's can predate the turn)."""
+        with self._lock:
+            workers = list(self._workers)
+        running = [worker for worker in workers if worker.alive()]
+        for worker in running:
+            worker.note_peak()
+        peaks = [worker.peak_rss for worker in workers if worker.peak_rss]
+        return ([worker.pid for worker in workers],
+                [worker.pid for worker in running if worker is _pooled],
+                [worker.pid for worker in running if worker is not _pooled],
+                max(peaks) if peaks else None)
+
+
+_usage = threading.local()
+
+
+class recording:
+    """Context manager: this thread's files are recorded in ``usage``."""
+
+    def __init__(self, usage):
+        self.usage = usage
+
+    def __enter__(self):
+        self.previous = getattr(_usage, "current", None)
+        _usage.current = self.usage
+        return self.usage
+
+    def __exit__(self, *_exc):
+        _usage.current = self.previous
+        return False
 
 
 def shutdown():
@@ -1260,6 +1352,10 @@ def _await_answer(child, facts, limit_seconds, headroom, plugin_package, accepte
         if isinstance(reported, dict):
             facts.update(reported)
         if event == "progress":
+            if isinstance(child, _Worker):
+                # At most once a second: a worker the OOM killer ends leaves
+                # no peak to read afterwards.
+                child.note_peak()
             continue
         if event == "error":
             category = _identifier_or(message.get("category"), "analysis_error")
@@ -1314,9 +1410,21 @@ def _run_exec(target, path, kwargs, reference, plugin_package, facts, limit_seco
                     "lumae_analysis analysis worker unavailable (%s); this process "
                     "analyzes in-process without the hard time limit", exc,
                 )
+            if slot is not None and slot.cancelled():
+                # Cancelled while the worker failed to start: no in-process
+                # analysis (it has no hard limit) for a file already given up.
+                raise AnalysisCancelled() from None
             return target(path, **kwargs)
         try:
             try:
+                if slot is not None and slot.cancelled():
+                    # Cancelled since the check above, e.g. while a new worker
+                    # started (cancel() then found none to kill): the file is
+                    # not sent and the worker is stopped (_checkin).
+                    raise AnalysisCancelled()
+                usage = getattr(_usage, "current", None)
+                if usage is not None:
+                    usage.used(worker)
                 worker.send(request)
                 return _await_answer(
                     worker, facts, limit_seconds, headroom, plugin_package, False,
