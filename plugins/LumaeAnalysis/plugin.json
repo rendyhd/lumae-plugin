@@ -112,6 +112,14 @@
   },
   "versions": [
     {
+      "version": "1.10.0",
+      "min_core_version": "3.2.0",
+      "changelog": "Library passes can use every AudioMuse worker. With the new setting Workers set to every worker, the workers that do not lead Lumae's background work help it: they walk the waveform, edge and loudness passes with it, a few tracks at a time, so no file is downloaded or analyzed twice, and a worker that goes away leaves its tracks to the others. One runner works per worker container, and Files analyzed at once across all workers caps the load on the music server. On-demand tracks, similar albums and artists, and catalogue work stay with one worker. The default, one worker, works as 1.9.2 did.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.10.0.zip",
+      "checksum": "5f16924c6cf703fced8f8a1a844bb7ab"
+    },
+    {
       "version": "1.9.2",
       "min_core_version": "3.2.0",
       "changelog": "Similar albums and artists compare energy and moods the way the Lumae app does. Energy is ranked on the library's own scale: with AudioMuse 3.4.0 and later almost every song counted as the most energetic, so energy told albums apart only by their near-silent songs. Moods are ranked through Lumae's calibration tables: AudioMuse gives a song's six moods nearly the same score, so moods barely changed a match. Similarities are rebuilt once after the upgrade, and the previous ones stay available until the rebuild finishes. The relationship status adds scoring_revision; nothing else on the wire changes. Includes every 1.9.1 change. AudioMuse 3.2.0 is still the minimum.",
