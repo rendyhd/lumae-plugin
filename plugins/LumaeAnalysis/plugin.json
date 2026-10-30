@@ -112,6 +112,14 @@
   },
   "versions": [
     {
+      "version": "1.9.2",
+      "min_core_version": "3.2.0",
+      "changelog": "Similar albums and artists compare energy and moods the way the Lumae app does. Energy is ranked on the library's own scale: with AudioMuse 3.4.0 and later almost every song counted as the most energetic, so energy told albums apart only by their near-silent songs. Moods are ranked through Lumae's calibration tables: AudioMuse gives a song's six moods nearly the same score, so moods barely changed a match. Similarities are rebuilt once after the upgrade, and the previous ones stay available until the rebuild finishes. The relationship status adds scoring_revision; nothing else on the wire changes. Includes every 1.9.1 change. AudioMuse 3.2.0 is still the minimum.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.9.2.zip",
+      "checksum": "587d4b6762d6fd934cb07edefea1ef63"
+    },
+    {
       "version": "1.9.1",
       "min_core_version": "3.2.0",
       "changelog": "Analysis workers: a file cancelled while its analysis worker was still starting is no longer analyzed anyway (it could run to its time limit after Lumae had moved on), and a file cancelled while a worker failed to start no longer runs inside AudioMuse's process without the time limit. Each runner turn that analyzes files now logs how many it analyzes at once and why (the setting, cores, memory, a container's limit, memory available) and, when it ends, the analysis processes it used, their largest peak memory and any left running, so a question about Lumae's processes or memory can be answered from AudioMuse's log. Nothing on the wire changes. Includes every 1.9.0 change. AudioMuse 3.2.0 is still the minimum.",

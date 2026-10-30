@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased
+## 1.9.2 (2026-10-30)
 
 Similar albums and artists rank energy and moods the way the app does
 (Album Dynamics v2, app `98f9ba505`; relationship scoring revision 2).
@@ -28,6 +28,9 @@ Similar albums and artists rank energy and moods the way the app does
   the next relationship request; the last published generation is served
   meanwhile. The stream's `algorithm_version` stays 1, because the app
   accepts nothing else; the status routes add `scoring_revision`.
+
+Nothing else on the wire changes. Includes every 1.9.1 change. AudioMuse
+3.2.0 is still the minimum.
 
 ## 1.9.1 (2026-10-29)
 
