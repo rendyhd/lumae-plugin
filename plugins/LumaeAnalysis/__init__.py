@@ -92,6 +92,7 @@ from .catalog_analysis import (
 from .catalog_enrichment import (
     RELATIONSHIP_ALGORITHM_VERSION,
     RELATIONSHIP_SCHEMA_VERSION,
+    RELATIONSHIP_SCORING_REVISION,
     claim_relationship_preparation,
     compact_enrichment_storage,
     externalize_journal_edges,
@@ -6601,6 +6602,7 @@ def start_relationship_preparation(
         and int(current.get("source_analysis_generation") or 0) == analysis_generation
         and int(current.get("schema_version") or 0) == RELATIONSHIP_SCHEMA_VERSION
         and int(current.get("algorithm_version") or 0) == RELATIONSHIP_ALGORITHM_VERSION
+        and int(current.get("scoring_revision") or 0) == RELATIONSHIP_SCORING_REVISION
     )
     if already_current:
         return {

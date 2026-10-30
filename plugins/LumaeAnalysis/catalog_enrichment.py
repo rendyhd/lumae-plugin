@@ -29,6 +29,7 @@ from . import migrations
 from .reconcile import wake_runners
 from .edge_profiles import edge_profile_v3, opaque_revision
 from .edge_profile_store import edge_join, edge_payload_sql, edge_v3_digest_sql
+from .sonic_calibration import energy_scale, mood_ranks, normalize_energy, raw_energy
 
 from .catalog import (
     JOURNAL_WRITER_GENERATION,
@@ -44,7 +45,14 @@ from .catalog import (
 
 
 RELATIONSHIP_SCHEMA_VERSION = 1
+# The stream's algorithm version: the app accepts only 1, so a scoring change
+# that keeps the payloads' meaning raises RELATIONSHIP_SCORING_REVISION instead.
 RELATIONSHIP_ALGORITHM_VERSION = 1
+# The scorer's inputs, internal to the plugin; a change marks published
+# relationships stale and the next build replaces them. 2: energy on the
+# library's energy scale and moods as ranks (sonic_calibration), as the app's
+# Album Dynamics v2; 1 scaled energy by a fixed 0.01-0.15 and used raw moods.
+RELATIONSHIP_SCORING_REVISION = 2
 RELATIONSHIP_LIMIT = 12
 RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR = 96
 RELATIONSHIP_MAX_CANDIDATE_ENTITIES = 384
@@ -68,7 +76,6 @@ PROFILE_COMPACTION_MAX_ADVANCE = 5_000
 # finished after this long was abandoned (its request died): it holds neither
 # a slot nor the journal floor, and the next create purges it.
 PROFILE_BOOTSTRAP_CAPTURE_MINUTES = 10
-MOOD_FEATURE_NAMES = ("danceable", "aggressive", "happy", "party", "relaxed", "sad")
 
 _ALBUM_WEIGHTS = {
     "core": 0.38,
@@ -643,6 +650,11 @@ def migrate_enrichment(db):
         "retry_count INTEGER NOT NULL DEFAULT 0",
         "next_retry_at TIMESTAMPTZ",
     )
+    # Relationships published before the column were scored by revision 1.
+    migrations.ensure_columns(
+        cur, t("relationship_state"),
+        "scoring_revision INTEGER NOT NULL DEFAULT 1",
+    )
 
     from .relationship_build import migrate_relationship_builds
     migrate_relationship_builds(cur)
@@ -655,8 +667,8 @@ def migrate_enrichment(db):
             f"""
             INSERT INTO {t("relationship_state")}
                 (catalog_instance_id, relationship_schema_version,
-                 algorithm_version, epoch)
-            VALUES (%s, %s, %s, %s)
+                 algorithm_version, scoring_revision, epoch)
+            VALUES (%s, %s, %s, %s, %s)
             ON CONFLICT (catalog_instance_id) DO UPDATE SET
                 relationship_schema_version=CASE
                     WHEN {t("relationship_state")}.result_generation = 0
@@ -668,11 +680,18 @@ def migrate_enrichment(db):
                     THEN EXCLUDED.algorithm_version
                     ELSE {t("relationship_state")}.algorithm_version
                 END,
+                scoring_revision=CASE
+                    WHEN {t("relationship_state")}.result_generation = 0
+                    THEN EXCLUDED.scoring_revision
+                    ELSE {t("relationship_state")}.scoring_revision
+                END,
                 status=CASE
                     WHEN {t("relationship_state")}.relationship_schema_version
                            <> EXCLUDED.relationship_schema_version
                       OR {t("relationship_state")}.algorithm_version
                            <> EXCLUDED.algorithm_version
+                      OR {t("relationship_state")}.scoring_revision
+                           <> EXCLUDED.scoring_revision
                     THEN 'stale'
                     ELSE {t("relationship_state")}.status
                 END,
@@ -681,6 +700,8 @@ def migrate_enrichment(db):
                            <> EXCLUDED.relationship_schema_version
                       OR {t("relationship_state")}.algorithm_version
                            <> EXCLUDED.algorithm_version
+                      OR {t("relationship_state")}.scoring_revision
+                           <> EXCLUDED.scoring_revision
                     THEN now()
                     ELSE {t("relationship_state")}.updated_at
                 END
@@ -689,6 +710,7 @@ def migrate_enrichment(db):
                 catalog_instance_id,
                 RELATIONSHIP_SCHEMA_VERSION,
                 RELATIONSHIP_ALGORITHM_VERSION,
+                RELATIONSHIP_SCORING_REVISION,
                 str(uuid.uuid4()),
             ),
         )
@@ -1132,40 +1154,6 @@ def _vector(blob, dimensions):
     if dimensions <= 0 or len(raw) != dimensions * 4:
         return None
     return np.frombuffer(raw, dtype="<f4")
-
-
-def _parse_features(value):
-    result = {}
-    if isinstance(value, dict):
-        values = value.items()
-    else:
-        values = []
-        for part in str(value or "").split(","):
-            name, separator, raw = part.partition(":")
-            if separator:
-                values.append((name, raw))
-    for name, raw in values:
-        try:
-            number = float(raw)
-        except (TypeError, ValueError):
-            continue
-        if math.isfinite(number):
-            result[str(name).strip()] = number
-    return result
-
-
-def _mood_vector(scalar):
-    mood = _parse_features((scalar or {}).get("mood_vector"))
-    other = _parse_features((scalar or {}).get("other_features"))
-    return [float(other.get(name, mood.get(name, 0.0))) for name in MOOD_FEATURE_NAMES]
-
-
-def _energy(value):
-    try:
-        raw = float(value)
-    except (TypeError, ValueError):
-        return None
-    return max(0.0, min(1.0, (raw - 0.01) / 0.14))
 
 
 def _average(values):
@@ -1870,12 +1858,14 @@ def _load_relationship_inputs(cur, source):
          analysis_generation, catalog_instance_id, catalog_generation),
     )
     rows = cur.fetchall()
+    scalars = [_json(row[10], {}) or {} for row in rows]
+    # The scale of every analysed song of the library, as the app's.
+    scale = energy_scale(raw_energy(scalar.get("energy")) for scalar in scalars)
     tracks = []
-    for order, row in enumerate(rows):
+    for order, (row, scalar) in enumerate(zip(rows, scalars)):
         embedding = _vector(row[11], row[12])
         if embedding is None or len(embedding) == 0:
             continue
-        scalar = _json(row[10], {}) or {}
         payload = _json(row[8], {}) or {}
         rich = payload.get("_lumae") if isinstance(payload.get("_lumae"), dict) else {}
         album = str(row[2] or rich.get("album") or "").strip()
@@ -1890,8 +1880,8 @@ def _load_relationship_inputs(cur, source):
                 "artist": artist,
                 "order": order,
                 "embedding": embedding,
-                "energy": _energy(scalar.get("energy")),
-                "mood": _mood_vector(scalar),
+                "energy": normalize_energy(raw_energy(scalar.get("energy")), scale),
+                "mood": mood_ranks(scalar.get("other_features")),
                 "year": rich.get("year"),
                 "track_cover": str(row[7]) if row[7] else None,
                 "artist_cover": str(row[9]) if row[9] else None,
@@ -2028,7 +2018,8 @@ def relationship_status(db, catalog_instance_id):
                album_count, artist_count, started_at, completed_at,
                last_error, updated_at,
                (SELECT progress FROM {t('relationship_builds')} b
-                 WHERE b.catalog_instance_id={t('relationship_state')}.catalog_instance_id)
+                 WHERE b.catalog_instance_id={t('relationship_state')}.catalog_instance_id),
+               scoring_revision
           FROM {t("relationship_state")} WHERE catalog_instance_id=%s
         """,
         (catalog_instance_id,),
@@ -2041,11 +2032,13 @@ def relationship_status(db, catalog_instance_id):
             "status": "not_initialized",
             "schema_version": RELATIONSHIP_SCHEMA_VERSION,
             "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
+            "scoring_revision": RELATIONSHIP_SCORING_REVISION,
         }
     return {
         "catalog_instance_id": catalog_instance_id,
         "schema_version": int(row[0]),
         "algorithm_version": int(row[1]),
+        "scoring_revision": int(row[16]) if len(row) > 16 else RELATIONSHIP_SCORING_REVISION,
         "source_catalog_generation": int(row[2]),
         "source_analysis_generation": int(row[3]),
         "generation": int(row[4]),

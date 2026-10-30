@@ -44,7 +44,8 @@ class InputsChanged(CatalogScanError):
 # The identity fields a staged build must share with the live inputs to be
 # finished (SQ.2); the generations and the analysis digest may move on.
 SNAPSHOT_SOURCE_FIELDS = (
-    "server_id", "catalog_epoch", "analysis_epoch", "algorithm_version", "build_format_version",
+    "server_id", "catalog_epoch", "analysis_epoch", "algorithm_version", "scoring_revision",
+    "build_format_version",
 )
 
 
@@ -179,7 +180,7 @@ def input_state(cur, source_id, lock=False):
     The identity pins the catalogue by generation and the analysis by a digest
     of the rows the build reads, not by the projection generation number.
     """
-    from .catalog_enrichment import RELATIONSHIP_ALGORITHM_VERSION
+    from .catalog_enrichment import RELATIONSHIP_ALGORITHM_VERSION, RELATIONSHIP_SCORING_REVISION
     cur.execute(f"""
         SELECT s.current_core_server_id, s.rebind_status,
                c.published_generation, c.catalog_epoch, c.status,
@@ -200,6 +201,7 @@ def input_state(cur, source_id, lock=False):
         "analysis_inputs": analysis_inputs_digest(cur, source_id, analysis_generation),
         "analysis_epoch": row[6],
         "algorithm_version": RELATIONSHIP_ALGORITHM_VERSION,
+        "scoring_revision": RELATIONSHIP_SCORING_REVISION,
         "build_format_version": BUILD_FORMAT_VERSION,
     }, analysis_generation
 
@@ -518,11 +520,13 @@ class Build:
                         "AND result_generation<>%s", (self.source_id, generation))
             cur.execute(f"""
                 UPDATE {t('relationship_state')} SET relationship_schema_version=%s, algorithm_version=%s,
+                    scoring_revision=%s,
                     source_catalog_generation=%s, source_analysis_generation=%s,
                     result_generation=%s, head_seq=%s, status='complete', album_count=%s, artist_count=%s,
                     completed_at=now(), last_error=NULL, updated_at=now()
                  WHERE catalog_instance_id=%s
             """, (e.RELATIONSHIP_SCHEMA_VERSION, e.RELATIONSHIP_ALGORITHM_VERSION,
+                  self.identity['scoring_revision'],
                   self.identity['catalog_generation'], self.analysis_generation,
                   generation, head_seq + changes, counts['albums'], counts['artists'], self.source_id))
             e.compact_change_journal(

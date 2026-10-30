@@ -7,6 +7,28 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased
+
+Similar albums and artists rank energy and moods the way the app does
+(Album Dynamics v2, app `98f9ba505`; relationship scoring revision 2).
+
+- Energy used a fixed 0.01–0.15 window. AudioMuse 3.4.0 puts a typical song
+  near 0.74, so on the owner's library 99.4% of songs scored 1 and 99.2% of
+  albums had the same energy. Energy is now on the library's own scale: the
+  app's fixed ranking table when the median is above 0.3 (AudioMuse 3.4.0 and
+  later), otherwise the library's p5/p95.
+- Moods used AudioMuse's raw CLAP scores, which give a song's six moods
+  nearly the same value, so the mood term barely moved a score (album pairs:
+  median 0.0015). Moods are now ranks through the app's tables (CLAP, or the
+  pre-0.9 classifier), and genre tags no longer stand in for a missing mood.
+- `sonic_calibration_v2.json` copies the app's `energy.v34`, `moods.clap` and
+  `moods.classifier` (`sonic-calibration-v2`); the app's golden fixtures pin
+  the values.
+- Relationships published by 1.9.1 turn `stale` at upgrade and are rebuilt by
+  the next relationship request; the last published generation is served
+  meanwhile. The stream's `algorithm_version` stays 1, because the app
+  accepts nothing else; the status routes add `scoring_revision`.
+
 ## 1.9.1 (2026-10-29)
 
 Analysis workers. A report had a waveform pass make Jellyfin 12.4 spawn

@@ -289,6 +289,8 @@ From SQ.2:
 - `prepare` records the request and wakes the runners, which build it step by step; it no longer queues a root task (`job_id` is absent).
 - From W2 a build starts no sooner than 15 minutes after the change that asked for it and at most every 6 hours after the last publication; a source's first generation starts at once, and the settings page's rebuild starts one now. The published generation is served meanwhile.
 
+From scoring revision 2 (unreleased): the state also carries `scoring_revision`, the plugin's own revision of how relationships are scored (2: energy on the library's energy scale and moods as ranks, as the app's Album Dynamics v2; 1 before). A source whose published generation has an older revision turns `stale` at migration and the next build replaces it. `algorithm_version` stays 1 on every route, because Lumae rejects a relationship change page with any other value (`pluginEnrichmentSync.ts`).
+
 ---
 
 ## 3. Profile endpoints

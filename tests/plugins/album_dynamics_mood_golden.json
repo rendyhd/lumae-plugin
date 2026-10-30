@@ -1,0 +1,256 @@
+{
+  "description": "Album Dynamics mood term: AudioMuse other_features as calibrated ranks (writeMoodFeatureSlots), the album mood stats and the mood distance (cosine of album means). Generated from the app code; the Python ports assert the same values.",
+  "calibrationVersion": "sonic-calibration-v2",
+  "moods": ["danceable", "aggressive", "happy", "party", "relaxed", "sad"],
+  "songs": [
+    {
+      "case": "library median (CLAP)",
+      "otherFeatures": "danceable:0.61,aggressive:0.61,happy:0.62,party:0.62,relaxed:0.57,sad:0.58",
+      "producer": "clap",
+      "ranks": [0.493786, 0.470141, 0.539562, 0.539634, 0.477163, 0.523155],
+      "slots": [
+        0.4937860071659088, 0.4701409935951233, 0.5395619869232178, 0.5396339893341064,
+        0.4771629869937897, 0.5231549739837646
+      ]
+    },
+    {
+      "case": "dance and party (CLAP)",
+      "otherFeatures": "danceable:0.72,aggressive:0.62,happy:0.66,party:0.7,relaxed:0.5,sad:0.49",
+      "producer": "clap",
+      "ranks": [0.955897, 0.559631, 0.896179, 0.94863, 0.082353, 0.064547],
+      "slots": [
+        0.9558969736099243, 0.5596309900283813, 0.8961790204048157, 0.9486299753189087,
+        0.08235300332307816, 0.06454700231552124
+      ]
+    },
+    {
+      "case": "calm and sad (CLAP)",
+      "otherFeatures": "danceable:0.54,aggressive:0.55,happy:0.56,party:0.53,relaxed:0.66,sad:0.65",
+      "producer": "clap",
+      "ranks": [0.042445, 0.067575, 0.09951, 0.044103, 0.925144, 0.926874],
+      "slots": [
+        0.042445000261068344, 0.06757500022649765, 0.09950999915599823, 0.044103000313043594,
+        0.9251440167427063, 0.9268739819526672
+      ]
+    },
+    {
+      "case": "CLAP range ends, beyond the table ends",
+      "otherFeatures": "danceable:0.4,aggressive:0.8,happy:0.4,party:0.8,relaxed:0.4,sad:0.8",
+      "producer": "clap",
+      "ranks": [0, 1, 0, 1, 0, 1],
+      "slots": [0, 1, 0, 1, 0, 1]
+    },
+    {
+      "case": "exact table points",
+      "otherFeatures": "danceable:0.5,aggressive:0.5,happy:0.5,party:0.5,relaxed:0.5,sad:0.5",
+      "producer": "clap",
+      "ranks": [0.00222, 0.001442, 0.00271, 0.006315, 0.082353, 0.091551],
+      "slots": [
+        0.002219999907538295, 0.0014420000370591879, 0.0027099999133497477, 0.0063149998895823956,
+        0.08235300332307816, 0.09155099838972092
+      ]
+    },
+    {
+      "case": "between table points",
+      "otherFeatures": "danceable:0.615,aggressive:0.605,happy:0.625,party:0.635,relaxed:0.575,sad:0.585",
+      "producer": "clap",
+      "ranks": [0.530018, 0.425836, 0.591883, 0.64127, 0.508737, 0.558658],
+      "slots": [
+        0.5300179719924927, 0.4258359968662262, 0.5918830037117004, 0.6412699818611145,
+        0.5087370276451111, 0.5586580038070679
+      ]
+    },
+    {
+      "case": "one mood above 0.80 sends all six to the classifier tables",
+      "otherFeatures": "danceable:0.81,aggressive:0.61,happy:0.62,party:0.62,relaxed:0.57,sad:0.58",
+      "producer": "classifier",
+      "ranks": [0.678333, 0.751357, 0.68216, 0.812135, 0.559004, 0.626983],
+      "slots": [
+        0.6783329844474792, 0.7513570189476013, 0.6821600198745728, 0.8121349811553955,
+        0.559004008769989, 0.6269829869270325
+      ]
+    },
+    {
+      "case": "pre-0.9 classifier probabilities",
+      "otherFeatures": "danceable:0.12,aggressive:0.03,happy:0.4,party:0.05,relaxed:0.7,sad:0.2",
+      "producer": "classifier",
+      "ranks": [0.12914, 0.379279, 0.477213, 0.268787, 0.634706, 0.334957],
+      "slots": [
+        0.1291400045156479, 0.3792789876461029, 0.4772129952907562, 0.2687869966030121,
+        0.6347060203552246, 0.3349570035934448
+      ]
+    },
+    {
+      "case": "a missing mood sends the others to the classifier tables; its slot stays 0",
+      "otherFeatures": "danceable:0.61,aggressive:0.61,happy:0.62,party:0.62,relaxed:0.57",
+      "producer": "classifier",
+      "ranks": [0.499548, 0.751357, 0.68216, 0.812135, 0.559004, null],
+      "slots": [
+        0.4995479881763458, 0.7513570189476013, 0.6821600198745728, 0.8121349811553955,
+        0.559004008769989, 0
+      ]
+    },
+    {
+      "case": "the last occurrence of a label wins",
+      "otherFeatures": "happy:0.5,danceable:0.61,aggressive:0.61,happy:0.62,party:0.62,relaxed:0.57,sad:0.58",
+      "producer": "clap",
+      "ranks": [0.493786, 0.470141, 0.539562, 0.539634, 0.477163, 0.523155],
+      "slots": [
+        0.4937860071659088, 0.4701409935951233, 0.5395619869232178, 0.5396339893341064,
+        0.4771629869937897, 0.5231549739837646
+      ]
+    },
+    {
+      "case": "labels trimmed, order free, other labels ignored",
+      "otherFeatures": "sad:0.58, relaxed : 0.57,electronic:0.9,party:0.62,happy:0.62,aggressive:0.61,danceable:0.61",
+      "producer": "clap",
+      "ranks": [0.493786, 0.470141, 0.539562, 0.539634, 0.477163, 0.523155],
+      "slots": [
+        0.4937860071659088, 0.4701409935951233, 0.5395619869232178, 0.5396339893341064,
+        0.4771629869937897, 0.5231549739837646
+      ]
+    },
+    {
+      "case": "an unparseable score counts as missing",
+      "otherFeatures": "danceable:x,aggressive:0.61,happy:0.62,party:0.62,relaxed:0.57,sad:0.58",
+      "producer": "classifier",
+      "ranks": [null, 0.751357, 0.68216, 0.812135, 0.559004, 0.626983],
+      "slots": [
+        0, 0.7513570189476013, 0.6821600198745728, 0.8121349811553955, 0.559004008769989,
+        0.6269829869270325
+      ]
+    },
+    {
+      "case": "no other_features: all slots 0",
+      "otherFeatures": null,
+      "producer": null,
+      "ranks": [null, null, null, null, null, null],
+      "slots": [0, 0, 0, 0, 0, 0]
+    },
+    {
+      "case": "empty other_features: all slots 0",
+      "otherFeatures": "",
+      "producer": null,
+      "ranks": [null, null, null, null, null, null],
+      "slots": [0, 0, 0, 0, 0, 0]
+    }
+  ],
+  "albums": [
+    {
+      "name": "dance",
+      "otherFeatures": [
+        "danceable:0.72,aggressive:0.62,happy:0.66,party:0.7,relaxed:0.5,sad:0.49",
+        "danceable:0.7,aggressive:0.6,happy:0.67,party:0.69,relaxed:0.51,sad:0.5",
+        "danceable:0.68,aggressive:0.64,happy:0.64,party:0.71,relaxed:0.52,sad:0.5"
+      ],
+      "mood": {
+        "mean": [
+          0.9028260111808777, 0.5572713017463684, 0.8607650399208069, 0.9458863735198975,
+          0.1284506767988205, 0.08254966884851456
+        ],
+        "min": [
+          0.8463960289955139, 0.3815310001373291, 0.7444350123405457, 0.9162200093269348,
+          0.08235300332307816, 0.06454700231552124
+        ],
+        "max": [
+          0.9558969736099243, 0.7306519746780396, 0.9416810274124146, 0.9728090167045593,
+          0.17756600677967072, 0.09155099838972092
+        ]
+      }
+    },
+    {
+      "name": "calm",
+      "otherFeatures": [
+        "danceable:0.54,aggressive:0.55,happy:0.56,party:0.53,relaxed:0.66,sad:0.65",
+        "danceable:0.55,aggressive:0.54,happy:0.57,party:0.52,relaxed:0.67,sad:0.64",
+        "danceable:0.53,aggressive:0.56,happy:0.55,party:0.54,relaxed:0.65,sad:0.66"
+      ],
+      "mood": {
+        "mean": [
+          0.04610700532793999, 0.07117466628551483, 0.10296066850423813, 0.04685666784644127,
+          0.9229333400726318, 0.9240869879722595
+        ],
+        "min": [
+          0.022115999832749367, 0.03943200036883354, 0.06528300046920776, 0.02538900077342987,
+          0.8957319855690002, 0.8927339911460876
+        ],
+        "max": [
+          0.0737600028514862, 0.1065170019865036, 0.1440889984369278, 0.07107800245285034,
+          0.947924017906189, 0.9526529908180237
+        ]
+      }
+    },
+    {
+      "name": "middle, one song without moods",
+      "otherFeatures": [
+        "danceable:0.61,aggressive:0.61,happy:0.62,party:0.62,relaxed:0.57,sad:0.58",
+        "danceable:0.62,aggressive:0.6,happy:0.63,party:0.61,relaxed:0.58,sad:0.57",
+        null
+      ],
+      "mood": {
+        "mean": [
+          0.35334500670433044, 0.28389066457748413, 0.3945886790752411, 0.3356209993362427,
+          0.33915796875953674, 0.32579800486564636
+        ],
+        "min": [0, 0, 0, 0, 0, 0],
+        "max": [
+          0.5662490129470825, 0.4701409935951233, 0.6442040205001831, 0.5396339893341064,
+          0.5403109788894653, 0.5231549739837646
+        ]
+      }
+    },
+    {
+      "name": "mixed producers",
+      "otherFeatures": [
+        "danceable:0.12,aggressive:0.03,happy:0.4,party:0.05,relaxed:0.7,sad:0.2",
+        "danceable:0.54,aggressive:0.55,happy:0.56,party:0.53,relaxed:0.66,sad:0.65"
+      ],
+      "mood": {
+        "mean": [
+          0.08579250425100327, 0.22342699766159058, 0.28836148977279663, 0.1564449965953827,
+          0.7799249887466431, 0.6309155225753784
+        ],
+        "min": [
+          0.042445000261068344, 0.06757500022649765, 0.09950999915599823, 0.044103000313043594,
+          0.6347060203552246, 0.3349570035934448
+        ],
+        "max": [
+          0.1291400045156479, 0.3792789876461029, 0.4772129952907562, 0.2687869966030121,
+          0.9251440167427063, 0.9268739819526672
+        ]
+      }
+    }
+  ],
+  "pairs": [
+    {
+      "a": "dance",
+      "b": "calm",
+      "moodDistance": 0.8133911669730398
+    },
+    {
+      "a": "dance",
+      "b": "middle, one song without moods",
+      "moodDistance": 0.13393989555945818
+    },
+    {
+      "a": "dance",
+      "b": "mixed producers",
+      "moodDistance": 0.5844716348419623
+    },
+    {
+      "a": "calm",
+      "b": "middle, one song without moods",
+      "moodDistance": 0.3544739207663703
+    },
+    {
+      "a": "calm",
+      "b": "mixed producers",
+      "moodDistance": 0.04360240601830545
+    },
+    {
+      "a": "middle, one song without moods",
+      "b": "mixed producers",
+      "moodDistance": 0.19075541273187357
+    }
+  ]
+}

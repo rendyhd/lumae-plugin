@@ -1,0 +1,101 @@
+{
+  "description": "Album Dynamics energy (lumae_album_dynamics_v2): raw AudioMuse energy on the library energy scale. Generated from src/lib/albumDynamics.ts; the Python ports assert the same values.",
+  "method": "lumae_album_dynamics_v2",
+  "calibrationVersion": "sonic-calibration-v2",
+  "songs": [
+    { "scale": { "kind": "v34" }, "raw": null, "energy": null },
+    { "scale": { "kind": "v34" }, "raw": 0, "energy": 0 },
+    { "scale": { "kind": "v34" }, "raw": 0.010772896, "energy": 0 },
+    { "scale": { "kind": "v34" }, "raw": 0.15, "energy": 0.001587 },
+    { "scale": { "kind": "v34" }, "raw": 0.2126, "energy": 0.0023 },
+    { "scale": { "kind": "v34" }, "raw": 0.3561628, "energy": 0.003936 },
+    { "scale": { "kind": "v34" }, "raw": 0.5303, "energy": 0.032338 },
+    { "scale": { "kind": "v34" }, "raw": 0.6824, "energy": 0.232063 },
+    { "scale": { "kind": "v34" }, "raw": 0.7369, "energy": 0.477673 },
+    { "scale": { "kind": "v34" }, "raw": 0.7405731, "energy": 0.501961 },
+    { "scale": { "kind": "v34" }, "raw": 0.7737, "energy": 0.735893 },
+    { "scale": { "kind": "v34" }, "raw": 0.8118, "energy": 0.947434 },
+    { "scale": { "kind": "v34" }, "raw": 0.8317, "energy": 0.989185 },
+    { "scale": { "kind": "v34" }, "raw": 0.90345806, "energy": 1 },
+    { "scale": { "kind": "v34" }, "raw": 0.95, "energy": 1 },
+    { "scale": { "kind": "range", "min": 0.0588, "max": 0.3108 }, "raw": null, "energy": null },
+    { "scale": { "kind": "range", "min": 0.0588, "max": 0.3108 }, "raw": 0.03, "energy": 0 },
+    { "scale": { "kind": "range", "min": 0.0588, "max": 0.3108 }, "raw": 0.0588, "energy": 0 },
+    {
+      "scale": { "kind": "range", "min": 0.0588, "max": 0.3108 },
+      "raw": 0.1261,
+      "energy": 0.26706349206349206
+    },
+    {
+      "scale": { "kind": "range", "min": 0.0588, "max": 0.3108 },
+      "raw": 0.1866,
+      "energy": 0.5071428571428571
+    },
+    {
+      "scale": { "kind": "range", "min": 0.0588, "max": 0.3108 },
+      "raw": 0.2496,
+      "energy": 0.7571428571428571
+    },
+    { "scale": { "kind": "range", "min": 0.0588, "max": 0.3108 }, "raw": 0.3108, "energy": 1 },
+    { "scale": { "kind": "range", "min": 0.0588, "max": 0.3108 }, "raw": 0.35, "energy": 1 },
+    { "scale": { "kind": "range", "min": 0.01, "max": 0.15 }, "raw": 0.005, "energy": 0 },
+    { "scale": { "kind": "range", "min": 0.01, "max": 0.15 }, "raw": 0.01, "energy": 0 },
+    {
+      "scale": { "kind": "range", "min": 0.01, "max": 0.15 },
+      "raw": 0.07,
+      "energy": 0.42857142857142866
+    },
+    { "scale": { "kind": "range", "min": 0.01, "max": 0.15 }, "raw": 0.15, "energy": 1 },
+    { "scale": { "kind": "range", "min": 0.01, "max": 0.15 }, "raw": 0.2, "energy": 1 }
+  ],
+  "albums": [
+    {
+      "name": "v34 quiet-to-loud arc",
+      "scale": { "kind": "v34" },
+      "rawEnergies": [0.5303, 0.6824, 0.7369, 0.7737, 0.8118],
+      "energy": {
+        "min": 0.032338,
+        "max": 0.947434,
+        "mean": 0.48508019999999996,
+        "q1": 0.232063,
+        "q3": 0.735893
+      }
+    },
+    {
+      "name": "v34 loud",
+      "scale": { "kind": "v34" },
+      "rawEnergies": [0.7737, 0.79, 0.8118, 0.8317, 0.8],
+      "energy": {
+        "min": 0.735893,
+        "max": 0.989185,
+        "mean": 0.8828934,
+        "q1": 0.842849,
+        "q3": 0.947434
+      }
+    },
+    {
+      "name": "v34 quiet with a missing song",
+      "scale": { "kind": "v34" },
+      "rawEnergies": [0.2126, 0.45, null, 0.6, 0.62],
+      "energy": {
+        "min": 0.0023,
+        "max": 0.099555,
+        "mean": 0.047759750000000004,
+        "q1": 0.010502,
+        "q3": 0.08184975
+      }
+    },
+    {
+      "name": "old formula",
+      "scale": { "kind": "range", "min": 0.0588, "max": 0.3108 },
+      "rawEnergies": [0.0588, 0.1261, 0.1866, 0.2496, 0.3108, 0.35],
+      "energy": {
+        "min": 0,
+        "max": 1,
+        "mean": 0.588558201058201,
+        "q1": 0.32708333333333334,
+        "q3": 0.9392857142857143
+      }
+    }
+  ]
+}

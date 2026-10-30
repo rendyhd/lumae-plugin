@@ -276,6 +276,7 @@ def render_relationship_status_panel():
             and int(state.get("source_analysis_generation") or 0) == analysis_generation
             and int(state.get("schema_version") or 0) == _pkg.RELATIONSHIP_SCHEMA_VERSION
             and int(state.get("algorithm_version") or 0) == _pkg.RELATIONSHIP_ALGORITHM_VERSION
+            and int(state.get("scoring_revision") or 0) == _pkg.RELATIONSHIP_SCORING_REVISION
         )
         active = status in ("queued", "running")
         active_work = active_work or active
