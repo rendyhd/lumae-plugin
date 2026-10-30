@@ -19,6 +19,18 @@ Library passes can use every AudioMuse worker (issue #10; plan
   download or analyze one track; a runner that goes away (no heartbeat for 90
   seconds) loses its batches to the next taker. On-demand tracks,
   relationships and catalogue work stay with the leader.
+- One runner per worker container works: an AudioMuse worker container
+  starts two task-queue workers, and "Files analyzed at once" is sized for
+  the whole container, so the other stands by.
+- A source's edge and loudness passes wait while its waveform pass has
+  tracks due or in flight (a waveform analysis measures edge and loudness
+  from the same download), and its loudness pass while edge batches are out,
+  so no file is downloaded twice.
+- The waveform tracks a worker had taken when it went away are due again at
+  the other workers' next turn, not after the hour a stale attempt waits; a
+  new leader takes up the waveform pass the previous one left at once; and a
+  helping worker takes the lead within about a minute of the leader going
+  away.
 - New setting `max_files_in_flight` (16, 1–64): the files analyzed at once
   across all workers, so more workers do not mean more load on the music
   server than this.

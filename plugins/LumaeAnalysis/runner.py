@@ -61,6 +61,13 @@ STANDBY_SECONDS = 60
 HEARTBEAT_SECONDS = 30
 # A worker counts as online while its runner's heartbeat is this recent.
 WORKER_ONLINE_SECONDS = 90
+# Multi-worker plan R1: an AudioMuse worker container runs two task-queue
+# workers (queues ``default`` and ``high``) and each starts a worker runner,
+# while ``background_workers`` sizes the files analysed at once for the whole
+# container. With helpers, a runner first takes its host's lock (this class,
+# and a hash of the role and host name): one runner per host leads or helps,
+# and the others there stand by.
+HOST_LOCK_CLASS = 550102133
 # With nothing due, a leader still looks this often.
 SWEEP_SECONDS = 15 * 60
 # Between turns that worked, so AudioMuse's request threads get the interpreter.
@@ -287,7 +294,7 @@ class Runner:
     whether a runner that misses the lock helps (multi-worker plan)."""
 
     def __init__(self, role, *, app, turn, connect, still_installed=None,
-                 startup_delay=None, clock=time.monotonic, can_help=None):
+                 startup_delay=None, clock=time.monotonic, can_help=None, host=None):
         if role not in ROLES:
             raise ValueError(f"unknown runner role {role!r}")
         self.role = role
@@ -300,6 +307,7 @@ class Runner:
                               else startup_delay)
         self.clock = clock
         self.pid = os.getpid()
+        self.host = (host or socket.gethostname())[:200]
         self.runner_id = new_runner_id()
         self.thread = None
         self.stopped = threading.Event()
@@ -382,7 +390,14 @@ class Runner:
         conn = self.connect(f"lumae-runner-{self.role}-{os.getpid()}")
         conn.autocommit = True
         self._conn = conn
-        if not self._try_lock() and not self._may_help():
+        helps = self._may_help()
+        if helps and not self._try_host_lock():
+            # Another runner on this host leads or helps.
+            self._release()
+            self.mode = "standby"
+            self._wait(STANDBY_SECONDS)
+            return
+        if not self._try_lock() and not (helps and not self._leader_here()):
             self._release()
             self.mode = "standby"
             self._wait(STANDBY_SECONDS)
@@ -410,13 +425,13 @@ class Runner:
                     break
                 if self.helping and self.clock() - tried >= STANDBY_SECONDS:
                     # A helper leads once the leader went away, and stands by
-                    # once helping is switched off.
+                    # once helping is switched off or the leader is on its host.
                     tried = self.clock()
                     if self._try_lock():
                         self.helping = False
                         logger.info("Lumae's %s runner %s leads now", self.role, self.runner_id)
                         self._heartbeat(started=True)
-                    elif not self._may_help():
+                    elif not self._may_help() or self._leader_here():
                         break
                 turn = self._turn()
                 if turn.worked:
@@ -451,6 +466,39 @@ class Runner:
             self.leading = True
             self.new_leader = True
         return won
+
+    def _try_host_lock(self):
+        """Take this host's lock for the role on this runner's connection (R1)."""
+        with self._conn_lock:
+            cur = self._conn.cursor()
+            try:
+                cur.execute("SELECT pg_try_advisory_lock(%s, hashtext(%s))",
+                            (HOST_LOCK_CLASS, f"{self.role}:{self.host}"))
+                return bool(cur.fetchone()[0])
+            finally:
+                cur.close()
+
+    def _leader_here(self):
+        """Whether the role's leader is another runner on this host: it works there,
+        so this one does not help (it led before helping was switched on, without the
+        host's lock). True when it cannot tell."""
+        with self._conn_lock:
+            cur = self._conn.cursor()
+            try:
+                cur.execute(
+                    f"""SELECT 1 FROM {workers_table()}
+                         WHERE role=%s AND leader AND host=%s AND runner_id<>%s
+                           AND heartbeat_at > now() - make_interval(secs => %s)
+                         LIMIT 1""",
+                    (self.role, self.host, self.runner_id, WORKER_ONLINE_SECONDS),
+                )
+                return cur.fetchone() is not None
+            except Exception:
+                logger.debug("Lumae's %s runner could not read where its leader runs", self.role,
+                             exc_info=True)
+                return True
+            finally:
+                cur.close()
 
     def _may_help(self):
         """Whether a runner that does not lead helps (``can_help``); False when it cannot tell."""
@@ -570,7 +618,7 @@ class Runner:
                 heartbeat_at=now()
             """,
             {"id": self.runner_id, "role": self.role, "leader": bool(self.leading),
-             "host": socket.gethostname()[:200], "pid": os.getpid(), "mode": str(self.mode)[:40],
+             "host": self.host, "pid": os.getpid(), "mode": str(self.mode)[:40],
              "reason": str(self.reason)[:200] if self.reason else None, "action": self.action,
              "last": self.last_action, "actions": self.actions, "files": self.files_at_once,
              "started": bool(started)},
@@ -602,7 +650,7 @@ class Runner:
                     ELSE now() END,
                 heartbeat_at=now()
             """,
-            {"role": self.role, "host": socket.gethostname()[:200], "pid": os.getpid(),
+            {"role": self.role, "host": self.host, "pid": os.getpid(),
              "mode": str(self.mode)[:40],
              "reason": str(self.reason)[:200] if self.reason else None,
              "action": self.action, "last": self.last_action, "actions": self.actions,
@@ -622,6 +670,16 @@ class Runner:
                     cur.close()
             except Exception:
                 logger.debug("Lumae's %s runner could not release its lock", self.role,
+                             exc_info=True)
+            try:
+                if leading:
+                    # Its host's other runner need not wait for this row to go stale (R1).
+                    cur = conn.cursor()
+                    cur.execute(f"UPDATE {workers_table()} SET leader=false WHERE runner_id=%s",
+                                (self.runner_id,))
+                    cur.close()
+            except Exception:
+                logger.debug("Lumae's %s runner could not clear its leader row", self.role,
                              exc_info=True)
             try:
                 conn.close()

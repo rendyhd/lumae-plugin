@@ -62,8 +62,18 @@ first draft*).
   The on-demand claims stay the role's, released by today's rules (R6 of the runner plan).
 - A helper steps aside exactly like the leader: for every `WORKER_YIELD_TASK_TYPES` job,
   and while AudioMuse analyses.
-- A helper tries the lock every STANDBY_SECONDS: it leads once the leader went away, and
-  stands by once helping is switched off.
+- A helper tries the lock between its turns, which last at most HELPER_TURN_SECONDS
+  (STANDBY_SECONDS, a minute): it leads once the leader went away, and stands by once
+  helping is switched off. Found in the end-to-end run: with a whole runner turn (five
+  minutes) between tries, the role went without a leader for four minutes.
+- **One runner per host.** An AudioMuse worker container runs two task-queue workers
+  (queues `default` and `high`), and each starts a worker runner, while K is sized for the
+  whole container. Found in the end-to-end run: with `every`, both helped, so a container
+  analysed 2K files. With `every` a runner first takes its host's advisory lock
+  (`HOST_LOCK_CLASS`, a hash of role and host name); without it, it stands by. A helper also
+  stands by while the leader is another runner on its host (a leader from before `every`
+  was switched on holds no host lock). A runner that stops leading clears its row's
+  `leader`, so its host's other runner need not wait for the row to go stale.
 
 ### R2 Runner identity
 - Every runner gets a `runner_id` (host, pid, a start nonce), and `RUNNER_ID` / `HELPING`
@@ -87,11 +97,32 @@ first draft*).
 - **Completion.** A pass completes only when nothing is due after its cursor and no batch
   is out, inside the same transaction. A pass another runner completed, or one that is
   parked, hands out nothing.
+- **Pass order.** A waveform analysis measures its track's edge and loudness from the same
+  download, and an edge analysis its loudness. One runner walks the passes one after the
+  other; with `every`, a runner that found the waveform pass's tracks all taken went on to
+  the loudness pass, which measured tracks the waveform pass then downloaded again (9 of
+  120 in the end-to-end run). So a source's edge and loudness passes wait
+  (`_earlier_pass_running`, `PASS_WAIT_SECONDS`) while its waveform pass has a track due or
+  in flight, and its loudness pass while edge batches are out. A waveform track counts as in
+  flight for a turn and its file's time limit after admission, so a runner that went away
+  holds the later passes back no longer than that.
 - **Waveform.** The waveform backfill selects due tracks, not a cursor, so it needs no
   batches: a background admission with `keep_live` leaves a track another runner's batch
   admitted since the selection to that attempt (`admit_attempts`), so two batches never
   admit one track. Helpers count what they analysed and leave the backfill's state to the
   leader.
+- **A waveform batch whose runner went away.** A runner records the attempts each waveform
+  batch admitted, with their tokens, in `pass_batches` (`shared_pass.hold`, pass
+  `waveform`) and forgets them when its slice ends. Once a turn every runner takes over the
+  records of runners whose heartbeat is gone (`take_over_gone`, one taker each), releases
+  those attempts uncounted (due again at once; the token keeps a newer attempt) and queues
+  the waveform pass. Found in the end-to-end run: without it, a killed runner's admitted
+  tracks waited an hour as stale attempts (6 of 120), and then for the pass's next run.
+- **A waveform pass the previous leader claimed.** Only a leader claims a waveform pass
+  (`claim_profile_backfill_batch`); a new leader with `every` queues the passes left
+  `running` at once (`_requeue_waveform_claims`) instead of after BACKFILL_STALE_MINUTES.
+  Should the previous leader still finish a batch, `keep_live` keeps the two apart. With
+  `one` the claim waits, as in 1.9.
 
 ### R5 Edge runtime per process
 - A runner without a qualified PyAV skips the edge and loudness passes and leaves their
@@ -137,7 +168,9 @@ Nothing changes until `worker_runners: every` is set.
 - **MW.5 Edge runtime and files in flight (R5, R6).**
 - **MW.6 Settings and status.** *Workers* and *Files analyzed at once across all workers* on
   the settings page; one line per worker runner in the background-work panel.
-- **MW.7 Verification.** See Tests, and the end-to-end run below.
+- **MW.7 Verification.** See Tests, and the end-to-end run
+  ([report](../perf/MULTI-WORKER-E2E-2026-10-30.md)), which found the two fixes above
+  (one runner per host, pass order).
 - **MW.8 Release.** 1.10.0, through the release process (CI's steps in a clean container
   first, then the Actions run on `main`).
 
@@ -146,7 +179,8 @@ Nothing changes until `worker_runners: every` is set.
 - `test_multi_worker_runner_postgres.py` (real advisory locks): a worker that misses the
   lock helps with `can_help` and stands by without it; a helper writes its own row and never
   the role's; it leads once the leader goes away; it stands by once helping is switched off
-  or the setting cannot be read; old rows are pruned.
+  or the setting cannot be read; one runner per host works, also next to a leader from
+  before helping; old rows are pruned.
 - `test_shared_pass_postgres.py`:
   - two takers racing over 40 tracks get disjoint batches and one of them ends the pass;
   - a batch handed back goes first with only its unfinished tracks; a dead runner's batch is
@@ -155,9 +189,16 @@ Nothing changes until `worker_runners: every` is set.
   - the real edge and loudness passes walked by a leader and a helper at once: each track
     downloaded and published once, the pass complete, no batch left; a runner that dies
     holding a batch loses none of its tracks;
-  - a leader's and a helper's waveform batches never admit one track;
+  - a leader's and a helper's waveform batches never admit one track, and a gone runner's
+    admitted waveform tracks are due again at its next taker's turn (a live runner's never);
+    a new leader queues its predecessor's waveform claim with `every` and not with `one`;
+    a helper's turn ends in time to try the lock;
   - a helper turn serves no on-demand work, walks only the per-track passes, gives its slots
-    back, waits while every slot is taken, and does nothing with `one`.
+    back, waits while every slot is taken, and does nothing with `one`;
+  - the edge and loudness passes wait while the waveform pass has a track due or in flight
+    (but not for a track admitted longer ago than a turn and a file's time limit), the
+    loudness pass while an edge batch is out, and a turn whose pass waited comes back in
+    PASS_WAIT_SECONDS.
 - `test_multi_worker_settings.py`: the settings, their form and the status lines.
 - The 1.9.2 suite unchanged (one-runner behaviour), plus CI's steps.
 
@@ -165,10 +206,11 @@ Nothing changes until `worker_runners: every` is set.
 
 - **The music server becomes the bottleneck.** R6 caps it. The settings page shows
   throughput per runner, so an owner can see it.
-- **A slow node holds a chunk.** Chunks are small, and an unfinished tail is released at
-  the runner's deadline; wraparound collects it.
-- **Postgres connections.** Each runner holds one connection for its lock and LISTEN,
-  plus its turn's connections, as the leader does today. Six workers add about twelve.
+- **A slow node holds a batch.** Batches are small, and what a runner did not start is
+  handed back at its slice's deadline for the next taker.
+- **Postgres connections.** Each working runner holds one connection for its lock and
+  LISTEN, plus its turn's connections, as the leader does today; a host's other runner
+  holds one only while it retries. Six workers add about twelve.
 
 ## Not in scope
 

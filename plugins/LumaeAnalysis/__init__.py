@@ -4756,6 +4756,37 @@ def _close_feed(db, feed):
                        exc_info=True)
 
 
+# Multi-worker plan R4: a waveform analysis also measures its track's edge and
+# loudness from the same download, and an edge analysis its loudness. One
+# runner walks the passes one after the other. With every runner walking them
+# at once, a source's edge and loudness passes wait while its waveform pass has
+# tracks due or in flight, and its loudness pass while edge batches are out, so
+# no file is fetched twice. A waveform track counts as in flight for a turn and
+# its file's time limit after its admission: a runner that went away holds the
+# later passes back no longer than that.
+EARLIER_PASS_RUNNING = "earlier_pass_running"
+PASS_WAIT_SECONDS = 30
+
+
+def _earlier_pass_running(db, action, server_id, catalog_instance_id):
+    """Whether the source's ``action`` pass (edge or loudness) waits for an earlier one."""
+    if find_backfill_ids(1, catalog_instance_id=catalog_instance_id, server_id=server_id):
+        return True
+    with db.cursor() as cur:
+        cur.execute(
+            f"""SELECT 1 FROM {source_profiles_table()}
+                 WHERE catalog_instance_id=%s AND status IN ('pending', 'pending_interactive')
+                   AND analyzed_at > now() - make_interval(secs => %s)
+                 LIMIT 1""",
+            (catalog_instance_id, RUNNER_TURN_SECONDS + analysis_time_limit_seconds()),
+        )
+        running = cur.fetchone() is not None
+    if not running and action == "loudness_backfill":
+        running = shared_pass.batches_out(db, "edge", catalog_instance_id) > 0
+    db.commit()
+    return running
+
+
 def _edge_pass_shared(db, server_id, catalog_instance_id, deadline):
     """The edge pass's slice when every worker runner walks it (multi-worker
     plan R4), on this turn's analysis threads, a batch at a time.
@@ -4769,6 +4800,8 @@ def _edge_pass_shared(db, server_id, catalog_instance_id, deadline):
             park_edge_backfill(db)
             return {"status": "paused", "reason": "edge_runtime_unavailable", "processed": 0}
         return {"status": "coalesced", "reason": "edge_runtime_unavailable", "processed": 0}
+    if _earlier_pass_running(db, "edge_backfill", server_id, catalog_instance_id):
+        return {"status": "coalesced", "reason": EARLIER_PASS_RUNNING, "processed": 0}
     pool = parallel_analysis.current()
     counts, limit = {}, analysis_time_limit_seconds()
     feed = _SharedFeed(
@@ -5024,6 +5057,8 @@ def _loudness_pass_shared(db, server_id, catalog_instance_id, deadline, result):
             loudness_backfill.park(db, catalog_instance_id)
             return {**result, "status": "paused", "reason": "loudness_runtime_unavailable"}
         return {**result, "status": "coalesced", "reason": "loudness_runtime_unavailable"}
+    if _earlier_pass_running(db, "loudness_backfill", server_id, catalog_instance_id):
+        return {**result, "status": "coalesced", "reason": EARLIER_PASS_RUNNING}
     pool = parallel_analysis.current()
     page_size = configured_backfill_limit()
     # A track waits for the edge pass when any runner makes edges, not only this one.
@@ -6710,14 +6745,18 @@ def profile_backfill_task(server_id, catalog_instance_id, deadline=None, shared=
             **({"keep_live": True} if shared else {}),
         )
         ids = [track_id for track_id in ids if track_id in claim_tokens]
-        result = analyze_tracks_task(
-            ids,
-            catalog_instance_id=catalog_instance_id,
-            server_id=server_id,
-            priority="background",
-            attempt_tokens=claim_tokens,
-            deadline=deadline,
-        )
+        held = _hold_waveform(catalog_instance_id, claim_tokens) if shared else None
+        try:
+            result = analyze_tracks_task(
+                ids,
+                catalog_instance_id=catalog_instance_id,
+                server_id=server_id,
+                priority="background",
+                attempt_tokens=claim_tokens,
+                deadline=deadline,
+            )
+        finally:
+            _forget_waveform(held)
         analysed = len(ids) - int((result or {}).get("deferred") or 0)
         next_ids = find_backfill_ids(
             1,
@@ -6778,6 +6817,83 @@ def profile_backfill_task(server_id, catalog_instance_id, deadline=None, shared=
 # Multi-worker plan R4: a helper's waveform batch selects again this many
 # times when other runners admitted every track it selected.
 SHARED_BATCH_ATTEMPTS = 3
+# Multi-worker plan R4: the record of a waveform batch's attempts, which any
+# runner releases once its runner went away.
+WAVEFORM_PASS = "waveform"
+
+
+def _hold_waveform(catalog_instance_id, tokens):
+    """Record this runner's admitted waveform attempts for its slice; the
+    record's ID, or None (outside a runner turn, nothing admitted, or the
+    record could not be written: then a stale attempt waits its hour)."""
+    if not tokens or runner.RUNNER_ID.get() is None:
+        return None
+    db = get_db()
+    try:
+        return shared_pass.hold(db, WAVEFORM_PASS, catalog_instance_id, tokens)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not record a waveform batch", exc_info=True)
+        return None
+
+
+def _forget_waveform(held):
+    if held is None:
+        return
+    db = get_db()
+    try:
+        shared_pass.forget(db, held)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not forget a waveform batch", exc_info=True)
+
+
+def _release_gone_waveform(db):
+    """Release the waveform attempts of runners that went away, due again at
+    once, and queue their sources' waveform pass; returns how many. Never
+    raises: what it could not release waits its hour as a stale attempt."""
+    released = 0
+    try:
+        gone = shared_pass.take_over_gone(db, WAVEFORM_PASS)
+        for catalog_instance_id, tokens in gone:
+            released += release_attempts(db, catalog_instance_id, tokens, "runner_gone",
+                                         count_failure=False)
+            with db.cursor() as cur:
+                cur.execute(
+                    f"""UPDATE {profile_backfill_state_table()}
+                           SET status='queued', next_retry_at=NULL, updated_at=now()
+                         WHERE catalog_instance_id=%s AND status <> 'running'""",
+                    (catalog_instance_id,),
+                )
+            db.commit()
+        if released:
+            logger.info("lumae_analysis released %d waveform attempts of a runner that went away",
+                        released)
+            wake_runners(db, "waveform_batch_taken_over", commit=True)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not release a gone runner's waveform attempts",
+                       exc_info=True)
+    return released
+
+
+def _requeue_waveform_claims(db):
+    """A new worker leader with ``every``: the waveform passes the previous
+    leader claimed (only a leader claims one) are queued again at once instead
+    of after BACKFILL_STALE_MINUTES. Should that leader still finish a batch,
+    ``keep_live`` admission keeps the two apart. Never raises."""
+    try:
+        with db.cursor() as cur:
+            cur.execute(
+                f"""UPDATE {profile_backfill_state_table()}
+                       SET status='queued', next_retry_at=NULL, updated_at=now()
+                     WHERE status='running'"""
+            )
+        db.commit()
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not queue the previous leader's waveform pass",
+                       exc_info=True)
 
 
 def helper_profile_batch_task(server_id, catalog_instance_id, deadline=None):
@@ -6804,6 +6920,7 @@ def helper_profile_batch_task(server_id, catalog_instance_id, deadline=None):
             break
     else:
         return {"status": "coalesced", "processed": 0}
+    held = _hold_waveform(catalog_instance_id, tokens)
     try:
         result = analyze_tracks_task(ids, catalog_instance_id=catalog_instance_id, server_id=server_id,
                                      priority="background", attempt_tokens=tokens, deadline=deadline)
@@ -6815,6 +6932,8 @@ def helper_profile_batch_task(server_id, catalog_instance_id, deadline=None):
         except Exception:
             logger.exception("lumae_analysis could not release a failed helper batch")
         raise
+    finally:
+        _forget_waveform(held)
     analysed = len(ids) - int((result or {}).get("deferred") or 0)
     db = get_db()
     with db.cursor() as cur:
@@ -7876,6 +7995,8 @@ def run_runner_turn(active):
     # passes with the helpers, a batch at a time, and parks a pass only when
     # no runner can make it (R5).
     shared = role == runner.ROLE_WORKER and _safe_shared_passes()
+    if shared and active.new_leader:
+        _requeue_waveform_claims(db)
     if role == runner.ROLE_WORKER:
         report_edge_runtime(park=not shared)
     elif allowed & HEAVY_ACTIONS:
@@ -7887,6 +8008,8 @@ def run_runner_turn(active):
     if PER_TRACK_ACTIONS & allowed and reconcile.live_host_task(db, ("main_analysis",)):
         done.update(PER_TRACK_ACTIONS)
     workers, sizing = background_sizing()
+    if shared:
+        _release_gone_waveform(db)
     if shared and PER_TRACK_ACTIONS - done:
         # R6: the leader's analysis threads count towards the files in flight too.
         granted = _safe_acquire_slots(db, workers)
@@ -7898,6 +8021,7 @@ def run_runner_turn(active):
     report = TurnReport()
     started = time.monotonic()
     worked = None
+    waited = False
     relationship_seconds = 0.0
     # Credits sweep once a turn (S8); the K analysis threads (WP1b) start on
     # first use and stop, with their analysis workers, when the turn ends.
@@ -7910,6 +8034,7 @@ def run_runner_turn(active):
                 if action is None:
                     break
                 status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
+                waited = waited or _held_back(result)
                 if _moved_on(status, result):
                     worked = action
                 if status in _SETTLED_STATUSES or (status == "complete" and action in _COMPLETE_SETTLES):
@@ -7932,7 +8057,14 @@ def run_runner_turn(active):
             _refresh_status_after_turn(db, report)
     if worked:
         return runner.Turn(True, "working", lane, None, worked)
+    if waited:
+        return runner.idle_turn(PASS_WAIT_SECONDS, EARLIER_PASS_RUNNING)
     return runner.idle_turn(_runner_next_due_seconds(db))
+
+
+def _held_back(result):
+    """Whether an action's pass waited for an earlier pass another runner walks."""
+    return isinstance(result, dict) and result.get("reason") == EARLIER_PASS_RUNNING
 
 
 def _safe_shared_passes():
@@ -7966,6 +8098,10 @@ def _safe_release_slots(db):
 
 # Multi-worker plan R1: what a helper turn may do, in this order.
 HELPER_ACTIONS = ("profile_backfill", "edge_backfill", "loudness_backfill")
+# A helper's turn is short: between turns it tries the role's lock, so a
+# leader that went away is replaced within about a minute, as by a runner
+# standing by (multi-worker plan R1).
+HELPER_TURN_SECONDS = runner.STANDBY_SECONDS
 
 
 def run_helper_turn(active):
@@ -7990,6 +8126,7 @@ def run_helper_turn(active):
         return runner.Turn(False, "waiting_host", "audiomuse:main_analysis",
                            RUNNER_HOST_WAIT_SECONDS, None)
     report_edge_runtime(park=False)
+    _release_gone_waveform(db)
     workers, sizing = background_sizing()
     granted = _safe_acquire_slots(db, workers)
     if not granted:
@@ -7998,15 +8135,17 @@ def run_helper_turn(active):
     report = TurnReport()
     started = time.monotonic()
     worked = None
+    waited = False
     done = set()
     try:
         with parallel_analysis.tick_scope(
                 granted, f"{sizing}; {granted} of {max_files_in_flight()} files in flight across workers"):
-            while time.monotonic() - started < RUNNER_TURN_SECONDS and not active.stopped.is_set():
+            while time.monotonic() - started < HELPER_TURN_SECONDS and not active.stopped.is_set():
                 action, result = _next_helper_action(db, report, active, done)
                 if action is None:
                     break
                 status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
+                waited = waited or _held_back(result)
                 if _moved_on(status, result):
                     worked = action
                 if status in _SETTLED_STATUSES or status == "complete":
@@ -8021,6 +8160,8 @@ def run_helper_turn(active):
             _refresh_status_after_turn(db, report)
     if worked:
         return runner.Turn(True, "working", "helper", None, worked)
+    if waited:
+        return runner.idle_turn(PASS_WAIT_SECONDS, EARLIER_PASS_RUNNING)
     return runner.idle_turn(None, "helper_nothing_due")
 
 

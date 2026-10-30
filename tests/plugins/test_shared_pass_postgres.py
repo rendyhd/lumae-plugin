@@ -295,6 +295,11 @@ def runners(tick, second_connection, monkeypatch, tmp_path):
     assert not list(tmp_path.glob("downloads/*"))
 
 
+def _waveforms_done(mod, monkeypatch):
+    """The waveform pass has nothing due: these tests walk the later passes alone."""
+    monkeypatch.setattr(mod, "find_backfill_ids", lambda *_args, **_kwargs: [])
+
+
 def _edge_tracks(db, names):
     _edge_library(db, names)
     with db.cursor() as cur:
@@ -307,8 +312,9 @@ def _edge_tracks(db, names):
     db.commit()
 
 
-def test_two_runners_walk_the_edge_pass_and_analyse_each_track_once(runners):
+def test_two_runners_walk_the_edge_pass_and_analyse_each_track_once(runners, monkeypatch):
     mod, db, downloads, together, _both = runners
+    _waveforms_done(mod, monkeypatch)
     names = [f"track-{index:02d}" for index in range(10)]
     _edge_tracks(db, names)
 
@@ -324,6 +330,7 @@ def test_two_runners_walk_the_edge_pass_and_analyse_each_track_once(runners):
 
 def test_two_runners_walk_the_loudness_pass_and_measure_each_track_once(runners, monkeypatch):
     mod, db, downloads, together, _both = runners
+    _waveforms_done(mod, monkeypatch)
     monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: False)
     mod.test_signature = lambda _track_id: "catalog-media:revision-a"  # _track's media
     names = [f"track-{index:02d}" for index in range(10)]
@@ -342,8 +349,9 @@ def test_two_runners_walk_the_loudness_pass_and_measure_each_track_once(runners,
     assert shared_pass.batches_out(db, "loudness", SOURCE) == 0
 
 
-def test_a_runner_that_dies_holding_a_batch_loses_none_of_its_tracks(runners):
+def test_a_runner_that_dies_holding_a_batch_loses_none_of_its_tracks(runners, monkeypatch):
     mod, db, downloads, together, _both = runners
+    _waveforms_done(mod, monkeypatch)
     names = [f"track-{index:02d}" for index in range(6)]
     _edge_tracks(db, names)
     _alive(db, dead=["gone"])
@@ -454,3 +462,142 @@ def test_a_helper_turn_with_one_worker_runner_does_nothing(tick, monkeypatch):
     active = Active("worker")
     active.helping = True
     assert mod.run_runner_turn(active).reason == "one_worker_runner"
+
+
+def test_with_every_runner_the_later_passes_wait_for_the_waveform_pass(tick, monkeypatch):
+    # A waveform analysis measures the track's edge and loudness from its own download: while
+    # the waveform pass has the track due or in flight, the edge and loudness passes leave it.
+    mod, db = tick
+    _track(db, "track-00")
+    loudness_backfill.ensure_sources(db)
+
+    def waits(action):
+        return mod._earlier_pass_running(db, action, SERVER, SOURCE)
+
+    assert waits("edge_backfill") and waits("loudness_backfill")  # due for its waveform
+    downloads = []
+    monkeypatch.setattr(mod, "load_track_file", lambda *args, **kwargs: downloads.append(args))
+    result = mod.loudness_backfill_task(SERVER, SOURCE, time.monotonic() + 5, True)
+    assert (result["status"], result["reason"]) == ("coalesced", mod.EARLIER_PASS_RUNNING)
+    assert downloads == [] and shared_pass.batches_out(db, "loudness", SOURCE) == 0
+
+    assert mod.mark_pending(["track-00"], catalog_instance_id=SOURCE, priority="background")
+    assert waits("edge_backfill") and waits("loudness_backfill")  # in flight on a runner
+    # Admitted longer ago than a turn and a file's time limit: its runner went away.
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {P}source_profiles SET analyzed_at=now()-interval '30 minutes'")
+    db.commit()
+    assert not waits("edge_backfill") and not waits("loudness_backfill")
+
+    # An edge batch out holds the loudness pass back (the edge measures loudness too).
+    with db.cursor() as cur:
+        cur.execute(f"INSERT INTO {P}pass_batches (pass_name, catalog_instance_id, runner_id, track_ids) "
+                    "VALUES ('edge', %s, 'leader', ARRAY['track-00'])", (SOURCE,))
+    db.commit()
+    assert waits("loudness_backfill") and not waits("edge_backfill")
+
+
+@pytest.mark.parametrize("helping", [True, False])
+def test_a_turn_whose_pass_waited_comes_back_soon(tick, monkeypatch, helping):
+    mod, db = tick
+    monkeypatch.setattr(mod, "_safe_shared_passes", lambda: True)
+    monkeypatch.setattr(mod, "background_sizing", lambda: (1, "test"))
+    monkeypatch.setattr(mod, "_runner_blocker", lambda *_args: None)
+    monkeypatch.setattr(mod, "runner_lane", lambda *_args: (mod.PER_TRACK_ACTIONS, "heavy_lane"))
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda **_kwargs: None)
+    answers = [("edge_backfill", {"status": "coalesced", "reason": mod.EARLIER_PASS_RUNNING}),
+               (None, None)]
+    name = "_next_helper_action" if helping else "_next_runner_action"
+    monkeypatch.setattr(mod, name, lambda *_args: answers.pop(0))
+    _alive(db, "runner-1")
+    active = Active("worker")
+    active.helping = helping
+    token = runner.RUNNER_ID.set("runner-1")
+    try:
+        result = mod.run_runner_turn(active)
+    finally:
+        runner.RUNNER_ID.reset(token)
+    assert (result.reason, result.next_due_seconds) == (mod.EARLIER_PASS_RUNNING, mod.PASS_WAIT_SECONDS)
+
+
+def test_a_gone_runners_waveform_attempts_are_due_again_at_once(tick):
+    # Without the record they would wait PREPARATION_STALE_HOURS as stale attempts.
+    mod, db = tick
+    for name in ("track-00", "track-01", "track-02"):
+        _track(db, name)
+    _alive(db, "live", dead=["gone"])
+
+    def admitted(runner_id, names):
+        tokens = mod.mark_pending(names, catalog_instance_id=SOURCE, priority="background")
+        token = runner.RUNNER_ID.set(runner_id)
+        try:
+            assert mod._hold_waveform(SOURCE, tokens)
+        finally:
+            runner.RUNNER_ID.reset(token)
+
+    admitted("gone", ["track-00", "track-01"])
+    admitted("live", ["track-02"])
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {P}profile_backfill_state SET status='complete', "
+                    "next_retry_at=now()+interval '6 hours'")
+    db.commit()
+
+    assert mod._release_gone_waveform(db) == 2
+    assert _rows(db, f"SELECT track_id, status FROM {P}source_profiles ORDER BY track_id") == [
+        ("track-00", "stale"), ("track-01", "stale"), ("track-02", "pending")]
+    assert sorted(mod.find_backfill_ids(5, catalog_instance_id=SOURCE, server_id=SERVER)) == [
+        "track-00", "track-01"]
+    assert _rows(db, f"SELECT status, next_retry_at FROM {P}profile_backfill_state") == [("queued", None)]
+    # The live runner's record stays; a second taker finds nothing.
+    assert _rows(db, f"SELECT runner_id, track_ids FROM {P}pass_batches") == [("live", ["track-02"])]
+    assert mod._release_gone_waveform(db) == 0
+
+
+def test_a_helper_turn_ends_in_time_to_try_the_lock(tick, monkeypatch):
+    # A helper tries the role's lock between turns: a leader that went away is
+    # replaced within about a minute, not after a whole turn of work.
+    mod, db = tick
+    monkeypatch.setattr(mod, "_safe_shared_passes", lambda: True)
+    monkeypatch.setattr(mod, "background_sizing", lambda: (1, "test"))
+    monkeypatch.setattr(mod, "_runner_blocker", lambda *_args: None)
+    monkeypatch.setattr(mod, "runner_lane", lambda *_args: (mod.PER_TRACK_ACTIONS, "heavy_lane"))
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda **_kwargs: None)
+    monkeypatch.setattr(mod, "HELPER_TURN_SECONDS", 0.3)
+    monkeypatch.setattr(mod, "_next_helper_action",
+                        lambda *_args: ("profile_backfill", {"status": "queued", "processed": 1}))
+    assert mod.HELPER_TURN_SECONDS < mod.RUNNER_TURN_SECONDS
+    _alive(db, "helper-1")
+    active = Active("worker")
+    active.helping = True
+    token = runner.RUNNER_ID.set("helper-1")
+    started = time.monotonic()
+    try:
+        result = mod.run_runner_turn(active)
+    finally:
+        runner.RUNNER_ID.reset(token)
+    assert result.worked and time.monotonic() - started < 3
+
+
+@pytest.mark.parametrize("shared", [True, False])
+def test_a_new_leader_with_every_runner_queues_its_predecessors_waveform_claim(tick, monkeypatch, shared):
+    # Only a leader claims a waveform pass; the lock says the previous one is gone.
+    # With one runner the claim waits BACKFILL_STALE_MINUTES, as in 1.9.
+    mod, db = tick
+    _queued_backfill(db)
+    assert mod.claim_profile_backfill_batch(SOURCE)
+    assert _rows(db, f"SELECT status FROM {P}profile_backfill_state") == [("running",)]
+    monkeypatch.setattr(mod, "_safe_shared_passes", lambda: shared)
+    monkeypatch.setattr(mod, "_runner_blocker", lambda *_args: None)
+    monkeypatch.setattr(mod, "runner_lane", lambda *_args: (mod.PER_TRACK_ACTIONS, "heavy_lane"))
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda **_kwargs: None)
+    monkeypatch.setattr(mod, "_next_runner_action", lambda *_args: (None, None))
+    _alive(db, "leader-2")
+    active = Active("worker")
+    active.new_leader = True
+    token = runner.RUNNER_ID.set("leader-2")
+    try:
+        mod.run_runner_turn(active)
+    finally:
+        runner.RUNNER_ID.reset(token)
+    status = "queued" if shared else "running"
+    assert _rows(db, f"SELECT status, next_retry_at FROM {P}profile_backfill_state") == [(status, None)]

@@ -5,7 +5,8 @@ instead of standing by: its turns run with ``helping`` (and ``HELPING``) set,
 it heartbeats a row of its own in ``runner_workers`` and never the role's
 ``runner_state`` row, it leads once the leader goes away, and it stands by
 again once helping is switched off. Without ``can_help`` a second worker
-stands by, as in 1.9.
+stands by, as in 1.9. One runner per host leads or helps: an AudioMuse worker
+container starts two.
 """
 import contextlib
 import os
@@ -68,6 +69,8 @@ def make(schema, turn, **kwargs):
         return psycopg2.connect(dsn, application_name=application_name,
                                 options=f"-c search_path={name},public")
 
+    # Each runner on a host of its own, unless the test puts two on one.
+    kwargs.setdefault("host", f"host-{uuid.uuid4().hex[:8]}")
     return runner.Runner("worker", app=App(), turn=turn, connect=connect, startup_delay=0, **kwargs)
 
 
@@ -201,6 +204,47 @@ def test_a_helper_that_cannot_read_the_setting_stands_by(schema):
     assert until(lambda: second.mode == "standby")
     assert not turns.of(second)
     stop(second, leader)
+
+
+def test_one_runner_per_host_works_and_the_other_there_stands_by(schema):
+    turns = Recorder()
+    leader = make(schema, turns, can_help=lambda: True, host="node-a")
+    leader.start()
+    assert until(lambda: leader.leading)
+    sibling = make(schema, turns, can_help=lambda: True, host="node-a")
+    helper = make(schema, turns, can_help=lambda: True, host="node-b")
+    sibling.start()
+    helper.start()
+    assert until(lambda: turns.of(helper))
+    assert until(lambda: sibling.mode == "standby")
+    time.sleep(0.4)
+    assert not turns.of(sibling)
+    # The leader goes away: its host's other runner works again, leading or helping.
+    stop(leader)
+    assert until(lambda: turns.of(sibling))
+    assert until(lambda: helper.leading or sibling.leading)
+    stop(sibling, helper)
+
+
+def test_a_leader_from_before_helping_keeps_its_host_to_itself(schema):
+    _dsn, _name, db = schema
+    turns = Recorder()
+    allowed = {"help": False}
+    leader = make(schema, turns, can_help=lambda: allowed["help"], host="node-a")
+    leader.start()
+    assert until(lambda: leader.leading and leader.runner_id in workers(db))
+    # Helping switched on: the leader never took its host's lock, yet no other
+    # runner there helps.
+    allowed["help"] = True
+    sibling = make(schema, turns, can_help=lambda: allowed["help"], host="node-a")
+    helper = make(schema, turns, can_help=lambda: allowed["help"], host="node-b")
+    sibling.start()
+    helper.start()
+    assert until(lambda: turns.of(helper))
+    assert until(lambda: sibling.mode == "standby")
+    time.sleep(0.4)
+    assert not turns.of(sibling)
+    stop(sibling, helper, leader)
 
 
 def test_rows_of_runners_gone_for_a_day_are_removed(schema):

@@ -1196,6 +1196,8 @@ _RUNNER_REASONS = {
     "helper": "analysis passes, with the other workers",
     "helper_nothing_due": "no analysis pass has a track left for it",
     "files_in_flight_cap": "the other workers analyze as many files as the limit allows",
+    "earlier_pass_running": "waiting while the other workers finish an earlier pass, which "
+                            "measures the same files",
     "one_worker_runner": "one worker does the heavy work (Workers: one worker)",
 }
 _RUNNER_MODES = {"waiting_host": "stepping aside", "standby": "standing by"}

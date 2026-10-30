@@ -19,6 +19,11 @@ Each pass's own per-track rules still apply (an edge job's claim, the due checks
 over from a runner that went away may hold tracks that runner finished, and ``refilter`` drops
 them before they are handed out again.
 
+The waveform pass selects due tracks rather than walking a cursor, and admits them with
+attempt tokens. A runner records each admitted batch with its tokens (``hold``) and forgets it
+when its slice ends; ``take_over_gone`` hands any live runner the batches of a runner that went
+away, so their attempts are released at once instead of after the hour stale attempts wait.
+
 ``acquire_slots`` caps the files analysed at once across every runner (R6). A runner holds one
 row of ``analysis_slots`` per analysis thread of its turn and gives them back when the turn ends;
 a runner that went away loses them.
@@ -46,10 +51,13 @@ def migrate(cur):
             catalog_instance_id TEXT NOT NULL,
             runner_id TEXT,
             track_ids TEXT[] NOT NULL,
-            taken_at TIMESTAMPTZ NOT NULL DEFAULT now()
+            taken_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            tokens TEXT[]
         )
         """
     )
+    # The waveform pass's attempt tokens, parallel to track_ids (``hold``).
+    migrations.ensure_columns(cur, batches_table(), "tokens TEXT[]")
     migrations.ensure_index(
         cur,
         f"CREATE INDEX IF NOT EXISTS {batches_table()}_pass_idx "
@@ -238,6 +246,63 @@ def drop(db, pass_name, catalog_instance_id=None):
     finally:
         cur.close()
     return dropped
+
+
+def hold(db, pass_name, catalog_instance_id, tokens, runner_id=None):
+    """Record a batch the pass admitted on its own: ``tokens`` maps each track ID to its attempt
+    token. Returns its ID, for ``forget``."""
+    runner_id = runner_id or runner.current_runner_id()
+    ids = sorted(tokens)
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""INSERT INTO {batches_table()} (pass_name, catalog_instance_id, runner_id, track_ids, tokens)
+                VALUES (%s, %s, %s, %s, %s) RETURNING batch_id""",
+            (pass_name, catalog_instance_id, runner_id, ids, [tokens[track] for track in ids]),
+        )
+        batch_id = cur.fetchone()[0]
+        db.commit()
+        return batch_id
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        cur.close()
+
+
+def forget(db, batch_id):
+    """The slice that held the batch ended (its attempts finished or were released)."""
+    cur = db.cursor()
+    try:
+        cur.execute(f"DELETE FROM {batches_table()} WHERE batch_id=%s", (batch_id,))
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        cur.close()
+
+
+def take_over_gone(db, pass_name):
+    """Remove the held batches of ``pass_name`` whose runners went away and return them as
+    ``[(catalog_instance_id, {track_id: token})]``; each goes to one taker."""
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""DELETE FROM {batches_table()} pb
+                 WHERE pb.pass_name=%s AND pb.tokens IS NOT NULL
+                   AND NOT {runner.live_runner_sql('pb.runner_id')}
+                RETURNING pb.catalog_instance_id, pb.track_ids, pb.tokens""",
+            (pass_name,),
+        )
+        gone = [(row[0], dict(zip(row[1], row[2]))) for row in cur.fetchall()]
+        db.commit()
+        return gone
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        cur.close()
 
 
 def batches_out(db, pass_name, catalog_instance_id):
