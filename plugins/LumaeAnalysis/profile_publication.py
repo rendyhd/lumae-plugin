@@ -224,8 +224,13 @@ def _withdraw_changed(cur, source, track_id, revision):
     return False
 
 def admit_attempts(db, source, ids, priority="background",
-                   analyzer_version=1, schema_version=1, recovery_arm=None):
-    """Claim exact published occurrences; a known new revision withdraws old data."""
+                   analyzer_version=1, schema_version=1, recovery_arm=None, keep_live=False):
+    """Claim exact published occurrences; a known new revision withdraws old data.
+
+    ``keep_live`` (multi-worker plan R4): leave a track whose attempt is pending (another
+    runner's batch admitted it since this one selected it) to that attempt, instead of taking
+    it over with a new token. Only the tracks admitted get a token.
+    """
     cur = db.cursor()
     tokens = {}
     try:
@@ -301,10 +306,15 @@ def admit_attempts(db, source, ids, priority="background",
                            WHEN {table('source_profiles')}.retry_media_signature
                                    IS DISTINCT FROM EXCLUDED.attempt_media_signature
                            THEN NULL ELSE {table('source_profiles')}.retry_category END,
-                       retry_after=NULL""",
+                       retry_after=NULL
+                   {f"WHERE {table('source_profiles')}.status NOT IN ('pending', 'pending_interactive')"
+                    if keep_live else ""}
+                   RETURNING attempt_token""",
                 (source, track_id, analyzer_version, schema_version, revision, status,
                  token, revision, epoch, analyzer_version, schema_version),
             )
+            if cur.fetchone() is None:
+                continue  # keep_live: another runner's pending attempt has it
             cur.execute(
                 f"""SELECT media_signature FROM {table('published_source_profiles')}
                     WHERE catalog_instance_id=%s AND track_id=%s FOR UPDATE""",

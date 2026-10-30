@@ -34,6 +34,7 @@ from .edge_profile_store import (
     park_edge_backfill, edge_backfill_row, edge_statuses, EDGE_BACKFILL_RESWEEP_HOURS,
     ensure_edge_backfill_sources, rewind_edge_backfill, edge_runtime_reported_within,
     edge_payload_sql, edge_schema_v3_ready, upgrade_stored_edges,
+    edge_due_among, complete_edge_pass_sql, pyav_reported,
 )
 from . import action_isolation
 from . import analysis_bundle
@@ -53,6 +54,7 @@ from . import covers, journeys, vibes
 from . import file_tags
 from . import loudness_backfill, loudness_stream, loudness_v1
 from . import runner
+from . import shared_pass
 from .core_compat import (
     SUPPORTED_CORE_RANGE,
     detect_core,
@@ -1450,10 +1452,11 @@ def _changed_profile_state(report):
     return any(entry["action"] in _PROFILE_STATE_ACTIONS for entry in report.actions)
 
 
-def _next_reconcile_action(db, report, budget, server_id, done):
+def _next_reconcile_action(db, report, budget, server_id, done, shared=False):
     """Run the first due action the budget fits; ``(action, result)`` or
     ``(None, None)`` when none ran. ``done`` collects actions with nothing
-    more to do this turn."""
+    more to do this turn. ``shared`` (multi-worker plan R4): the per-track
+    passes are walked with the helpers."""
 
     def due(action):
         return action not in done and budget.fits(action)
@@ -1576,26 +1579,33 @@ def _next_reconcile_action(db, report, budget, server_id, done):
             return "profile_backfill", _reconcile_step(
                 db, report, "profile_backfill", profile[0], profile[1], profile[1],
                 profile[2] if len(profile) > 2 else 0, profile_backfill_task, *profile[:2],
-                budget.deadline,
+                budget.deadline, *((True,) if shared else ()),
             )
         done.add("profile_backfill")
+    # Multi-worker plan R4: only a shared turn passes ``shared`` on, so a
+    # one-runner turn calls the passes exactly as 1.9 did.
+    sharing = {"shared": True} if shared else {}
     if due("edge_backfill"):
-        edge = next_edge_backfill(db, server_id=server_id) if edge_profiles_enabled() else None
+        # R5: a shared pass is offered to a leader without a runtime too: it
+        # parks the pass when no runner can make edges.
+        edge = (next_edge_backfill(db, server_id=server_id, **sharing)
+                if edge_profiles_enabled() or shared else None)
         if edge:
             budget.start()
             return "edge_backfill", _reconcile_step(
                 db, report, "edge_backfill", edge[0], edge[1], edge[1], 0,
-                edge_backfill_task, edge[0], edge[1], budget.deadline,
+                edge_backfill_task, edge[0], edge[1], budget.deadline, *((True,) if shared else ()),
             )
         done.add("edge_backfill")
     # LN.4c: last of the track work, so it measures only when nothing else waits.
     if due("loudness_backfill"):
-        loudness = next_loudness_backfill(db, server_id=server_id)
+        loudness = next_loudness_backfill(db, server_id=server_id, **sharing)
         if loudness:
             budget.start()
             return "loudness_backfill", _reconcile_step(
                 db, report, "loudness_backfill", loudness[0], loudness[1], loudness[1], 0,
                 loudness_backfill_task, loudness[0], loudness[1], budget.deadline,
+                *((True,) if shared else ()),
             )
         done.add("loudness_backfill")
     for action, call in (("credits", _safe_credits_reconcile),
@@ -2397,7 +2407,7 @@ def arm_profile_claim_recovery(catalog_instance_id, db=None, commit=True):
         cur.close()
 
 
-def mark_pending(ids, catalog_instance_id=None, priority="background"):
+def mark_pending(ids, catalog_instance_id=None, priority="background", keep_live=False):
     if not ids:
         return {}
     if catalog_instance_id:
@@ -2405,7 +2415,7 @@ def mark_pending(ids, catalog_instance_id=None, priority="background"):
         return admit_attempts(
             db, catalog_instance_id, ids, priority=priority,
             analyzer_version=ANALYZER_VERSION, schema_version=SCHEMA_VERSION,
-            recovery_arm=arm_profile_claim_recovery,
+            recovery_arm=arm_profile_claim_recovery, keep_live=keep_live,
         )
     pending_status = "pending_interactive" if priority == "interactive" else "pending"
     db = get_db()
@@ -4542,7 +4552,7 @@ def _release_edge(state):
             remove_downloaded_file(state["info"].get("cleanup_path"))
 
 
-def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
+def edge_backfill_task(server_id, catalog_instance_id, deadline=None, shared=False):
     """One library-pass slice: edges for published tracks until the slice's
     deadline, then yield.
 
@@ -4550,9 +4560,13 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None):
     track at a time until the slice's ``deadline`` (WP1a; it took a fixed 30 s
     before), reading due tracks a page at a time, serving on-demand work
     between tracks, and keeps its cursor at the last track it reached.
+    ``shared`` (multi-worker plan R4): every worker runner walks the pass at
+    once, a batch at a time (``_edge_pass_shared``).
     """
     if maintenance_paused():
         return {"status": "paused", "processed": 0}
+    if shared:
+        return _edge_pass_shared(get_db(), server_id, catalog_instance_id, deadline)
     db = get_db()
     if not edge_profiles_enabled():
         park_edge_backfill(db)
@@ -4670,19 +4684,161 @@ def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, d
     return {"status": "queued", "processed": processed, **counts}
 
 
-def next_loudness_backfill(db, server_id=None):
+# Multi-worker plan R4: a shared pass takes this many tracks per analysis
+# thread at a time, so what a runner hands back at its deadline stays small.
+SHARED_BATCH_PER_THREAD = 2
+SHARED_BATCH_MAX = 25
+
+
+def _shared_batch_size(pool):
+    workers = pool.workers if pool is not None else 1
+    return max(2, min(SHARED_BATCH_MAX, workers * SHARED_BATCH_PER_THREAD))
+
+
+class _SharedFeed:
+    """The units of a shared pass's slice (multi-worker plan R4), a batch at a
+    time from ``shared_pass.take`` as the pass needs them; ``why`` says why
+    it stopped (``shared_pass.OUT`` or ``ENDED``). The pass calls ``started``
+    for each unit it prepares and adds the ones it cancels to ``cancelled``;
+    ``close`` ends this slice's batches, handing back every other unit."""
+
+    def __init__(self, pass_name, state_table, catalog_instance_id, size, *, next_units, track_id,
+                 refilter, complete):
+        self.pass_name, self.state_table = pass_name, state_table
+        self.catalog_instance_id, self.size = catalog_instance_id, size
+        self.next_units, self.track_id, self.refilter, self.complete = next_units, track_id, refilter, complete
+        self.batches = []
+        self.taken = set()
+        self.cancelled = []
+        self.why = None
+
+    def __iter__(self):
+        while True:
+            db = get_db()
+            batch, why = shared_pass.take(
+                db, self.pass_name, self.state_table, self.catalog_instance_id, self.size,
+                next_units=lambda after, size: self.next_units(db, after, size),
+                track_id=self.track_id, refilter=lambda ids: self.refilter(db, ids),
+                complete=lambda cur: self.complete(cur, self.catalog_instance_id))
+            if batch is None:
+                self.why = why
+                return
+            self.batches.append(batch)
+            yield from batch.units
+
+    def started(self, unit):
+        """The pass prepares ``unit``: from now on it finishes it or cancels it. (``run`` may draw a
+        unit it never starts: its serial path draws the next before it looks at the deadline.)"""
+        self.taken.add(self.track_id(unit))
+
+    def close(self):
+        """Delete this slice's batches, handing back their unfinished tracks; returns how many."""
+        cancelled = {self.track_id(unit) for unit in self.cancelled}
+        unfinished = [track for batch in self.batches for track in batch.track_ids
+                      if track not in self.taken or track in cancelled]
+        db = get_db()
+        handed_back = shared_pass.finish(db, self.pass_name, self.state_table, self.catalog_instance_id,
+                                         self.batches, unfinished)
+        self.batches = []
+        if handed_back:
+            wake_runners(db, f"{self.pass_name}_batch_handed_back", commit=True)
+        return handed_back
+
+
+def _close_feed(db, feed):
+    try:
+        feed.close()
+    except Exception:
+        _rollback_if_possible(db)
+        # The batches stay this runner's: once its heartbeat stops another
+        # runner takes them over; until then the pass waits for them.
+        logger.warning("lumae_analysis could not hand back a shared %s batch", feed.pass_name,
+                       exc_info=True)
+
+
+def _edge_pass_shared(db, server_id, catalog_instance_id, deadline):
+    """The edge pass's slice when every worker runner walks it (multi-worker
+    plan R4), on this turn's analysis threads, a batch at a time.
+
+    A runner without a qualified runtime leaves the pass to those with one;
+    the leader parks it only when no runner reported one (R5). A helper
+    serves no on-demand work between files (``serve_interactive``).
+    """
+    if not edge_profiles_enabled():
+        if not runner.HELPING.get() and edge_profiles_analyzable(db) is False:
+            park_edge_backfill(db)
+            return {"status": "paused", "reason": "edge_runtime_unavailable", "processed": 0}
+        return {"status": "coalesced", "reason": "edge_runtime_unavailable", "processed": 0}
+    pool = parallel_analysis.current()
+    counts, limit = {}, analysis_time_limit_seconds()
+    feed = _SharedFeed(
+        "edge", table("edge_backfill_state"), catalog_instance_id, _shared_batch_size(pool),
+        next_units=lambda conn, after, size: edge_backfill_candidates(conn, catalog_instance_id, after, size),
+        track_id=lambda unit: unit,
+        refilter=lambda conn, ids: edge_due_among(conn, catalog_instance_id, ids),
+        complete=complete_edge_pass_sql)
+
+    def prepare(track_id):
+        feed.started(track_id)
+        jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
+        if not jobs:
+            return None
+        outcome, state = _prepare_edge(jobs[0], catalog_instance_id, server_id, defer=True)
+        if state is None:
+            if outcome is not None:
+                counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+            return None
+        info, path, kwargs = state["info"], state["path"], state["kwargs"]
+        return (lambda: (fetch_track_file(info), run_file_analysis(
+            loudness_v1.analyze_edge_file, path, limit_seconds=limit, **kwargs))[1]), state
+
+    def finish(track_id, state, payload, error):
+        if isinstance(error, analysis_download.DownloadError):
+            _refuse_own_download(catalog_instance_id, error)
+            error = parallel_analysis.Cancelled()
+        if isinstance(error, parallel_analysis.Cancelled):
+            _release_edge(state)
+            feed.cancelled.append(track_id)
+            counts["released"] = counts.get("released", 0) + 1
+            return
+        outcome = _finish_edge(state, payload, error)
+        counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+
+    report_edge_runtime(park=False)
+    try:
+        parallel_analysis.run(iter(feed), prepare, finish, pool=pool, deadline=deadline,
+                              between=_serve_between)
+    except Exception as exc:
+        _rollback_if_possible(db)
+        _close_feed(db, feed)
+        update_edge_backfill(db, catalog_instance_id, "failed", error=exc)
+        raise
+    _close_feed(db, feed)
+    processed = sum(counts.values())
+    shared_pass.end_slice(db, table("edge_backfill_state"), catalog_instance_id, processed)
+    if feed.why == shared_pass.ENDED:
+        return {"status": "complete", "processed": processed, **counts}
+    if feed.why == shared_pass.OUT and not processed:
+        # Other runners hold the rest of the pass: nothing for this one now.
+        return {"status": "coalesced", "processed": 0}
+    return {"status": "queued", "processed": processed, **counts}
+
+
+def next_loudness_backfill(db, server_id=None, shared=False):
     """``(server_id, catalog_instance_id)`` of the next loudness turn, or None (LN.4c)."""
-    return loudness_backfill.next_due(db, server_id=server_id)
+    return loudness_backfill.next_due(db, server_id=server_id, shared=shared)
 
 
-def loudness_backfill_task(server_id, catalog_instance_id, deadline=None):
+def loudness_backfill_task(server_id, catalog_instance_id, deadline=None, shared=False):
     """One loudness turn (LN.4c): follow the published catalogue when its generation moved, then
     measure due tracks on the standalone path until the slice's deadline and yield.
 
     Measures one track at a time until the slice's ``deadline`` (WP1a; it took a fixed 30 s and one
     page before), reading due tracks a page of the admin batch size at a time, serving on-demand
     work between tracks, publishes each page's measurements together and keeps its cursor at the
-    last track it reached. A worker without PyAV parks the pass before downloading.
+    last track it reached. A worker without PyAV parks the pass before downloading. ``shared``
+    (multi-worker plan R4): every worker runner walks the pass at once, a batch at a time; a helper
+    leaves following the catalogue to the leader.
     """
     if maintenance_paused():
         return {"status": "paused", "processed": 0}
@@ -4691,8 +4847,13 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None):
     result = {"status": "current", "processed": 0, "ready": 0, "failed": 0, "reconciled": 0}
     try:
         generation = row.get("published_generation")
-        if generation is not None and generation != row.get("reconciled_generation"):
+        if (generation is not None and generation != row.get("reconciled_generation")
+                and not runner.HELPING.get()):
             result["reconciled"] = loudness_backfill.follow_catalogue(db, catalog_instance_id, generation)
+        if shared:
+            if not row.get("shared_due"):
+                return result
+            return _loudness_pass_shared(db, server_id, catalog_instance_id, deadline, result)
         if not row.get("pass_due"):
             return result
         if not loudness_backfill.runtime_available():
@@ -4853,6 +5014,81 @@ def _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, du
     return {**result, "status": "queued"}
 
 
+def _loudness_pass_shared(db, server_id, catalog_instance_id, deadline, result):
+    """The loudness pass's slice when every worker runner walks it (multi-worker plan R4), on this
+    turn's analysis threads, a batch at a time; measurements are published a page (the admin batch
+    size) at a time as on the walk. A runner without PyAV leaves the pass to those with it; the
+    leader parks it only when no runner reported PyAV (R5)."""
+    if not loudness_backfill.runtime_available():
+        if not runner.HELPING.get() and not pyav_reported(db):
+            loudness_backfill.park(db, catalog_instance_id)
+            return {**result, "status": "paused", "reason": "loudness_runtime_unavailable"}
+        return {**result, "status": "coalesced", "reason": "loudness_runtime_unavailable"}
+    pool = parallel_analysis.current()
+    page_size = configured_backfill_limit()
+    # A track waits for the edge pass when any runner makes edges, not only this one.
+    edges_enabled = edge_profiles_enabled() or (
+        edge_setting_enabled() and edge_profiles_analyzable(db) is True)
+    measured, limit = [], analysis_time_limit_seconds()
+    feed = _SharedFeed(
+        "loudness", table("loudness_backfill_state"), catalog_instance_id, _shared_batch_size(pool),
+        next_units=lambda conn, after, size: loudness_backfill.candidates(
+            conn, catalog_instance_id, after, size, edges_enabled=edges_enabled),
+        track_id=lambda unit: unit[0],
+        refilter=lambda conn, ids: loudness_backfill.due_among(
+            conn, catalog_instance_id, ids, edges_enabled=edges_enabled),
+        complete=loudness_backfill.complete_sql)
+
+    def prepare(item):
+        feed.started(item)
+        track_id, media_revision = item
+        outcome, state = _prepare_loudness(db, catalog_instance_id, server_id, track_id,
+                                           media_revision, defer=True)
+        if state is None:
+            result[outcome] += 1
+            return None
+        info = state["info"]
+        return (lambda: (fetch_track_file(info), run_file_analysis(
+            loudness_v1.measure_file, info["file_path"], limit_seconds=limit))[1]), state
+
+    def publish():
+        failed = _publish_loudness(db, catalog_instance_id, measured)
+        result["ready"] -= failed
+        result["failed"] += failed
+        measured.clear()
+
+    def finish(item, state, record, error):
+        if isinstance(error, analysis_download.DownloadError):
+            _refuse_own_download(catalog_instance_id, error)
+            error = parallel_analysis.Cancelled()
+        if isinstance(error, parallel_analysis.Cancelled):
+            if state["info"]:
+                remove_downloaded_file(state["info"].get("cleanup_path"))
+            feed.cancelled.append(item)
+            return
+        result[_finish_loudness(state, record, error, measured)] += 1
+        if len(measured) >= page_size:
+            publish()
+
+    try:
+        parallel_analysis.run(iter(feed), prepare, finish, pool=pool, deadline=deadline,
+                              between=_serve_between)
+        publish()
+    except Exception as exc:
+        _rollback_if_possible(db)
+        _close_feed(db, feed)
+        loudness_backfill.update(db, catalog_instance_id, "failed", error=exc)
+        raise
+    _close_feed(db, feed)
+    result["processed"] = result["ready"] + result["failed"]
+    shared_pass.end_slice(db, table("loudness_backfill_state"), catalog_instance_id, result["processed"])
+    if feed.why == shared_pass.ENDED:
+        return {**result, "status": "complete"}
+    if feed.why == shared_pass.OUT and not result["processed"]:
+        return {**result, "status": "coalesced"}
+    return {**result, "status": "queued"}
+
+
 def _publish_loudness(db, catalog_instance_id, measured):
     """Publish a turn's measurements in one transaction; returns how many failed. Should the batch
     fail, each is published alone, and one that still fails backs off like a failed measurement."""
@@ -4888,9 +5124,11 @@ def serve_interactive(limit=None):
 
     First in every runner pass, and between the files of a library pass, so
     a request waits about one file. Waveform first, then edges. Never raises.
+    A helper serves none (multi-worker plan R1): the on-demand claims are the
+    role's, and the leader serves them between its own files.
     """
     global _serving_interactive
-    if _serving_interactive or maintenance_paused():
+    if _serving_interactive or runner.HELPING.get() or maintenance_paused():
         return 0
     limit = limit or INTERACTIVE_PROFILE_CHUNK_SIZE
     _serving_interactive = True
@@ -6420,11 +6658,13 @@ def next_profile_retry_at(catalog_instance_id, db=None):
     return row[0] if row else None
 
 
-def profile_backfill_task(server_id, catalog_instance_id, deadline=None):
+def profile_backfill_task(server_id, catalog_instance_id, deadline=None, shared=False):
     """Process one small batch; the runner resumes a queued next batch.
 
     ``deadline``: the runner slice's; tracks not started by then are due
-    again at once.
+    again at once. ``shared`` (multi-worker plan R4): helpers admit batches
+    of the same source meanwhile, so a track another runner's batch admitted
+    is left to it.
     """
     if maintenance_paused():
         update_profile_backfill_state(
@@ -6466,7 +6706,8 @@ def profile_backfill_task(server_id, catalog_instance_id, deadline=None):
                     "processed": 0, "queued_next": False}
         claimed_ids = ids
         claim_tokens = mark_pending(
-            ids, catalog_instance_id=catalog_instance_id, priority="background"
+            ids, catalog_instance_id=catalog_instance_id, priority="background",
+            **({"keep_live": True} if shared else {}),
         )
         ids = [track_id for track_id in ids if track_id in claim_tokens]
         result = analyze_tracks_task(
@@ -6532,6 +6773,58 @@ def profile_backfill_task(server_id, catalog_instance_id, deadline=None):
             retry_after_seconds=BACKFILL_ABORT_RETRY_SECONDS,
         )
         raise
+
+
+# Multi-worker plan R4: a helper's waveform batch selects again this many
+# times when other runners admitted every track it selected.
+SHARED_BATCH_ATTEMPTS = 3
+
+
+def helper_profile_batch_task(server_id, catalog_instance_id, deadline=None):
+    """A helper's waveform batch (multi-worker plan R4): like the leader's
+    ``profile_backfill_task`` but without its per-source claim and its state.
+
+    The leader keeps the source's backfill state (queued, complete, its
+    retries and stale recovery); a helper only selects due tracks, admits the
+    ones no other runner's batch holds (``keep_live``), analyses them until
+    ``deadline`` and counts them. ``coalesced`` when nothing is left for it.
+    """
+    if maintenance_paused():
+        return {"status": "paused", "processed": 0}
+    resolve_profile_source(catalog_instance_id=catalog_instance_id, server_id=server_id)
+    for _attempt in range(SHARED_BATCH_ATTEMPTS):
+        ids = find_backfill_ids(background_batch_limit(), catalog_instance_id=catalog_instance_id,
+                                server_id=server_id, include_failed=False)
+        if not ids:
+            return {"status": "coalesced", "processed": 0}
+        tokens = mark_pending(ids, catalog_instance_id=catalog_instance_id, priority="background",
+                              keep_live=True)
+        ids = [track_id for track_id in ids if track_id in tokens]
+        if ids:
+            break
+    else:
+        return {"status": "coalesced", "processed": 0}
+    try:
+        result = analyze_tracks_task(ids, catalog_instance_id=catalog_instance_id, server_id=server_id,
+                                     priority="background", attempt_tokens=tokens, deadline=deadline)
+    except Exception as exc:
+        try:
+            release_pending(ids, catalog_instance_id=catalog_instance_id,
+                            reason=f"Background enrichment batch failed: {exc}", tokens=tokens,
+                            count_failure=False)
+        except Exception:
+            logger.exception("lumae_analysis could not release a failed helper batch")
+        raise
+    analysed = len(ids) - int((result or {}).get("deferred") or 0)
+    db = get_db()
+    with db.cursor() as cur:
+        cur.execute(
+            f"UPDATE {profile_backfill_state_table()} SET processed_profiles=processed_profiles+%s "
+            "WHERE catalog_instance_id=%s",
+            (int(analysed), catalog_instance_id),
+        )
+    db.commit()
+    return {**(result or {}), "status": "queued", "processed": analysed}
 
 
 def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=None):
@@ -7077,6 +7370,15 @@ def settings():
                     "server": "Heavy work runs on this server, with or without a worker.",
                     "worker": "Heavy work runs only in an AudioMuse worker.",
                 }[value]
+            elif action == "save_worker_runners":
+                value = save_worker_runners(request.form.get("worker_runners"))
+                limit = save_max_files_in_flight(request.form.get("max_files_in_flight"))
+                wake_runners(get_db(), "worker_runners_changed", commit=True)
+                message = {
+                    "one": "One AudioMuse worker does Lumae's heavy work; the others wait.",
+                    "every": (f"Every AudioMuse worker analyzes library tracks, at most {limit} "
+                              "files at once across workers. Workers start helping within a minute."),
+                }[value]
             elif action == "save_collections":
                 enabled = request.form.get("collection_manager_enabled") == "on"
                 set_setting("collection_manager_enabled", enabled)
@@ -7299,6 +7601,7 @@ def start_runner(role):
         role, app=app, turn=run_runner_turn,
         connect=lambda name: connect_raw(application_name=name),
         still_installed=_runner_code_current,
+        can_help=_worker_may_help if role == runner.ROLE_WORKER else None,
     )
 
 
@@ -7410,6 +7713,61 @@ def save_heavy_work(value):
     return value
 
 
+# Multi-worker plan (2026-10-30): ``worker_runners`` says whether the worker
+# processes that do not lead help with the per-track passes (``every``) or
+# stand by (``one``, 1.9's behaviour and the default).
+WORKER_RUNNERS_SETTINGS = ("one", "every")
+# R6: files analysed at once across every worker runner.
+DEFAULT_MAX_FILES_IN_FLIGHT = 16
+MAX_FILES_IN_FLIGHT_LIMIT = 64
+# A helper whose turn found every analysis slot taken looks again after this.
+SLOT_WAIT_SECONDS = 30
+
+
+def worker_runners_setting():
+    value = str(get_setting("worker_runners", "one") or "one").strip().lower()
+    return value if value in WORKER_RUNNERS_SETTINGS else "one"
+
+
+def save_worker_runners(value):
+    """The settings form's ``worker_runners``; returns the stored value."""
+    value = str(value or "").strip().lower()
+    if value not in WORKER_RUNNERS_SETTINGS:
+        raise ValueError("Worker runners must be one or every.")
+    set_setting("worker_runners", value)
+    return value
+
+
+def normalize_max_files_in_flight(raw):
+    try:
+        value = int(raw)
+    except (TypeError, ValueError):
+        return DEFAULT_MAX_FILES_IN_FLIGHT
+    return min(max(value, 1), MAX_FILES_IN_FLIGHT_LIMIT)
+
+
+def max_files_in_flight():
+    return normalize_max_files_in_flight(get_setting("max_files_in_flight", DEFAULT_MAX_FILES_IN_FLIGHT))
+
+
+def save_max_files_in_flight(raw):
+    """The settings form's ``max_files_in_flight``; returns the stored value."""
+    value = normalize_max_files_in_flight(raw)
+    set_setting("max_files_in_flight", value)
+    return value
+
+
+def shared_passes():
+    """Whether every worker runner walks the per-track passes (``worker_runners: every``)."""
+    return worker_runners_setting() == "every"
+
+
+def _worker_may_help():
+    """``Runner.can_help`` for the worker role: helpers only with ``every``, and
+    only while the worker lane does the heavy work."""
+    return shared_passes() and heavy_work_setting() != "server"
+
+
 # W3: the status page's count of files Lumae has stopped trying, counted at
 # most this often (the panel is polled).
 PARKED_FILES_SECONDS = 300
@@ -7495,6 +7853,8 @@ def run_runner_turn(active):
     each in a slice of its own, until none is due or RUNNER_TURN_SECONDS
     pass, stepping aside for AudioMuse before each (R3, R4). A relationship
     build gets at most RUNNER_RELATIONSHIP_SECONDS of the turn."""
+    if getattr(active, "helping", False):
+        return run_helper_turn(active)
     db = get_db()
     role = active.role
     if active.new_leader:
@@ -7512,8 +7872,12 @@ def run_runner_turn(active):
         _runner_bookkeeping(db)
     if not allowed:
         return runner.idle_turn(None, lane)
+    # Multi-worker plan: with ``every`` the worker leader walks the per-track
+    # passes with the helpers, a batch at a time, and parks a pass only when
+    # no runner can make it (R5).
+    shared = role == runner.ROLE_WORKER and _safe_shared_passes()
     if role == runner.ROLE_WORKER:
-        report_edge_runtime()
+        report_edge_runtime(park=not shared)
     elif allowed & HEAVY_ACTIONS:
         # R7: the web process qualifies its own runtime before heavy work.
         report_edge_runtime(park=False)
@@ -7522,6 +7886,15 @@ def run_runner_turn(active):
         done.update(("credits:before_background", "music_metadata:before_background"))
     if PER_TRACK_ACTIONS & allowed and reconcile.live_host_task(db, ("main_analysis",)):
         done.update(PER_TRACK_ACTIONS)
+    workers, sizing = background_sizing()
+    if shared and PER_TRACK_ACTIONS - done:
+        # R6: the leader's analysis threads count towards the files in flight too.
+        granted = _safe_acquire_slots(db, workers)
+        if not granted:
+            done.update(PER_TRACK_ACTIONS)
+        workers = max(1, granted)
+        sizing = f"{sizing}; {granted} of {max_files_in_flight()} files in flight across workers"
+    active.files_at_once = workers
     report = TurnReport()
     started = time.monotonic()
     worked = None
@@ -7530,10 +7903,10 @@ def run_runner_turn(active):
     # first use and stop, with their analysis workers, when the turn ends.
     credits_service.begin_tick()
     try:
-        with parallel_analysis.tick_scope(*background_sizing()):
+        with parallel_analysis.tick_scope(workers, sizing):
             while time.monotonic() - started < RUNNER_TURN_SECONDS and not active.stopped.is_set():
                 action_started = time.monotonic()
-                action, result = _next_runner_action(db, report, active, done)
+                action, result = _next_runner_action(db, report, active, done, shared)
                 if action is None:
                     break
                 status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
@@ -7553,11 +7926,163 @@ def run_runner_turn(active):
                     break
     finally:
         credits_service.end_tick()
+        if shared:
+            _safe_release_slots(db)
         if report.actions:
             _refresh_status_after_turn(db, report)
     if worked:
         return runner.Turn(True, "working", lane, None, worked)
     return runner.idle_turn(_runner_next_due_seconds(db))
+
+
+def _safe_shared_passes():
+    try:
+        return shared_passes()
+    except Exception:
+        logger.warning("lumae_analysis could not read worker_runners; one worker runner works",
+                       exc_info=True)
+        return False
+
+
+def _safe_acquire_slots(db, workers):
+    """R6: up to ``workers`` analysis slots for this runner's turn; 0 when none
+    is free or the slots cannot be read."""
+    try:
+        return shared_pass.acquire_slots(db, workers, max_files_in_flight())
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not take analysis slots", exc_info=True)
+        return 0
+
+
+def _safe_release_slots(db):
+    try:
+        shared_pass.release_slots(db)
+    except Exception:
+        _rollback_if_possible(db)
+        # Freed once this runner's heartbeat stops.
+        logger.warning("lumae_analysis could not give back its analysis slots", exc_info=True)
+
+
+# Multi-worker plan R1: what a helper turn may do, in this order.
+HELPER_ACTIONS = ("profile_backfill", "edge_backfill", "loudness_backfill")
+
+
+def run_helper_turn(active):
+    """One turn of a helper (multi-worker plan R1): only the per-track passes,
+    shared with the leader and the other helpers, on the analysis threads
+    its slots allow (R6). It steps aside for AudioMuse as the leader does and
+    serves no on-demand work (``serve_interactive``)."""
+    db = get_db()
+    if maintenance_paused():
+        return runner.Turn(False, "paused", "maintenance_paused", None, None)
+    if not _safe_shared_passes():
+        return runner.idle_turn(None, "one_worker_runner")
+    blocker = _runner_blocker(db, runner.ROLE_WORKER)
+    if blocker:
+        return runner.Turn(False, "waiting_host", f"audiomuse:{blocker}",
+                           RUNNER_HOST_WAIT_SECONDS, None)
+    allowed, lane = runner_lane(db, runner.ROLE_WORKER)
+    if not allowed & PER_TRACK_ACTIONS:
+        return runner.idle_turn(None, lane)
+    if reconcile.live_host_task(db, ("main_analysis",)):
+        # R4: AudioMuse's song hook does the run's songs.
+        return runner.Turn(False, "waiting_host", "audiomuse:main_analysis",
+                           RUNNER_HOST_WAIT_SECONDS, None)
+    report_edge_runtime(park=False)
+    workers, sizing = background_sizing()
+    granted = _safe_acquire_slots(db, workers)
+    if not granted:
+        return runner.Turn(False, "waiting", "files_in_flight_cap", SLOT_WAIT_SECONDS, None)
+    active.files_at_once = granted
+    report = TurnReport()
+    started = time.monotonic()
+    worked = None
+    done = set()
+    try:
+        with parallel_analysis.tick_scope(
+                granted, f"{sizing}; {granted} of {max_files_in_flight()} files in flight across workers"):
+            while time.monotonic() - started < RUNNER_TURN_SECONDS and not active.stopped.is_set():
+                action, result = _next_helper_action(db, report, active, done)
+                if action is None:
+                    break
+                status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
+                if _moved_on(status, result):
+                    worked = action
+                if status in _SETTLED_STATUSES or status == "complete":
+                    done.add(action)
+                if _runner_blocker(db, runner.ROLE_WORKER) or reconcile.live_host_task(db, ("main_analysis",)):
+                    break
+                if active.stopped.wait(runner.PAUSE_SECONDS):
+                    break
+    finally:
+        _safe_release_slots(db)
+        if report.actions:
+            _refresh_status_after_turn(db, report)
+    if worked:
+        return runner.Turn(True, "working", "helper", None, worked)
+    return runner.idle_turn(None, "helper_nothing_due")
+
+
+def _next_helper_action(db, report, active, done):
+    """One helper action in a slice of its own: the first per-track pass with
+    work for it. ``(action, result)``, or ``(None, None)`` when none has."""
+    for action in HELPER_ACTIONS:
+        if action in done:
+            continue
+        budget = SliceBudget()
+        active.begin_action(action)
+        ran = False
+        try:
+            source = _next_shared_source(db, action)
+            if source is None:
+                done.add(action)
+                continue
+            start = time.monotonic()
+            function = {"profile_backfill": helper_profile_batch_task,
+                        "edge_backfill": edge_backfill_task,
+                        "loudness_backfill": loudness_backfill_task}[action]
+            args = (source[0], source[1], budget.deadline) + (() if action == "profile_backfill" else (True,))
+            result = _call_action(function, source[0], *args)
+            status = str((result or {}).get("status") or "")
+            ran = status not in ("coalesced", "current")
+            if ran:
+                _record_turn(db, report, action, source[0], source[1], result, start)
+            return action, result
+        except Exception:
+            _rollback_if_possible(db)
+            logger.warning("lumae_analysis helper action %s failed; it is retried", action,
+                           exc_info=True)
+            done.add(action)
+            return action, {"status": "failed"}
+        finally:
+            active.end_action(ran=ran)
+    return None, None
+
+
+def _next_shared_source(db, action):
+    """``(server_id, catalog_instance_id)`` of a source whose ``action`` pass a
+    helper can share now, or None."""
+    if action == "profile_backfill":
+        with db.cursor() as cur:
+            cur.execute(
+                f"""SELECT st.server_id, st.catalog_instance_id
+                      FROM {profile_backfill_state_table()} st
+                      JOIN {table('catalog_sources')} s USING (catalog_instance_id)
+                     WHERE s.rebind_status='active' AND st.status IN ('queued', 'running', 'failed')
+                     ORDER BY st.updated_at, st.catalog_instance_id LIMIT 1"""
+            )
+            row = cur.fetchone()
+        db.commit()
+        return (str(row[0]), str(row[1])) if row else None
+    if action == "edge_backfill":
+        if not edge_profiles_enabled():
+            return None
+        edge = next_edge_backfill(db, shared=True)
+        return (edge[0], edge[1]) if edge else None
+    if not loudness_backfill.runtime_available():
+        return None
+    return next_loudness_backfill(db, shared=True)
 
 
 # The server runner's bookkeeping (what 1.8.0's watchdog tick did) at most this often.
@@ -7581,6 +8106,10 @@ def _runner_bookkeeping(db):
         recover_interrupted_events(db)
         enqueue_required_catalog_preparations(db=db)
         _safe_release_runner_claims(db, runner.ROLE_WORKER, runner.WORKER_ONLINE_SECONDS)
+        # Multi-worker plan R2: rows of runners gone for a day.
+        with db.cursor() as cur:
+            runner.prune_workers(cur)
+        db.commit()
     except Exception:
         _rollback_if_possible(db)
         logger.exception("lumae_analysis runner bookkeeping failed")
@@ -7602,10 +8131,11 @@ def _refresh_status_after_turn(db, report):
         logger.exception("lumae_analysis could not refresh the status snapshot")
 
 
-def _next_runner_action(db, report, active, done):
+def _next_runner_action(db, report, active, done, shared=False):
     """One action of the turn in a slice of its own; ``active`` shows each
     action while the turn looks for its work and does it (``fits``), and
-    counts the one that ran (``start``)."""
+    counts the one that ran (``start``). ``shared``: the per-track passes are
+    walked with the helpers (multi-worker plan R4)."""
 
     class Budget(SliceBudget):
         last = None
@@ -7621,7 +8151,7 @@ def _next_runner_action(db, report, active, done):
 
     budget = Budget()
     try:
-        return _next_reconcile_action(db, report, budget, None, done)
+        return _next_reconcile_action(db, report, budget, None, done, shared=shared)
     except AnalysisProjectionDeferred as exc:
         # Held back by design (an unresolved provider identity, say): the
         # journal keeps the retry, and the log needs no traceback (R9).

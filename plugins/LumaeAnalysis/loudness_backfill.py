@@ -145,6 +145,30 @@ def candidates(db, catalog_instance_id, after="", limit=10, *, edges_enabled=Tru
     return rows
 
 
+def due_among(db, catalog_instance_id, track_ids, *, edges_enabled=True):
+    """``[(track_id, media_revision)]`` of ``track_ids`` still due, in track id order (multi-worker
+    plan R4: a batch handed back, or taken over from a runner that went away)."""
+    if not track_ids:
+        return []
+    cur = db.cursor()
+    cur.execute(
+        f"SELECT m.track_id, {_REVISION} FROM {_due_sql(edges_enabled)} AND m.track_id = ANY(%s) "
+        "ORDER BY m.track_id",
+        (catalog_instance_id, list(track_ids)),
+    )
+    rows = [(str(track), str(revision)) for track, revision in cur.fetchall()]
+    cur.close()
+    return rows
+
+
+def complete_sql(cur, catalog_instance_id):
+    """End a shared pass (multi-worker plan R4) as ``update`` does a walk that reached the end,
+    inside the caller's transaction."""
+    cur.execute(f"""UPDATE {t('loudness_backfill_state')} SET status='complete', cursor='', retry_count=0,
+            next_retry_at=now()+make_interval(hours => %s), last_error=NULL, completed_at=now(), updated_at=now()
+        WHERE catalog_instance_id=%s""", (RESWEEP_HOURS, catalog_instance_id))
+
+
 def ensure_sources(db):
     """Give every active source a pass row (a new row is due now); returns rows added."""
     cur = db.cursor()
@@ -157,10 +181,12 @@ def ensure_sources(db):
     return added
 
 
-def next_due(db, server_id=None):
+def next_due(db, server_id=None, shared=False):
     """``(server_id, catalog_instance_id)`` of the next source with a due pass or a catalogue to
-    follow, or None."""
+    follow, or None. ``shared`` (multi-worker plan R4): every worker runner walks a pass at once, so
+    a running pass is offered too."""
     ensure_sources(db)
+    running = "TRUE" if shared else "st.updated_at < now()-interval '30 minutes'"
     cur = db.cursor()
     cur.execute(f"""SELECT s.current_core_server_id, st.catalog_instance_id
         FROM {t('loudness_backfill_state')} st
@@ -171,7 +197,7 @@ def next_due(db, server_id=None):
           AND ((c.published_generation <> st.reconciled_generation
                 AND (st.status <> 'failed' OR st.next_retry_at IS NULL OR st.next_retry_at <= now()))
                OR ((st.status IN ('queued', 'failed', 'complete')
-                    OR (st.status='running' AND st.updated_at < now()-interval '30 minutes'))
+                    OR (st.status='running' AND {running}))
                    AND (st.next_retry_at IS NULL OR st.next_retry_at <= now())))
         ORDER BY st.next_retry_at NULLS FIRST, st.catalog_instance_id LIMIT 1""",
                 (server_id, server_id))
@@ -187,13 +213,18 @@ def state(db, catalog_instance_id):
     cur.execute(f"""SELECT st.status, st.cursor, st.processed, st.reconciled_generation, c.published_generation,
                ((st.status IN ('queued', 'failed', 'complete')
                  OR (st.status='running' AND st.updated_at < now()-interval '30 minutes'))
+                AND (st.next_retry_at IS NULL OR st.next_retry_at <= now())),
+               (st.status IN ('queued', 'failed', 'complete', 'running')
                 AND (st.next_retry_at IS NULL OR st.next_retry_at <= now()))
         FROM {t('loudness_backfill_state')} st JOIN {t('catalog_state')} c USING (catalog_instance_id)
         WHERE st.catalog_instance_id=%s""", (catalog_instance_id,))
     row = cur.fetchone()
     cur.close()
     db.commit()
-    keys = ("status", "cursor", "processed", "reconciled_generation", "published_generation", "pass_due")
+    # ``shared_due``: due for a shared pass (multi-worker plan R4), where a running pass is walked by
+    # every worker runner at once.
+    keys = ("status", "cursor", "processed", "reconciled_generation", "published_generation", "pass_due",
+            "shared_due")
     return dict(zip(keys, row)) if row else None
 
 

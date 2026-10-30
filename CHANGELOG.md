@@ -9,6 +9,24 @@ still matters. Exact, code-verified wire behaviour for every version lives in
 
 ## Unreleased
 
+Library passes can use every AudioMuse worker (issue #10; plan
+`docs/plan/LUMAE_MULTI_WORKER_PLAN_2026-10-30.md`).
+
+- New setting `worker_runners` (`one` by default, or `every`). With `every`
+  the worker runners that miss the lock help the one that holds it: they walk
+  the waveform, edge and loudness passes with it. Each runner takes a batch of
+  a few due tracks at a time under the pass's row lock, so two runners never
+  download or analyze one track; a runner that goes away (no heartbeat for 90
+  seconds) loses its batches to the next taker. On-demand tracks,
+  relationships and catalogue work stay with the leader.
+- New setting `max_files_in_flight` (16, 1–64): the files analyzed at once
+  across all workers, so more workers do not mean more load on the music
+  server than this.
+- A pass parks for a missing edge runtime only when no worker runner has it.
+- The settings page shows one line per worker runner (leads or helps, files
+  at once, its action) once more than one runs.
+- New tables `runner_workers`, `pass_batches` and `analysis_slots`. Nothing
+  changes with `one`, and nothing on the wire changes.
 - A relationship build no longer holds back the volume, edge and loudness
   passes. A build checkpoints after each step and is due again at once, and
   it comes before those passes, so while it ran they never got a turn: on one

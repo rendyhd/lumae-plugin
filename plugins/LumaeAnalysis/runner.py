@@ -23,6 +23,14 @@ context, so each action's ``get_db()`` is a fresh connection the context's
 teardown closes. Whoever records work calls ``notify()`` before committing,
 which wakes the leaders within a second wherever they run.
 
+Multi-worker plan (2026-10-30): with ``can_help()`` true (the setting
+``worker_runners: every``), a worker runner that misses the lock **helps**
+instead of standing by. A helper runs the same loop and turn function with
+``HELPING`` set, so the turn does only the per-track library passes, and it
+tries the lock again every STANDBY_SECONDS: when the leader goes away, one
+helper leads. Every runner, leader or helper, heartbeats a row of its own in
+``runner_workers`` (``runner_id``); only the leader writes ``runner_state``.
+
 No host imports at module level, so it loads in tests without a host.
 """
 
@@ -32,6 +40,7 @@ import select
 import socket
 import threading
 import time
+import uuid
 from collections import namedtuple
 from contextvars import ContextVar
 
@@ -63,16 +72,54 @@ Turn = namedtuple("Turn", "worked mode reason next_due_seconds action")
 # a request, the song hook). R5: the web process sizes its analysis smaller and
 # downloads outside AudioMuse's TEMP_DIR.
 ROLE = ContextVar("lumae_runner_role", default=None)
+# Multi-worker plan: whether this thread's turn is a helper's (the per-track
+# passes only, never on-demand work), and the id of the runner whose turn it
+# is (the owner of the batches and analysis slots it takes).
+HELPING = ContextVar("lumae_runner_helping", default=False)
+RUNNER_ID = ContextVar("lumae_runner_id", default=None)
 
 
 def idle_turn(next_due_seconds=None, reason="nothing_due"):
     return Turn(False, "idle", reason, next_due_seconds, None)
 
 
+def new_runner_id():
+    """``host:pid:nonce``: unique per runner, readable on the status page."""
+    return f"{socket.gethostname()[:120]}:{os.getpid()}:{uuid.uuid4().hex[:8]}"
+
+
+_process_runner_id = (None, None)  # (pid, id): a fork gets an id of its own
+
+
+def current_runner_id():
+    """The id of this thread's runner, or one id per process outside a runner
+    (a test, a request): what owns a batch or slot taken here."""
+    global _process_runner_id
+    runner_id = RUNNER_ID.get()
+    if runner_id:
+        return runner_id
+    if _process_runner_id[0] != os.getpid():
+        _process_runner_id = (os.getpid(), new_runner_id())
+    return _process_runner_id[1]
+
+
 def state_table():
     from plugin.api import table
 
     return table("runner_state")
+
+
+def workers_table():
+    from plugin.api import table
+
+    return table("runner_workers")
+
+
+def live_runner_sql(column):
+    """SQL: the runner ``column`` names heartbeated within WORKER_ONLINE_SECONDS."""
+    return (f"EXISTS (SELECT 1 FROM {workers_table()} live_runner "
+            f"WHERE live_runner.runner_id={column} "
+            f"AND live_runner.heartbeat_at > now() - make_interval(secs => {int(WORKER_ONLINE_SECONDS)}))")
 
 
 def migrate_runner_state(cur):
@@ -103,6 +150,59 @@ def migrate_runner_state(cur):
         )
         """
     )
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {workers_table()} (
+            runner_id TEXT PRIMARY KEY,
+            role TEXT NOT NULL,
+            leader BOOLEAN NOT NULL DEFAULT FALSE,
+            host TEXT,
+            pid INTEGER,
+            mode TEXT NOT NULL DEFAULT 'idle',
+            reason TEXT,
+            current_action TEXT,
+            last_action TEXT,
+            actions BIGINT NOT NULL DEFAULT 0,
+            files_at_once INTEGER,
+            started_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            heartbeat_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+            CHECK (role IN ('server', 'worker'))
+        )
+        """
+    )
+
+
+# A runner's row stays this long after its last heartbeat (the status page
+# shows the recent ones; the server's bookkeeping removes the rest).
+WORKER_ROW_RETENTION_SECONDS = 24 * 60 * 60
+
+
+def read_workers(cur, seconds=WORKER_ROW_RETENTION_SECONDS):
+    """Every runner that heartbeated within ``seconds``, leaders first."""
+    cur.execute(
+        f"""
+        SELECT runner_id, role, leader, host, pid, mode, reason, current_action,
+               last_action, actions, files_at_once, started_at, heartbeat_at,
+               EXTRACT(EPOCH FROM (now() - heartbeat_at))
+          FROM {workers_table()}
+         WHERE heartbeat_at > now() - make_interval(secs => %s)
+         ORDER BY role, leader DESC, host, runner_id
+        """,
+        (int(seconds),),
+    )
+    keys = ("runner_id", "role", "leader", "host", "pid", "mode", "reason", "current_action",
+            "last_action", "actions", "files_at_once", "started_at", "heartbeat_at",
+            "heartbeat_age_seconds")
+    return [dict(zip(keys, row)) for row in cur.fetchall()]
+
+
+def prune_workers(cur, seconds=WORKER_ROW_RETENTION_SECONDS):
+    """Remove the rows of runners gone longer than ``seconds``; returns how many."""
+    cur.execute(
+        f"DELETE FROM {workers_table()} WHERE heartbeat_at < now() - make_interval(secs => %s)",
+        (int(seconds),),
+    )
+    return max(0, cur.rowcount or 0)
 
 
 def marks_table():
@@ -183,10 +283,11 @@ def read_states(cur):
 class Runner:
     """One role's loop in this process. ``turn(runner)`` does a bounded
     amount of work and returns a ``Turn``; ``still_installed()`` says whether
-    this process's plugin code is still the installed one (R2)."""
+    this process's plugin code is still the installed one (R2); ``can_help()``
+    whether a runner that misses the lock helps (multi-worker plan)."""
 
     def __init__(self, role, *, app, turn, connect, still_installed=None,
-                 startup_delay=None, clock=time.monotonic):
+                 startup_delay=None, clock=time.monotonic, can_help=None):
         if role not in ROLES:
             raise ValueError(f"unknown runner role {role!r}")
         self.role = role
@@ -194,10 +295,12 @@ class Runner:
         self.turn = turn
         self.connect = connect
         self.still_installed = still_installed or (lambda: True)
+        self.can_help = can_help or (lambda: False)
         self.startup_delay = (STARTUP_DELAY_SECONDS[role] if startup_delay is None
                               else startup_delay)
         self.clock = clock
         self.pid = os.getpid()
+        self.runner_id = new_runner_id()
         self.thread = None
         self.stopped = threading.Event()
         self._wake = threading.Event()
@@ -205,6 +308,7 @@ class Runner:
         self._conn_lock = threading.Lock()
         self._beating = None
         self.leading = False
+        self.helping = False
         # Until its first turn as leader ends: the turn releases what the
         # role's previous leader took (R6).
         self.new_leader = False
@@ -214,6 +318,9 @@ class Runner:
         self.last_action = None
         self.actions = 0
         self.next_wake_in = None
+        # Files the current turn analyses at once (its granted slots); the
+        # status page shows it.
+        self.files_at_once = None
         self._action_changed = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -275,24 +382,22 @@ class Runner:
         conn = self.connect(f"lumae-runner-{self.role}-{os.getpid()}")
         conn.autocommit = True
         self._conn = conn
-        cur = conn.cursor()
-        cur.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEYS[self.role],))
-        if not cur.fetchone()[0]:
-            cur.close()
+        if not self._try_lock() and not self._may_help():
             self._release()
             self.mode = "standby"
             self._wait(STANDBY_SECONDS)
             return
-        self.leading = True
-        self.new_leader = True
+        self.helping = not self.leading
+        cur = conn.cursor()
         cur.execute(f"LISTEN {NOTIFY_CHANNEL}")
         cur.close()
-        self.mode, self.reason = "working", "leader"
+        self.mode, self.reason = "working", "leader" if self.leading else "helper"
         self._heartbeat(started=True)
         self._beating = threading.Event()
         beat = threading.Thread(target=self._beat, args=(self._beating,),
                                 name=f"lumae-runner-{self.role}-heartbeat", daemon=True)
         beat.start()
+        tried = self.clock()
         try:
             while not self.stopped.is_set():
                 with self.app.app_context():
@@ -303,6 +408,16 @@ class Runner:
                                    "code", self.role)
                     self.stop()
                     break
+                if self.helping and self.clock() - tried >= STANDBY_SECONDS:
+                    # A helper leads once the leader went away, and stands by
+                    # once helping is switched off.
+                    tried = self.clock()
+                    if self._try_lock():
+                        self.helping = False
+                        logger.info("Lumae's %s runner %s leads now", self.role, self.runner_id)
+                        self._heartbeat(started=True)
+                    elif not self._may_help():
+                        break
                 turn = self._turn()
                 if turn.worked:
                     self._drain()
@@ -311,6 +426,8 @@ class Runner:
                     continue
                 wait = SWEEP_SECONDS if turn.next_due_seconds is None else max(
                     PAUSE_SECONDS, min(SWEEP_SECONDS, float(turn.next_due_seconds)))
+                if self.helping:
+                    wait = min(wait, max(PAUSE_SECONDS, STANDBY_SECONDS - (self.clock() - tried)))
                 self.next_wake_in = wait
                 self._heartbeat()
                 self._wait_for_wake(wait)
@@ -318,19 +435,48 @@ class Runner:
         finally:
             self._beating.set()
             beat.join(timeout=5)
+            self.helping = False
             self._release()
+
+    def _try_lock(self):
+        """Take the role's lock on this runner's connection; True when it leads."""
+        with self._conn_lock:
+            cur = self._conn.cursor()
+            try:
+                cur.execute("SELECT pg_try_advisory_lock(%s)", (LOCK_KEYS[self.role],))
+                won = bool(cur.fetchone()[0])
+            finally:
+                cur.close()
+        if won:
+            self.leading = True
+            self.new_leader = True
+        return won
+
+    def _may_help(self):
+        """Whether a runner that does not lead helps (``can_help``); False when it cannot tell."""
+        try:
+            with self.app.app_context():
+                return bool(self.can_help())
+        except Exception:
+            logger.debug("Lumae's %s runner could not read whether it helps", self.role,
+                         exc_info=True)
+            return False
 
     def _turn(self):
         self.mode, self.reason = "working", "turn"
-        token = ROLE.set(self.role)
+        tokens = (ROLE.set(self.role), HELPING.set(self.helping), RUNNER_ID.set(self.runner_id))
         try:
             with self.app.app_context():
                 turn = self.turn(self)
-            self.new_leader = False
+            if self.leading:
+                self.new_leader = False
         finally:
-            ROLE.reset(token)
+            RUNNER_ID.reset(tokens[2])
+            HELPING.reset(tokens[1])
+            ROLE.reset(tokens[0])
             if self.action:
                 self.end_action()
+            self.files_at_once = None
         self.mode, self.reason = turn.mode, turn.reason
         return turn
 
@@ -392,38 +538,76 @@ class Runner:
                 return
             cur = self._conn.cursor()
             try:
-                cur.execute(
-                    f"""
-                    INSERT INTO {state_table()} AS s
-                        (role, host, pid, mode, reason, current_action, last_action, actions,
-                         next_wake_at, started_at, action_started_at, heartbeat_at)
-                    VALUES (%(role)s, %(host)s, %(pid)s, %(mode)s, %(reason)s, %(action)s,
-                            %(last)s, %(actions)s,
-                            CASE WHEN %(wake)s::float IS NULL THEN NULL
-                                 ELSE now() + make_interval(secs => %(wake)s::float) END,
-                            now(), CASE WHEN %(action)s::text IS NULL THEN NULL ELSE now() END,
-                            now())
-                    ON CONFLICT (role) DO UPDATE SET
-                        host=EXCLUDED.host, pid=EXCLUDED.pid, mode=EXCLUDED.mode,
-                        reason=EXCLUDED.reason, current_action=EXCLUDED.current_action,
-                        last_action=EXCLUDED.last_action, actions=EXCLUDED.actions,
-                        next_wake_at=EXCLUDED.next_wake_at,
-                        started_at=CASE WHEN %(started)s THEN now() ELSE s.started_at END,
-                        action_started_at=CASE
-                            WHEN EXCLUDED.current_action IS NULL THEN NULL
-                            WHEN s.current_action IS NOT DISTINCT FROM EXCLUDED.current_action
-                                 AND NOT %(started)s THEN s.action_started_at
-                            ELSE now() END,
-                        heartbeat_at=now()
-                    """,
-                    {"role": self.role, "host": socket.gethostname()[:200], "pid": os.getpid(),
-                     "mode": str(self.mode)[:40],
-                     "reason": str(self.reason)[:200] if self.reason else None,
-                     "action": self.action, "last": self.last_action, "actions": self.actions,
-                     "wake": self.next_wake_in, "started": bool(started)},
-                )
+                if self.leading:
+                    self._heartbeat_role(cur, started)
             finally:
                 cur.close()
+            cur = self._conn.cursor()
+            try:
+                self._heartbeat_worker(cur, started)
+            except Exception:
+                # A database the plugin has not migrated yet (no
+                # ``runner_workers``): the role's row above is what counts.
+                logger.debug("Lumae's %s runner could not write its own row", self.role,
+                             exc_info=True)
+            finally:
+                cur.close()
+
+    def _heartbeat_worker(self, cur, started):
+        """This runner's ``runner_workers`` row, leader or helper."""
+        cur.execute(
+            f"""
+            INSERT INTO {workers_table()} AS w
+                (runner_id, role, leader, host, pid, mode, reason, current_action, last_action,
+                 actions, files_at_once, started_at, heartbeat_at)
+            VALUES (%(id)s, %(role)s, %(leader)s, %(host)s, %(pid)s, %(mode)s, %(reason)s,
+                    %(action)s, %(last)s, %(actions)s, %(files)s, now(), now())
+            ON CONFLICT (runner_id) DO UPDATE SET
+                leader=EXCLUDED.leader, mode=EXCLUDED.mode, reason=EXCLUDED.reason,
+                current_action=EXCLUDED.current_action, last_action=EXCLUDED.last_action,
+                actions=EXCLUDED.actions, files_at_once=EXCLUDED.files_at_once,
+                started_at=CASE WHEN %(started)s THEN now() ELSE w.started_at END,
+                heartbeat_at=now()
+            """,
+            {"id": self.runner_id, "role": self.role, "leader": bool(self.leading),
+             "host": socket.gethostname()[:200], "pid": os.getpid(), "mode": str(self.mode)[:40],
+             "reason": str(self.reason)[:200] if self.reason else None, "action": self.action,
+             "last": self.last_action, "actions": self.actions, "files": self.files_at_once,
+             "started": bool(started)},
+        )
+
+    def _heartbeat_role(self, cur, started):
+        """The role's ``runner_state`` row: the leader's alone."""
+        cur.execute(
+            f"""
+            INSERT INTO {state_table()} AS s
+                (role, host, pid, mode, reason, current_action, last_action, actions,
+                 next_wake_at, started_at, action_started_at, heartbeat_at)
+            VALUES (%(role)s, %(host)s, %(pid)s, %(mode)s, %(reason)s, %(action)s,
+                    %(last)s, %(actions)s,
+                    CASE WHEN %(wake)s::float IS NULL THEN NULL
+                         ELSE now() + make_interval(secs => %(wake)s::float) END,
+                    now(), CASE WHEN %(action)s::text IS NULL THEN NULL ELSE now() END,
+                    now())
+            ON CONFLICT (role) DO UPDATE SET
+                host=EXCLUDED.host, pid=EXCLUDED.pid, mode=EXCLUDED.mode,
+                reason=EXCLUDED.reason, current_action=EXCLUDED.current_action,
+                last_action=EXCLUDED.last_action, actions=EXCLUDED.actions,
+                next_wake_at=EXCLUDED.next_wake_at,
+                started_at=CASE WHEN %(started)s THEN now() ELSE s.started_at END,
+                action_started_at=CASE
+                    WHEN EXCLUDED.current_action IS NULL THEN NULL
+                    WHEN s.current_action IS NOT DISTINCT FROM EXCLUDED.current_action
+                         AND NOT %(started)s THEN s.action_started_at
+                    ELSE now() END,
+                heartbeat_at=now()
+            """,
+            {"role": self.role, "host": socket.gethostname()[:200], "pid": os.getpid(),
+             "mode": str(self.mode)[:40],
+             "reason": str(self.reason)[:200] if self.reason else None,
+             "action": self.action, "last": self.last_action, "actions": self.actions,
+             "wake": self.next_wake_in, "started": bool(started)},
+        )
 
     def _release(self):
         with self._conn_lock:

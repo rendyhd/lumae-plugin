@@ -45,111 +45,121 @@ start, `task_types.py`).
 
 ## Design
 
+As built (the first draft's R3 and the loudness lease were dropped; see *Changes from the
+first draft*).
+
 ### R1 Leader and helpers
 - The worker role keeps one leader (the advisory lock, unchanged). It alone runs the
-  singleton heavy work: relationship builds, pass bookkeeping (start, complete, resweep,
-  park), and edge-runtime parking.
+  singleton heavy work: relationship builds, on-demand tracks, the waveform backfill's
+  state (queued, complete, retries, stale recovery), loudness's catalogue following, and
+  parking a pass when no runner can make it.
 - With `every`, a worker runner that misses the lock becomes a **helper** instead of
-  standing by. A helper's lane is on-demand work plus the per-track passes
-  (`interactive`, `profile_backfill`, `edge_backfill`, `loudness_backfill`) and nothing
-  else. It sizes K from its own process, as the leader does, so a Pi takes less than a Ryzen.
+  standing by (`Runner.can_help`, `__init__._worker_may_help`: `every` and heavy work not
+  on the server). A helper's turn (`run_helper_turn`) walks only the per-track passes:
+  `profile_backfill` (`helper_profile_batch_task`), `edge_backfill`, `loudness_backfill`.
+  It sizes K from its own process, as the leader does, so a Pi takes less than a Ryzen.
+- A helper serves no on-demand work (`serve_interactive` returns 0 with `HELPING` set).
+  The on-demand claims stay the role's, released by today's rules (R6 of the runner plan).
 - A helper steps aside exactly like the leader: for every `WORKER_YIELD_TASK_TYPES` job,
-  and its per-track work pauses while AudioMuse analyses.
-- A helper that wins the lock later (the leader went away) becomes the leader through
-  today's path.
+  and while AudioMuse analyses.
+- A helper tries the lock every STANDBY_SECONDS: it leads once the leader went away, and
+  stands by once helping is switched off.
 
 ### R2 Runner identity
-- Every runner gets a `runner_id` (host, pid, a start nonce).
-- New table `runner_workers`: one row per runner (role, leader or helper, host, pid, K,
-  mode, current action, actions, heartbeat). `runner_state` stays as it is for the status
-  page and `worker_online`.
-
-### R3 Per-runner claims
-- An on-demand claim names its runner, not its role. A claim is released only when its
-  runner's heartbeat is gone, by whoever notices (the server's bookkeeping, a new leader).
-  A new leader no longer releases a live helper's work.
-- Claims written by 1.9.2 (role markers) keep today's release rule, so an upgrade strands
-  nothing.
+- Every runner gets a `runner_id` (host, pid, a start nonce), and `RUNNER_ID` / `HELPING`
+  context variables during its turns.
+- New table `runner_workers`: one row per runner (role, leader or helper, host, pid, files
+  at once, mode, current action, actions, heartbeat), pruned a day after its last
+  heartbeat. Only the leader writes `runner_state`, which keeps the status page's role rows
+  and `worker_online` as they were.
 
 ### R4 Shared passes
-- **Chunk handout.** A runner takes its next chunk of due track IDs by advancing the
-  pass's cursor in one `UPDATE` on the pass row. The row lock serialises takers, so chunks
-  never overlap. This replaces the pass-level `running` exclusivity for the edge and
-  loudness passes. The leader and the helpers take chunks the same way.
-- **A claim per track in every pass.**
-  - Edges keep their job claim.
-  - Loudness gets a lease per track (owner `runner_id`, 30 minutes, like an edge job).
-  - A background waveform admission becomes conditional: it never takes a track whose
-    attempt is live and younger than the stale window. Its batch is leased per runner,
-    not per source.
-  - So no track is analysed twice, whatever the cursors do.
-- **Completion by wraparound.** A pass completes only when a walk from the start finds
-  nothing due and no chunk is out. A track released by a runner that died or hit its
-  deadline is then reached again in the same pass, not after the 6-hour resweep.
-- The settings page's counts and ETA read the work tables, as now. The ETA sums K over
-  every online runner.
+- **Batches (`shared_pass.take`).** A runner takes a batch of a few due track IDs (two per
+  analysis thread, at most 25) while it holds the pass's row (`FOR UPDATE`), so batches
+  never overlap. It hands out first a batch handed back or one whose runner's heartbeat is
+  gone (keeping only its tracks still due), then the next due tracks after the cursor,
+  which it moves past them. This replaces the pass-level `running` exclusivity for the edge
+  and loudness passes; the leader and the helpers take batches the same way.
+- **End of a slice (`shared_pass.finish`).** A runner keeps its batches until its slice
+  ends, then deletes them, handing back the tracks it did not start or cancelled (and wakes
+  the runners). A runner that dies keeps its batches until its heartbeat is gone; then
+  another runner takes them over.
+- **Completion.** A pass completes only when nothing is due after its cursor and no batch
+  is out, inside the same transaction. A pass another runner completed, or one that is
+  parked, hands out nothing.
+- **Waveform.** The waveform backfill selects due tracks, not a cursor, so it needs no
+  batches: a background admission with `keep_live` leaves a track another runner's batch
+  admitted since the selection to that attempt (`admit_attempts`), so two batches never
+  admit one track. Helpers count what they analysed and leave the backfill's state to the
+  leader.
 
 ### R5 Edge runtime per process
 - A runner without a qualified PyAV skips the edge and loudness passes and leaves their
-  state alone.
-- Only the leader parks a pass, and only when no runner reported a qualified runtime
-  within the fresh window (today's `edge_worker_runtime` rule).
+  state alone (`coalesced`).
+- With `every` the leader reports its runtime without parking, and parks a pass only when
+  no runner reported a qualified runtime (`edge_profiles_analyzable`) or PyAV
+  (`pyav_reported`) within the freshness window.
+- A track waits for the edge pass's decode (loudness) when any runner makes edges.
 
 ### R6 Files in flight
-- A runner takes a slot before each download, from a counted lease table, up to
-  `max_files_in_flight`, and gives it back after the file.
-- A dead runner's slots go with its heartbeat.
+- Each runner's turn takes up to K slots of `analysis_slots` (`shared_pass.acquire_slots`),
+  never more than `max_files_in_flight` across all runners, and analyses that many files at
+  once; it gives them back when the turn ends. A runner that went away loses its slots. A
+  helper that gets none waits SLOT_WAIT_SECONDS.
+
+### Changes from the first draft
+- **No per-runner on-demand claims (draft R3).** Helpers never take on-demand work, so the
+  role's claim markers and their release rules stay exactly as in 1.9; nothing to migrate.
+  The leader serves on-demand work between its own files, as now.
+- **No loudness lease.** Batches are disjoint and a dead runner's batch is taken over only
+  once its heartbeat is gone (the heartbeat thread is apart from the turn, so a busy runner
+  is never taken for dead); the takeover drops tracks no longer due.
+- **No wraparound.** Handed-back and taken-over batches replace it: no track is behind the
+  cursor without a batch that holds it.
+- **Slots per turn, not per file.** A file's slot would need a wait inside the analysis
+  driver; a turn's K slots size its analysis threads instead.
+- **Setting change mid-pass.** Switching between `one` and `every` during a pass can let
+  one turn of the old mode overlap the new one; edges keep their per-track job claim, so the
+  worst case is a loudness track measured twice in that turn.
 
 ## Steps
 
-Each step has its own commit and leaves the suite green. Nothing changes until a step
-reads `worker_runners: every`.
+Nothing changes until `worker_runners: every` is set.
 
-- **MW.0 Spike.** On the e2e harness, start two and three worker containers against one
-  Postgres on 1.9.2. Expected: one leads and the others stand by. Measure the leader's
-  throughput as a baseline. Check that each container has its own `TEMP_DIR`.
-- **MW.1 Identity and helpers (R1, R2).** `runner_id`, `runner_workers`, the helper lane,
-  and the setting (`one` by default). Helpers don't take passes yet: with `every` they
-  serve only on-demand work.
-- **MW.2 Per-runner claims (R3).** Claim markers with `runner_id`, release by heartbeat,
-  and the upgrade path for role markers.
-- **MW.3 Loudness and waveform claims (R4, part).** The loudness lease, conditional
-  waveform admission, waveform batches leased per runner. Single-runner behaviour must not
-  change; the existing pass tests prove it.
-- **MW.4 Chunk handout and wraparound (R4).** The edge and loudness passes on chunks, then
-  helpers take per-track passes.
+- **MW.0 Baseline.** The suite on 1.9.2 in CI's container: green but for one timing flake
+  (`test_parallel_analysis.py::test_a_failing_pass_kills_the_files_in_flight_and_finishes_them_cancelled`
+  failed once under the full suite's load and passed 3 of 3 alone, on unchanged 1.9.2).
+- **MW.1 Identity and helpers (R1, R2).** `runner_id`, `runner_workers`, the helper loop
+  and turn, the setting (`one` by default).
+- **MW.2 On-demand work stays the leader's** (replaces the draft's per-runner claims).
+- **MW.3 Waveform admission (R4).** `keep_live`; the helper's waveform batch.
+- **MW.4 Shared edge and loudness passes (R4).** `shared_pass` batches and completion.
 - **MW.5 Edge runtime and files in flight (R5, R6).**
-- **MW.6 Status and docs.** One line per runner on the settings page (host, role, K,
-  action, heartbeat, throughput); the summed ETA; `EDGE_PROFILES.md`,
-  `LUMAE_SYNC_CONTRACT.md` (additive), README.
-- **MW.7 Verification.** See Tests.
+- **MW.6 Settings and status.** *Workers* and *Files analyzed at once across all workers* on
+  the settings page; one line per worker runner in the background-work panel.
+- **MW.7 Verification.** See Tests, and the end-to-end run below.
 - **MW.8 Release.** 1.10.0, through the release process (CI's steps in a clean container
   first, then the Actions run on `main`).
 
 ## Tests
 
-- **Unit (fake clock and database).**
-  - A worker that misses the lock helps with `every` and stands by with `one`.
-  - A helper's lane holds no singleton action.
-  - A helper steps aside for AudioMuse jobs.
-  - A new leader releases only the claims of runners whose heartbeat is gone.
-- **Postgres.**
-  - Two takers on one pass get disjoint chunks.
-  - A runner that dies mid-chunk: its tracks are done in the same pass, and its on-demand
-    claims are released after its heartbeat goes, never a live peer's.
-  - A pass completes only when nothing is due and no chunk is out.
-  - Two loudness takers never measure one track.
-  - Two waveform batches never admit one track.
-  - The files-in-flight cap holds across runners.
-  - Role markers from 1.9.2 are still released.
-- **End to end.** Two and three worker containers on the e2e harness with a seeded
-  library.
-  - Every runner works, and no track is published twice (journal counts per track).
-  - Stopping a worker mid-pass loses nothing.
-  - *Start analysis* pauses every runner.
-  - `one` behaves like 1.9.2.
-- **Full suite.** Under CI's container (Python 3.12, Postgres 17, the `av==17.1.0` edge
-  test, `build_catalog.py --check`).
+- `test_multi_worker_runner_postgres.py` (real advisory locks): a worker that misses the
+  lock helps with `can_help` and stands by without it; a helper writes its own row and never
+  the role's; it leads once the leader goes away; it stands by once helping is switched off
+  or the setting cannot be read; old rows are pruned.
+- `test_shared_pass_postgres.py`:
+  - two takers racing over 40 tracks get disjoint batches and one of them ends the pass;
+  - a batch handed back goes first with only its unfinished tracks; a dead runner's batch is
+    taken over with its finished tracks dropped; a live runner's batch never is;
+  - slots never exceed the cap, also when taken at the same moment, and a dead runner's go;
+  - the real edge and loudness passes walked by a leader and a helper at once: each track
+    downloaded and published once, the pass complete, no batch left; a runner that dies
+    holding a batch loses none of its tracks;
+  - a leader's and a helper's waveform batches never admit one track;
+  - a helper turn serves no on-demand work, walks only the per-track passes, gives its slots
+    back, waits while every slot is taken, and does nothing with `one`.
+- `test_multi_worker_settings.py`: the settings, their form and the status lines.
+- The 1.9.2 suite unchanged (one-runner behaviour), plus CI's steps.
 
 ## Risks
 

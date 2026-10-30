@@ -211,6 +211,23 @@ def test_the_panel_renders_throughput_and_eta(tick, monkeypatch):
     assert "At 4 at once: about 1.1 hours" in body  # 2.0 h x 1.86 / 3.38
 
 
+def test_with_every_worker_the_panel_gives_the_cap_and_no_single_runner_estimate(tick, monkeypatch):
+    # Multi-worker plan R6: the rates are every runner's together; one runner's K says little.
+    mod, db = tick
+    _summary(db, ready=1000, total=1500)
+    _event(db, "profile_backfill", 10, ready=250)
+    monkeypatch.setattr(mod, "background_workers", lambda: 2)
+    monkeypatch.setattr(par, "available_cpus", lambda: 8)
+    monkeypatch.setattr(mod, "shared_passes", lambda: True)
+    monkeypatch.setattr(mod, "max_files_in_flight", lambda: 12)
+
+    body = settings_render.render_reconcile_status_panel()
+
+    assert "500 left, about 2.0 hours at this rate" in body
+    assert "Files analyzed at once: 2 per worker (auto), at most 12 across all workers." in body
+    assert "at once: about" not in body
+
+
 @pytest.mark.parametrize(("state", "server_line"), [
     ("working", "<strong>Server</strong>: working: profile backfill."),
     ("waiting_host", "<strong>Server</strong>: stepping aside: waiting for AudioMuse’s main analysis."),

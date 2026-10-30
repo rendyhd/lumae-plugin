@@ -1164,6 +1164,13 @@ def _throughput_html():
     setting = _pkg.configured_background_workers()
     workers_text = f"Files analyzed at once: {workers}{' (auto)' if setting == 'auto' else ''}."
     higher = _pkg.parallel_analysis.next_workers(workers)
+    if _pkg.shared_passes():
+        # Every worker runner walks the passes: the rates above are theirs together, and one
+        # runner's K says little about the whole (multi-worker plan R6).
+        workers_text = (f"Files analyzed at once: {workers} per worker"
+                        f"{' (auto)' if setting == 'auto' else ''}, at most"
+                        f" {_pkg.max_files_in_flight()} across all workers.")
+        higher = None
     if higher and analysis_eta:
         now, then = _pkg.parallel_analysis.speedup(workers), _pkg.parallel_analysis.speedup(higher)
         if now and then:
@@ -1185,6 +1192,11 @@ _RUNNER_REASONS = {
     "no_worker_online": "catalogue, credits and lookups, and on-demand tracks while no worker is online",
     "nothing_due": "nothing due",
     "host_without_connect_raw": "this AudioMuse has no database.connect_raw (AudioMuse 3.2.0 or newer)",
+    # Multi-worker plan: a helper's turns.
+    "helper": "analysis passes, with the other workers",
+    "helper_nothing_due": "no analysis pass has a track left for it",
+    "files_in_flight_cap": "the other workers analyze as many files as the limit allows",
+    "one_worker_runner": "one worker does the heavy work (Workers: one worker)",
 }
 _RUNNER_MODES = {"waiting_host": "stepping aside", "standby": "standing by"}
 _RUNNER_ROLES = (
@@ -1231,6 +1243,40 @@ def _runner_row_html(role, label, purpose, row):
             f"<div class=\"lumae-help\">{_pkg.escape(detail)}.</div></li>")
 
 
+def _worker_runners_html(workers):
+    """Multi-worker plan R2: one line per worker runner seen lately, once more than one worker
+    runs Lumae's worker runner or every worker helps."""
+    workers = [row for row in workers if row.get("role") == "worker"]
+    online = [row for row in workers
+              if row.get("heartbeat_age_seconds") is not None
+              and float(row["heartbeat_age_seconds"]) < _pkg.runner.WORKER_ONLINE_SECONDS]
+    if len(online) < 2 and _pkg.worker_runners_setting() != "every":
+        return ""
+    lines = []
+    for row in workers:
+        age = row.get("heartbeat_age_seconds")
+        if row not in online:
+            state = f"gone (last seen {_age_text(float(age) if age is not None else None)})"
+        elif row.get("current_action"):
+            state = f"working: {str(row['current_action']).replace('_', ' ')}"
+        elif row.get("mode") == "standby":
+            state = "standing by"
+        else:
+            mode = str(row.get("mode") or "idle")
+            state = f"{_RUNNER_MODES.get(mode, mode.replace('_', ' '))}: {_runner_reason(row)}"
+        role = "leads" if row.get("leader") else "helps"
+        files = row.get("files_at_once")
+        detail = f"{row.get('host') or 'unknown host'} (pid {row.get('pid') or '?'}), {role}"
+        if files:
+            detail += f", {int(files)} file{'s' if int(files) != 1 else ''} at once"
+        detail += f", {int(row.get('actions') or 0):,} actions"
+        lines.append(f"<li>{_pkg.escape(detail)}: {_pkg.escape(state)}.</li>")
+    if not lines:
+        return ""
+    return (f"<li><strong>Workers</strong>: {len(online)} online."
+            f"<ul class=\"lumae-help\">{''.join(lines)}</ul></li>")
+
+
 def _parked_files_html():
     """W3: the files Lumae stopped trying, and why."""
     counts = _pkg.parked_files(_pkg.get_db())
@@ -1267,7 +1313,7 @@ def render_reconcile_status_panel():
     runners_html = "".join(
         _runner_row_html(role, label, purpose, rows.get(role))
         for role, label, purpose in _RUNNER_ROLES
-    )
+    ) + _worker_runners_html(snapshot.get("workers") or [])
     pending = snapshot.get("pending") or {}
     pending_html = "".join(
         f"<li><strong>{int(count):,}</strong> {_pkg.escape(str(label))}</li>"
@@ -1419,6 +1465,42 @@ def _heavy_work_form():
     """
 
 
+_WORKER_RUNNERS_CHOICES = (
+    ("one", "One worker (default)"),
+    ("every", "Every worker"),
+)
+
+
+def _worker_runners_form():
+    """Multi-worker plan: which AudioMuse workers do the waveform, edge and loudness passes."""
+    current = _pkg.worker_runners_setting()
+    options = "".join(
+        f'<option value="{value}"{" selected" if value == current else ""}>{_pkg.escape(label)}</option>'
+        for value, label in _WORKER_RUNNERS_CHOICES
+    )
+    limit = _pkg.max_files_in_flight()
+    return f"""
+        <form class="lumae-form" method="post">
+          <label class="lumae-field">
+            <span>Workers for the volume and ramp, edge and loudness passes</span>
+            <select name="worker_runners">{options}</select>
+          </label>
+          <label class="lumae-field">
+            <span>Files analyzed at once across all workers (1-{_pkg.MAX_FILES_IN_FLIGHT_LIMIT})</span>
+            <input name="max_files_in_flight" value="{_pkg.escape(str(limit))}" inputmode="numeric">
+          </label>
+          <p class="lumae-help">With one worker, a single AudioMuse worker does all of Lumae's heavy
+            work and the others wait. With every worker, each AudioMuse worker also analyzes tracks
+            of the library passes, as many at once as its own cores and memory allow, and never the
+            same track as another. One worker still builds relationships and serves the tracks the
+            app asks for. Each file is downloaded in full from the music server, so the limit across
+            workers keeps it from serving too many at once.</p>
+          <button class="lumae-button-secondary" type="submit" name="action"
+            value="save_worker_runners">Save workers</button>
+        </form>
+    """
+
+
 def render_settings(message=None, error=None):
     batch_size = _pkg.configured_backfill_limit()
     paused = _pkg.maintenance_paused()
@@ -1460,6 +1542,7 @@ def render_settings(message=None, error=None):
           </button>
         </form>
         {_heavy_work_form()}
+        {_worker_runners_form()}
         {_pkg.render_publication_repair_form()}
       </section>
     """

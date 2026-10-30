@@ -12,7 +12,7 @@ import time
 
 from plugin.api import get_db, logger, table
 
-from . import migrations, runner
+from . import migrations, runner, shared_pass
 
 
 LUMAE_TASK_TYPE_PREFIX = "plugin.lumae_analysis."
@@ -77,6 +77,7 @@ def migrate_reconcile(db):
     migrate_metadata(db)
     with db.cursor() as runner_cur:
         runner.migrate_runner_state(runner_cur)
+        shared_pass.migrate(runner_cur)
     cur = db.cursor()
     for name in ("analysis_runs", "preparation_state", "profile_backfill_state", "relationship_state"):
         migrations.ensure_columns(
@@ -509,9 +510,14 @@ def discard_event(db, event_id):
     _current_event_id.set(None)
 
 
+# The status page lists the runners that heartbeated this recently (multi-worker plan R2).
+STATUS_WORKER_SECONDS = 10 * 60
+
+
 def read_reconcile_status(db):
     cur = db.cursor()
     runners = runner.read_states(cur)
+    workers = runner.read_workers(cur, STATUS_WORKER_SECONDS)
     cur.execute(
         f"""
         SELECT action, count(*)
@@ -560,6 +566,8 @@ def read_reconcile_status(db):
     return {
         # One row per runner role that has led: runner.read_states.
         "runners": runners,
+        # One row per runner, leader or helper, seen in STATUS_WORKER_SECONDS.
+        "workers": workers,
         "pending": pending,
         "events": events,
     }
