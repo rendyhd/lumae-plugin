@@ -6,7 +6,7 @@ import os
 import re
 import socket
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
 from html import escape
 
@@ -1452,11 +1452,12 @@ def _changed_profile_state(report):
     return any(entry["action"] in _PROFILE_STATE_ACTIONS for entry in report.actions)
 
 
-def _next_reconcile_action(db, report, budget, server_id, done, shared=False):
+def _next_reconcile_action(db, report, budget, server_id, done, shared=False, slots=None):
     """Run the first due action the budget fits; ``(action, result)`` or
     ``(None, None)`` when none ran. ``done`` collects actions with nothing
     more to do this turn. ``shared`` (multi-worker plan R4): the per-track
-    passes are walked with the helpers."""
+    passes are walked with the helpers. ``slots`` (R6): a shared leader's
+    ``_LeaderSlots``, held while a per-track pass runs and only then."""
 
     def due(action):
         return action not in done and budget.fits(action)
@@ -1575,12 +1576,14 @@ def _next_reconcile_action(db, report, budget, server_id, done, shared=False):
     if due("profile_backfill"):
         profile = next_profile_backfill_run(db=db, server_id=server_id)
         if profile:
-            budget.start()
-            return "profile_backfill", _reconcile_step(
-                db, report, "profile_backfill", profile[0], profile[1], profile[1],
-                profile[2] if len(profile) > 2 else 0, profile_backfill_task, *profile[:2],
-                budget.deadline, *((True,) if shared else ()),
-            )
+            with _pass_slots(slots, done) as free:
+                if free:
+                    budget.start()
+                    return "profile_backfill", _reconcile_step(
+                        db, report, "profile_backfill", profile[0], profile[1], profile[1],
+                        profile[2] if len(profile) > 2 else 0, profile_backfill_task, *profile[:2],
+                        budget.deadline, *((True,) if shared else ()),
+                    )
         done.add("profile_backfill")
     # Multi-worker plan R4: only a shared turn passes ``shared`` on, so a
     # one-runner turn calls the passes exactly as 1.9 did.
@@ -1591,22 +1594,27 @@ def _next_reconcile_action(db, report, budget, server_id, done, shared=False):
         edge = (next_edge_backfill(db, server_id=server_id, **sharing)
                 if edge_profiles_enabled() or shared else None)
         if edge:
-            budget.start()
-            return "edge_backfill", _reconcile_step(
-                db, report, "edge_backfill", edge[0], edge[1], edge[1], 0,
-                edge_backfill_task, edge[0], edge[1], budget.deadline, *((True,) if shared else ()),
-            )
+            with _pass_slots(slots, done) as free:
+                if free:
+                    budget.start()
+                    return "edge_backfill", _reconcile_step(
+                        db, report, "edge_backfill", edge[0], edge[1], edge[1], 0,
+                        edge_backfill_task, edge[0], edge[1], budget.deadline,
+                        *((True,) if shared else ()),
+                    )
         done.add("edge_backfill")
     # LN.4c: last of the track work, so it measures only when nothing else waits.
     if due("loudness_backfill"):
         loudness = next_loudness_backfill(db, server_id=server_id, **sharing)
         if loudness:
-            budget.start()
-            return "loudness_backfill", _reconcile_step(
-                db, report, "loudness_backfill", loudness[0], loudness[1], loudness[1], 0,
-                loudness_backfill_task, loudness[0], loudness[1], budget.deadline,
-                *((True,) if shared else ()),
-            )
+            with _pass_slots(slots, done) as free:
+                if free:
+                    budget.start()
+                    return "loudness_backfill", _reconcile_step(
+                        db, report, "loudness_backfill", loudness[0], loudness[1], loudness[1], 0,
+                        loudness_backfill_task, loudness[0], loudness[1], budget.deadline,
+                        *((True,) if shared else ()),
+                    )
         done.add("loudness_backfill")
     for action, call in (("credits", _safe_credits_reconcile),
                          ("music_metadata", _safe_metadata_reconcile)):
@@ -8008,16 +8016,14 @@ def run_runner_turn(active):
     if PER_TRACK_ACTIONS & allowed and reconcile.live_host_task(db, ("main_analysis",)):
         done.update(PER_TRACK_ACTIONS)
     workers, sizing = background_sizing()
+    slots = None
     if shared:
         _release_gone_waveform(db)
-    if shared and PER_TRACK_ACTIONS - done:
-        # R6: the leader's analysis threads count towards the files in flight too.
-        granted = _safe_acquire_slots(db, workers)
-        if not granted:
-            done.update(PER_TRACK_ACTIONS)
-        workers = max(1, granted)
-        sizing = f"{sizing}; {granted} of {max_files_in_flight()} files in flight across workers"
-    active.files_at_once = workers
+        # R6: the leader's analysis threads count towards the files in flight
+        # too, but only while a per-track pass runs (_LeaderSlots).
+        slots = _LeaderSlots(db, active, workers)
+        sizing = f"{sizing}; at most {max_files_in_flight()} files in flight across workers"
+    active.files_at_once = None if shared else workers
     report = TurnReport()
     started = time.monotonic()
     worked = None
@@ -8030,7 +8036,7 @@ def run_runner_turn(active):
         with parallel_analysis.tick_scope(workers, sizing):
             while time.monotonic() - started < RUNNER_TURN_SECONDS and not active.stopped.is_set():
                 action_started = time.monotonic()
-                action, result = _next_runner_action(db, report, active, done, shared)
+                action, result = _next_runner_action(db, report, active, done, shared, slots)
                 if action is None:
                     break
                 status = str((result or {}).get("status") or "") if isinstance(result, dict) else ""
@@ -8094,6 +8100,49 @@ def _safe_release_slots(db):
         _rollback_if_possible(db)
         # Freed once this runner's heartbeat stops.
         logger.warning("lumae_analysis could not give back its analysis slots", exc_info=True)
+
+
+class _LeaderSlots:
+    """R6 for a shared leader turn: up to ``workers`` analysis slots for each
+    per-track pass, given back when the pass returns. A turn also runs the
+    leader's relationship and catalogue work, which analyses no file; holding
+    the slots through it left the helpers half the files in flight (owner's
+    server, 2026-10-31: a relationship build held 8 of 16 for minutes)."""
+
+    def __init__(self, db, active, workers):
+        self.db, self.active, self.workers = db, active, workers
+
+    def take(self, done):
+        granted = _safe_acquire_slots(self.db, self.workers)
+        if not granted:
+            # The helpers have every slot: this turn leaves the passes to them.
+            done.update(PER_TRACK_ACTIONS)
+            return False
+        pool = parallel_analysis.current()
+        if pool is not None:
+            pool.workers = granted
+        self.active.files_at_once = granted
+        return True
+
+    def give_back(self):
+        _safe_release_slots(self.db)
+        self.active.files_at_once = None
+
+
+@contextmanager
+def _pass_slots(slots, done):
+    """Whether a per-track pass may run now; a shared leader holds its slots
+    (``_LeaderSlots``) for the pass alone."""
+    if slots is None:
+        yield True
+        return
+    if not slots.take(done):
+        yield False
+        return
+    try:
+        yield True
+    finally:
+        slots.give_back()
 
 
 # Multi-worker plan R1: what a helper turn may do, in this order.
@@ -8272,11 +8321,11 @@ def _refresh_status_after_turn(db, report):
         logger.exception("lumae_analysis could not refresh the status snapshot")
 
 
-def _next_runner_action(db, report, active, done, shared=False):
+def _next_runner_action(db, report, active, done, shared=False, slots=None):
     """One action of the turn in a slice of its own; ``active`` shows each
     action while the turn looks for its work and does it (``fits``), and
     counts the one that ran (``start``). ``shared``: the per-track passes are
-    walked with the helpers (multi-worker plan R4)."""
+    walked with the helpers (multi-worker plan R4), on ``slots`` (R6)."""
 
     class Budget(SliceBudget):
         last = None
@@ -8292,7 +8341,7 @@ def _next_runner_action(db, report, active, done, shared=False):
 
     budget = Budget()
     try:
-        return _next_reconcile_action(db, report, budget, None, done, shared=shared)
+        return _next_reconcile_action(db, report, budget, None, done, shared=shared, slots=slots)
     except AnalysisProjectionDeferred as exc:
         # Held back by design (an unresolved provider identity, say): the
         # journal keeps the retry, and the log needs no traceback (R9).

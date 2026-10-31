@@ -578,6 +578,72 @@ def test_a_helper_turn_ends_in_time_to_try_the_lock(tick, monkeypatch):
     assert result.worked and time.monotonic() - started < 3
 
 
+def test_a_leader_holds_analysis_slots_only_while_a_per_track_pass_runs(tick, monkeypatch):
+    # The owner's server: a relationship build in the leader's turn held 8 of the 16 slots
+    # for minutes, so the helpers analysed half the files they could.
+    mod, db = tick
+    monkeypatch.setattr(mod, "_safe_shared_passes", lambda: True)
+    monkeypatch.setattr(mod, "background_sizing", lambda: (3, "test"))
+    monkeypatch.setattr(mod, "max_files_in_flight", lambda: 4)
+    monkeypatch.setattr(mod, "_runner_blocker", lambda *_args: None)
+    monkeypatch.setattr(mod, "runner_lane",
+                        lambda *_args: (mod.PER_TRACK_ACTIONS | {"relationships"}, "heavy_lane"))
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda **_kwargs: None)
+    runs = {"relationships": [(SERVER, SOURCE, 0)], "profile_backfill": [(SERVER, SOURCE, 0)]}
+    monkeypatch.setattr(mod, "next_relationship_run",
+                        lambda **_kwargs: runs["relationships"].pop() if runs["relationships"] else None)
+    monkeypatch.setattr(mod, "next_profile_backfill_run",
+                        lambda **_kwargs: runs["profile_backfill"].pop() if runs["profile_backfill"] else None)
+    monkeypatch.setattr(mod, "next_edge_backfill", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(mod, "next_loudness_backfill", lambda *_args, **_kwargs: None)
+    seen = []
+    active = Active("worker")
+
+    def step(_db, _report, action, *_args):
+        pool = par.current()
+        seen.append((action, shared_pass.slots_in_use(db), pool.workers, active.files_at_once))
+        return {"status": "complete"}
+
+    monkeypatch.setattr(mod, "_reconcile_step", step)
+    _alive(db, "leader-1", "helper-1")
+    assert shared_pass.acquire_slots(db, 1, 4, runner_id="helper-1") == 1
+    token = runner.RUNNER_ID.set("leader-1")
+    try:
+        mod.run_runner_turn(active)
+    finally:
+        runner.RUNNER_ID.reset(token)
+    # Only the helper's slot while the leader builds relationships; three more for its pass.
+    assert seen == [("relationships", 1, 3, None), ("profile_backfill", 4, 3, 3)]
+    assert shared_pass.slots_in_use(db) == 1
+    assert active.files_at_once is None
+
+
+def test_a_leader_whose_helpers_hold_every_slot_leaves_the_passes_to_them(tick, monkeypatch):
+    mod, db = tick
+    monkeypatch.setattr(mod, "_safe_shared_passes", lambda: True)
+    monkeypatch.setattr(mod, "background_sizing", lambda: (3, "test"))
+    monkeypatch.setattr(mod, "max_files_in_flight", lambda: 2)
+    monkeypatch.setattr(mod, "_runner_blocker", lambda *_args: None)
+    monkeypatch.setattr(mod, "runner_lane", lambda *_args: (mod.PER_TRACK_ACTIONS, "heavy_lane"))
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda **_kwargs: None)
+    monkeypatch.setattr(mod, "next_profile_backfill_run", lambda **_kwargs: (SERVER, SOURCE, 0))
+    asked = []
+    monkeypatch.setattr(mod, "next_edge_backfill", lambda *_args, **_kwargs: asked.append("edge"))
+    monkeypatch.setattr(mod, "next_loudness_backfill", lambda *_args, **_kwargs: asked.append("loudness"))
+    monkeypatch.setattr(mod, "_reconcile_step", lambda *_args: pytest.fail("a pass ran without a slot"))
+    _alive(db, "leader-1", "helper-1")
+    assert shared_pass.acquire_slots(db, 2, 2, runner_id="helper-1") == 2
+    active = Active("worker")
+    token = runner.RUNNER_ID.set("leader-1")
+    try:
+        result = mod.run_runner_turn(active)
+    finally:
+        runner.RUNNER_ID.reset(token)
+    assert not result.worked and asked == []
+    assert active.files_at_once is None
+    assert shared_pass.slots_in_use(db) == 2
+
+
 @pytest.mark.parametrize("shared", [True, False])
 def test_a_new_leader_with_every_runner_queues_its_predecessors_waveform_claim(tick, monkeypatch, shared):
     # Only a leader claims a waveform pass; the lock says the previous one is gone.
