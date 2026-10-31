@@ -133,10 +133,13 @@ first draft*).
 - A track waits for the edge pass's decode (loudness) when any runner makes edges.
 
 ### R6 Files in flight
-- Each runner's turn takes up to K slots of `analysis_slots` (`shared_pass.acquire_slots`),
-  never more than `max_files_in_flight` across all runners, and analyses that many files at
-  once; it gives them back when the turn ends. A runner that went away loses its slots. A
-  helper that gets none waits SLOT_WAIT_SECONDS.
+- Each runner takes up to K slots of `analysis_slots` (`shared_pass.acquire_slots`), never
+  more than `max_files_in_flight` across all runners, and analyses that many files at once.
+  A helper takes them for its turn. The leader takes them before each per-track pass and
+  gives them back when the pass returns, so its relationship and catalogue work holds none
+  (found on the owner's server, [report](../perf/MULTI-WORKER-PROD-2026-10-31.md)). A runner
+  that went away loses its slots. A helper that gets none waits SLOT_WAIT_SECONDS; a leader
+  that gets none leaves the passes to the helpers for that turn.
 
 ### Changes from the first draft
 - **No per-runner on-demand claims (draft R3).** Helpers never take on-demand work, so the

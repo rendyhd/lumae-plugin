@@ -7,11 +7,12 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## 1.10.0 (2026-10-30)
+## 1.10.0 (2026-10-31)
 
 Library passes can use every AudioMuse worker (issue #10; plan
-`docs/plan/LUMAE_MULTI_WORKER_PLAN_2026-10-30.md`, end-to-end report
-`docs/perf/MULTI-WORKER-E2E-2026-10-30.md`).
+`docs/plan/LUMAE_MULTI_WORKER_PLAN_2026-10-30.md`, end-to-end reports
+`docs/perf/MULTI-WORKER-E2E-2026-10-30.md` and
+`docs/perf/MULTI-WORKER-PROD-2026-10-31.md`).
 
 - New setting `worker_runners` (`one` by default, or `every`). With `every`
   the worker runners that miss the lock help the one that holds it: they walk
@@ -34,7 +35,9 @@ Library passes can use every AudioMuse worker (issue #10; plan
   away.
 - New setting `max_files_in_flight` (16, 1–64): the files analyzed at once
   across all workers, so more workers do not mean more load on the music
-  server than this.
+  server than this. The leader counts towards it only while it walks a
+  pass, so its relationship and catalogue work leaves the files in flight
+  to the helpers.
 - A pass parks for a missing edge runtime only when no worker runner has it.
 - The settings page shows one line per worker runner (leads or helps, files
   at once, its action) once more than one runs.
@@ -54,7 +57,9 @@ Library passes can use every AudioMuse worker (issue #10; plan
   the page says "in the last 6.0 hours".
 
 On three AudioMuse worker containers, `every` analysed 120 tracks in 143 s
-against 446 s with `one`, each file downloaded once. Includes every 1.9.2
+against 446 s with `one`, each file downloaded once. On the owner's server
+(three worker containers on one PC, 8 files at once each) it analysed 300
+tracks in 415 s against 700 s, each file downloaded once. Includes every 1.9.2
 change. AudioMuse 3.2.0 is still the minimum.
 
 ## 1.9.2 (2026-10-30)

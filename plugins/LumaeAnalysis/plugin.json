@@ -117,7 +117,7 @@
       "changelog": "Library passes can use every AudioMuse worker. With the new setting Workers set to every worker, the workers that do not lead Lumae's background work help it: they walk the waveform, edge and loudness passes with it, a few tracks at a time, so no file is downloaded or analyzed twice, and a worker that goes away leaves its tracks to the others. One runner works per worker container, and Files analyzed at once across all workers caps the load on the music server. On-demand tracks, similar albums and artists, and catalogue work stay with one worker. The default, one worker, works as 1.9.2 did.",
       "imageUrl": "",
       "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.10.0.zip",
-      "checksum": "5f16924c6cf703fced8f8a1a844bb7ab"
+      "checksum": "3f43c682e676d0861815cb8734d05392"
     },
     {
       "version": "1.9.2",
