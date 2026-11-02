@@ -21,9 +21,10 @@ import hashlib
 import json
 import math
 from flask import jsonify, request
-from plugin.api import get_db, table
+from plugin.api import get_db, render_page, table
 from . import migrations
-from .collection_manager import current_principal, require_collections_enabled
+from .collection_manager import current_collection_scope, current_principal, require_collections_enabled
+from .undertone_ui import render_undertone_page
 
 UNDERTONE_SCHEMA_VERSION = 1
 MAX_RECORD_BYTES = 32_768
@@ -205,7 +206,46 @@ def _source():
     return _text(request.args.get("source"), "Undertone source", 128)
 
 
+def list_sources(cur, principal):
+    """This principal's Undertone sources, most recently changed first, with their size and name."""
+    cur.execute(f"""SELECT source,
+            count(*) FILTER (WHERE id LIKE 'item:t:%%' AND value->>'deletedAt' IS NULL),
+            count(*) FILTER (WHERE id LIKE 'item:a:%%' AND value->>'deletedAt' IS NULL),
+            count(*) FILTER (WHERE id LIKE 'preset:%%' AND value->>'deletedAt' IS NULL),
+            max(seq),
+            max(CASE WHEN id = 'item:source' THEN value->'record'->'body'->>'libraryName' END),
+            max(CASE WHEN id = 'item:source' THEN value->'record'->'body'->>'serverType' END)
+        FROM {table('undertone_records')} WHERE principal=%s
+        GROUP BY source ORDER BY max(seq) DESC""", (principal,))
+    return [
+        {"source": r[0], "tracks": r[1], "albums": r[2], "presets": r[3], "seq": r[4],
+         "library": r[5], "serverType": r[6]}
+        for r in cur.fetchall()
+    ]
+
+
 def register_undertone_routes(bp):
+    @bp.get("/undertone")
+    @require_collections_enabled
+    def undertone_page():
+        scope = current_collection_scope()
+        detail = (
+            "Everyone using the AudioMuse installation token sees this Undertone library."
+            if scope["mode"] == "shared"
+            else "Only this signed-in AudioMuse user can see it."
+        )
+        return render_page(render_undertone_page(scope["label"], detail), title="Undertone")
+
+    @bp.get("/api/undertone/sources")
+    @require_collections_enabled
+    def undertone_sources():
+        principal = current_principal()
+        with get_db().cursor() as cur:
+            sources = list_sources(cur, principal)
+        response = jsonify(sources=sources, max_batch=MAX_BATCH)
+        response.headers["Cache-Control"] = "private, no-store"
+        return response
+
     @bp.get("/api/undertone/changes")
     @require_collections_enabled
     def undertone_changes():

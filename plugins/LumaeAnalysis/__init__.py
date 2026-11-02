@@ -282,6 +282,9 @@ CATALOG_JOB_TIMEOUT_SECONDS = 90 * 60
 RELATIONSHIP_JOB_TIMEOUT_SECONDS = 60 * 60
 COLLECTIONS_MENU_LABEL = "Living Collections"
 COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
+# Lumae's Undertone page (UT.9) sits beside Living Collections, switched by the same setting.
+UNDERTONE_MENU_LABEL = "Undertone"
+UNDERTONE_MENU_ENDPOINT = "lumae_analysis.undertone_page"
 
 bp = Blueprint("lumae_analysis", __name__)
 register_collection_routes(bp)
@@ -363,13 +366,20 @@ def sync_collections_menu(enabled, manager=None):
     items = [
         item
         for item in record.get("menu_items", [])
-        if item.get("endpoint") != COLLECTIONS_MENU_ENDPOINT
+        if item.get("endpoint") not in (COLLECTIONS_MENU_ENDPOINT, UNDERTONE_MENU_ENDPOINT)
     ]
     if enabled:
         items.append(
             {
                 "label": COLLECTIONS_MENU_LABEL,
                 "endpoint": COLLECTIONS_MENU_ENDPOINT,
+                "admin_only": False,
+            }
+        )
+        items.append(
+            {
+                "label": UNDERTONE_MENU_LABEL,
+                "endpoint": UNDERTONE_MENU_ENDPOINT,
                 "admin_only": False,
             }
         )
@@ -7637,6 +7647,7 @@ def register(ctx):
     ctx.set_settings_page("lumae_analysis.settings")
     if collections_enabled():
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
+        ctx.add_menu_item(UNDERTONE_MENU_LABEL, UNDERTONE_MENU_ENDPOINT)
     ctx.on_install(migrate)
     ctx.on_flask_start(flask_start)
     if hasattr(ctx, "on_worker_start"):

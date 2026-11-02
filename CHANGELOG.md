@@ -17,6 +17,13 @@ Undertone records (Lumae UT.7; contract §5.8).
   (the server and library Undertone reads), with revisions, tombstones,
   receipts and a compact change feed as saved Vibes have. Switched by the
   collection manager. The plugin never interprets a record.
+- The Undertone page (Lumae UT.9), in the Plugins menu beside Living
+  Collections: the synced library as a table with the fields as columns, a
+  field set on many rows at once or pasted down a column, presets,
+  categories and fields edited, and the phone's own Undertone file exported
+  and imported. It never asks the music server; phones take the changes at
+  their next sync. `/api/undertone/sources` lists a person's Undertone
+  libraries.
 
 ## 1.9.2 (2026-10-30)
 

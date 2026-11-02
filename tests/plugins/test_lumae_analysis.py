@@ -8166,7 +8166,12 @@ def test_register_exposes_enabled_collections_in_plugins_menu(monkeypatch):
             "label": "Living Collections",
             "endpoint": "lumae_analysis.collection_manager_page",
             "admin_only": False,
-        }
+        },
+        {
+            "label": "Undertone",
+            "endpoint": "lumae_analysis.undertone_page",
+            "admin_only": False,
+        },
     ]
 
 
@@ -8192,6 +8197,11 @@ def test_sync_collections_menu_updates_live_plugin_record():
         {
             "label": "Living Collections",
             "endpoint": "lumae_analysis.collection_manager_page",
+            "admin_only": False,
+        },
+        {
+            "label": "Undertone",
+            "endpoint": "lumae_analysis.undertone_page",
             "admin_only": False,
         },
     ]

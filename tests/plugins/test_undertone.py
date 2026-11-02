@@ -106,3 +106,49 @@ def test_batch_applies_in_order_with_per_record_answers(client):
     bad = client.post("/api/undertone/mutations/batch?source=src-a", json={"mutations": [put("x"), put("x")]},
                       headers={"Test-User": "alice"})
     assert bad.status_code == 400
+
+
+def item(mutation_id, record_id, body):
+    return put(mutation_id, record_id, record={"kind": "item", "body": body})
+
+
+def test_sources_list_each_library_with_its_name_and_size(client):
+    batch = [
+        item("i0", "item:source", {"kind": "source", "server": "second", "serverType": "jellyfin", "libraryName": "Sleep"}),
+        item("i1", "item:t:t1", {"kind": "track", "id": "t1", "title": "Rain"}),
+        item("i2", "item:t:t2", {"kind": "track", "id": "t2", "title": "Wind"}),
+        item("i3", "item:a:a1", {"kind": "album", "id": "a1", "title": "Calm"}),
+        put("p1", "preset:p1"),
+    ]
+    assert client.post("/api/undertone/mutations/batch?source=src-a", json={"mutations": batch},
+                       headers={"Test-User": "alice"}).status_code == 200
+    post(client, delete("gone", record_id="item:t:t2", base=1))
+    post(client, put("other", "preset:p9"), source="src-b")
+    response = client.get("/api/undertone/sources", headers={"Test-User": "alice"})
+    assert response.headers["Cache-Control"] == "private, no-store"
+    body = response.get_json()
+    assert body["max_batch"] == 200
+    assert [s["source"] for s in body["sources"]] == ["src-b", "src-a"]
+    assert body["sources"][1] == {"source": "src-a", "tracks": 1, "albums": 1, "presets": 1,
+                                  "seq": body["sources"][1]["seq"], "library": "Sleep", "serverType": "jellyfin"}
+    assert client.get("/api/undertone/sources", headers={"Test-User": "bob"}).get_json()["sources"] == []
+
+
+def test_page_is_served_beside_living_collections(client):
+    body = client.get("/undertone", headers={"Test-User": "alice"}).get_data(as_text=True)
+    assert "Personal library · alice" in body
+    assert "Only this signed-in AudioMuse user can see it." in body
+    # Reads and writes only through the Undertone record routes, relative to the plugin.
+    assert "const api='api/undertone'" in body
+    assert "/mutations/batch?source=" in body and "/changes?source=" in body
+    # The phone's own file, and the phone's matching ladder for imports.
+    assert "format:'lumae-undertone',version:1" in body
+    assert "musicBrainzId" in body and "Math.abs(t.seconds-m.seconds)<=2" in body
+    # A record changed elsewhere is written once more over its new revision.
+    assert "r.error==='undertone_conflict'" in body and "w.tries<1" in body
+
+
+def test_page_escapes_the_principal():
+    ui = importlib.import_module("plugins.LumaeAnalysis.undertone_ui")
+    body = ui.render_undertone_page("<b>x</b>", "a & b")
+    assert "&lt;b&gt;x&lt;/b&gt;" in body and "a &amp; b" in body
