@@ -2,7 +2,7 @@
   "id": "lumae_analysis",
   "name": "Lumae Analysis",
   "author": "Lumae",
-  "description": "Mirrors supported Navidrome and Jellyfin catalogues and prepares Lumae volume, SmoothFade, album-similarity, and artist-similarity data away from the phone.",
+  "description": "Companion plugin for Lumae Music (https://lumaemusic.app), providing additional analysis and sync.",
   "requirements": [],
   "capabilities": {
     "lumae_analysis_profiles": {
