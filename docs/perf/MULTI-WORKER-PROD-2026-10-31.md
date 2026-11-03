@@ -84,7 +84,9 @@ killed one's. That is not changed in this build.
   host in the first run.
 - An AudioMuse analysis during a pass, covered in the first run.
 
-The server was left on the re-cut with `worker_runners: every`. Setting Workers back to one
+The server was left on the re-cut with `worker_runners: every`, and on 2026-11-03 got the
+next re-cut (`7310a168`), which adds 8fbc2e9's limit on a relationship build's share of a
+turn; it loaded on Flask and all three workers without an error. Setting Workers back to one
 worker restores the 1.9 behaviour without a reinstall. Going back to 1.9.0's code
 (`dist/lumae_analysis/lumae_analysis_1.9.0.zip`, `f6756477…`, also kept on both volumes) was not
 tried.
