@@ -7,7 +7,7 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## 1.10.0 (2026-10-31)
+## 1.10.0 (2026-11-03)
 
 Library passes can use every AudioMuse worker (issue #10; plan
 `docs/plan/LUMAE_MULTI_WORKER_PLAN_2026-10-30.md`, end-to-end reports
@@ -41,8 +41,6 @@ Library passes can use every AudioMuse worker (issue #10; plan
 - A pass parks for a missing edge runtime only when no worker runner has it.
 - The settings page shows one line per worker runner (leads or helps, files
   at once, its action) once more than one runs.
-- New tables `runner_workers`, `pass_batches` and `analysis_slots`. Nothing
-  changes with `one`, and nothing on the wire changes.
 - A relationship build no longer holds back the volume, edge and loudness
   passes. A build checkpoints after each step and is due again at once, and
   it comes before those passes, so while it ran they never got a turn: on one
@@ -55,6 +53,9 @@ Library passes can use every AudioMuse worker (issue #10; plan
   hours", and 0 for queues whose events had been dropped. When the journal
   reaches back less than a day, every queue now counts over the same span and
   the page says "in the last 6.0 hours".
+- New tables `runner_workers`, `pass_batches` and `analysis_slots`. With
+  `one` the worker runner works as in 1.9.2 apart from the relationship
+  build's share of a turn, and nothing on the wire changes.
 
 On three AudioMuse worker containers, `every` analysed 120 tracks in 143 s
 against 446 s with `one`, each file downloaded once. On the owner's server
