@@ -7,6 +7,21 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased
+
+- A relationship build no longer holds back the volume, edge and loudness
+  passes. A build checkpoints after each step and is due again at once, and
+  it comes before those passes, so while it ran they never got a turn: on one
+  library a build ran for days and the settings page said about 15,000
+  loudness records were left, with none measured. A build now takes at most
+  half of each runner turn; the passes get the rest.
+- The settings page's throughput says how far back it counts. The journal
+  keeps at most 1,000 events per source, and a running relationship build
+  (about 166 steps an hour) fills that in six hours: the page said "999 in 24
+  hours", and 0 for queues whose events had been dropped. When the journal
+  reaches back less than a day, every queue now counts over the same span and
+  the page says "in the last 6.0 hours".
+
 ## 1.9.2 (2026-10-30)
 
 Similar albums and artists rank energy and moods the way the app does

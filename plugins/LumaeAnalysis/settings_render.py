@@ -1118,6 +1118,16 @@ def _eta_text(hours):
     return f"about {hours / 24:.1f} days"
 
 
+def _window_text(hours):
+    """The span a queue's day count covers: 24 hours, or less when a busy
+    journal reaches back less than a day (``reconcile.queue_throughput``)."""
+    if hours is None:
+        return "24 hours"
+    if hours < 1:
+        return f"the last {max(1, round(hours * 60))} minutes"
+    return f"the last {hours:.1f} hours"
+
+
 def _age_text(seconds):
     if seconds is None:
         return "earlier"
@@ -1141,7 +1151,8 @@ def _throughput_html():
     analysis_eta = 0.0
     for queue in queues:
         approximate = queue["action"] in ("edge_backfill", "loudness_backfill")
-        text = (f"{queue['last_hour']:,} in the last hour, {queue['last_day']:,} in 24 hours")
+        text = (f"{queue['last_hour']:,} in the last hour, {queue['last_day']:,} in "
+                f"{_window_text(queue.get('day_hours'))}")
         if queue["remaining"] is not None:
             text += f"; {'about ' if approximate else ''}{queue['remaining']:,} left"
             if queue["eta_hours"] is not None:

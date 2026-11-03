@@ -140,11 +140,51 @@ def test_after_a_statistics_reset_what_is_left_uses_the_larger_count(tick):
     assert _loudness_left(db) == 10
 
 
+def test_a_full_journal_counts_and_says_only_what_it_still_holds(tick, monkeypatch):
+    # 166 relationship steps an hour fill a source's 1,000 events in six
+    # hours: the panel said "999 in 24 hours", and 0 for the queues whose
+    # events had been trimmed.
+    mod, db = tick
+    monkeypatch.setattr(reconcile, "EVENT_RETENTION_MAX", 4)
+    for minutes in (600, 300, 240, 180, 120, 50, 10):  # oldest first: the 4 newest stay
+        _event(db, "relationships", minutes, status="queued")
+    reconcile.record_event(db, "credits", SERVER, None, "success", phase="done", duration_ms=10,
+                           summary={"status": "published"})
+    with db.cursor() as cur:  # another source's journal, not full, from before the cut
+        cur.execute(f"UPDATE {P}reconcile_events SET completed_at=now()-interval '400 minutes' "
+                    "WHERE catalog_instance_id IS NULL")
+    db.commit()
+    monkeypatch.setattr(mod, "background_workers", lambda: 2)
+    monkeypatch.setattr(par, "available_cpus", lambda: 8)
+
+    queues = {queue["action"]: queue for queue in reconcile.queue_throughput(db)}
+    body = settings_render.render_reconcile_status_panel()
+
+    assert (queues["relationships"]["last_hour"], queues["relationships"]["last_day"]) == (2, 4)
+    assert queues["relationships"]["day_hours"] == pytest.approx(3.0, abs=0.05)
+    assert queues["credits"]["last_day"] == 0  # every queue counts over the same span
+    assert "2 in the last hour, 4 in the last 3.0 hours" in body
+
+
+def test_a_journal_that_holds_the_day_says_24_hours(tick):
+    mod, db = tick
+    _event(db, "relationships", 600, status="queued")
+    [relationships] = [q for q in reconcile.queue_throughput(db) if q["action"] == "relationships"]
+    assert (relationships["last_day"], relationships["day_hours"]) == (1, None)
+
+
 @pytest.mark.parametrize("hours,text", [
     (0.2, "about 12 minutes"), (2.0, "about 2.0 hours"), (36, "about 1.5 days"), (None, ""),
 ])
 def test_eta_wording(hours, text):
     assert settings_render._eta_text(hours) == text
+
+
+@pytest.mark.parametrize("hours,text", [
+    (None, "24 hours"), (5.96, "the last 6.0 hours"), (0.5, "the last 30 minutes"),
+])
+def test_day_window_wording(hours, text):
+    assert settings_render._window_text(hours) == text
 
 
 def test_the_eta_at_more_files_at_once_follows_the_measured_scaling():

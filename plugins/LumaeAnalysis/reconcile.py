@@ -613,8 +613,24 @@ def queue_throughput(db):
     rate (S12). What is left is approximate for edges and loudness: published
     waveforms without an edge, the summary's eligible tracks without a
     loudness record, from the tables' live row counts. Read-only, and it never scans the library: the settings
-    status route renders it (P2-1)."""
+    status route renders it (P2-1).
+
+    A source's journal holds at most EVENT_RETENTION_MAX events: a busy one
+    reaches back less than a day (166 relationship steps an hour fill it in
+    six). Then every queue counts only since the newest such cut, and
+    ``day_hours`` says how many hours that is (None: the full 24)."""
     cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT max(oldest), EXTRACT(EPOCH FROM now() - max(oldest)) / 3600.0
+          FROM (SELECT min(COALESCE(completed_at, started_at)) AS oldest, count(*) AS kept
+                  FROM {events_table()} WHERE status <> 'running'
+                 GROUP BY COALESCE(catalog_instance_id, '')) sources
+         WHERE kept >= %s AND oldest > now() - interval '24 hours'
+        """,
+        (EVENT_RETENTION_MAX,),
+    )
+    since, day_hours = cur.fetchone() or (None, None)
     cur.execute(
         f"""
         SELECT action,
@@ -629,10 +645,11 @@ def queue_throughput(db):
                             ELSE 1 END AS units
                   FROM {events_table()}
                  WHERE action = ANY(%s) AND status IN ('success', 'deferred')
-                   AND completed_at > now() - interval '24 hours') recent
+                   AND completed_at > now() - interval '24 hours'
+                   AND (%s::timestamptz IS NULL OR completed_at >= %s::timestamptz)) recent
          GROUP BY action
         """,
-        ([action for action, _label, _unit in THROUGHPUT_QUEUES],),
+        ([action for action, _label, _unit in THROUGHPUT_QUEUES], since, since),
     )
     done = {str(row[0]): (int(row[1] or 0), int(row[2] or 0)) for row in cur.fetchall()}
     cur.execute(
@@ -664,6 +681,7 @@ def queue_throughput(db):
         remaining = int(left[index]) if index < len(left) and left[index] is not None else None
         eta = remaining / last_hour if remaining is not None and last_hour > 0 else None
         queues.append({"action": action, "label": label, "last_hour": last_hour, "last_day": last_day,
+                       "day_hours": float(day_hours) if day_hours is not None else None,
                        "remaining": remaining, "eta_hours": eta})
     return queues
 

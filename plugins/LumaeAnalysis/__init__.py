@@ -7363,6 +7363,11 @@ WORKER_YIELD_TASK_TYPES = (
 # for a change of plugin before the next.
 RUNNER_SLICE_SECONDS = 15
 RUNNER_TURN_SECONDS = 300
+# A relationship build checkpoints after each slice and is due again at once,
+# and it comes before the per-track passes: it takes at most this much of a
+# turn, and the passes after it the rest. A build that ran for days held the
+# loudness pass back the whole time (15,000 tracks left, none measured).
+RUNNER_RELATIONSHIP_SECONDS = RUNNER_TURN_SECONDS // 2
 # While an AudioMuse job holds a runner back it looks again this often.
 RUNNER_HOST_WAIT_SECONDS = 60
 # An analysis run in its settling grace is due again within this.
@@ -7488,7 +7493,8 @@ def run_runner_turn(active):
     """One turn of ``active`` (runner.Runner): today's actions in today's order
     (``_next_reconcile_action``) for every source, within the runner's lane,
     each in a slice of its own, until none is due or RUNNER_TURN_SECONDS
-    pass, stepping aside for AudioMuse before each (R3, R4)."""
+    pass, stepping aside for AudioMuse before each (R3, R4). A relationship
+    build gets at most RUNNER_RELATIONSHIP_SECONDS of the turn."""
     db = get_db()
     role = active.role
     if active.new_leader:
@@ -7519,12 +7525,14 @@ def run_runner_turn(active):
     report = TurnReport()
     started = time.monotonic()
     worked = None
+    relationship_seconds = 0.0
     # Credits sweep once a turn (S8); the K analysis threads (WP1b) start on
     # first use and stop, with their analysis workers, when the turn ends.
     credits_service.begin_tick()
     try:
         with parallel_analysis.tick_scope(*background_sizing()):
             while time.monotonic() - started < RUNNER_TURN_SECONDS and not active.stopped.is_set():
+                action_started = time.monotonic()
                 action, result = _next_runner_action(db, report, active, done)
                 if action is None:
                     break
@@ -7533,6 +7541,10 @@ def run_runner_turn(active):
                     worked = action
                 if status in _SETTLED_STATUSES or (status == "complete" and action in _COMPLETE_SETTLES):
                     done.add(action)
+                if action == "relationships":
+                    relationship_seconds += time.monotonic() - action_started
+                    if relationship_seconds >= RUNNER_RELATIONSHIP_SECONDS:
+                        done.add(action)
                 blocker = _runner_blocker(db, role)
                 if blocker:
                     return runner.Turn(True, "waiting_host", f"audiomuse:{blocker}",
