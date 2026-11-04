@@ -131,7 +131,10 @@ def test_one_backfill_batch_at_a_time_and_each_track_once(two_connections, monke
 
     def work(conn):
         seen = []
-        for _ in range(20):
+        # Until the pass is done, not a number of tries: on a slow disk a batch's commits take
+        # long and a try that finds the other batch running does not.
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
             result = mod.profile_backfill_task(SERVER, SOURCE)
             seen.append(result["status"])
             if result["status"] in ("complete", "waiting_retry"):
