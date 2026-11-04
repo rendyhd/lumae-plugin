@@ -3,7 +3,10 @@ for each queue, its throughput per hour from the journal, what is left and
 an ETA; for the analysis queues the ETA at the current number of files
 analysed at once and at a higher one. Since the runners (R9) the panel shows
 each runner's state, not a schedule's or a refused AudioMuse schedule's.
+Since 1.10.1 the counts are the throughput table's, not the journal's.
 """
+from concurrent.futures import ThreadPoolExecutor
+
 import psycopg2
 import pytest
 
@@ -21,6 +24,31 @@ def _event(db, action, minutes_ago, **summary):
         cur.execute(f"UPDATE {P}reconcile_events SET completed_at=now()-make_interval(mins => %s) "
                     "WHERE event_id=(SELECT max(event_id) FROM {P}reconcile_events)".replace("{P}", P),
                     (minutes_ago,))
+        # Its units went to this minute's count: the test's minute is when it finished.
+        cur.execute(f"""
+            WITH moved AS (DELETE FROM {P}throughput_counts
+                            WHERE minute > now() - interval '2 minutes' AND action=%s RETURNING units)
+            INSERT INTO {P}throughput_counts AS counts (minute, action, units)
+            SELECT date_trunc('minute', now() - make_interval(mins => %s)), %s, units FROM moved
+            ON CONFLICT (minute, action) DO UPDATE SET units = counts.units + EXCLUDED.units
+            """, (action, minutes_ago, action))
+    db.commit()
+
+
+def _counts(db):
+    with db.cursor() as cur:
+        cur.execute(f"SELECT action, sum(units) FROM {P}throughput_counts WHERE units > 0 GROUP BY action")
+        return {action: int(units) for action, units in cur.fetchall()}
+
+
+def _before_the_counts(db):
+    with db.cursor() as cur:
+        cur.execute(f"DROP TABLE {P}throughput_counts")
+    db.commit()
+
+
+def _upgrade(db):
+    reconcile.migrate_reconcile(db)
     db.commit()
 
 
@@ -52,15 +80,20 @@ def test_throughput_counts_the_last_hour_and_day_per_queue(tick):
     assert queues["loudness_backfill"]["last_hour"] == 0
 
 
-def test_remaining_and_eta(tick):
+@pytest.mark.parametrize("minutes,eta", [
+    (59, 2.0),  # about an hour's work: 250 an hour
+    (10, 0.35),  # 250 in ten minutes is 1,500 an hour, not 250
+    (2, 500 * (5 / 60) / 250),  # under five minutes says little: counted as five
+])
+def test_remaining_and_eta(tick, minutes, eta):
     mod, db = tick
     _summary(db, ready=1000, total=1500)
-    _event(db, "profile_backfill", 10, ready=250)
+    _event(db, "profile_backfill", minutes, ready=250)
 
     [waveforms] = [q for q in reconcile.queue_throughput(db) if q["action"] == "profile_backfill"]
 
     assert waveforms["remaining"] == 500
-    assert waveforms["eta_hours"] == pytest.approx(2.0)
+    assert waveforms["eta_hours"] == pytest.approx(eta, abs=0.04)
 
 
 def test_no_throughput_means_no_eta(tick):
@@ -140,35 +173,171 @@ def test_after_a_statistics_reset_what_is_left_uses_the_larger_count(tick):
     assert _loudness_left(db) == 10
 
 
-def test_a_full_journal_counts_and_says_only_what_it_still_holds(tick, monkeypatch):
-    # 166 relationship steps an hour fill a source's 1,000 events in six
-    # hours: the panel said "999 in 24 hours", and 0 for the queues whose
-    # events had been trimmed.
+def test_the_counts_outlive_a_full_journal(tick, monkeypatch):
+    # Six worker runners fill a source's 1,000 events in about an hour: the
+    # panel's span fell from 3.6 hours to 1.0 as a loudness pass ran on.
     mod, db = tick
     monkeypatch.setattr(reconcile, "EVENT_RETENTION_MAX", 4)
-    for minutes in (600, 300, 240, 180, 120, 50, 10):  # oldest first: the 4 newest stay
+    for minutes in (600, 300, 240, 180, 120, 50, 10):  # oldest first: the 4 newest stay in the journal
         _event(db, "relationships", minutes, status="queued")
+    monkeypatch.setattr(mod, "background_workers", lambda: 2)
+    monkeypatch.setattr(par, "available_cpus", lambda: 8)
+
+    [relationships] = [q for q in reconcile.queue_throughput(db) if q["action"] == "relationships"]
+    body = settings_render.render_reconcile_status_panel()
+
+    with db.cursor() as cur:
+        cur.execute(f"SELECT count(*) FROM {P}reconcile_events")
+        assert cur.fetchone()[0] == 4
+    assert (relationships["last_hour"], relationships["last_day"]) == (2, 7)
+    assert relationships["day_hours"] is None
+    assert "2 in the last hour, 7 in 24 hours" in body
+
+
+def test_a_finished_event_counts_its_units(tick):
+    mod, db = tick
+    running = reconcile.begin_event(db, "loudness_backfill", SERVER, SOURCE)
+    assert _counts(db) == {}
+
+    reconcile.finish_event(db, running, "success", phase="done", summary={"ready": 7})
+    second = reconcile.begin_event(db, "loudness_backfill", SERVER, SOURCE)
+    reconcile.finish_event(db, second, "deferred", phase="done", summary={"ready": 5})
+    failed = reconcile.begin_event(db, "loudness_backfill", SERVER, SOURCE)
+    reconcile.finish_event(db, failed, "failed", phase="failed", error="no", summary={"ready": 100})
+    empty = reconcile.begin_event(db, "edge_backfill", SERVER, SOURCE)
+    reconcile.finish_event(db, empty, "success", phase="done", summary={"ready": 0})
+    other = reconcile.begin_event(db, "catalog_preparation", SERVER, SOURCE)
+    reconcile.finish_event(db, other, "success", phase="done", summary={"ready": 9})
+    for status in ("published", "current"):
+        reconcile.record_event(db, "credits", SERVER, None, "success", phase=status, duration_ms=10,
+                               summary={"status": status})
+
+    assert _counts(db) == {"loudness_backfill": 12, "credits": 1}
+
+
+def test_runners_finishing_at_once_lose_no_counts(tick, second_connection):
+    # Every runner writes this minute's row.
+    mod, db = tick
+
+    def finish(connection):
+        for _ in range(30):
+            reconcile.record_event(connection, "loudness_backfill", SERVER, SOURCE, "success",
+                                   phase="done", duration_ms=10, summary={"ready": 2})
+
+    with ThreadPoolExecutor(2) as pool:
+        list(pool.map(finish, (db, second_connection)))
+
+    assert _counts(db) == {"loudness_backfill": 120}
+
+
+def test_a_count_that_fails_does_not_cost_the_event(tick):
+    mod, db = tick
+    _before_the_counts(db)
+
+    event = reconcile.begin_event(db, "loudness_backfill", SERVER, SOURCE)
+    reconcile.finish_event(db, event, "success", phase="done", summary={"ready": 3})
+    reconcile.record_event(db, "credits", SERVER, SOURCE, "success", phase="done", duration_ms=10,
+                           summary={"status": "published"})
+
+    with db.cursor() as cur:
+        cur.execute(f"SELECT action, status FROM {P}reconcile_events ORDER BY event_id")
+        assert cur.fetchall() == [("loudness_backfill", "success"), ("credits", "success")]
+
+
+def test_counts_older_than_a_day_go(tick):
+    mod, db = tick
+    with db.cursor() as cur:
+        cur.execute(f"INSERT INTO {P}throughput_counts (minute, action, units) VALUES "
+                    "(now() - interval '26 hours', 'loudness_backfill', 5), "
+                    "(now() - interval '24 hours', 'loudness_backfill', 6)")
+    db.commit()
+
+    reconcile.record_event(db, "relationships", SERVER, SOURCE, "success", phase="done", duration_ms=10)
+
+    assert _counts(db) == {"loudness_backfill": 6, "relationships": 1}
+
+
+def _full_journal(db, monkeypatch, minutes):
+    """A full journal from 1.10.0: its 4 newest events stay."""
+    monkeypatch.setattr(reconcile, "EVENT_RETENTION_MAX", 4)
+    for finished in minutes:
+        _event(db, "loudness_backfill", finished, ready=100)
+
+
+def _full_journal_upgraded(db, monkeypatch, minutes):
+    _full_journal(db, monkeypatch, minutes)
+    _before_the_counts(db)
+    _upgrade(db)
+
+
+def test_an_upgrade_counts_from_a_full_journal_and_says_how_far_back(tick, monkeypatch):
+    mod, db = tick
+    _full_journal(db, monkeypatch, (600, 300, 240, 180, 120, 50, 10))
     reconcile.record_event(db, "credits", SERVER, None, "success", phase="done", duration_ms=10,
                            summary={"status": "published"})
     with db.cursor() as cur:  # another source's journal, not full, from before the cut
         cur.execute(f"UPDATE {P}reconcile_events SET completed_at=now()-interval '400 minutes' "
                     "WHERE catalog_instance_id IS NULL")
     db.commit()
+    _before_the_counts(db)
+    _upgrade(db)
     monkeypatch.setattr(mod, "background_workers", lambda: 2)
     monkeypatch.setattr(par, "available_cpus", lambda: 8)
 
     queues = {queue["action"]: queue for queue in reconcile.queue_throughput(db)}
     body = settings_render.render_reconcile_status_panel()
 
-    assert (queues["relationships"]["last_hour"], queues["relationships"]["last_day"]) == (2, 4)
-    assert queues["relationships"]["day_hours"] == pytest.approx(3.0, abs=0.05)
-    assert queues["credits"]["last_day"] == 0  # every queue counts over the same span
-    assert "2 in the last hour, 4 in the last 3.0 hours" in body
+    assert (queues["loudness_backfill"]["last_hour"], queues["loudness_backfill"]["last_day"]) == (200, 400)
+    assert queues["loudness_backfill"]["day_hours"] == pytest.approx(3.0, abs=0.05)
+    assert queues["credits"]["last_day"] == 0  # every queue counts from the same moment
+    assert "200 in the last hour, 400 in the last 3.0 hours" in body
 
 
-def test_a_journal_that_holds_the_day_says_24_hours(tick):
+def test_an_upgrade_counts_once(tick, monkeypatch):
+    mod, db = tick
+    _full_journal_upgraded(db, monkeypatch, (300, 200, 40, 30, 20, 10))
+    before = _counts(db)
+
+    _upgrade(db)
+
+    assert before == {"loudness_backfill": 400} == _counts(db)
+
+
+def test_the_span_goes_when_the_counts_have_run_a_day(tick, monkeypatch):
+    mod, db = tick
+    _full_journal_upgraded(db, monkeypatch, (300, 200, 40, 30, 20, 10))
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {P}throughput_counts SET minute=now() - interval '24 hours 1 minute' "
+                    "WHERE action=%s", (reconcile.COUNTED_SINCE,))
+    db.commit()
+
+    [loudness] = [q for q in reconcile.queue_throughput(db) if q["action"] == "loudness_backfill"]
+
+    assert loudness["day_hours"] is None
+
+
+def test_counts_under_an_hour_say_so_and_rate_what_they_hold(tick, monkeypatch):
+    # 400 in 36 minutes said "400 in the last hour" and, of 1,000 left, 2.5
+    # hours instead of 1.5.
+    mod, db = tick
+    _full_journal_upgraded(db, monkeypatch, (300, 200, 36, 27, 18, 9))
+    _eligible(db, 1000)
+    monkeypatch.setattr(mod, "background_workers", lambda: 2)
+    monkeypatch.setattr(par, "available_cpus", lambda: 8)
+
+    [loudness] = [q for q in reconcile.queue_throughput(db) if q["action"] == "loudness_backfill"]
+    body = settings_render.render_reconcile_status_panel()
+
+    assert loudness["eta_hours"] == pytest.approx(1.5, abs=0.05)
+    assert "400 in the last 36 minutes; about 1,000 left, about 1.5 hours at this rate" in body
+    assert "400 in the last hour" not in body
+
+
+def test_an_upgrade_from_a_journal_that_holds_the_day_says_24_hours(tick):
     mod, db = tick
     _event(db, "relationships", 600, status="queued")
+    _before_the_counts(db)
+    _upgrade(db)
     [relationships] = [q for q in reconcile.queue_throughput(db) if q["action"] == "relationships"]
     assert (relationships["last_day"], relationships["day_hours"]) == (1, None)
 
@@ -198,7 +367,7 @@ def test_the_eta_at_more_files_at_once_follows_the_measured_scaling():
 def test_the_panel_renders_throughput_and_eta(tick, monkeypatch):
     mod, db = tick
     _summary(db, ready=1000, total=1500)
-    _event(db, "profile_backfill", 10, ready=250)
+    _event(db, "profile_backfill", 59, ready=250)
     monkeypatch.setattr(mod, "background_workers", lambda: 2)
     monkeypatch.setattr(par, "available_cpus", lambda: 8)
 
@@ -215,7 +384,7 @@ def test_with_every_worker_the_panel_gives_the_cap_and_no_single_runner_estimate
     # Multi-worker plan R6: the rates are every runner's together; one runner's K says little.
     mod, db = tick
     _summary(db, ready=1000, total=1500)
-    _event(db, "profile_backfill", 10, ready=250)
+    _event(db, "profile_backfill", 59, ready=250)
     monkeypatch.setattr(mod, "background_workers", lambda: 2)
     monkeypatch.setattr(par, "available_cpus", lambda: 8)
     monkeypatch.setattr(mod, "shared_passes", lambda: True)

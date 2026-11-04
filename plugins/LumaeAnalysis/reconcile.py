@@ -49,6 +49,15 @@ EVENT_RETENTION_HOURS = 24
 EVENT_RETENTION_MIN = 25
 EVENT_RETENTION_MAX = 1000
 EVENT_JOURNAL_LIMIT = 25
+# The settings page's throughput counts, one row per queue and minute (``_count_units``). Six
+# worker runners fill a source's 1,000 journal events in about an hour, so the counts keep to
+# themselves, for a little over the day the page shows.
+THROUGHPUT_KEEP_HOURS = 25
+# A row in that table: how far back the counts reach while that is under a day, after an
+# upgrade from a journal that held less (``_seed_throughput``).
+COUNTED_SINCE = "counted_since"
+# An ETA counts at least this much of a queue's work: a rate from less says little.
+THROUGHPUT_RATE_MIN_HOURS = 5 / 60
 # AudioMuse shows a task's message in Recent tasks: a job an older version
 # queued still runs one of these functions once.
 TICK_MESSAGE_MAX = 100
@@ -62,6 +71,10 @@ def control_table():
 
 def events_table():
     return table("reconcile_events")
+
+
+def throughput_table():
+    return table("throughput_counts")
 
 
 def _work_table(name):
@@ -137,6 +150,20 @@ def migrate_reconcile(db):
         f"CREATE INDEX IF NOT EXISTS {table('reconcile_events_source_idx')} "
         f"ON {events_table()} (catalog_instance_id, event_id DESC)",
     )
+    cur.execute("SELECT to_regclass(%s)", (throughput_table(),))
+    new_counts = (cur.fetchone() or (None,))[0] is None
+    cur.execute(
+        f"""
+        CREATE TABLE IF NOT EXISTS {throughput_table()} (
+            minute TIMESTAMPTZ NOT NULL,
+            action TEXT NOT NULL,
+            units BIGINT NOT NULL,
+            PRIMARY KEY (minute, action)
+        )
+        """
+    )
+    if new_counts:
+        _seed_throughput(cur)
     cur.close()
 
 
@@ -442,6 +469,7 @@ def finish_event(db, event_id, status, *, phase, summary=None, error=None, next_
         ),
     )
     _trim_events(cur)
+    _count_units(cur, event_id)
     cur.close()
     db.commit()
     _current_event_id.set(None)
@@ -459,6 +487,7 @@ def record_event(db, action, server_id, catalog_instance_id, status, *, phase,
              heartbeat_at, completed_at, duration_ms, summary, last_error)
         VALUES (%s, %s, %s, %s, %s, now() - make_interval(secs => %s / 1000.0),
                 now(), now(), %s, %s::jsonb, %s)
+        RETURNING event_id
         """,
         (
             server_id,
@@ -472,7 +501,9 @@ def record_event(db, action, server_id, catalog_instance_id, status, *, phase,
             str(error)[:2000] if error else None,
         ),
     )
+    event_id = cur.fetchone()[0]
     _trim_events(cur)
+    _count_units(cur, event_id)
     cur.close()
     db.commit()
 
@@ -498,6 +529,78 @@ def _trim_events(cur):
         """,
         (EVENT_RETENTION_MAX, EVENT_RETENTION_MIN, EVENT_RETENTION_HOURS),
     )
+
+
+def _count_units(cur, event_id):
+    """Add a finished event's units to its queue's count for this minute, last before the
+    event's commit as every runner writes these rows. The settings page's counts never cost a
+    pass its event: a failure here is logged and the event stands."""
+    cur.execute("SAVEPOINT lumae_throughput")
+    try:
+        cur.execute(
+            f"""
+            INSERT INTO {throughput_table()} AS counts (minute, action, units)
+            SELECT date_trunc('minute', completed_at), action, units
+              FROM (SELECT action, completed_at, {_EVENT_UNITS} AS units
+                      FROM {events_table()}
+                     WHERE event_id=%s AND action = ANY(%s)
+                       AND status IN ('success', 'deferred')) finished
+             WHERE units > 0
+            ON CONFLICT (minute, action) DO UPDATE SET units = counts.units + EXCLUDED.units
+            """,
+            (event_id, _throughput_actions()),
+        )
+        cur.execute(
+            f"""
+            DELETE FROM {throughput_table()}
+             WHERE (minute, action) IN (
+                 SELECT minute, action FROM {throughput_table()}
+                  WHERE minute < now() - make_interval(hours => %s)
+                    FOR UPDATE SKIP LOCKED)
+            """,
+            (THROUGHPUT_KEEP_HOURS,),
+        )
+        cur.execute("RELEASE SAVEPOINT lumae_throughput")
+    except Exception:
+        cur.execute("ROLLBACK TO SAVEPOINT lumae_throughput")
+        logger.exception("lumae_analysis could not count an event's throughput")
+
+
+def _seed_throughput(cur):
+    """A new throughput table starts from the journal, and says how far back that is when a
+    full journal holds less than a day. Every queue counts from the same moment."""
+    cur.execute(
+        f"""
+        SELECT max(oldest)
+          FROM (SELECT min(COALESCE(completed_at, started_at)) AS oldest, count(*) AS kept
+                  FROM {events_table()} WHERE status <> 'running'
+                 GROUP BY COALESCE(catalog_instance_id, '')) sources
+         WHERE kept >= %s AND oldest > now() - interval '24 hours'
+        """,
+        (EVENT_RETENTION_MAX,),
+    )
+    since = (cur.fetchone() or (None,))[0]
+    cur.execute(
+        f"""
+        INSERT INTO {throughput_table()} (minute, action, units)
+        SELECT date_trunc('minute', completed_at), action, sum(units)
+          FROM (SELECT action, completed_at, {_EVENT_UNITS} AS units
+                  FROM {events_table()}
+                 WHERE action = ANY(%s) AND status IN ('success', 'deferred')
+                   AND completed_at > now() - interval '24 hours'
+                   AND (%s::timestamptz IS NULL OR completed_at >= %s::timestamptz)) finished
+         WHERE units > 0
+         GROUP BY 1, 2
+        ON CONFLICT (minute, action) DO NOTHING
+        """,
+        (_throughput_actions(), since, since),
+    )
+    if since is not None:
+        cur.execute(
+            f"INSERT INTO {throughput_table()} (minute, action, units) VALUES (%s, %s, 0) "
+            "ON CONFLICT (minute, action) DO NOTHING",
+            (since, COUNTED_SINCE),
+        )
 
 
 def discard_event(db, event_id):
@@ -594,8 +697,19 @@ THROUGHPUT_QUEUES = (
     ("relationships", "Relationship steps", "runs"),
     ("credits", "MusicBrainz credits", "published"),
 )
+# SQL for those units from an event's action and summary.
+_EVENT_UNITS = """CASE WHEN action IN ('profile_backfill', 'edge_backfill', 'loudness_backfill')
+                       THEN CASE WHEN jsonb_typeof(summary->'ready')='number'
+                                 THEN (summary->>'ready')::numeric::bigint ELSE 0 END
+                       WHEN action='credits'
+                       THEN CASE WHEN summary->>'status'='published' THEN 1 ELSE 0 END
+                       ELSE 1 END"""
 # The queues whose files K analysis threads analyse (performance plan WP1b).
 ANALYSIS_QUEUES = ("profile_backfill", "edge_backfill", "loudness_backfill")
+
+
+def _throughput_actions():
+    return [action for action, _label, _unit in THROUGHPUT_QUEUES]
 
 
 def _estimated_rows(name):
@@ -616,50 +730,42 @@ def _estimated_rows(name):
 
 
 def queue_throughput(db):
-    """Per queue: units done in the last hour and the last 24 hours (from the
-    journal, which keeps a day), units left and the ETA at the last hour's
-    rate (S12). What is left is approximate for edges and loudness: published
+    """Per queue: units done in the last hour and the last 24 hours, units left
+    and the ETA at the queue's recent rate (S12). The rate is the last hour's
+    units over the part of that hour since the queue's first of them, so a
+    queue that started ten minutes ago is not taken for one doing ten minutes'
+    work an hour. What is left is approximate for edges and loudness: published
     waveforms without an edge, the summary's eligible tracks without a
     loudness record, from the tables' live row counts. Read-only, and it never scans the library: the settings
     status route renders it (P2-1).
 
-    A source's journal holds at most EVENT_RETENTION_MAX events: a busy one
-    reaches back less than a day (166 relationship steps an hour fill it in
-    six). Then every queue counts only since the newest such cut, and
-    ``day_hours`` says how many hours that is (None: the full 24)."""
+    The counts are the throughput table's (``_count_units``), not the journal's:
+    the journal holds at most EVENT_RETENTION_MAX events a source, about an hour
+    on six worker runners. ``day_hours`` says how many hours the counts reach
+    back while an upgrade from a full journal has not counted for a day (None:
+    the full 24)."""
     cur = db.cursor()
     cur.execute(
-        f"""
-        SELECT max(oldest), EXTRACT(EPOCH FROM now() - max(oldest)) / 3600.0
-          FROM (SELECT min(COALESCE(completed_at, started_at)) AS oldest, count(*) AS kept
-                  FROM {events_table()} WHERE status <> 'running'
-                 GROUP BY COALESCE(catalog_instance_id, '')) sources
-         WHERE kept >= %s AND oldest > now() - interval '24 hours'
-        """,
-        (EVENT_RETENTION_MAX,),
+        f"SELECT EXTRACT(EPOCH FROM now() - minute) / 3600.0 FROM {throughput_table()} "
+        "WHERE action=%s AND minute > now() - interval '24 hours'",
+        (COUNTED_SINCE,),
     )
-    since, day_hours = cur.fetchone() or (None, None)
+    since = cur.fetchone()
+    day_hours = float(since[0]) if since else None
     cur.execute(
         f"""
         SELECT action,
-               COALESCE(sum(units) FILTER (WHERE completed_at > now() - interval '1 hour'), 0),
-               COALESCE(sum(units), 0)
-          FROM (SELECT action, completed_at,
-                       CASE WHEN action IN ('profile_backfill', 'edge_backfill', 'loudness_backfill')
-                            THEN CASE WHEN jsonb_typeof(summary->'ready')='number'
-                                      THEN (summary->>'ready')::bigint ELSE 0 END
-                            WHEN action='credits'
-                            THEN CASE WHEN summary->>'status'='published' THEN 1 ELSE 0 END
-                            ELSE 1 END AS units
-                  FROM {events_table()}
-                 WHERE action = ANY(%s) AND status IN ('success', 'deferred')
-                   AND completed_at > now() - interval '24 hours'
-                   AND (%s::timestamptz IS NULL OR completed_at >= %s::timestamptz)) recent
+               COALESCE(sum(units) FILTER (WHERE minute > now() - interval '1 hour'), 0),
+               COALESCE(sum(units), 0),
+               EXTRACT(EPOCH FROM now() - min(minute) FILTER (WHERE minute > now() - interval '1 hour'))
+                   / 3600.0
+          FROM {throughput_table()}
+         WHERE action = ANY(%s) AND minute > now() - interval '24 hours'
          GROUP BY action
         """,
-        ([action for action, _label, _unit in THROUGHPUT_QUEUES], since, since),
+        (_throughput_actions(),),
     )
-    done = {str(row[0]): (int(row[1] or 0), int(row[2] or 0)) for row in cur.fetchall()}
+    done = {str(row[0]): (int(row[1] or 0), int(row[2] or 0), float(row[3] or 0)) for row in cur.fetchall()}
     cur.execute(
         f"""
         SELECT
@@ -685,12 +791,13 @@ def queue_throughput(db):
     cur.close()
     queues = []
     for index, (action, label, _unit) in enumerate(THROUGHPUT_QUEUES):
-        last_hour, last_day = done.get(action, (0, 0))
+        last_hour, last_day, worked_hours = done.get(action, (0, 0, 0.0))
         remaining = int(left[index]) if index < len(left) and left[index] is not None else None
-        eta = remaining / last_hour if remaining is not None and last_hour > 0 else None
+        eta = None
+        if remaining is not None and last_hour > 0:
+            eta = remaining * max(worked_hours, THROUGHPUT_RATE_MIN_HOURS) / last_hour
         queues.append({"action": action, "label": label, "last_hour": last_hour, "last_day": last_day,
-                       "day_hours": float(day_hours) if day_hours is not None else None,
-                       "remaining": remaining, "eta_hours": eta})
+                       "day_hours": day_hours, "remaining": remaining, "eta_hours": eta})
     return queues
 
 
