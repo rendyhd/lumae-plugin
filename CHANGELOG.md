@@ -7,6 +7,26 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.10.1 (2026-11-04)
+
+The settings page's throughput keeps its own counts.
+
+- The counts came from the journal, which holds at most 1,000 events per
+  source. Six worker runners write about 1,000 events an hour, so as a loudness
+  pass ran on, the page's "in the last" span fell from 3.6 hours to 1.0. They now
+  have a table of their own, `throughput_counts`, one row per queue and minute
+  for a little over a day: the page says "in the last hour" and "in 24 hours"
+  however many workers run. The journal still holds what it did.
+- An upgrade starts the counts from the journal. When a full journal holds less
+  than a day, the page says how far back it counts until the day has passed, so
+  the span grows from there. Under an hour it gives only that span.
+- An ETA goes by how long the queue has been working in the last hour, at least
+  five minutes, not by the whole hour. A pass that had just started showed 6.7
+  hours where the next reading showed 1.7, and a journal holding 36 minutes said
+  "400 in the last hour" and, of 1,000 left, 2.5 hours where 1.5 was right.
+- Counting never costs a pass its event: a count that fails is logged and the
+  event stands. With `one` or `every`, nothing on the wire changes.
+
 ## 1.10.0 (2026-11-03)
 
 Library passes can use every AudioMuse worker (issue #10; plan

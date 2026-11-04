@@ -112,6 +112,14 @@
   },
   "versions": [
     {
+      "version": "1.10.1",
+      "min_core_version": "3.2.0",
+      "changelog": "The settings page's throughput keeps its own counts. They came from the background journal, which on several workers holds only about an hour, so the \"in the last\" span kept shrinking while a pass ran, and below an hour the estimate ran long. The page now says the last hour and the last 24 hours however many workers run; for up to a day after this upgrade it says how far back it counts. An estimate now goes by how long the queue has been working in the last hour, so a pass that has just started no longer shows one several times too long.",
+      "imageUrl": "",
+      "checksum": "86cf37532e15ffa27414d67c49e7cc79",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.10.1.zip"
+    },
+    {
       "version": "1.10.0",
       "min_core_version": "3.2.0",
       "changelog": "Library passes can use every AudioMuse worker. With the new setting Workers set to every worker, the workers that do not lead Lumae's background work help it: they walk the waveform, edge and loudness passes with it, a few tracks at a time, so no file is downloaded or analyzed twice, and a worker that goes away leaves its tracks to the others. One runner works per worker container, and Files analyzed at once across all workers caps the load on the music server. On-demand tracks, similar albums and artists, and catalogue work stay with one worker. The default, one worker, works as 1.9.2 did, except that a relationship build no longer holds back the volume, edge and loudness passes: it takes at most half of each turn. The throughput panel says how far back it counts.",
