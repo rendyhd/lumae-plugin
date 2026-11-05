@@ -27,6 +27,11 @@ _unaccent_warned = False
 _stale_search_warned = False
 # Section totals are exact up to this many rows, then "1000+" (LUM-016).
 TOTAL_CAP = 1000
+# A search matching at most this many tracks reads its pages from their ids
+# (see ``_matching_track_ids``). A list this long costs scope=all about 100 ms.
+# Above it, a term spread through the titles fills a 37-row page within the
+# first 4% of a million-track walk.
+SEARCH_ID_CAP = 1000
 
 
 def unaccent_available(cur):
@@ -341,7 +346,57 @@ def _search_state(cur, catalog, query, artist):
     }
 
 
-def _track_filters(ctx, tracks="t", album_name="al.name"):
+def _matching_track_ids(cur, ctx):
+    """The tracks a search matches, or None when there are too many to list.
+
+    The planner cannot tell a rare term from a common one. It estimates
+    ``LIKE '%term%'`` from the 99 rows ``ANALYZE`` happened to put in
+    ``search_text``'s histogram, over every catalogue in the table: one mention
+    means 1/99 of the rows, whatever the true count. Expecting a page soon, it
+    walks a keyset index with the search as a filter, and for a rare term that
+    reads the whole generation, in each section. The walk is also what makes a
+    common term fast, so neither plan can be fixed in advance.
+
+    So a search asks first. Unordered and limited, this statement stops early
+    for a common term and goes through the trigram index for a rare one. Up to
+    ``SEARCH_ID_CAP`` matches, every section reads from these ids (see
+    ``_page_order``). Above it, a page is usually near the start of a walk, so
+    the sections keep the text filter and the planner's choice.
+    """
+    if not ctx["stored"] or not ctx["tokens"]:
+        return None
+    filters, params = _text_filters(ctx)
+    cur.execute(
+        f"SELECT t.track_id FROM {table('catalog_tracks')} t "
+        "WHERE t.catalog_instance_id=%s AND t.published_generation=%s AND t.available"
+        f"{filters} LIMIT %s",
+        tuple([ctx["catalog"], ctx["generation"]] + params + [SEARCH_ID_CAP + 1]),
+    )
+    ids = [row[0] for row in cur.fetchall()]
+    return ids if len(ids) <= SEARCH_ID_CAP else None
+
+
+def _track_filters(cur, ctx):
+    """What keeps a catalogue track in this search, as `` AND ...``."""
+    if "track_ids" not in ctx:
+        ctx["track_ids"] = _matching_track_ids(cur, ctx)
+    if ctx["track_ids"] is not None:
+        return " AND t.track_id = ANY(%s::text[])", [ctx["track_ids"]]
+    return _text_filters(ctx)
+
+
+def _page_order(ctx, sort_key):
+    """What a section orders by, after ``_track_filters``.
+
+    With the tracks listed, ``|| ''`` keeps every index from offering the order,
+    so the section sorts what the ids give instead of walking for a page. Even
+    with an exact count of tracks the walk can be the wrong plan: all of one
+    artist's tracks are one row of the artists section, which then never fills.
+    """
+    return f"({sort_key} || '')" if ctx["track_ids"] is not None else sort_key
+
+
+def _text_filters(ctx, tracks="t", album_name="al.name"):
     """The search and artist filters on catalogue tracks, as `` AND ...``."""
     text = f"{tracks}.search_text" if ctx["stored"] else search_text_sql(
         ctx["folded"], tracks, album_name)
@@ -413,19 +468,20 @@ def _section(cur, rows, cursor, first_page, count_sql, params, exact=None):
 
 def _keyset_tracks(cur, ctx, limit, offset, after):
     """Tracks by ``(lower(title), track_id)``."""
-    filters, params = _track_filters(ctx)
+    filters, params = _track_filters(cur, ctx)
     base = (f"FROM {table('catalog_tracks')} t {_album_join()} "
             "WHERE t.catalog_instance_id=%s AND t.published_generation=%s AND t.available "
             f"AND NULLIF(t.title, '') IS NOT NULL{filters}")
     params = [ctx["catalog"], ctx["generation"]] + params
     keyset, keyset_params = _after("lower(t.title)", "t.track_id", after)
+    order = _page_order(ctx, "lower(t.title)")
     rows, cursor, _keys = _paged(
         cur,
         "SELECT t.track_id, t.title, t.artist_display AS artist, al.name AS album, "
         "COALESCE(NULLIF(t.album_artist_display, ''), t.artist_display) AS album_artist, "
         "NULL::INTEGER AS year, NULL::INTEGER AS rating, t.track_id AS cover_item_id, "
         f"lower(t.title) AS sort_key, t.track_id AS sort_id {base}{keyset} "
-        "ORDER BY lower(t.title), t.track_id",
+        f"ORDER BY {order}, t.track_id",
         params + keyset_params, limit, offset,
     )
     for row in rows:
@@ -441,7 +497,7 @@ def _keyset_tracks(cur, ctx, limit, offset, after):
 
 def _keyset_albums(cur, ctx, limit, offset, after):
     """Catalogue albums with a matching track, by ``(lower(name), album_id)``."""
-    filters, params = _track_filters(ctx)
+    filters, params = _track_filters(cur, ctx)
     base = (f"FROM {table('catalog_albums')} al "
             "WHERE al.catalog_instance_id=%s AND al.published_generation=%s AND al.available "
             "AND NULLIF(al.name, '') IS NOT NULL "
@@ -451,11 +507,12 @@ def _keyset_albums(cur, ctx, limit, offset, after):
             f"AND t.album_id=al.album_id AND t.available{filters})")
     base_params = [ctx["catalog"], ctx["generation"]] + params
     keyset, keyset_params = _after("lower(al.name)", "al.album_id", after)
+    order = _page_order(ctx, "lower(al.name)")
     rows, cursor, _keys = _paged(
         cur,
         "SELECT al.album_id, al.name AS title, al.album_artist_display AS album_row_artist, "
         f"lower(al.name) AS sort_key, al.album_id AS sort_id {base}{keyset} "
-        "ORDER BY lower(al.name), al.album_id",
+        f"ORDER BY {order}, al.album_id",
         base_params + keyset_params, limit, offset,
     )
     details = {}
@@ -491,16 +548,17 @@ ARTIST_KEY_SQL = "COALESCE(NULLIF(t.album_artist_display, ''), t.artist_display)
 def _keyset_artists(cur, ctx, limit, offset, after):
     """Artist names (album artist, else track artist) by ``(lower(name), name)``."""
     key = ARTIST_KEY_SQL
-    filters, params = _track_filters(ctx)
+    filters, params = _track_filters(cur, ctx)
     base = (f"FROM {table('catalog_tracks')} t {_album_join()} "
             "WHERE t.catalog_instance_id=%s AND t.published_generation=%s AND t.available "
             f"AND NULLIF({key}, '') IS NOT NULL{filters}")
     base_params = [ctx["catalog"], ctx["generation"]] + params
     keyset, keyset_params = _after(f"lower({key})", key, after)
+    order = _page_order(ctx, f"lower({key})")
     _rows, cursor, keys = _paged(
         cur,
-        f"SELECT DISTINCT lower({key}) AS sort_key, {key} AS sort_id {base}{keyset} "
-        f"ORDER BY lower({key}), {key}",
+        f"SELECT DISTINCT {order} AS sort_key, {key} AS sort_id {base}{keyset} "
+        f"ORDER BY {order}, {key}",
         base_params + keyset_params, limit, offset,
     )
     details = {}

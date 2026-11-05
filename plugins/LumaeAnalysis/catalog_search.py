@@ -18,6 +18,8 @@ present):
   installed; otherwise search filters the generation's rows (logged once).
   It is scoped by catalogue and generation through the keyset btrees below,
   which the planner ANDs with it, and because old generations are pruned.
+  A search reads it once per request, to list a rare term's tracks
+  (``collection_library._matching_track_ids``).
 - keyset btrees on ``(catalog_instance_id, published_generation, lower(key),
   id)`` for tracks by title, albums by name and artists by name;
 - ``(catalog_instance_id, published_generation, album_id)`` on tracks.
