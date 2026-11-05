@@ -315,6 +315,17 @@ class Recording:
         return Cursor()
 
 
+# ANALYZE samples 300 rows per unit of a table's highest statistics target. At the
+# default (100) search_text's histogram is 99 rows drawn at random from 30k of the
+# 50k below, and a term found in one of them is estimated at 1/99 of the rows,
+# whatever its true count: "e5d0" (9 rows in the generation) went from 2 estimated
+# rows to 240 in about 4% of runs, and the planner chose the keyset walk over the
+# trigram index. From 167 up ANALYZE reads every row, so the statistics, and the
+# plans below, depend on the data alone. 1000 also keeps one mention close to the
+# truth (24 rows), under any collation's choice of histogram rows.
+SEARCH_TEXT_STATISTICS = 1000
+
+
 def publish_large(db):
     """30k tracks in 2k albums, plus a second catalogue and an old generation."""
     catalog_search = mod("catalog_search")
@@ -345,6 +356,8 @@ def publish_large(db):
     db.commit()
     db.autocommit = True
     with db.cursor() as cur:
+        cur.execute(f"ALTER TABLE {t('catalog_tracks')} ALTER COLUMN search_text "
+                    f"SET STATISTICS {SEARCH_TEXT_STATISTICS}")
         cur.execute(f"ANALYZE {t('catalog_tracks')}")
         cur.execute(f"ANALYZE {t('catalog_albums')}")
     db.autocommit = False
