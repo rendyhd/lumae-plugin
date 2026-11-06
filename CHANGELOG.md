@@ -7,9 +7,10 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## 1.10.1 (2026-11-04)
+## 1.10.1 (2026-11-06)
 
-The settings page's throughput keeps its own counts.
+The settings page's throughput keeps its own counts, and a search for a rare
+term no longer reads the whole library.
 
 - The counts came from the journal, which holds at most 1,000 events per
   source. Six worker runners write about 1,000 events an hour, so as a loudness
@@ -26,6 +27,20 @@ The settings page's throughput keeps its own counts.
   "400 in the last hour" and, of 1,000 left, 2.5 hours where 1.5 was right.
 - Counting never costs a pass its event: a count that fails is logged and the
   event stands. With `one` or `every`, nothing on the wire changes.
+- A search for a rare term could read every track. When `ANALYZE` had sampled
+  the term, the planner expected a page soon and walked a keyset index past the
+  whole generation, in all three sections of `scope=all`, until the next
+  `ANALYZE` drew another sample. A term common in another catalogue did the same.
+  A search now asks for the matching ids first, and with at most 1000 of them
+  every section reads those rows and no others. Results and paging are unchanged.
+  A rare term went from 1060 ms to 6 ms at 132k tracks and from 12.7 s to 9 ms at
+  1M. A term of another catalogue went from 1383 to 133 ms at 132k and from 7.3 s
+  to 499 ms at 1M, still over the 300 ms budget there.
+- That costs some searches time. With 100 to 1000 matches that the sample missed,
+  a search takes about twice as long (14 to 28 ms at 132k, 43 to 111 ms at 1M),
+  and every search runs one more statement. Above 1000 matches a search keeps the
+  planner's choice, so matches that sit together can still walk: one artist's
+  3000 tracks at 1M take about 1.5 s.
 
 ## 1.10.0 (2026-11-03)
 

@@ -114,10 +114,10 @@
     {
       "version": "1.10.1",
       "min_core_version": "3.2.0",
-      "changelog": "The settings page's throughput keeps its own counts. They came from the background journal, which on several workers holds only about an hour, so the \"in the last\" span kept shrinking while a pass ran, and below an hour the estimate ran long. The page now says the last hour and the last 24 hours however many workers run; for up to a day after this upgrade it says how far back it counts. An estimate now goes by how long the queue has been working in the last hour, so a pass that has just started no longer shows one several times too long.",
+      "changelog": "The settings page's throughput keeps its own counts. They came from the background journal, which on several workers holds only about an hour, so the \"in the last\" span kept shrinking while a pass ran, and below an hour the estimate ran long. The page now says the last hour and the last 24 hours however many workers run; for up to a day after this upgrade it says how far back it counts. An estimate now goes by how long the queue has been working in the last hour, so a pass that has just started no longer shows one several times too long. A search for a rare term no longer reads through the whole library, which took about a second at 132,000 tracks and over ten at a million.",
       "imageUrl": "",
-      "checksum": "86cf37532e15ffa27414d67c49e7cc79",
-      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.10.1.zip"
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.10.1.zip",
+      "checksum": "b0435102ae0e934373ebe4b6021b136a"
     },
     {
       "version": "1.10.0",
