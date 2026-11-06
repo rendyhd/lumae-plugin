@@ -1027,7 +1027,7 @@ A journey is the phone's own listening plan (an artist's albums in order, a coll
 - **Provider-identity rekey** rewrites exact old provider ids inside stored journeys and receipts (song and album ids, `builtFrom` sources), with a new seq and the same revision, as §5.5. Phones rekey their own copies.
 - **Client rules.** Send the outbox, then pull. After a successful write, take the returned record when it differs from what was sent: it may hold another phone's credits, newer song states or a place played later. A pulled record at the revision the phone already holds brings only credits. Keep the time of every state change in `stateAt`, also when a song is marked not played.
 
-### 5.8 Undertone records (`undertone.py`, unreleased; Lumae UT.7)
+### 5.8 Undertone records (`undertone.py`, from 1.10.1; Lumae UT.7)
 
 Gate: `capabilities.undertone` = `{schema_version: 1, enabled, scope, max_record_bytes: 32768, max_batch: 200, kinds: ["category","detail","field","group","item","preset"]}`. `enabled` and `scope` are the collection manager's, as for saved Vibes (§5.5): with `scope: null` every route answers that caller 401, and every route answers 404 `collection_manager_disabled` when the setting is off.
 

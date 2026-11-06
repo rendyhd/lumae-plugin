@@ -7,28 +7,10 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased
-
-Undertone records (Lumae UT.7; contract §5.8).
-
-- `capabilities.undertone` and `/api/undertone/changes`, `/mutations` and
-  `/mutations/batch`: the phone's Undertone fields, categories, presets,
-  groups, details and music index, kept per person and per Undertone source
-  (the server and library Undertone reads), with revisions, tombstones,
-  receipts and a compact change feed as saved Vibes have. Switched by the
-  collection manager. The plugin never interprets a record.
-- The Undertone page (Lumae UT.9), in the Plugins menu beside Living
-  Collections: the synced library as a table with the fields as columns, a
-  field set on many rows at once or pasted down a column, presets,
-  categories and fields edited, and the phone's own Undertone file exported
-  and imported. It never asks the music server; phones take the changes at
-  their next sync. `/api/undertone/sources` lists a person's Undertone
-  libraries.
-
 ## 1.10.1 (2026-11-06)
 
-The settings page's throughput keeps its own counts, and a search for a rare
-term no longer reads the whole library.
+The settings page's throughput keeps its own counts, a search for a rare term no
+longer reads the whole library, and Undertone can sync here.
 
 - The counts came from the journal, which holds at most 1,000 events per
   source. Six worker runners write about 1,000 events an hour, so as a loudness
@@ -59,6 +41,24 @@ term no longer reads the whole library.
   and every search runs one more statement. Above 1000 matches a search keeps the
   planner's choice, so matches that sit together can still walk: one artist's
   3000 tracks at 1M take about 1.5 s.
+
+Undertone's records and page (Lumae UT.7, UT.9; contract §5.8). Nothing happens
+until a version of Lumae with Undertone syncs: an upgrade adds three empty tables
+and, where Living Collections is on, the page in the Plugins menu.
+
+- `capabilities.undertone` and `/api/undertone/changes`, `/mutations` and
+  `/mutations/batch`: the phone's Undertone fields, categories, presets,
+  groups, details and music index, kept per person and per Undertone source
+  (the server and library Undertone reads), with revisions, tombstones,
+  receipts and a compact change feed as saved Vibes have. Switched by the
+  collection manager. The plugin never interprets a record, so a preset's
+  filter comes back as the phone wrote it.
+- The Undertone page, in the Plugins menu beside Living Collections: the synced
+  library as a table with the fields as columns, a field set on many rows at once
+  or pasted down a column, presets, categories and fields edited, and the phone's
+  own Undertone file exported and imported. It never asks the music server; phones
+  take the changes at their next sync. `/api/undertone/sources` lists a person's
+  Undertone libraries.
 
 ## 1.10.0 (2026-11-03)
 

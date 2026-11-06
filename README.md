@@ -82,6 +82,11 @@ a running 1.2.5 installation — no 1.2.5 process may keep running once the
   conflict response (K9, §5.3); and collection items carry an explicit
   `catalog_instance_id`, so the same track can be a distinct item per
   catalogue (K10, LUM-013, §5.1).
+* **Undertone.** From 1.10.1, a version of Lumae with Undertone can sync its
+  focus and sleep library's fields, presets and details here, per person and
+  per library, and the Undertone page in the Plugins menu edits them in a
+  table (§5.8). It's switched by the collection manager and never stores audio
+  or sign-ins.
 * **Diagnostics and readiness.** The settings page shows a per-source
   readiness panel — catalogue, analysis projection, waveform profiles, edge
   profiles and relationships — each with an availability word, a last
@@ -175,7 +180,7 @@ the whole object back — the POST replaces every stored setting.
 | `analysis_time_limit_seconds` | 900 | 60–86400 | Per-file wall-clock kill for waveform/edge analysis (Analysis time limits, above). A new value applies to the next analyzed file; no worker restarts. |
 | `diagnostic_statement_timeout_ms` | 5000 | 1000–30000 | `SET LOCAL statement_timeout` for each read behind the settings-page diagnostics and `/database-state`; a section whose read timed out is reported as "unavailable", never as zero. |
 | `edge_profiles_enabled` | `true` | — | Turns edge (SmoothFade) analysis off without touching already-published waveform profiles. Also gated by the PyAV runtime (any PyAV >= 16.0 that passes the built-in qualification check); see `capabilities.edge_profiles.available` in health. |
-| `collection_manager_enabled` | `false` | — | Enables Living Collections and Personal Shelves sync (Collections, above). |
+| `collection_manager_enabled` | `false` | — | Enables Living Collections, Personal Shelves sync (Collections, above) and Undertone. |
 | `heavy_work` | `auto` | `auto`, `server`, `worker` | From 1.9.0, which runner does the heavy lane (waveform, edge and loudness passes, on-demand tracks, relationships): `auto` an AudioMuse worker while one is online, and the server only for on-demand tracks while none is; `server` the web process, with or without a worker; `worker` never the web process. Also on the settings page. |
 | `worker_runners` | `one` | `one`, `every` | From 1.10.0, how many AudioMuse workers do the heavy lane's library passes. `one`: the worker runner that holds the lock, as in 1.9. `every`: every other worker container helps it walk the waveform, edge and loudness passes (one runner per container), each taking a few tracks at a time so no track is analyzed or downloaded twice; on-demand tracks, relationships and catalogue work stay with the one that leads. Every worker steps aside for AudioMuse's own jobs. No helper runs while `heavy_work` is `server`. Also on the settings page. |
 | `max_files_in_flight` | 16 | 1–64 | From 1.10.0, with `worker_runners: every`, the most files analyzed at once across all workers (each still runs `background_workers` at a time); it caps the load on the music server. |
