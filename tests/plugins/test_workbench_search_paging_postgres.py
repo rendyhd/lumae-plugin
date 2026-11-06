@@ -6,6 +6,8 @@
 - ``EXPLAIN`` on a migrated, analysed catalogue: search uses the trigram
   index, a cursor page reads the keyset index scoped by catalogue and
   generation with no Sort and no OFFSET, album pages use the album_id index.
+- A term the statistics overrate reads no keyset index to find its page, and a
+  common term still does.
 - Without pg_trgm or unaccent, migration and search still work.
 - Publication writes the search text with the rows.
 """
@@ -390,11 +392,13 @@ def test_plans_use_the_trigram_keyset_and_album_indexes(migrated_db, lib, monkey
         assert "(catalog_instance_id, published_generation, " in definition, definition
     assert "gin_trgm_ops" in definitions[t("idx_catalog_tracks_search_trgm")]
 
-    # Search: the stored text through the trigram index.
+    # Search: the stored text through the trigram index, then the page by id.
     result = lib.browse_library(scope="tracks", query="e5d0", catalog_instance_id=CAT)
     assert result["sections"]["tracks"]["items"]
-    plan = _plan(migrated_db, *_page_sql(recording, "lower(t.title) AS sort_key"))
+    plan = _plan(migrated_db, *_page_sql(recording, "SELECT t.track_id FROM"))
     assert f"Bitmap Index Scan on {t('idx_catalog_tracks_search_trgm')}" in plan, plan
+    sql, params = _page_sql(recording, "lower(t.title) AS sort_key")
+    assert "ANY(" in sql and "LIKE" not in sql
 
     # A deep page by cursor: the keyset index, scoped, no Sort, no OFFSET.
     with migrated_db.cursor() as cur:
@@ -424,6 +428,181 @@ def test_plans_use_the_trigram_keyset_and_album_indexes(migrated_db, lib, monkey
     assert f"{t('idx_catalog_albums_name_keyset')}" in plan, plan
     assert f"{t('idx_catalog_tracks_album')}" in plan, plan
     assert "Sort" not in plan, plan
+    migrated_db.rollback()
+
+
+# --- plans that depend on what ANALYZE sampled ------------------------------
+
+# More rows than a listed search's statements discard (a hash join may scan the
+# 6k albums of every generation) and far fewer than the 30k of the generation
+# that a walk reads and throws away.
+WALKED = 10000
+
+
+def _analyse_at_the_default_target(db):
+    """The statistics an installed plugin has, with the GIN pending list flushed."""
+    db.commit()
+    db.autocommit = True
+    with db.cursor() as cur:
+        cur.execute(f"ALTER TABLE {t('catalog_tracks')} ALTER COLUMN search_text SET STATISTICS -1")
+        cur.execute(f"VACUUM ANALYZE {t('catalog_tracks')}")
+    db.autocommit = False
+
+
+def _term_in_the_histogram(db):
+    """A term ANALYZE's sample mentions once, whichever rows it drew: it is read
+    back from the histogram, so the mention is not left to chance. Each row holds
+    an md5 of its own there, apart from the first tracks, whose md5 is also an
+    album's, so the term that matches one track of the generation is picked."""
+    with db.cursor() as cur:
+        cur.execute("SELECT histogram_bounds::text::text[] FROM pg_stats "
+                    "WHERE tablename=%s AND attname='search_text'", (t("catalog_tracks"),))
+        inner = cur.fetchone()[0][1:-1]
+        assert len(inner) == 99
+        for bound in inner:
+            term = bound.split()[1][:12]
+            cur.execute(f"SELECT count(*) FROM {t('catalog_tracks')} WHERE catalog_instance_id=%s "
+                        "AND published_generation=2 AND search_text LIKE %s", (CAT, f"%{term}%"))
+            if cur.fetchone()[0] == 1 and sum(term in other for other in inner) == 1:
+                return term
+    raise AssertionError("no row of the histogram holds a term of its own")
+
+
+def _plain_search_plan(db, term, limit=13):
+    """The page a search would read without asking first, as the planner plans it."""
+    with db.cursor() as cur:
+        cur.execute(
+            f"EXPLAIN SELECT t.track_id FROM {t('catalog_tracks')} t "
+            "WHERE t.catalog_instance_id=%s AND t.published_generation=2 AND t.available "
+            "AND t.search_text LIKE %s ORDER BY lower(t.title), t.track_id LIMIT %s",
+            (CAT, f"%{term}%", limit))
+        return "\n".join(row[0] for row in cur.fetchall())
+
+
+def _scans(node):
+    yield node
+    for child in node.get("Plans", ()):
+        yield from _scans(child)
+
+
+def _what_each_statement_read(db, statements):
+    """``(plan text, rows its scans discarded)`` per statement on the tracks."""
+    results = []
+    with db.cursor() as cur:
+        for sql, params in statements:
+            if t("catalog_tracks") not in sql:
+                continue
+            cur.execute("EXPLAIN (ANALYZE, FORMAT JSON) " + sql, params)
+            nodes = list(_scans(cur.fetchone()[0][0]["Plan"]))
+            results.append((sql, " ".join(str(n.get("Index Name", n["Node Type"])) for n in nodes),
+                            sum(n.get("Rows Removed by Filter", 0) * n["Actual Loops"]
+                                for n in nodes)))
+    return results
+
+
+def _search(db, lib, monkeypatch, term, catalog=CAT):
+    recording = Recording(db)
+    monkeypatch.setattr(lib, "get_db", lambda: recording)
+    sections = lib.browse_library(scope="all", query=term, catalog_instance_id=catalog)["sections"]
+    return sections, recording.statements
+
+
+def test_a_term_the_statistics_overrate_does_not_walk_the_keyset_indexes(
+        migrated_db, lib, monkeypatch):
+    publish_large(migrated_db)
+    _analyse_at_the_default_target(migrated_db)
+
+    # A rare term that one histogram row mentions: 1/99 of the rows, by estimate.
+    term = _term_in_the_histogram(migrated_db)
+    assert t("idx_catalog_tracks_title_keyset") in _plain_search_plan(migrated_db, term), (
+        "a search that does not ask first no longer walks: this test shows nothing")
+    sections, statements = _search(migrated_db, lib, monkeypatch, term)
+    with migrated_db.cursor() as cur:
+        cur.execute(f"SELECT track_id FROM {t('catalog_tracks')} WHERE catalog_instance_id=%s "
+                    "AND published_generation=2 AND search_text LIKE %s", (CAT, f"%{term}%"))
+        matches = [row[0] for row in cur.fetchall()]
+    assert [item["track_id"] for item in sections["tracks"]["items"]] == matches
+    assert len(matches) == 1 and sections["artists"]["items"] and sections["albums"]["items"]
+    read = _what_each_statement_read(migrated_db, statements)
+    assert len(read) >= 3, read
+    assert t("idx_catalog_tracks_search_trgm") in read[0][1], read[0]
+    assert all(discarded < WALKED for _sql, _plan, discarded in read), read
+
+    # Common elsewhere in the table and rare where it is searched, at any sample:
+    # the estimate describes the table, not the catalogue and generation. Here,
+    # in every row of generation 1 of CAT, the other catalogue's generation number.
+    with migrated_db.cursor() as cur:
+        cur.execute(f"UPDATE {t('catalog_tracks')} SET search_text=search_text||' zzbach' "
+                    "WHERE (catalog_instance_id=%s AND published_generation=1) "
+                    "OR track_id='tr-000007'", (CAT,))
+    _analyse_at_the_default_target(migrated_db)
+    assert t("idx_catalog_tracks_title_keyset") in _plain_search_plan(migrated_db, "zzbach"), (
+        "a search that does not ask first no longer walks: this test shows nothing")
+    for catalog in (CAT, OTHER):
+        sections, statements = _search(migrated_db, lib, monkeypatch, "zzbach", catalog)
+        assert [item["track_id"] for item in sections["tracks"]["items"]] == ["tr-000007"]
+        # The question itself may read the table once; the pages must not.
+        pages = _what_each_statement_read(migrated_db, statements)[1:]
+        assert len(pages) >= 3, pages
+        assert not any("LIKE" in sql for sql, _plan, _discarded in pages), pages
+        assert all(discarded < WALKED for _sql, _plan, discarded in pages), pages
+
+    # One artist's tracks, listed and counted exactly, are still one row of the
+    # artists section, which a walk for its page would never fill.
+    with migrated_db.cursor() as cur:
+        cur.execute(f"UPDATE {t('catalog_tracks')} SET artist_display='Zzsmall', "
+                    "search_text=search_text||' zzsmall' WHERE catalog_instance_id=%s "
+                    "AND published_generation=2 AND track_id>'tr-010000' AND track_id<='tr-010300'",
+                    (CAT,))
+    _analyse_at_the_default_target(migrated_db)
+    sections, statements = _search(migrated_db, lib, monkeypatch, "zzsmall")
+    assert [item["artist"] for item in sections["artists"]["items"]] == ["Zzsmall"]
+    assert (sections["tracks"]["total"], sections["artists"]["total"]) == (300, 1)
+    read = _what_each_statement_read(migrated_db, statements)
+    assert all(discarded < WALKED for _sql, _plan, discarded in read), read
+
+    # A common term still walks, and stops at its page: ids would cost more here.
+    sections, statements = _search(migrated_db, lib, monkeypatch, "song")
+    pages = [item for item in _what_each_statement_read(migrated_db, statements)
+             if "sort_key" in item[0]]
+    assert len(sections["tracks"]["items"]) == 12
+    assert {"LIKE" in sql for sql, _plan, _discarded in pages} == {True}, pages
+    assert t("idx_catalog_tracks_title_keyset") in " ".join(plan for _sql, plan, _ in pages), pages
+    assert sum(discarded for _sql, _plan, discarded in pages) == 0, pages
+    migrated_db.rollback()
+
+
+def test_results_are_the_same_on_either_side_of_the_id_cap(migrated_db, lib, monkeypatch):
+    publish_small(migrated_db)
+
+    def hello_page_sql(cap):
+        monkeypatch.setattr(lib, "SEARCH_ID_CAP", cap)
+        recording = Recording(migrated_db)
+        monkeypatch.setattr(lib, "get_db", lambda: recording)
+        items = lib.browse_library(scope="tracks", query="hello")["sections"]["tracks"]["items"]
+        assert sorted(item["track_id"] for item in items) == ["t01", "t02", "t11"]
+        monkeypatch.setattr(lib, "get_db", lambda: migrated_db)
+        return _page_sql(recording, "lower(t.title) AS sort_key")[0]
+
+    # "hello" matches three tracks: listed at a cap of three, not at two.
+    assert "ANY(" in hello_page_sql(3)
+    assert "LIKE" in hello_page_sql(2)
+    # Every search of the oracle comparison, mostly by id and mostly by text.
+    for cap in (1000, 1):
+        monkeypatch.setattr(lib, "SEARCH_ID_CAP", cap)
+        _assert_matches_oracle(migrated_db, lib)
+        # And a search's cursor pages walk the same order either way.
+        for scope in ("albums", "tracks", "artists"):
+            expected = oracle(migrated_db, lib, scope, "e e")[0]
+            assert len(expected) > 2, scope
+            walked, cursor = [], None
+            for _ in expected:
+                items, _total, section = _new(lib, scope, query="e e", limit=2, cursor=cursor)
+                walked += items
+                cursor = section["next_cursor"]
+                if cursor is None:
+                    break
+            assert walked == expected, (scope, cap)
     migrated_db.rollback()
 
 
