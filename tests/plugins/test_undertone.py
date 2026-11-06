@@ -146,6 +146,8 @@ def test_page_is_served_beside_living_collections(client):
     assert "musicBrainzId" in body and "Math.abs(t.seconds-m.seconds)<=2" in body
     # A record changed elsewhere is written once more over its new revision.
     assert "r.error==='undertone_conflict'" in body and "w.tries<1" in body
+    # Released before every Lumae has Undertone, so the empty page says what it needs.
+    assert body.count("With a version of Lumae that has Undertone") == 2
     # A preset's filter is the phone's: the page edits around it and imports it whole.
     assert "const {id:_id,updatedAt:_u,...rest}=p" in body
     assert "mine={kind:'filter',filter:plays.filter}" in body
