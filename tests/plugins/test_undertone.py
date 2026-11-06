@@ -146,6 +146,32 @@ def test_page_is_served_beside_living_collections(client):
     assert "musicBrainzId" in body and "Math.abs(t.seconds-m.seconds)<=2" in body
     # A record changed elsewhere is written once more over its new revision.
     assert "r.error==='undertone_conflict'" in body and "w.tries<1" in body
+    # A preset's filter is the phone's: the page edits around it and imports it whole.
+    assert "const {id:_id,updatedAt:_u,...rest}=p" in body
+    assert "mine={kind:'filter',filter:plays.filter}" in body
+
+
+def test_a_preset_filter_comes_back_as_the_phone_wrote_it(client):
+    # Lumae UT.12's filter keys aren't the plugin's to know: all of, leaving out, a track's length.
+    record = {
+        "kind": "preset",
+        "body": {
+            "name": "Rain, no thunder",
+            "between": "gapless",
+            "plays": {
+                "kind": "filter",
+                "filter": {
+                    "clauses": [
+                        {"fieldId": "f_moods", "op": "any", "values": ["Calm", "Serene"], "matchAll": True},
+                        {"fieldId": "f_style", "op": "any", "values": [], "not": ["Thunder bursts"]},
+                        {"fieldId": "length", "op": "range", "min": 45, "max": None},
+                    ]
+                },
+            },
+        },
+    }
+    assert post(client, put("filter", record=record)).status_code == 200
+    assert changes(client)["records"][0]["record"] == record
 
 
 def test_page_escapes_the_principal():
