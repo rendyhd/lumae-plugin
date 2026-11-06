@@ -873,6 +873,9 @@ def test_get_routes_perform_zero_writes_when_nothing_changed(v3_routes, monkeypa
     _get(routes, "/api/catalog/health")
     assert routes.connection.writes()
     assert routes.connection.commits == 1
+    # The status page's parked-files count is read at most every five minutes and its
+    # read ends with a commit; count it now, as a page polled earlier would have.
+    routes.mod.parked_files(routes.db)
 
     for path in ("/api/catalog/health", "/api/health", "/settings/status", "/database-state"):
         calls = routes.ping["calls"]

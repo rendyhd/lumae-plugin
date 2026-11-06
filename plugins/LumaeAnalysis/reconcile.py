@@ -12,7 +12,7 @@ import time
 
 from plugin.api import get_db, logger, table
 
-from . import migrations, runner
+from . import migrations, runner, shared_pass
 
 
 LUMAE_TASK_TYPE_PREFIX = "plugin.lumae_analysis."
@@ -77,6 +77,7 @@ def migrate_reconcile(db):
     migrate_metadata(db)
     with db.cursor() as runner_cur:
         runner.migrate_runner_state(runner_cur)
+        shared_pass.migrate(runner_cur)
     cur = db.cursor()
     for name in ("analysis_runs", "preparation_state", "profile_backfill_state", "relationship_state"):
         migrations.ensure_columns(
@@ -509,9 +510,14 @@ def discard_event(db, event_id):
     _current_event_id.set(None)
 
 
+# The status page lists the runners that heartbeated this recently (multi-worker plan R2).
+STATUS_WORKER_SECONDS = 10 * 60
+
+
 def read_reconcile_status(db):
     cur = db.cursor()
     runners = runner.read_states(cur)
+    workers = runner.read_workers(cur, STATUS_WORKER_SECONDS)
     cur.execute(
         f"""
         SELECT action, count(*)
@@ -560,6 +566,8 @@ def read_reconcile_status(db):
     return {
         # One row per runner role that has led: runner.read_states.
         "runners": runners,
+        # One row per runner, leader or helper, seen in STATUS_WORKER_SECONDS.
+        "workers": workers,
         "pending": pending,
         "events": events,
     }
@@ -613,8 +621,24 @@ def queue_throughput(db):
     rate (S12). What is left is approximate for edges and loudness: published
     waveforms without an edge, the summary's eligible tracks without a
     loudness record, from the tables' live row counts. Read-only, and it never scans the library: the settings
-    status route renders it (P2-1)."""
+    status route renders it (P2-1).
+
+    A source's journal holds at most EVENT_RETENTION_MAX events: a busy one
+    reaches back less than a day (166 relationship steps an hour fill it in
+    six). Then every queue counts only since the newest such cut, and
+    ``day_hours`` says how many hours that is (None: the full 24)."""
     cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT max(oldest), EXTRACT(EPOCH FROM now() - max(oldest)) / 3600.0
+          FROM (SELECT min(COALESCE(completed_at, started_at)) AS oldest, count(*) AS kept
+                  FROM {events_table()} WHERE status <> 'running'
+                 GROUP BY COALESCE(catalog_instance_id, '')) sources
+         WHERE kept >= %s AND oldest > now() - interval '24 hours'
+        """,
+        (EVENT_RETENTION_MAX,),
+    )
+    since, day_hours = cur.fetchone() or (None, None)
     cur.execute(
         f"""
         SELECT action,
@@ -629,10 +653,11 @@ def queue_throughput(db):
                             ELSE 1 END AS units
                   FROM {events_table()}
                  WHERE action = ANY(%s) AND status IN ('success', 'deferred')
-                   AND completed_at > now() - interval '24 hours') recent
+                   AND completed_at > now() - interval '24 hours'
+                   AND (%s::timestamptz IS NULL OR completed_at >= %s::timestamptz)) recent
          GROUP BY action
         """,
-        ([action for action, _label, _unit in THROUGHPUT_QUEUES],),
+        ([action for action, _label, _unit in THROUGHPUT_QUEUES], since, since),
     )
     done = {str(row[0]): (int(row[1] or 0), int(row[2] or 0)) for row in cur.fetchall()}
     cur.execute(
@@ -664,6 +689,7 @@ def queue_throughput(db):
         remaining = int(left[index]) if index < len(left) and left[index] is not None else None
         eta = remaining / last_hour if remaining is not None and last_hour > 0 else None
         queues.append({"action": action, "label": label, "last_hour": last_hour, "last_day": last_day,
+                       "day_hours": float(day_hours) if day_hours is not None else None,
                        "remaining": remaining, "eta_hours": eta})
     return queues
 

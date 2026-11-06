@@ -2,7 +2,7 @@
   "id": "lumae_analysis",
   "name": "Lumae Analysis",
   "author": "Lumae",
-  "description": "Mirrors supported Navidrome and Jellyfin catalogues and prepares Lumae volume, SmoothFade, album-similarity, and artist-similarity data away from the phone.",
+  "description": "Companion plugin for Lumae Music (https://lumaemusic.app), providing additional analysis and sync.",
   "requirements": [],
   "capabilities": {
     "lumae_analysis_profiles": {
@@ -111,6 +111,14 @@
     }
   },
   "versions": [
+    {
+      "version": "1.10.0",
+      "min_core_version": "3.2.0",
+      "changelog": "Library passes can use every AudioMuse worker. With the new setting Workers set to every worker, the workers that do not lead Lumae's background work help it: they walk the waveform, edge and loudness passes with it, a few tracks at a time, so no file is downloaded or analyzed twice, and a worker that goes away leaves its tracks to the others. One runner works per worker container, and Files analyzed at once across all workers caps the load on the music server. On-demand tracks, similar albums and artists, and catalogue work stay with one worker. The default, one worker, works as 1.9.2 did, except that a relationship build no longer holds back the volume, edge and loudness passes: it takes at most half of each turn. The throughput panel says how far back it counts.",
+      "imageUrl": "",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.10.0.zip",
+      "checksum": "7310a168148e38af02432856fbb39911"
+    },
     {
       "version": "1.9.2",
       "min_core_version": "3.2.0",

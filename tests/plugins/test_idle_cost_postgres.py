@@ -348,9 +348,10 @@ class _Counting:
 # counted every tick; 1.8.0's idle tick ran 28. A runner turn has no schedule
 # to keep and no cron_retry to read (R2, R4); the server's bookkeeping (events,
 # preparations, a gone worker's claims, the snapshot's age) adds six at most
-# once a minute.
+# once a minute, and the rows of worker runners gone a day (multi-worker plan)
+# one more.
 IDLE_TURN_STATEMENTS = 17
-IDLE_BOOKKEEPING_STATEMENTS = 23
+IDLE_BOOKKEEPING_STATEMENTS = 24
 
 
 def test_an_idle_turn_runs_few_statements(tick, monkeypatch):

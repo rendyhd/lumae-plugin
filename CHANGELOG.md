@@ -25,6 +25,62 @@ Undertone records (Lumae UT.7; contract §5.8).
   their next sync. `/api/undertone/sources` lists a person's Undertone
   libraries.
 
+## 1.10.0 (2026-11-03)
+
+Library passes can use every AudioMuse worker (issue #10; plan
+`docs/plan/LUMAE_MULTI_WORKER_PLAN_2026-10-30.md`, end-to-end reports
+`docs/perf/MULTI-WORKER-E2E-2026-10-30.md` and
+`docs/perf/MULTI-WORKER-PROD-2026-10-31.md`).
+
+- New setting `worker_runners` (`one` by default, or `every`). With `every`
+  the worker runners that miss the lock help the one that holds it: they walk
+  the waveform, edge and loudness passes with it. Each runner takes a batch of
+  a few due tracks at a time under the pass's row lock, so two runners never
+  download or analyze one track; a runner that goes away (no heartbeat for 90
+  seconds) loses its batches to the next taker. On-demand tracks,
+  relationships and catalogue work stay with the leader.
+- One runner per worker container works: an AudioMuse worker container
+  starts two task-queue workers, and "Files analyzed at once" is sized for
+  the whole container, so the other stands by.
+- A source's edge and loudness passes wait while its waveform pass has
+  tracks due or in flight (a waveform analysis measures edge and loudness
+  from the same download), and its loudness pass while edge batches are out,
+  so no file is downloaded twice.
+- The waveform tracks a worker had taken when it went away are due again at
+  the other workers' next turn, not after the hour a stale attempt waits; a
+  new leader takes up the waveform pass the previous one left at once; and a
+  helping worker takes the lead within about a minute of the leader going
+  away.
+- New setting `max_files_in_flight` (16, 1–64): the files analyzed at once
+  across all workers, so more workers do not mean more load on the music
+  server than this. The leader counts towards it only while it walks a
+  pass, so its relationship and catalogue work leaves the files in flight
+  to the helpers.
+- A pass parks for a missing edge runtime only when no worker runner has it.
+- The settings page shows one line per worker runner (leads or helps, files
+  at once, its action) once more than one runs.
+- A relationship build no longer holds back the volume, edge and loudness
+  passes. A build checkpoints after each step and is due again at once, and
+  it comes before those passes, so while it ran they never got a turn: on one
+  library a build ran for days and the settings page said about 15,000
+  loudness records were left, with none measured. A build now takes at most
+  half of each runner turn; the passes get the rest.
+- The settings page's throughput says how far back it counts. The journal
+  keeps at most 1,000 events per source, and a running relationship build
+  (about 166 steps an hour) fills that in six hours: the page said "999 in 24
+  hours", and 0 for queues whose events had been dropped. When the journal
+  reaches back less than a day, every queue now counts over the same span and
+  the page says "in the last 6.0 hours".
+- New tables `runner_workers`, `pass_batches` and `analysis_slots`. With
+  `one` the worker runner works as in 1.9.2 apart from the relationship
+  build's share of a turn, and nothing on the wire changes.
+
+On three AudioMuse worker containers, `every` analysed 120 tracks in 143 s
+against 446 s with `one`, each file downloaded once. On the owner's server
+(three worker containers on one PC, 8 files at once each) it analysed 300
+tracks in 415 s against 700 s, each file downloaded once. Includes every 1.9.2
+change. AudioMuse 3.2.0 is still the minimum.
+
 ## 1.9.2 (2026-10-30)
 
 Similar albums and artists rank energy and moods the way the app does

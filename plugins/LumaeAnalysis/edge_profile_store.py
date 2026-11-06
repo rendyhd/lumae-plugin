@@ -553,6 +553,39 @@ def edge_backfill_candidates(db, catalog_id, after='', limit=100):
     return ids
 
 
+def edge_due_among(db, catalog_id, ids):
+    """Which of ``ids`` the pass would still take (multi-worker plan R4), in track ID order."""
+    if not ids:
+        return []
+    cur = db.cursor()
+    cur.execute(f"""SELECT p.track_id FROM {_edge_due_sql()} AND p.track_id = ANY(%s)
+        ORDER BY p.track_id""", (catalog_id, list(ids)))
+    due = [row[0] for row in cur.fetchall()]
+    cur.close()
+    return due
+
+
+def complete_edge_pass_sql(cur, catalog_id):
+    """End a shared pass (multi-worker plan R4) as ``update_edge_backfill`` does a walk that
+    reached the end, inside the caller's transaction."""
+    cur.execute(f"""UPDATE {table('edge_backfill_state')} SET status='complete', cursor='',
+            retry_count=0, next_retry_at=now()+make_interval(hours => %s), last_error=NULL,
+            completed_at=now(), updated_at=now()
+        WHERE catalog_instance_id=%s""", (EDGE_BACKFILL_RESWEEP_HOURS, catalog_id))
+
+
+def pyav_reported(db):
+    """Whether a process with PyAV reported its runtime within the freshness window."""
+    cur = db.cursor()
+    cur.execute(f"""SELECT EXISTS(SELECT 1 FROM {table('edge_runtime_state')}
+        WHERE reported_at > now() - make_interval(hours => %s)
+          AND COALESCE(status->>'pyav', '') NOT IN ('', 'false', 'null'))""",
+                (EDGE_RUNTIME_FRESH_HOURS,))
+    found = bool(cur.fetchone()[0])
+    cur.close()
+    return found
+
+
 # ---------------------------------------------------------------- library pass
 # A runner walks the published library by track ID, a slice at a time until
 # its deadline, after the waveform backfill. A finished pass sweeps again
@@ -573,9 +606,13 @@ def ensure_edge_backfill_sources(db):
     return added
 
 
-def next_edge_backfill(db, server_id=None):
-    """``(server_id, catalog_instance_id, cursor)`` of the next due pass, or None."""
+def next_edge_backfill(db, server_id=None, shared=False):
+    """``(server_id, catalog_instance_id, cursor)`` of the next due pass, or None.
+
+    ``shared`` (multi-worker plan R4): every worker runner walks a pass at once,
+    so a running pass is offered too."""
     ensure_edge_backfill_sources(db)
+    running = "TRUE" if shared else "st.updated_at < now()-interval '30 minutes'"
     cur = db.cursor()
     cur.execute(f"""SELECT s.current_core_server_id, st.catalog_instance_id, st.cursor
         FROM {table('edge_backfill_state')} st
@@ -583,7 +620,7 @@ def next_edge_backfill(db, server_id=None):
         WHERE s.rebind_status='active'
           AND (%s IS NULL OR s.current_core_server_id=%s)
           AND (st.status IN ('queued', 'failed', 'complete')
-               OR (st.status='running' AND st.updated_at < now()-interval '30 minutes'))
+               OR (st.status='running' AND {running}))
           AND (st.next_retry_at IS NULL OR st.next_retry_at <= now())
         ORDER BY st.next_retry_at NULLS FIRST, st.catalog_instance_id LIMIT 1""",
                 (server_id, server_id))

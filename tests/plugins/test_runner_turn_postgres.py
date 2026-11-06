@@ -134,6 +134,33 @@ def test_per_track_passes_wait_while_audiomuse_analyses(turn, monkeypatch):
     assert passes == ["profile"]
 
 
+def test_a_relationship_build_leaves_the_rest_of_the_turn_to_the_passes(turn, monkeypatch):
+    # A build checkpoints after each step and is due again at once. Before the
+    # cap a build that ran for days held every worker turn, and the loudness
+    # pass behind it measured nothing (15,000 tracks left).
+    mod, _db, calls, _settings = turn
+    monkeypatch.setattr(mod, "RUNNER_TURN_SECONDS", 1)
+    monkeypatch.setattr(mod, "RUNNER_RELATIONSHIP_SECONDS", 0.2)
+    monkeypatch.setattr(mod, "next_relationship_run", lambda db=None, server_id=None: (SERVER, SOURCE, 0))
+
+    def build_step(*_args):
+        calls.append("relationships")
+        time.sleep(0.05)
+        return {"status": "queued", "reason": "batch_complete"}
+
+    monkeypatch.setattr(mod, "relationship_preparation_task", build_step)
+    monkeypatch.setattr(mod, "next_loudness_backfill", lambda db=None, server_id=None: (SERVER, SOURCE))
+    monkeypatch.setattr(mod, "loudness_backfill_task", lambda *_args: calls.append("loudness") or {
+        "status": "queued", "processed": 1, "ready": 1, "failed": 0})
+    for _ in range(2):  # the cap is per turn: each turn's build steps come first
+        calls.clear()
+        assert mod.run_runner_turn(Active("worker")).worked
+        work = [call for call in calls if call in ("relationships", "loudness")]
+        steps = work.count("relationships")
+        assert steps >= 1 and work[:steps] == ["relationships"] * steps
+        assert work[steps:] and set(work[steps:]) == {"loudness"}
+
+
 def test_a_paused_plugin_does_nothing(turn, monkeypatch):
     mod, _db, calls, _settings = turn
     monkeypatch.setattr(mod, "maintenance_paused", lambda: True)
