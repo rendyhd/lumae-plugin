@@ -229,11 +229,19 @@ def test_rerun_migrate_does_not_wait_behind_open_readers(
     second_connection.rollback()
 
 
+def _migration_markers(db):
+    with db.cursor() as cur:
+        cur.execute(f"SELECT name FROM {P}profile_migrations ORDER BY name")
+        markers = cur.fetchall()
+    db.commit()
+    return markers
+
+
 def test_rerun_migrate_leaves_schema_identical(migrated_db, run_plugin_migration):
     _populate(migrated_db, run_plugin_migration)
-    before = _schema(migrated_db)
+    before = _schema(migrated_db), _migration_markers(migrated_db)
     run_plugin_migration(migrated_db)
-    assert _schema(migrated_db) == before
+    assert (_schema(migrated_db), _migration_markers(migrated_db)) == before
 
 
 # Each undo takes the schema back to an older release's shape for one object

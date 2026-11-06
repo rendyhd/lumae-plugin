@@ -288,9 +288,7 @@ def test_no_file_starts_once_the_deadline_is_nearer_than_the_average(pool):
     assert [error for _u, _r, error in recorder.finished] == [None] * 3
 
 
-def test_files_in_flight_at_the_deadline_run_to_completion(pool, monkeypatch):
-    monkeypatch.setattr(par, "DRAIN_SECONDS", 0.2, raising=False)  # 1.8.0's window, scaled
-
+def test_files_in_flight_at_the_deadline_run_to_completion(pool):
     def work_for(unit):
         def work():
             time.sleep(1.0)  # several times the time left at the start
@@ -324,7 +322,7 @@ def test_on_demand_work_is_served_while_the_pass_waits_past_the_deadline(pool, m
     assert not report.cancelled and report.reached() == 2
 
 
-def test_a_file_slower_than_the_tick_completes_and_the_pass_reaches_its_end(pool, monkeypatch, tmp_path):
+def test_a_file_slower_than_the_tick_completes_and_the_pass_reaches_its_end(pool, tmp_path):
     """The 1.8.0 livelock: a pass that keeps its cursor before a file that
     did not finish, run tick after tick, with one file longer than a tick.
     Cancelled at every deadline, the file restarted every tick and the pass
@@ -333,8 +331,6 @@ def test_a_file_slower_than_the_tick_completes_and_the_pass_reaches_its_end(pool
     media.write_bytes(b"\0")
     units = list(range(8))
     slow, tick_seconds = 2, 0.4
-    # 1.8.0's 5 s drain window, scaled to these ticks (gone since).
-    monkeypatch.setattr(par, "DRAIN_SECONDS", 0.2, raising=False)
     started, cursor, ticks = [], -1, []
 
     def work_for(unit):

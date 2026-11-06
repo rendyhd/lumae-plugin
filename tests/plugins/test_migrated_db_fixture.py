@@ -66,34 +66,6 @@ PRODUCTION_TABLES = (
 )
 
 
-def _schema_snapshot(db):
-    with db.cursor() as cur:
-        cur.execute(
-            """SELECT table_name, column_name, data_type, is_nullable
-                 FROM information_schema.columns
-                WHERE table_schema=current_schema()
-                ORDER BY table_name, column_name"""
-        )
-        columns = cur.fetchall()
-        cur.execute(
-            "SELECT indexname, indexdef FROM pg_indexes "
-            "WHERE schemaname=current_schema() ORDER BY indexname"
-        )
-        indexes = cur.fetchall()
-        cur.execute(
-            """SELECT conname, pg_get_constraintdef(c.oid)
-                 FROM pg_constraint c
-                 JOIN pg_namespace n ON n.oid=c.connamespace
-                WHERE n.nspname=current_schema()
-                ORDER BY conname"""
-        )
-        constraints = cur.fetchall()
-        cur.execute(f"SELECT name FROM {PREFIX}profile_migrations ORDER BY name")
-        markers = cur.fetchall()
-    db.commit()
-    return columns, indexes, constraints, markers
-
-
 def test_migrated_db_has_production_tables(migrated_db):
     with migrated_db.cursor() as cur:
         cur.execute(
@@ -116,13 +88,6 @@ def test_migrated_db_has_production_tables(migrated_db):
     assert PREFIX + "vibe_sequence" in sequences
     assert PREFIX + "journey_sequence" in sequences
     assert PREFIX + "cover_sequence" in sequences
-
-
-def test_plugin_migration_is_idempotent(migrated_db, run_plugin_migration):
-    before = _schema_snapshot(migrated_db)
-    run_plugin_migration(migrated_db)
-    run_plugin_migration(migrated_db)
-    assert _schema_snapshot(migrated_db) == before
 
 
 def test_second_connection_shares_the_schema(migrated_db, second_connection):

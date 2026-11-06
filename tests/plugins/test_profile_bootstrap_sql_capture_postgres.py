@@ -318,19 +318,6 @@ def _oracle():
 ORACLE = _oracle()
 
 
-def test_oracle_copy_value_escapes_copy_text_format():
-    """The oracle's COPY escaping (moved here from the edge-ref tests)."""
-    copy_value = ORACLE._copy_value
-    assert copy_value(None) == "\\N"
-    assert copy_value("\\N") == "\\\\N"
-    assert copy_value("a\tb\nc\rd\\e") == "a\\tb\\nc\\rd\\\\e"
-    # The backslash is doubled first, so an escaped tab is not re-escaped.
-    assert copy_value("\\\t") == "\\\\\\t"
-    assert copy_value("\\.") == "\\\\."
-    assert copy_value(12) == "12"
-    assert copy_value("plain 曲 \U0001F3B5") == "plain 曲 \U0001F3B5"
-
-
 # ---------------------------------------------------------------------------
 # Fixture: the values where SQL and Python part ways.
 # ---------------------------------------------------------------------------

@@ -1,5 +1,12 @@
-"""Running one runner turn in a test (runner plan RN.6)."""
+"""Running one runner turn in a test (runner plan RN.6), and what the runner
+lifecycle tests share: a schema of their own, a stand-in app, a polling wait."""
+import contextlib
+import os
 import threading
+import time
+import uuid
+
+import pytest
 
 
 class Active:
@@ -42,3 +49,47 @@ def turn(mod, role="server"):
         mod.runner.ROLE.reset(token)
         mod.TurnReport = real
     return result, (reports[0].actions if reports else [])
+
+
+@pytest.fixture
+def schema():
+    """``(dsn, schema name, autocommit connection)``, with the runner's own tables."""
+    # The test module has loaded the plugin; a fixture only runs after that.
+    from plugins.LumaeAnalysis import runner
+
+    psycopg2 = pytest.importorskip("psycopg2")
+    dsn = os.environ.get("LUMAE_POSTGRES_TEST_DSN")
+    if not dsn:
+        pytest.skip("set LUMAE_POSTGRES_TEST_DSN to run PostgreSQL integration tests")
+    name = f"lumae_runner_{uuid.uuid4().hex}"
+    db = psycopg2.connect(dsn)
+    db.autocommit = True
+    with db.cursor() as cur:
+        cur.execute(f"CREATE SCHEMA {name}")
+        cur.execute(f"SET search_path TO {name}, public")
+        runner.migrate_runner_state(cur)
+    try:
+        yield dsn, name, db
+    finally:
+        runner.stop_all()
+        for active in list(runner._runners.values()):
+            if active.thread is not None:
+                active.thread.join(timeout=5)
+        runner._runners.clear()
+        with db.cursor() as cur:
+            cur.execute(f"DROP SCHEMA IF EXISTS {name} CASCADE")
+        db.close()
+
+
+class App:
+    def app_context(self):
+        return contextlib.nullcontext()
+
+
+def until(condition, seconds=5.0):
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if condition():
+            return True
+        time.sleep(0.02)
+    return False

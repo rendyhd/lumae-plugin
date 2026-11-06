@@ -17,7 +17,6 @@ from jellyfin_fixtures import (
     LIB_B,
     SERVER_A,
     SERVER_B,
-    FakeCore,
     FakeJellyfinHttp,
     FakeJellyfinModule,
     JellyfinBridge,
@@ -715,9 +714,3 @@ def test_catalog_health_exposes_the_bound_server_id_and_version(migrated_db, mon
     assert server["provider_identity_transition"]["state"] == "normal"
     assert server["catalog_sync_allowed"] is True
     assert body["capability"]["supported_provider_types"] == ["jellyfin", "navidrome"]
-
-
-def test_core_fake_matches_the_production_bridge_shape():
-    """Guards the fixture: the production bridge accepts FakeCore."""
-    core = FakeCore([jellyfin_server()], {})
-    assert bridge_with_core(core.servers, {}).require_server("server-j")["supported"] is True

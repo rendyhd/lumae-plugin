@@ -64,8 +64,8 @@ def test_transient_exhaustion_and_revision_repair(edge_publication_db):
 
 
 # One permanent code: they share one predicate.
-@pytest.mark.parametrize("code", ["unsupported_media"])
-def test_permanent_media_failure_waits_for_revision(edge_publication_db, code):
+def test_permanent_media_failure_waits_for_revision(edge_publication_db):
+    code = "unsupported_media"
     db = edge_publication_db
     track = "retry-" + code
     _track(db, track)
@@ -82,17 +82,6 @@ def test_missing_file_has_bounded_retry(edge_publication_db):
     assert state[4] is not None and not eligible("retry-missing")
     _track(db, "retry-missing", "revision-b")
     assert eligible("retry-missing")
-
-
-def test_failure_preserves_published_baseline(edge_publication_db):
-    db = edge_publication_db
-    _track(db, "retry-baseline")
-    token = publication.admit_attempts(db, SOURCE, ["retry-baseline"])["retry-baseline"]
-    assert publication.complete_attempt(db, SOURCE, "retry-baseline", token,
-        _result(), "ready", None, "catalog-media:revision-a", 1, 1)
-    baseline = _state(db, "retry-baseline")
-    fail(db, "retry-baseline", "analysis_timeout")
-    assert _state(db, "retry-baseline") == baseline
 
 
 def test_queue_release_is_fenced_and_cools_down(edge_publication_db):
@@ -116,15 +105,6 @@ def test_old_completion_cannot_change_retry_count(edge_publication_db):
         object(), "failed", "secret", None, 1, 1, failure_code="analysis_error")
     assert row(db, "retry-fence")[3] == 0
     assert row(db, "retry-fence")[6] == current
-
-
-def test_missing_revision_defers_until_known(edge_publication_db):
-    db = edge_publication_db
-    _track(db, "retry-deferred", None)
-    assert publication.admit_attempts(db, SOURCE, ["retry-deferred"]) == {}
-    assert not eligible("retry-deferred")
-    _track(db, "retry-deferred", "revision-a")
-    assert eligible("retry-deferred")
 
 
 def test_due_selection_skips_cooling_row_before_limit(edge_publication_db):

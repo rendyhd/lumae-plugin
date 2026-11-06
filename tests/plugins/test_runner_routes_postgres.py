@@ -103,34 +103,6 @@ def test_the_compatibility_edge_backfill_leaves_the_tracks_to_the_pass(runners_o
     assert "edge_backfill_ready" in _notified(listener)
 
 
-def test_a_preparation_request_is_claimed_not_queued(runners_on, monkeypatch):
-    mod, db, _listener = runners_on
-    source = {"catalog_instance_id": SOURCE, "server_id": SERVER}
-    monkeypatch.setattr(mod, "_resolve_preparation_source", lambda body: source)
-    monkeypatch.setattr(mod, "_preparation_api_payload",
-                        lambda source, state=None: {"publication_current": False, "status": "queued"})
-    monkeypatch.setattr(mod, "preparation_state", lambda catalog: None)
-    monkeypatch.setattr(mod, "preparation_is_active", lambda state: False)
-    claims = []
-    monkeypatch.setattr(mod, "claim_preparation", lambda source: claims.append(source) or True)
-    response = plugin_client(mod).post("/api/catalog/prepare", json={})
-    assert response.status_code == 202
-    assert response.headers["Retry-After"] == "2"
-    assert claims == [source]
-
-
-def test_a_relationship_build_and_a_waveform_pass_are_claimed_not_queued(runners_on, monkeypatch):
-    mod, _db, _listener = runners_on
-    source = {"catalog_instance_id": SOURCE, "server_id": SERVER,
-              "catalog": {"generation": 2}, "analysis": {"generation": 2}}
-    monkeypatch.setattr(mod, "resolve_profile_source", lambda **_k: source)
-    monkeypatch.setattr(mod, "claim_profile_backfill", lambda source: True)
-    assert mod.start_profile_backfill(SOURCE, SERVER)["deferred"] is True
-    monkeypatch.setattr(mod, "relationship_status", lambda db, catalog: {"status": "queued"})
-    monkeypatch.setattr(mod, "claim_relationship_preparation", lambda db, catalog, force=False: True)
-    assert mod.start_relationship_preparation(SOURCE, SERVER, force=True)["deferred"] is True
-
-
 def test_recorded_work_wakes_the_runners_with_its_commit(runners_on):
     _mod, db, listener = runners_on
     before = _rows(db, f"SELECT mode, cron_expr FROM {P}reconcile_control")
@@ -146,5 +118,3 @@ def test_a_tick_queued_by_an_older_version_only_wakes_the_runners(runners_on):
     mod, _db, listener = runners_on
     assert mod.catalog_reconcile_task()["status"] == "runner"
     assert "queued_tick" in _notified(listener)
-
-

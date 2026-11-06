@@ -315,61 +315,11 @@ def test_standalone_compaction_rereads_locked_head(edge_publication_db, monkeypa
 
 
 
-def test_legacy_and_edge_publishers_share_source_order(edge_publication_db):
-    jobs, _ready = edge_profile_store.claim_edge_jobs(edge_publication_db, SOURCE, ["track-a"])
-    assert len(jobs) == 1
-    job = jobs[0]
-    payload = _edge_payload_for_job(job)
-    legacy = _peer(edge_publication_db)
-    edge = _peer(edge_publication_db)
-    try:
-        _publish(legacy, "branch-legacy")
-        started = Event()
-
-        def publish_edge():
-            started.set()
-            assert edge_profile_store.publish_edge_profile(
-                edge, SOURCE, job, payload, "private/path:123:456"
-            )
-
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(publish_edge)
-            try:
-                _wait_for_lock(edge_publication_db, edge.get_backend_pid(), started)
-                assert _frontier(edge_publication_db)[0][1] == 0
-            finally:
-                legacy.commit()
-            future.result(timeout=5)
-        state, events, _profiles = _frontier(edge_publication_db)
-        assert state[1:] == (2, 0)
-        assert [(row[0], row[1]) for row in events] == [
-            (1, "branch-legacy"), (2, "track-a")
-        ]
-        assert events[1][2]["edge_profile"] == payload
-        cur = edge_publication_db.cursor()
-        cur.execute("SELECT status FROM plugin_lumae_analysis__edge_profile_jobs WHERE catalog_instance_id=%s AND track_id=%s", (SOURCE, "track-a"))
-        assert cur.fetchone()[0] == "ready"
-        cur.execute("SELECT payload FROM plugin_lumae_analysis__edge_profiles WHERE catalog_instance_id=%s AND track_id=%s", (SOURCE, "track-a"))
-        assert cur.fetchone()[0] == payload
-        cur.close()
-    finally:
-        legacy.rollback()
-        edge.rollback()
-        legacy.close()
-        edge.close()
-
-
-
 def _legacy_result():
     return SimpleNamespace(
         sample_rate=48000, duration_ms=210, ref_lufs=-13.0,
         start_ramp_blob=b"first", end_ramp_blob=b"last",
     )
-
-
-def _enable_legacy_upsert(db):
-    # The shared fixture already has the attempt and publication schemas.
-    pass
 
 
 def _claim_track(db, track):
@@ -390,7 +340,6 @@ def _claim_track(db, track):
 def test_actual_upsert_profile_serializes_two_independent_connections(
     edge_publication_db, monkeypatch
 ):
-    _enable_legacy_upsert(edge_publication_db)
     mod = load_plugin()
     active = local()
     monkeypatch.setattr(mod, "get_db", lambda: active.db)
@@ -451,60 +400,6 @@ def Event_set():
     event = Event()
     event.set()
     return event
-
-
-def test_edge_first_blocks_legacy_publication(edge_publication_db, monkeypatch):
-    jobs, _ = edge_profile_store.claim_edge_jobs(edge_publication_db, SOURCE, ["track-a"])
-    job = jobs[0]
-    payload = _edge_payload_for_job(job)
-    original = enrichment.record_profile_change
-    edge_staged = Event()
-    release_edge = Event()
-
-    def pause_after_edge(cur, source, track, status, public_payload, **kwargs):
-        seq = original(cur, source, track, status, public_payload, **kwargs)
-        if track == "track-a":
-            edge_staged.set()
-            assert release_edge.wait(5), "edge publisher was not released"
-        return seq
-
-    monkeypatch.setattr(enrichment, "record_profile_change", pause_after_edge)
-    edge = _peer(edge_publication_db)
-    legacy = _peer(edge_publication_db)
-    try:
-        def publish_edge():
-            assert edge_profile_store.publish_edge_profile(
-                edge, SOURCE, job, payload, "private/path:123:456"
-            )
-
-        def publish_legacy():
-            _publish(legacy, "branch-legacy")
-            legacy.commit()
-
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            edge_future = pool.submit(publish_edge)
-            assert edge_staged.wait(5), "edge publication did not stage"
-            legacy_future = pool.submit(publish_legacy)
-            try:
-                _wait_for_lock(edge_publication_db, legacy.get_backend_pid(), Event_set())
-                assert _frontier(edge_publication_db)[0][1] == 0
-            finally:
-                release_edge.set()
-            edge_future.result(timeout=5)
-            legacy_future.result(timeout=5)
-        state, events, _ = _frontier(edge_publication_db)
-        assert state[1:] == (2, 0)
-        assert [(row[0], row[1]) for row in events] == [
-            (1, "track-a"), (2, "branch-legacy")
-        ]
-        assert events[0][2]["edge_profile"] == payload
-    finally:
-        release_edge.set()
-        edge.rollback()
-        legacy.rollback()
-        edge.close()
-        legacy.close()
-
 
 
 def test_compactor_first_serializes_following_profile_publication(
@@ -639,7 +534,6 @@ def test_populated_enrichment_migration_keeps_epoch_and_history(edge_publication
 def test_actual_upsert_rolls_back_at_each_publication_boundary(
     edge_publication_db, monkeypatch, fault
 ):
-    _enable_legacy_upsert(edge_publication_db)
     mod = load_plugin()
     failed_token = _claim_track(edge_publication_db, "branch-failed")
     recovery_token = _claim_track(edge_publication_db, "branch-recovery")
@@ -774,7 +668,6 @@ def test_old_unlocked_allocator_collides_then_new_writer_succeeds(edge_publicati
 def test_actual_upsert_and_edge_publishers_share_one_order(
     edge_publication_db, monkeypatch, first_kind
 ):
-    _enable_legacy_upsert(edge_publication_db)
     legacy_token = _claim_track(edge_publication_db, "branch-legacy")
     jobs, _ = edge_profile_store.claim_edge_jobs(edge_publication_db, SOURCE, ["track-a"])
     job = jobs[0]

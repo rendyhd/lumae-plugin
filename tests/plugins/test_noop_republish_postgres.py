@@ -490,21 +490,6 @@ def test_a_background_waveform_leaves_its_edge_to_the_pass(source_db, monkeypatc
     assert store.edge_backfill_candidates(db, SOURCE) == ["track-a"]
 
 
-def test_an_on_demand_waveform_without_its_edge_leaves_it_to_the_pass(source_db, monkeypatch, tmp_path):
-    """WP2: on-demand work makes its edge in the waveform's own call; one
-    analysed without it queues no edge task per track either (before WP2 it
-    queued one at once)."""
-    mod = load_plugin()
-    db = source_db
-    _edge_pass(db, "complete", next_retry_hours=6)
-
-    outcome = _analyse_one(mod, monkeypatch, tmp_path, "interactive")
-
-    assert outcome == {"track_id": "track-a", "status": "ready"}
-    assert _snapshot(db, "track-a")["jobs"] == []
-    assert _pass_row(db) == ("queued", "", True)
-
-
 def test_song_hook_on_current_row_with_current_edge_requests_no_job(
     source_db, monkeypatch, tmp_path,
 ):

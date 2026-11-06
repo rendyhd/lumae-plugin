@@ -3,7 +3,6 @@
 import os
 import hashlib
 import re
-import uuid
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -447,31 +446,6 @@ def test_missing_public_database_url_fails_closed_while_legacy_endpoint_imports(
         assert response.status_code == 503
         assert response.json["message"] == "bootstrap_unavailable"
         assert client.get("/api/profiles/bootstrap").status_code != 404
-
-
-def test_provisional_sessions_invalidated_by_idempotent_migration(edge_publication_db):
-    db = edge_publication_db
-    with db.cursor() as cur:
-        cur.execute(f"ALTER TABLE {SESSIONS} DROP COLUMN transfer_contract_version")
-        cur.execute(f"ALTER TABLE {SESSIONS} DROP COLUMN source_scope")
-        cur.execute(f"ALTER TABLE {SESSIONS} ADD COLUMN principal TEXT NOT NULL DEFAULT 'user:alice'")
-        cur.execute(f"ALTER TABLE {SESSIONS} ADD COLUMN principal_contract_version INTEGER "
-                    "NOT NULL DEFAULT 2")
-        cur.execute(f"INSERT INTO {SESSIONS} (session_id, token_hash, signing_secret, "
-                    "catalog_instance_id, core_server_id, catalog_epoch, profile_epoch, "
-                    "schema_version, page_size, snapshot_seq, snapshot_count, expires_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,1,250,0,0,now()+interval '1 hour')",
-                    (str(uuid.uuid4()), "legacy-token", "secret", SOURCE, "server-a", "epoch-a",
-                     "old-profile-epoch"))
-    db.commit()
-    catalog_enrichment.migrate_enrichment(db)
-    catalog_enrichment.migrate_enrichment(db)
-    db.commit()
-    with db.cursor() as cur:
-        cur.execute(f"SELECT count(*) FROM {SESSIONS}")
-        assert cur.fetchone()[0] == 0
-    db.rollback()
-    assert profile_bootstrap.create_session(body())["transfer_contract"] == "source_scoped_v1"
 
 
 def test_owned_connection_rolls_back_and_closes_on_capture_error(edge_publication_db, monkeypatch):

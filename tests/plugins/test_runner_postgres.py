@@ -5,45 +5,18 @@ NOTIFY that wakes an idle leader, the heartbeat row (and a worker counted
 online by it), a stop when the plugin changed under the process, and a restart
 after a turn fails.
 """
-import contextlib
-import os
 import threading
 import time
-import uuid
 
 import pytest
 
 from test_lumae_analysis import load_plugin
+from runner_helpers import App, schema, until  # noqa: F401  (schema is a fixture)
 
 load_plugin()
 from plugins.LumaeAnalysis import runner  # noqa: E402
 
 psycopg2 = pytest.importorskip("psycopg2")
-
-
-@pytest.fixture
-def schema():
-    dsn = os.environ.get("LUMAE_POSTGRES_TEST_DSN")
-    if not dsn:
-        pytest.skip("set LUMAE_POSTGRES_TEST_DSN to run PostgreSQL integration tests")
-    name = f"lumae_runner_{uuid.uuid4().hex}"
-    db = psycopg2.connect(dsn)
-    db.autocommit = True
-    with db.cursor() as cur:
-        cur.execute(f"CREATE SCHEMA {name}")
-        cur.execute(f"SET search_path TO {name}, public")
-        runner.migrate_runner_state(cur)
-    try:
-        yield dsn, name, db
-    finally:
-        runner.stop_all()
-        for active in list(runner._runners.values()):
-            if active.thread is not None:
-                active.thread.join(timeout=5)
-        runner._runners.clear()
-        with db.cursor() as cur:
-            cur.execute(f"DROP SCHEMA IF EXISTS {name} CASCADE")
-        db.close()
 
 
 @pytest.fixture(autouse=True)
@@ -54,11 +27,6 @@ def fast(monkeypatch):
     monkeypatch.setattr(runner, "RESTART_DELAYS", (0.2,))
 
 
-class App:
-    def app_context(self):
-        return contextlib.nullcontext()
-
-
 def make(schema, role, turn, **kwargs):
     dsn, name, _db = schema
 
@@ -67,15 +35,6 @@ def make(schema, role, turn, **kwargs):
                                 options=f"-c search_path={name},public")
 
     return runner.Runner(role, app=App(), turn=turn, connect=connect, startup_delay=0, **kwargs)
-
-
-def until(condition, seconds=5.0):
-    deadline = time.monotonic() + seconds
-    while time.monotonic() < deadline:
-        if condition():
-            return True
-        time.sleep(0.02)
-    return False
 
 
 def rows(db, sql, params=()):

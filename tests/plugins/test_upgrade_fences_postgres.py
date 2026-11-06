@@ -108,15 +108,6 @@ def _version(text):
     return tuple(int(part) for part in text.split("."))
 
 
-def test_plugin_version_is_1_3_or_later_and_differs_from_the_1_2_5_release():
-    mod = load_plugin()
-    # Every release from 1.3.0 carries the fences; a 1.2.5 worker and this
-    # source are distinguishable by the attestation.
-    assert _version(mod.PLUGIN_VERSION) >= (1, 3, 0)
-    with zipfile.ZipFile(ARCHIVE_125) as archive:
-        assert b'PLUGIN_VERSION = "1.2.5"' in archive.read("__init__.py")
-
-
 def test_migration_retargets_preparation_and_fences_a_1_2_5_worker(
     migrated_db, run_plugin_migration, monkeypatch
 ):

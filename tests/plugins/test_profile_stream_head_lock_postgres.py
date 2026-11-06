@@ -376,18 +376,17 @@ def _assert_dense(state, rows, epoch):
 
 # A first append that commits: test_appends_on_different_tracks_queue_behind_a_read_head
 # covers every ordering of the two kinds.
-@pytest.mark.parametrize("first_outcome", ["rollback"])
 @pytest.mark.parametrize("second_kind", APPENDS)
 @pytest.mark.parametrize("first_kind", APPENDS)
 def test_append_waits_for_a_head_another_append_read(
     migrated_db, first_connection, open_connection, observer,
-    first_kind, second_kind, first_outcome,
+    first_kind, second_kind,
 ):
     epoch = _source(migrated_db)
     park = _Park("first")
     first = _Writer(
         "first", first_connection, _append(first_kind, "first", park),
-        finish=first_outcome,
+        finish="rollback",
     )
     second = _Writer("second", open_connection(), _append(second_kind, "second"))
 
@@ -397,9 +396,7 @@ def test_append_waits_for_a_head_another_append_read(
     _assert_no_errors(first, second)
     state, rows = _journal(migrated_db)
     _assert_dense(state, rows, epoch)
-    expected = (
-        _journaled(first_kind, "first") if first_outcome == "commit" else []
-    ) + _journaled(second_kind, "second")
+    expected = _journaled(second_kind, "second")  # the first rolled back
     assert _events(rows) == expected
     assert (state["head"], state["floor"]) == (len(expected), 0)
 

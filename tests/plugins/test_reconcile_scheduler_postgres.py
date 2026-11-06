@@ -143,12 +143,11 @@ def _backfill_row(db):
     )[0]
 
 
-@pytest.mark.parametrize("retry_count", [2])  # 0 takes the same branch
-def test_waiting_retry_keeps_the_backfill_retry_time(tick, monkeypatch, retry_count):
+def test_waiting_retry_keeps_the_backfill_retry_time(tick, monkeypatch):
     mod, db = tick
     for track in ("track-a", "track-b"):
         _retry_armed(db, track)
-    _queued_backfill(db, retry_count)
+    _queued_backfill(db, 2)  # 0 takes the same branch
     analysed = []
     monkeypatch.setattr(mod, "analyze_tracks_task", lambda ids, **_: analysed.append(ids))
 

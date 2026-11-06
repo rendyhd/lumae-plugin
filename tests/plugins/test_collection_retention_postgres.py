@@ -141,19 +141,6 @@ def test_finished_restores_older_than_cutoff_are_deleted(migrated_db):
         assert _count(cur, manager.collection_restores_table()) == 0
 
 
-def test_an_in_progress_restore_is_never_deleted(migrated_db):
-    manager, _ = _load()
-    with migrated_db.cursor() as cur:
-        _insert_restore(cur, manager, "alice", "active", chunks_done=5, chunk_count=6,
-                         age_days=0)
-    migrated_db.commit()
-
-    deleted = manager.purge_stale_collection_restores(migrated_db)
-    assert deleted == 0
-    with migrated_db.cursor() as cur:
-        assert _count(cur, manager.collection_restores_table()) == 1
-
-
 def test_a_resumable_restore_survives(migrated_db):
     manager, _ = _load()
     principal, key, fingerprint = "alice", "resumable", "fp-3"

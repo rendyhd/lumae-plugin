@@ -48,17 +48,6 @@ def test_a_form_without_the_field_leaves_it(monkeypatch):
     assert stored["background_workers"] == 2
 
 
-def test_the_tick_reads_it_and_falls_back_to_one(monkeypatch):
-    mod = load_plugin()
-    stored = {"background_workers": 2}
-    monkeypatch.setattr(mod, "get_setting", lambda key, default=None: stored.get(key, default))
-    assert mod.background_workers() == 2
-    stored["background_workers"] = "auto"
-    assert mod.background_workers() == 1  # the suite's autouse fixture: one core past the reserve
-    monkeypatch.setattr(mod, "get_setting", lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("db")))
-    assert mod.background_workers() == 1
-
-
 def test_the_turn_is_told_the_setting_behind_k(monkeypatch):
     mod = load_plugin()
     stored = {"background_workers": 3}

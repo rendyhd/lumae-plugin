@@ -114,8 +114,6 @@ def _slow(mod, monkeypatch, track_id, seconds):
         return real(analyzer, path, **kwargs)
 
     monkeypatch.setattr(mod, "run_file_analysis", analyse)
-    # 1.8.0's 5 s drain window, scaled to these ticks (gone since).
-    monkeypatch.setattr(par, "DRAIN_SECONDS", 0.5, raising=False)
     return calls
 
 

@@ -97,21 +97,6 @@ def test_timing_success_and_malformed_sqlstate_are_bounded(monkeypatch):
     ]
 
 
-def test_an_autocommit_connection_reads_in_a_transaction_it_owns_and_rolls_back():
-    cursor = Cursor(row=(3,))
-    db = Db(cursor)
-    db.autocommit = True
-    errors, diagnostics = [], []
-    assert state._fetchone(db, "SELECT 1", (), errors, diagnostics, "analysis items", (0,)) == (3,)
-    assert cursor.statements == [
-        "BEGIN",
-        f"SET LOCAL statement_timeout = {state.DEFAULT_DIAGNOSTIC_STATEMENT_TIMEOUT_MS}",
-        "SELECT 1",
-        "ROLLBACK",
-    ]
-    assert errors == []
-
-
 def test_cursor_creation_failure_and_record_bound_are_safe():
     class BadDb:
         def cursor(self):

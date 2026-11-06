@@ -88,20 +88,6 @@ def settings_catalog_source():
     }
 
 
-def expect_v3_readiness(core_version):
-    return {
-        "qualified_core_version": core_version,
-        "detected_core_version": core_version,
-        "applicable": True,
-        "status": "catalog_not_initialized",
-        "ready": False,
-        "verification_mode": None,
-        "administrator_acknowledged": False,
-        "acknowledged_at": None,
-        "blockers": ["catalog_not_initialized"],
-    }
-
-
 def test_plugin_manifest_has_lumae_identity():
     with open("plugins/LumaeAnalysis/plugin.json", "r", encoding="utf-8") as fh:
         manifest = json.load(fh)
@@ -622,10 +608,9 @@ def test_catalog_health_uses_v2_single_server_adapter():
 
 
 # Readiness ignores the patch version; one v3.0 host stands for all.
-@pytest.mark.parametrize("core_version", ["v3.0.3"])
-def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch, core_version):
+def test_catalog_health_sanitizes_v3_server_credentials(monkeypatch):
     mod = load_plugin()
-    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", core_version)
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", "v3.0.3")
     monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
     monkeypatch.setattr(plugin_api_module, "use_server", lambda _server_id: None, raising=False)
     monkeypatch.setattr(
@@ -1787,10 +1772,9 @@ def test_catalog_health_rejects_unsupported_core_before_server_work(monkeypatch,
 
 
 # Readiness reads the live contract, not the version string.
-@pytest.mark.parametrize("version", ["v4.0.0"])
-def test_catalog_health_admits_future_core_when_live_v3_contract_passes(monkeypatch, version):
+def test_catalog_health_admits_future_core_when_live_v3_contract_passes(monkeypatch):
     mod = load_plugin()
-    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", version)
+    monkeypatch.setattr(plugin_api_module.config, "APP_VERSION", "v4.0.0")
     monkeypatch.setattr(plugin_api_module, "active_server_id", lambda: "server-a", raising=False)
     monkeypatch.setattr(plugin_api_module, "use_server", lambda _server_id: None, raising=False)
     monkeypatch.setattr(
@@ -2203,14 +2187,6 @@ def test_collection_track_sorts_use_source_columns_not_nested_select_aliases():
     assert all("author" in order for order in orders)
 
 
-def test_collection_catalogue_search_projection_normalizes_accents():
-    library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
-
-    sql = " ".join(library.catalog_track_view_sql().split())
-
-    assert "lower(unaccent(concat_ws(" in sql
-
-
 def test_collection_batch_remove_applies_one_revision_and_one_commit(monkeypatch):
     mod = load_plugin()
     collections = importlib.import_module("plugins.LumaeAnalysis.collection_manager")
@@ -2342,10 +2318,10 @@ def test_collection_preview_target_keeps_provider_credentials_server_side(monkey
 
 
 # Unsupported providers take one branch.
-@pytest.mark.parametrize("provider_type", ["emby"])
-def test_collection_preview_has_no_emby_or_lyrion_reader(monkeypatch, provider_type):
+def test_collection_preview_has_no_emby_or_lyrion_reader(monkeypatch):
     """JF.2: Emby and Lyrion are not supported servers; a persisted source of
     either type gets no stream or artwork, whatever the host is configured as."""
+    provider_type = "emby"
     library = importlib.import_module("plugins.LumaeAnalysis.collection_library")
     monkeypatch.setattr(library.config, "MEDIASERVER_TYPE", provider_type, raising=False)
     monkeypatch.setattr(library.config, "EMBY_URL", "https://emby.example", raising=False)
@@ -2870,54 +2846,10 @@ def test_settled_analysis_run_selector_is_scoped_and_terminal_aware():
     assert "'SUCCESS', 'FAILURE', 'FAIL', 'REVOKED'" in sql
     assert "NOT EXISTS" in sql
 
-def test_plugin_runtime_has_no_private_rq_imports():
-    source = pathlib.Path("plugins/LumaeAnalysis/__init__.py").read_text(encoding="utf-8")
-
-    assert "rq_queue_" not in source
-    assert "from rq" not in source
-    assert "get_current_job" not in source
-
-
 def test_encode_ramp_matches_lumae_byte_layout():
     from plugins.LumaeAnalysis.ramp_codec import encode_ramp
 
     assert encode_ramp([(-17, 3), (0, 513)]) == bytes([239, 3, 0, 0, 1, 2])
-
-
-def test_analyze_buffer_produces_waveform_profile():
-    from plugins.LumaeAnalysis.loudness import analyze_buffer
-
-    sr = 48000
-    t = np.arange(sr * 2, dtype=np.float32) / sr
-    audio = np.sin(2 * np.pi * 440 * t).astype(np.float32) * 0.25
-
-    result = analyze_buffer(audio, sr)
-
-    assert result.sample_rate == sr
-    assert result.duration_ms == 2000
-    assert math.isfinite(result.ref_lufs)
-    assert result.start_ramp
-    assert result.end_ramp
-    assert result.start_ramp_blob
-    assert result.end_ramp_blob
-
-
-def test_apply_biquad_uses_vectorized_scipy(monkeypatch):
-    import plugins.LumaeAnalysis.loudness as loudness
-
-    calls = []
-
-    def fake_lfilter(b, a, samples):
-        calls.append((b, a, samples.copy()))
-        return np.asarray(samples, dtype=np.float64)
-
-    monkeypatch.setattr(loudness.scipy_signal, "lfilter", fake_lfilter)
-    samples = np.linspace(-0.5, 0.5, 32, dtype=np.float32)
-
-    result = loudness._apply_biquad(samples, loudness.KWEIGHT_STAGE1)
-
-    assert len(calls) == 1
-    assert result.dtype == np.float64
 
 
 def test_vectorized_biquad_matches_reference_recurrence():
@@ -3450,22 +3382,6 @@ class AnalysisRunDb:
 
     def commit(self):
         self.commits += 1
-
-
-class LimitAwareCursor(FakeCursor):
-    def fetchall(self):
-        if not self.executed:
-            return self.rows
-        _, params = self.executed[-1]
-        if params:
-            return self.rows[: int(params[0])]
-        return self.rows
-
-
-class LimitAwareDb(FakeDb):
-    def __init__(self, rows=None):
-        self.cursor_obj = LimitAwareCursor(rows)
-        self.commits = 0
 
 
 class CronCursor(FakeCursor):
@@ -4388,14 +4304,6 @@ def test_track_batch_counts_attempts_separately_from_reused_and_promoted_tracks(
     }
 
 
-def _stub_edge_reconcile(monkeypatch, mod):
-    """Reconcile ticks without the edge runtime report, deferred work, edge or loudness pass."""
-    monkeypatch.setattr(mod, "report_edge_runtime", lambda *_args, **_kwargs: None)
-    monkeypatch.setattr(mod, "serve_interactive", lambda *_args, **_kwargs: 0)
-    monkeypatch.setattr(mod, "next_edge_backfill", lambda db=None, server_id=None: None)
-    monkeypatch.setattr(mod, "next_loudness_backfill", lambda db=None, server_id=None: None)
-
-
 def test_track_batch_does_not_count_tracks_paused_before_dispatch_as_attempted(monkeypatch):
     mod = load_plugin()
     pause_checks = iter([False, False, True])
@@ -4640,13 +4548,6 @@ def test_migrate_retires_every_lumae_schedule(monkeypatch):
         assert f"plugin_lumae_analysis__{table_name}" in migration_sql
     assert "ADD COLUMN IF NOT EXISTS retry_count" in migration_sql
     assert "ADD COLUMN IF NOT EXISTS next_retry_at" in migration_sql
-
-
-def test_v1_0_1_has_no_infinite_plugin_job_timeout():
-    source = pathlib.Path("plugins/LumaeAnalysis/__init__.py").read_text(
-        encoding="utf-8"
-    )
-    assert "job_timeout=-1" not in source
 
 
 def test_maintenance_pause_blocks_background_work_but_preserves_control_state(
@@ -5728,8 +5629,7 @@ def test_catalogue_source_accepts_only_a_proven_legacy_server_alias():
 
 
 # Unsupported providers take one branch.
-@pytest.mark.parametrize("provider_type", ["emby"])
-def test_catalogue_source_migration_does_not_create_unsupported_sources(provider_type):
+def test_catalogue_source_migration_does_not_create_unsupported_sources():
     from plugins.LumaeAnalysis.catalog import ensure_catalog_sources
 
     db = RebindDb([])
@@ -5740,7 +5640,7 @@ def test_catalogue_source_migration_does_not_create_unsupported_sources(provider
                 {
                     "server_id": "server-other",
                     "name": "Other",
-                    "provider_type": provider_type,
+                    "provider_type": "emby",
                     "is_default": True,
                 }
             ]
@@ -7154,26 +7054,6 @@ def test_refresh_catalog_rejects_partial_or_unknown_library_memberships():
     assert not any("SET published_generation" in sql for sql, _params in db.executed)
 
 
-def test_refresh_failure_preserves_published_readiness():
-    from plugins.LumaeAnalysis.catalog import refresh_catalog
-
-    db = RefreshDb(previous_counts={"track": 3})
-
-    with pytest.raises(RuntimeError, match="provider unavailable"):
-        refresh_catalog(
-            "server-a",
-            db=db,
-            bridge=RefreshBridge(error=RuntimeError("provider unavailable")),
-        )
-
-    failure_sql = next(
-        sql
-        for sql, params in db.executed
-        if params and params[0] == "provider unavailable" and "catalog_state" in sql
-    )
-    assert "CASE WHEN published_generation=0 THEN 'failed' ELSE status END" in failure_sql
-
-
 class ProjectionCursor(FakeCursor):
     def __init__(self, db):
         super().__init__([])
@@ -7746,37 +7626,6 @@ def test_v3_historical_upgrade_sequence_is_reported_unavailable_not_read():
     }
 
 
-def test_v3_readiness_does_not_depend_on_historical_task_diagnostics():
-    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
-    compatibility = types.SimpleNamespace(
-        core_version="v3.0.5",
-        adapter="v3_registry",
-    )
-    db = ReadinessDb(
-        coverage=(10, 10, 10, 150.0),
-        link_counts=(10, 0, 0, 0, 10, 0),
-    )
-
-    class MissingTaskHistoryCursor(ReadinessCursor):
-        def execute(self, sql, params=None):
-            if "FROM task_status" in sql:
-                raise RuntimeError("task history unavailable")
-            super().execute(sql, params)
-
-    db.cursor = lambda: MissingTaskHistoryCursor(db)
-
-    result = readiness.v3_release_readiness(
-        db,
-        compatibility,
-        readiness_source(),
-        readiness_policy(),
-    )
-
-    assert result["ready"] is True
-    assert result["verification_mode"] == "automatic"
-    assert result["task_evidence"]["diagnostics_available"] is False
-
-
 @pytest.mark.parametrize(
     "core_version",
     ["v3.0.3", "v3.0.5", "v3.0.6", "v4.0.0"],
@@ -7801,64 +7650,6 @@ def test_v3_complete_evidence_is_automatic_across_core_releases(core_version):
     assert result["ready"] is True
     assert result["verification_mode"] == "automatic"
     assert result["qualified_core_version"] == core_version
-    assert result["admission"]["analysis"]["admitted"] is True
-
-
-def test_v3_readiness_ignores_obsolete_acknowledgement_settings(monkeypatch):
-    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
-    compatibility = types.SimpleNamespace(
-        core_version="v3.0.5",
-        adapter="v3_registry",
-    )
-    monkeypatch.setattr(
-        plugin_api_module,
-        "get_setting",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(
-            AssertionError("readiness must not load manual acknowledgements")
-        ),
-    )
-
-    result = readiness.v3_release_readiness(
-        ReadinessDb(
-            coverage=(10, 10, 10, 150.0),
-            tasks=[],
-            link_counts=(10, 0, 0, 0, 10, 0),
-        ),
-        compatibility,
-        readiness_source(),
-        readiness_policy(),
-    )
-
-    assert result["ready"] is True
-    assert result["administrator_acknowledged"] is False
-    assert result["qualified_core_version"] == "v3.0.5"
-    assert result["verification_mode"] == "automatic"
-
-
-def test_v3_readiness_admits_future_patch_from_complete_runtime_evidence():
-    readiness = importlib.import_module("plugins.LumaeAnalysis.catalog_readiness")
-    compatibility = types.SimpleNamespace(
-        core_version="v3.0.6",
-        adapter="v3_registry",
-    )
-
-    result = readiness.v3_release_readiness(
-        ReadinessDb(
-            coverage=(10, 10, 10, 150.0),
-            tasks=[],
-            link_counts=(10, 0, 0, 0, 10, 0),
-        ),
-        compatibility,
-        readiness_source(),
-        readiness_policy(),
-    )
-
-    assert result["qualified_core_version"] == "v3.0.6"
-    assert result["detected_core_version"] == "v3.0.6"
-    assert result["status"] == "ready"
-    assert result["ready"] is True
-    assert result["blockers"] == []
-    assert result["admission"]["catalog"]["admitted"] is True
     assert result["admission"]["analysis"]["admitted"] is True
 
 

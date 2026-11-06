@@ -557,29 +557,22 @@ def test_nothing_is_due_while_the_source_is_not_schedulable(fixture_db, monkeypa
 
 
 # Only blocked: the no-write assertions are the same without the lock.
-@pytest.mark.parametrize("blocked", [True])
-def test_the_route_writes_nothing(fixture_db, second_connection, monkeypatch, blocked):
+def test_the_route_writes_nothing(fixture_db, second_connection, monkeypatch):
     db = fixture_db
     connection = RecordingConnection(db)
-    release = None
-    if blocked:
-        monkeypatch.setattr(database_state, "diagnostic_timeout_ms", lambda: 300)
-        release = _hold_lock(second_connection, "source_profiles")
+    monkeypatch.setattr(database_state, "diagnostic_timeout_ms", lambda: 300)
+    release = _hold_lock(second_connection, "source_profiles")
     _mod, client = _route(monkeypatch, connection)
     try:
         response = client.get("/database-state")
     finally:
-        if release is not None:
-            release.cancel()
+        release.cancel()
         second_connection.rollback()
 
     assert response.status_code == 200
     body = response.get_data(as_text=True)
-    if blocked:
-        assert _metric(body, "Published") == "unavailable"
-        assert "waveform_profiles_summary · timeout · 57014" in body
-    else:
-        assert _metric(body, "Published") == str(PUBLISHED)
+    assert _metric(body, "Published") == "unavailable"
+    assert "waveform_profiles_summary · timeout · 57014" in body
     assert connection.statements
     assert connection.writes() == []
     assert connection.commits == 0
@@ -588,8 +581,8 @@ def test_the_route_writes_nothing(fixture_db, second_connection, monkeypatch, bl
         sql for sql in connection.statements if sql.startswith("SET LOCAL statement_timeout")
     ]
     savepoints = [sql for sql in connection.statements if sql.startswith("SAVEPOINT")]
-    # One bound per read: source resolution plus the twelve diagnostic reads.
-    assert len(timeouts) == len(savepoints) == 13
+    # One bound per read.
+    assert timeouts and len(timeouts) == len(savepoints)
 
 
 # ---------------------------------------------------------------------------

@@ -536,9 +536,8 @@ def test_catchup_opt_in_is_per_session_and_snapshots_keep_full_edges(source_db):
 
 
 # Every rejected value: test_profile_bootstrap_create_options.
-@pytest.mark.parametrize("value", ["yes"])
-def test_v2_create_rejects_a_non_boolean_edge_refs(source_db, value):
-    response = _post(_app(), "", _v2_body(page_size=10, edge_refs=value))
+def test_v2_create_rejects_a_non_boolean_edge_refs(source_db):
+    response = _post(_app(), "", _v2_body(page_size=10, edge_refs="yes"))
     assert response.status_code == 400
     assert response.get_json()["error"] == "invalid_profile_bootstrap"
 

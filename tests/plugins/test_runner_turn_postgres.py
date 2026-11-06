@@ -192,9 +192,6 @@ def test_the_turn_shows_each_action_it_looks_at_and_counts_the_one_that_ran(turn
 def test_a_failing_action_does_not_stop_the_turn(turn, monkeypatch):
     mod, _db, calls, _settings = turn
 
-    def broken(db=None, server_id=None):
-        raise RuntimeError("boom")
-
     monkeypatch.setattr(mod, "_safe_next_wanted_catalog_refresh", lambda db, server_id: ("s", "c"))
     monkeypatch.setattr(mod, "wanted_catalog_refresh_task", lambda *a: (_ for _ in ()).throw(RuntimeError("boom")))
     result = mod.run_runner_turn(Active("server"))
