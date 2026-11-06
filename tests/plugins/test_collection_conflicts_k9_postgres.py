@@ -716,7 +716,7 @@ def test_health_answers_200_with_a_null_scope_for_an_unknown_auth_method(monkeyp
 
     app.register_blueprint(mod.bp)
     client = app.test_client()
-    scoped = ("collections", "shelves", "vibes", "journeys", "covers", "personal_discovery")
+    scoped = ("collections", "shelves", "vibes", "undertone", "journeys", "covers", "personal_discovery")
 
     def health(headers):
         response = client.get("/api/health", headers=headers)

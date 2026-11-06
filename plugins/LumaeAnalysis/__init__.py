@@ -50,7 +50,7 @@ from .shelves import (
     purge_expired_shelf_mutations,
     register_shelf_routes,
 )
-from . import covers, journeys, vibes
+from . import covers, journeys, undertone, vibes
 from . import file_tags
 from . import loudness_backfill, loudness_stream, loudness_v1
 from . import runner
@@ -284,11 +284,15 @@ CATALOG_JOB_TIMEOUT_SECONDS = 90 * 60
 RELATIONSHIP_JOB_TIMEOUT_SECONDS = 60 * 60
 COLLECTIONS_MENU_LABEL = "Living Collections"
 COLLECTIONS_MENU_ENDPOINT = "lumae_analysis.collection_manager_page"
+# Lumae's Undertone page (UT.9) sits beside Living Collections, switched by the same setting.
+UNDERTONE_MENU_LABEL = "Undertone"
+UNDERTONE_MENU_ENDPOINT = "lumae_analysis.undertone_page"
 
 bp = Blueprint("lumae_analysis", __name__)
 register_collection_routes(bp)
 register_shelf_routes(bp)
 vibes.register_vibe_routes(bp)
+undertone.register_undertone_routes(bp)
 journeys.register_journey_routes(bp)
 covers.register_cover_routes(bp)
 personal_discovery.register_routes(bp)
@@ -364,13 +368,20 @@ def sync_collections_menu(enabled, manager=None):
     items = [
         item
         for item in record.get("menu_items", [])
-        if item.get("endpoint") != COLLECTIONS_MENU_ENDPOINT
+        if item.get("endpoint") not in (COLLECTIONS_MENU_ENDPOINT, UNDERTONE_MENU_ENDPOINT)
     ]
     if enabled:
         items.append(
             {
                 "label": COLLECTIONS_MENU_LABEL,
                 "endpoint": COLLECTIONS_MENU_ENDPOINT,
+                "admin_only": False,
+            }
+        )
+        items.append(
+            {
+                "label": UNDERTONE_MENU_LABEL,
+                "endpoint": UNDERTONE_MENU_ENDPOINT,
                 "admin_only": False,
             }
         )
@@ -1824,6 +1835,7 @@ def collection_retention_task():
         restores_deleted = purge_stale_collection_restores(db)
         shelf_deleted = purge_expired_shelf_mutations(db)
         vibe_deleted = vibes.purge_expired_vibe_mutations(db)
+        undertone_deleted = undertone.purge_expired_undertone_mutations(db)
         journey_deleted = journeys.purge_expired_journey_mutations(db)
         cover_deleted = covers.purge_expired_cover_mutations(db)
         cover_images_deleted = covers.purge_unused_cover_images(db)
@@ -1837,6 +1849,7 @@ def collection_retention_task():
         "collection_restores_deleted": restores_deleted,
         "shelf_mutations_deleted": shelf_deleted,
         "vibe_mutations_deleted": vibe_deleted,
+        "undertone_mutations_deleted": undertone_deleted,
         "journey_mutations_deleted": journey_deleted,
         "cover_mutations_deleted": cover_deleted,
         "cover_images_deleted": cover_images_deleted,
@@ -2225,6 +2238,7 @@ def migrate(db):
     refresh_status_summaries(db)
     migrate_shelves(db)
     vibes.migrate_vibes(db)
+    undertone.migrate_undertone(db)
     journeys.migrate_journeys(db)
     covers.migrate_covers(db)
     personal_discovery.migrate(db)
@@ -3167,6 +3181,7 @@ def health():
                     "scope": health_scope_mode(),
                 },
                 "vibes": vibes.capability(collections_enabled(), health_scope_mode()),
+                "undertone": undertone.capability(collections_enabled(), health_scope_mode()),
                 "journeys": journeys.capability(collections_enabled(), health_scope_mode()),
                 "covers": covers.capability(collections_enabled(), health_scope_mode()),
                 "collections": {
@@ -7664,7 +7679,7 @@ RUNNER_PRELOAD_MODULES = (
     "credits_store", "file_tags", "jellyfin_continuity", "jellyfin_provider", "journeys",
     "loudness_backfill", "loudness_stream", "music_metadata", "profile_publication",
     "provider_identity_rekey", "redaction", "relationship_build", "shelves", "status_model",
-    "vibes",
+    "undertone", "vibes",
 )
 
 
@@ -8364,6 +8379,7 @@ def register(ctx):
     ctx.set_settings_page("lumae_analysis.settings")
     if collections_enabled():
         ctx.add_menu_item(COLLECTIONS_MENU_LABEL, COLLECTIONS_MENU_ENDPOINT)
+        ctx.add_menu_item(UNDERTONE_MENU_LABEL, UNDERTONE_MENU_ENDPOINT)
     ctx.on_install(migrate)
     ctx.on_flask_start(flask_start)
     if hasattr(ctx, "on_worker_start"):

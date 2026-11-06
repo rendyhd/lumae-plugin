@@ -7,6 +7,24 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased
+
+Undertone records (Lumae UT.7; contract §5.8).
+
+- `capabilities.undertone` and `/api/undertone/changes`, `/mutations` and
+  `/mutations/batch`: the phone's Undertone fields, categories, presets,
+  groups, details and music index, kept per person and per Undertone source
+  (the server and library Undertone reads), with revisions, tombstones,
+  receipts and a compact change feed as saved Vibes have. Switched by the
+  collection manager. The plugin never interprets a record.
+- The Undertone page (Lumae UT.9), in the Plugins menu beside Living
+  Collections: the synced library as a table with the fields as columns, a
+  field set on many rows at once or pasted down a column, presets,
+  categories and fields edited, and the phone's own Undertone file exported
+  and imported. It never asks the music server; phones take the changes at
+  their next sync. `/api/undertone/sources` lists a person's Undertone
+  libraries.
+
 ## 1.10.1 (2026-11-06)
 
 The settings page's throughput keeps its own counts, and a search for a rare
