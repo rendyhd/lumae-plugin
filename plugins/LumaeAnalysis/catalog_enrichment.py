@@ -52,7 +52,9 @@ RELATIONSHIP_ALGORITHM_VERSION = 1
 # relationships stale and the next build replaces them. 2: energy on the
 # library's energy scale and moods as ranks (sonic_calibration), as the app's
 # Album Dynamics v2; 1 scaled energy by a fixed 0.01-0.15 and used raw moods.
-RELATIONSHIP_SCORING_REVISION = 2
+# 3: the index's ids are read as analysis ids. Before, they were looked up as
+# provider track ids and missed, so every candidate list was published empty.
+RELATIONSHIP_SCORING_REVISION = 3
 RELATIONSHIP_LIMIT = 12
 RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR = 96
 RELATIONSHIP_MAX_CANDIDATE_ENTITIES = 384
@@ -1831,7 +1833,8 @@ def _load_relationship_inputs(cur, source):
                tr.payload,
                ac.cover_art_id,
                ai.scalar_payload,
-               ai.musicnn_vector, ai.musicnn_dimensions
+               ai.musicnn_vector, ai.musicnn_dimensions,
+               ln.analysis_id
           FROM {t("catalog_tracks")} tr
           JOIN {t("track_analysis_links")} ln
             ON ln.catalog_instance_id=tr.catalog_instance_id
@@ -1875,6 +1878,7 @@ def _load_relationship_inputs(cur, source):
         tracks.append(
             {
                 "id": str(row[0]),
+                "analysis_id": str(row[13]),
                 "album_id": str(row[1]) if row[1] else None,
                 "album": album or None,
                 "artist": artist,
@@ -1941,8 +1945,13 @@ def _fingerprint_query_vectors(entity_type, fingerprint):
     ][:8]
 
 
-def _ivf_candidate_track_ids(query_vectors, per_vector_n):
-    """Return a bounded provider-track shortlist from AudioMuse's paged IVF."""
+def _ivf_candidate_analysis_ids(query_vectors, per_vector_n):
+    """Return a bounded shortlist from AudioMuse's paged IVF.
+
+    The index holds AudioMuse's own item ids, which are this plugin's analysis
+    ids and not the music server's track ids (``fp_...`` on a fingerprinted
+    library), so a caller reads them through ``track_analysis_links``.
+    """
     try:
         from tasks import ivf_manager
     except (AttributeError, ImportError) as exc:
@@ -1982,27 +1991,33 @@ def _relationship_candidates(
     source,
     entity_type,
     entities_by_key,
-    track_to_entity,
+    analysis_to_entities,
     candidate_lookup,
 ):
+    """Entities whose songs the index puts near this one. One analysis can stand
+    for several tracks (the same audio on two albums), so it maps to every
+    entity that holds one of them."""
     query_vectors = _fingerprint_query_vectors(entity_type, source["fingerprint"])
     if not query_vectors:
         return []
-    track_ids = candidate_lookup(
+    analysis_ids = candidate_lookup(
         query_vectors,
         RELATIONSHIP_CANDIDATE_TRACKS_PER_VECTOR,
     )
     candidate_keys = []
-    seen = set()
-    for track_id in track_ids:
-        key = track_to_entity.get(str(track_id))
-        if key is None or key == source["key"] or key in seen:
-            continue
-        seen.add(key)
-        candidate_keys.append(key)
+    seen = {source["key"]}
+    for analysis_id in analysis_ids:
+        for key in analysis_to_entities.get(str(analysis_id), ()):
+            if key not in seen:
+                seen.add(key)
+                candidate_keys.append(key)
         if len(candidate_keys) >= RELATIONSHIP_MAX_CANDIDATE_ENTITIES:
             break
-    return [entities_by_key[key] for key in candidate_keys if key in entities_by_key]
+    return [
+        entities_by_key[key]
+        for key in candidate_keys[:RELATIONSHIP_MAX_CANDIDATE_ENTITIES]
+        if key in entities_by_key
+    ]
 
 
 def relationship_status(db, catalog_instance_id):
@@ -2116,7 +2131,7 @@ def prepare_relationships(catalog_instance_id, db=None, candidate_lookup=None, p
     from .relationship_build import run_relationship_build
     return run_relationship_build(
         catalog_instance_id, db=db or get_db(),
-        candidate_lookup=candidate_lookup or _ivf_candidate_track_ids,
+        candidate_lookup=candidate_lookup or _ivf_candidate_analysis_ids,
         progress=progress, batch_size=batch_size,
         time_budget_seconds=time_budget_seconds,
     )

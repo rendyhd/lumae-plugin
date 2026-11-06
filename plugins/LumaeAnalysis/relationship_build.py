@@ -28,7 +28,9 @@ from psycopg2.extras import execute_values
 from .catalog import CatalogScanError, canonical_json, opaque_cursor
 
 log = logging.getLogger("lumae.relationships")
-BUILD_FORMAT_VERSION = 1
+# 2: staged inputs carry each track's analysis id, which scoring reads. A build
+# staged by an older version can't finish here, so it starts again.
+BUILD_FORMAT_VERSION = 2
 CHECKPOINT_SIZE = 16
 
 
@@ -139,8 +141,9 @@ def unpack_entity(blob):
 def analysis_inputs_digest(cur, source_id, generation):
     """Digest of the sonic analysis inputs a relationship build reads.
 
-    ``_load_relationship_inputs`` uses only ready links, and from their items
-    the MusicNN vector and the scalar payload (energy and mood). The UMAP
+    ``_load_relationship_inputs`` uses only ready links with their analysis id
+    (how the index names the track), and from their items the MusicNN vector
+    and the scalar payload (energy and mood). The UMAP
     coordinates stored in the same payload are not used. A new projection
     generation that carries these rows unchanged keeps the same digest, so it
     neither restarts a running build nor requires a rebuild.
@@ -153,7 +156,7 @@ def analysis_inputs_digest(cur, source_id, generation):
                count(*)
           FROM (
             SELECT ln.provider_track_id,
-                   md5(ROW(ln.provider_track_id, ai.musicnn_dimensions,
+                   md5(ROW(ln.provider_track_id, ln.analysis_id, ai.musicnn_dimensions,
                            COALESCE(ai.musicnn_fp, encode(sha256(ai.musicnn_vector), 'hex')),
                            ai.scalar_payload - 'umap')::text) AS row_digest
               FROM {t('track_analysis_links')} ln
@@ -423,13 +426,15 @@ class Build:
                 entities[kind][key] = unpack_entity(blob)
                 if result_fp is None:
                     pending.append((kind, key))
-            cur.execute(f"SELECT track_id, album_key, artist_key FROM {t('relationship_build_tracks')} "
-                        "WHERE catalog_instance_id=%s", (self.source_id,))
-            mapping = cur.fetchall()
-            track_maps = {
-                "album": {row[0]: row[1] for row in mapping if row[1]},
-                "artist": {row[0]: row[2] for row in mapping},
-            }
+            # In input order, so a candidate cap keeps the same entities each time.
+            cur.execute(f"SELECT input_payload->>'analysis_id', album_key, artist_key "
+                        f"FROM {t('relationship_build_tracks')} "
+                        "WHERE catalog_instance_id=%s ORDER BY input_order", (self.source_id,))
+            analysis_maps = {"album": {}, "artist": {}}
+            for analysis_id, album_key, artist_key in cur.fetchall():
+                if album_key:
+                    analysis_maps["album"].setdefault(analysis_id, []).append(album_key)
+                analysis_maps["artist"].setdefault(analysis_id, []).append(artist_key)
         self.db.commit()
         completed = {kind: sum(r[0] == kind and r[3] is not None for r in rows)
                      for kind in entities}
@@ -443,7 +448,7 @@ class Build:
                         completed[kind], len(entities[kind]))
             with self.timed("candidate_lookup"):
                 candidates = e._relationship_candidates(
-                    entity, kind, entities[kind], track_maps[kind], candidate_lookup)
+                    entity, kind, entities[kind], analysis_maps[kind], candidate_lookup)
             with self.timed("scoring"):
                 ranked = (e._rank_albums if kind == 'album' else e._rank_artists)(entity, candidates)
                 payload = {"entity_type": kind, "entity_id": key,
@@ -476,13 +481,19 @@ class Build:
                         "WHERE catalog_instance_id=%s FOR UPDATE", (self.source_id,))
             previous_generation, epoch, head_seq = cur.fetchone()
             generation = int(previous_generation) + 1
-            cur.execute(f"SELECT count(*), count(*) FILTER (WHERE result_fp IS NULL) "
+            cur.execute(f"SELECT count(*), count(*) FILTER (WHERE result_fp IS NULL), "
+                        "count(*) FILTER (WHERE jsonb_array_length(payload->'candidates') > 0) "
                         f"FROM {t('relationship_build_entities')} WHERE catalog_instance_id=%s",
                         (self.source_id,))
-            total, incomplete = cur.fetchone()
+            total, incomplete, with_candidates = cur.fetchone()
             counts = self.diagnostics['counts']
             if incomplete or total != counts['albums'] + counts['artists']:
                 raise CatalogScanError("Relationship checkpoint is incomplete")
+            if total > 1 and not with_candidates:
+                # An empty list reads as "nothing similar", so nothing else shows this.
+                log.warning("relationship build source=%s found no similar album or artist "
+                            "for any of its %s entities; the index may not match the "
+                            "analysis ids", self.source_id, total)
             # Generate the journal BEFORE replacing published results. A stable
             # ordering makes retries deterministic, with unchanged rows omitted.
             cur.execute(f"""

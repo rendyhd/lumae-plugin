@@ -7,6 +7,23 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased
+
+Similar albums and artists have results.
+
+- Every album and artist had an empty list, so the app's "Sonically similar"
+  rows never appeared. AudioMuse's index answers with its own item ids (`fp_...`),
+  and the build looked them up as the music server's track ids. None matched on
+  a fingerprinted library, and an empty list isn't an error, so nothing said so.
+  The build now reads them through `track_analysis_links`, where one analysis can
+  stand for several tracks (the same audio on two albums).
+- Scoring revision 3 and build format 2: a published revision 2 generation turns
+  stale at migration and the next build replaces it, serving the old one
+  meanwhile; a staged build starts again. `algorithm_version` stays 1, so phones
+  take the new lists as ordinary changes on their next sync. Every list changes
+  once, so that sync downloads about 3 KB per album and artist.
+- A build that finds no neighbour for any album or artist logs a warning.
+
 ## 1.10.1 (2026-11-06)
 
 The settings page's throughput keeps its own counts, a search for a rare term no

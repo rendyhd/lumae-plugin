@@ -967,15 +967,15 @@ def test_relationship_candidate_scoring_is_bounded_by_ivf_shortlist(monkeypatch)
 
     entities = [entity(index) for index in range(1000)]
     entities_by_key = {row["key"]: row for row in entities}
-    track_to_entity = {
-        f"track-{index}": row["key"] for index, row in enumerate(entities)
+    analysis_to_entities = {
+        f"analysis-{index}": [row["key"]] for index, row in enumerate(entities)
     }
     candidates = enrichment._relationship_candidates(
         entities[0],
         "album",
         entities_by_key,
-        track_to_entity,
-        lambda _vectors, _limit: [f"track-{index}" for index in range(1, 1000)],
+        analysis_to_entities,
+        lambda _vectors, _limit: [f"analysis-{index}" for index in range(1, 1000)],
     )
 
     calls = []
@@ -1005,7 +1005,7 @@ def test_relationship_builder_waits_instead_of_falling_back_without_ivf(monkeypa
     )
 
     with pytest.raises(enrichment.RelationshipIndexUnavailable, match="not ready"):
-        enrichment._ivf_candidate_track_ids(
+        enrichment._ivf_candidate_analysis_ids(
             [np.ones(200, dtype=np.float32)],
             10,
         )
@@ -1038,7 +1038,7 @@ def test_relationship_builder_loads_ivf_and_caps_queries_to_small_indexes(monkey
         types.SimpleNamespace(ivf_manager=fake_manager),
     )
 
-    assert enrichment._ivf_candidate_track_ids(
+    assert enrichment._ivf_candidate_analysis_ids(
         [np.ones(200, dtype=np.float32)],
         96,
     ) == ["track-a"]

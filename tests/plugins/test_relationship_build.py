@@ -83,7 +83,7 @@ def connection_like(db):
 
 def advance(db, **kwargs):
     return e.prepare_relationships('catalog-a', db=db,
-                                  candidate_lookup=kwargs.pop('candidate_lookup', lambda *_: ['tr-0', 'tr-4']),
+                                  candidate_lookup=kwargs.pop('candidate_lookup', lambda *_: ['ai-0', 'ai-4']),
                                   time_budget_seconds=kwargs.pop('time_budget_seconds', 60), **kwargs)
 
 
@@ -143,7 +143,9 @@ def test_input_query_preserves_rows_order_and_duplicate_cover_semantics(relation
         actual = cur.fetchall()
         cur.execute(Path(__file__).with_name('relationship_inputs_legacy.sql').read_text(), (1, 'catalog-a', 1))
         expected = cur.fetchall()
-    assert actual == expected
+    # The analysis id (last column) is newer than the frozen legacy baseline.
+    assert [row[:-1] for row in actual] == expected
+    assert [row[-1] for row in actual] == [row[0].replace('tr-', 'ai-') for row in actual]
     assert len(actual) == 6
     assert [r[9] for r in actual if r[0] == 'tr-0'] == ['aaa']
     assert [r[9] for r in actual if r[0] == 'tr-5'] == [None]
@@ -190,11 +192,97 @@ def test_binary_checkpoint_preserves_vectors_and_ranker_output(relationship_db):
     assert rb.unpack_entity(blob)['vectors'][0][0] == 1.123456789
 
 
+def candidates_by_entity(db):
+    return {(kind, key): [c.get('albumKey') or c.get('artistKey') for c in payload['candidates']]
+            for kind, key, payload in published(db)}
+
+
+def test_the_index_answers_with_analysis_ids_not_provider_track_ids(relationship_db):
+    """AudioMuse's IVF ids are its own item ids (fp_...), which differ from the
+    music server's track ids. Reading them as track ids found no neighbours, so
+    every album and artist published an empty list."""
+    finish(relationship_db, candidate_lookup=lambda *_: ['ai-0', 'ai-4'])
+    candidates = candidates_by_entity(relationship_db)
+    assert candidates[('album', 'artist 0::album 0')] == ['artist 1::album 1']
+    assert candidates[('album', 'artist 1::album 1')] == ['artist 0::album 0']
+    assert candidates[('artist', 'artist 0')] == ['artist 1']
+    assert candidates[('artist', 'artist 1')] == ['artist 0']
+
+
+def test_provider_track_ids_are_not_index_ids(relationship_db):
+    finish(relationship_db, candidate_lookup=lambda *_: ['tr-0', 'tr-4'])
+    assert not any(candidates_by_entity(relationship_db).values())
+
+
+def test_one_analysis_reaches_every_track_that_shares_it(relationship_db):
+    """The same audio in two albums is one analysis, so one index id (37,939
+    links over 36,752 embeddings on the owner's library)."""
+    with relationship_db.cursor() as cur:
+        cur.execute("UPDATE plugin_lumae_analysis__track_analysis_links SET analysis_id='ai-0' "
+                    "WHERE provider_track_id='tr-4'")
+        # A third album whose only neighbours come through that shared analysis.
+        cur.execute("""
+            INSERT INTO plugin_lumae_analysis__catalog_albums
+                (catalog_instance_id, published_generation, album_id, name, album_artist_display,
+                 metadata_fp, payload, first_seen_at, last_seen_at)
+            VALUES ('catalog-a', 1, 'al-x', 'Album X', 'Artist X', '', '{}', now(), now());
+            INSERT INTO plugin_lumae_analysis__catalog_tracks
+                (catalog_instance_id, published_generation, track_id, album_id, title,
+                 artist_display, disc_number, track_number, analysis_eligible, metadata_fp,
+                 payload, first_seen_at, last_seen_at)
+            VALUES ('catalog-a', 1, 'tr-x', 'al-x', 'Track X', 'Artist X', 1, 0, TRUE, '',
+                    '{"_lumae":{"year":2000}}', now(), now());
+            INSERT INTO plugin_lumae_analysis__analysis_items
+                (catalog_instance_id, projection_generation, analysis_id,
+                 scalar_payload, musicnn_vector, musicnn_dimensions)
+            SELECT 'catalog-a', 1, 'ai-x', scalar_payload, musicnn_vector, musicnn_dimensions
+              FROM plugin_lumae_analysis__analysis_items WHERE analysis_id='ai-0';
+            INSERT INTO plugin_lumae_analysis__track_analysis_links
+                (catalog_instance_id, projection_generation, provider_track_id, analysis_id, status)
+            VALUES ('catalog-a', 1, 'tr-x', 'ai-x', 'ready');
+        """)
+    relationship_db.commit()
+    finish(relationship_db, candidate_lookup=lambda *_: ['ai-0'])
+    candidates = candidates_by_entity(relationship_db)
+    assert candidates[('album', 'artist x::album x')] == ['artist 0::album 0', 'artist 1::album 1']
+    assert candidates[('artist', 'artist x')] == ['artist 0', 'artist 1']
+
+
+def test_a_changed_analysis_id_is_a_changed_input(relationship_db):
+    with relationship_db.cursor() as cur:
+        before = rb.analysis_inputs_digest(cur, 'catalog-a', 1)
+        cur.execute("UPDATE plugin_lumae_analysis__track_analysis_links SET status='missing' "
+                    "WHERE provider_track_id='tr-0'")
+        cur.execute("""
+            INSERT INTO plugin_lumae_analysis__analysis_items
+                (catalog_instance_id, projection_generation, analysis_id,
+                 scalar_payload, musicnn_vector, musicnn_dimensions)
+            SELECT catalog_instance_id, projection_generation, 'ai-new',
+                   scalar_payload, musicnn_vector, musicnn_dimensions
+              FROM plugin_lumae_analysis__analysis_items WHERE analysis_id='ai-0';
+            UPDATE plugin_lumae_analysis__track_analysis_links
+               SET analysis_id='ai-new', status='ready' WHERE provider_track_id='tr-0';
+        """)
+        assert rb.analysis_inputs_digest(cur, 'catalog-a', 1) != before
+
+
+def test_a_build_with_no_neighbour_anywhere_warns(relationship_db, caplog):
+    with caplog.at_level(logging.WARNING, logger='lumae.relationships'):
+        finish(relationship_db, candidate_lookup=lambda *_: [])
+    assert any('no similar album or artist' in record.getMessage() for record in caplog.records)
+
+
+def test_a_build_with_neighbours_does_not_warn(relationship_db, caplog):
+    with caplog.at_level(logging.WARNING, logger='lumae.relationships'):
+        finish(relationship_db)
+    assert not any('no similar album or artist' in record.getMessage() for record in caplog.records)
+
+
 def test_relationship_builder_publishes_only_bounded_shortlist_candidates(relationship_db):
     calls = []
     def lookup(_vectors, limit):
         calls.append(limit)
-        return ['tr-0', 'tr-4', 'not-in-this-source']
+        return ['ai-0', 'ai-4', 'not-in-this-source']
     result = finish(relationship_db, batch_size=2, candidate_lookup=lookup)
     assert result['album_count'] == result['artist_count'] == 2
     assert result['track_count'] == 8
@@ -226,7 +314,7 @@ def test_scoring_resumes_after_worker_interruption_without_repeating_completed_w
         calls.append(1)
         if len(calls) == 2:
             raise KeyboardInterrupt('worker stopped')
-        return ['tr-0', 'tr-4']
+        return ['ai-0', 'ai-4']
     with pytest.raises(KeyboardInterrupt):
         advance(db, candidate_lookup=lookup)
     assert scalar(db, 'SELECT count(*) FROM plugin_lumae_analysis__relationship_build_entities WHERE result_fp IS NOT NULL') == 1
@@ -235,7 +323,7 @@ def test_scoring_resumes_after_worker_interruption_without_repeating_completed_w
     other = connection_like(db)
     try:
         monkeypatch.setattr(e, '_load_relationship_inputs', lambda *_: pytest.fail('reloaded completed inputs'))
-        result = finish(other, candidate_lookup=lambda *_: calls.append(1) or ['tr-0', 'tr-4'])
+        result = finish(other, candidate_lookup=lambda *_: calls.append(1) or ['ai-0', 'ai-4'])
         assert result['generation'] == 1
         assert len(calls) == 5  # Four entities, plus the interrupted attempt only.
     finally:
@@ -647,7 +735,7 @@ def test_progress_callback_cannot_commit_partial_publication_and_no_lock_during_
         with other.cursor() as cur:
             cur.execute('SELECT * FROM plugin_lumae_analysis__relationship_state FOR UPDATE NOWAIT')
         other.rollback()
-        return ['tr-0', 'tr-4']
+        return ['ai-0', 'ai-4']
     try:
         result = finish(db, candidate_lookup=lookup, progress=progress)
         assert result['generation'] == 1

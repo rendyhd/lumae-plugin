@@ -110,7 +110,7 @@ def _row(track_id, album, energy, other_features, *, embedding=True):
     vector = bytes(4 * 2) if not embedding else b"\x00\x00\x80?" + b"\x00\x00\x00\x00"
     scalar = {"energy": energy, "other_features": other_features, "mood_vector": "happy:0.73"}
     return (track_id, f"album-{album}", album, "Artist", "Artist", 1, 1, None, "{}", None,
-            json.dumps(scalar), vector if embedding else b"", 2)
+            json.dumps(scalar), vector if embedding else b"", 2, f"analysis-{track_id}")
 
 
 def test_relationship_inputs_rank_energy_on_the_library_scale_and_moods_as_ranks():
@@ -157,7 +157,7 @@ def test_energy_separates_otherwise_identical_albums():
     assert [row["albumKey"] for row in ranked] == ["zebra", "aardvark"]
 
 
-@pytest.mark.parametrize("revision, queued", [(1, True), (2, False)])
+@pytest.mark.parametrize("revision, queued", [(2, True), (3, False)])
 def test_complete_relationships_of_an_older_scoring_revision_are_rebuilt(
     monkeypatch, revision, queued
 ):
@@ -183,7 +183,7 @@ def test_complete_relationships_of_an_older_scoring_revision_are_rebuilt(
     result = mod.start_relationship_preparation("catalog-a", "server-a")
 
     assert result["queued"] is queued
-    assert mod.RELATIONSHIP_SCORING_REVISION == 2
+    assert mod.RELATIONSHIP_SCORING_REVISION == 3
 
 
 def test_postgres_published_revision_1_relationships_turn_stale(  # noqa: F811

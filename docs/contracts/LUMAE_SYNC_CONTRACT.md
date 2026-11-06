@@ -291,6 +291,8 @@ From SQ.2:
 
 From scoring revision 2 (1.9.2): the state also carries `scoring_revision`, the plugin's own revision of how relationships are scored (2: energy on the library's energy scale and moods as ranks, as the app's Album Dynamics v2; 1 before). A source whose published generation has an older revision turns `stale` at migration and the next build replaces it. `algorithm_version` stays 1 on every route, because Lumae rejects a relationship change page with any other value (`pluginEnrichmentSync.ts`).
 
+From scoring revision 3 (Unreleased): `candidates` holds what the index finds. Before it, every candidate list was `[]` on a library whose analysis ids differ from its provider track ids, because the index's ids were looked up as track ids. Clients need no change; a revision 2 generation turns `stale` the same way and its replacement reaches them as ordinary upserts.
+
 ---
 
 ## 3. Profile endpoints
