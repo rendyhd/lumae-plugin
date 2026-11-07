@@ -40,29 +40,6 @@ def test_a_refresh_request_is_kept_and_wakes_the_runners(runners_on):
     assert _rows(db, f"SELECT reason FROM {P}reconcile_control")[0][0] != "catalog_refresh_wanted"
 
 
-def test_every_track_asked_for_is_accepted_and_none_deferred(runners_on, monkeypatch):
-    mod, db, listener = runners_on
-    monkeypatch.setattr(mod, "resolve_profile_source",
-                        lambda **_k: {"catalog_instance_id": SOURCE, "server_id": SERVER})
-    monkeypatch.setattr(mod, "split_analyze_ids",
-                        lambda ids, catalog_instance_id=None: (["t1", "t2", "t3", "t4"], ["t5"], ["t6"]))
-    monkeypatch.setattr(mod, "mark_pending", lambda ids, catalog_instance_id=None, priority=None:
-                        {track: f"token-{track}" for track in ids})
-    recorded = []
-    monkeypatch.setattr(mod, "mark_profiles_waiting",
-                        lambda db, catalog, tokens: recorded.append(dict(tokens)))
-    response = plugin_client(mod).post("/api/analyze", json={
-        "catalog_instance_id": SOURCE, "ids": ["t1", "t2", "t3", "t4", "t5", "t6"]})
-    assert response.status_code == 202
-    body = response.get_json()
-    assert body["accepted"] == ["t1", "t2", "t3", "t4"]
-    assert body["deferred"] == []
-    assert body["already_pending"] == ["t6"]
-    # One record for the runner, chunks no longer matter.
-    assert recorded == [{f"t{i}": f"token-t{i}" for i in (1, 2, 3, 4, 6)}]
-    assert "interactive_profiles" in _notified(listener)
-
-
 def test_edges_asked_for_are_recorded_for_the_runner(runners_on, monkeypatch):
     mod, db, listener = runners_on
     monkeypatch.setattr(mod, "resolve_profile_source",

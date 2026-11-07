@@ -311,6 +311,6 @@ def test_migration_is_idempotent(lumae_postgres_db):
     mod.migrate_journeys(lumae_postgres_db)
     lumae_postgres_db.commit()
     with lumae_postgres_db.cursor() as cur:
-        cur.execute("SELECT count(*) FROM pg_indexes WHERE indexname IN "
+        cur.execute("SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN "
                     "('lumae_journey_changes_idx','lumae_journey_mutations_created_idx')")
         assert cur.fetchone()[0] == 2

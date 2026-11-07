@@ -203,5 +203,5 @@ def test_migration_is_idempotent(lumae_postgres_db):
     mod.migrate_vibes(lumae_postgres_db)
     lumae_postgres_db.commit()
     with lumae_postgres_db.cursor() as cur:
-        cur.execute("SELECT count(*) FROM pg_indexes WHERE indexname IN ('lumae_vibe_changes_idx','lumae_vibe_mutations_created_idx')")
+        cur.execute("SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN ('lumae_vibe_changes_idx','lumae_vibe_mutations_created_idx')")
         assert cur.fetchone()[0] == 2

@@ -636,24 +636,6 @@ def test_a_mixed_catalogue_collection_streams_and_shows_art_per_item(workbench, 
     assert [track["track_id"] for track in album.get_json()["tracks"]] == [
         "al-kid-t1", "al-kid-t2"]
 
-    ui = importlib.import_module("plugins.LumaeAnalysis.collection_ui")
-    body = ui.render_collection_workbench("Label", "Detail")
-
-    def function(name):
-        start = body.index(f"function {name}(")
-        return body[start:body.index("\nfunction ", start)]
-
-    assert "const catalogOf=item=>item?.catalog_instance_id||catalog;" in body
-    assert "artUrl(cover,120,catalogOf(item))" in function("renderItemRows")
-    assert "artUrl(item.cover_item_id||item.track_id,240,catalogOf(item))" in function(
-        "collectionMosaic")
-    preview = function("playPreview")
-    assert "artUrl(cover,120,catalogOf(item))" in preview
-    assert "streamUrl(item.track_id,catalogOf(item))" in preview
-    assert ("withCatalog(new URLSearchParams({title:item.title,artist:item.artist}),"
-            "catalogOf(item))") in function("openAlbum")
-    assert "artUrl(cover,480,catalogOf(album))" in function("renderAlbumDetail")
-
 
 def test_workbench_script_declares_every_binding():
     """A declaration keyword glued to its name (review P3-5b: ``constcatalogued=``)

@@ -292,6 +292,6 @@ def test_migration_is_idempotent(lumae_postgres_db):
     mod.migrate_covers(lumae_postgres_db)
     lumae_postgres_db.commit()
     with lumae_postgres_db.cursor() as cur:
-        cur.execute("SELECT count(*) FROM pg_indexes WHERE indexname IN "
+        cur.execute("SELECT count(*) FROM pg_indexes WHERE schemaname=current_schema() AND indexname IN "
                     "('lumae_cover_changes_idx','lumae_cover_mutations_created_idx','lumae_cover_images_created_idx')")
         assert cur.fetchone()[0] == 3
