@@ -409,6 +409,9 @@ def test_the_upgrade_request_locks_every_catalogue_in_id_order(
         assert other.fetchall() == []
     second_connection.rollback()
     db.rollback()
+
+
+def _restored_legacy_database(db, version):
     """Applied, then Navidrome reports ``version`` with its pre-rekey IDs."""
     from plugins.LumaeAnalysis import provider_identity_guard as guard
 

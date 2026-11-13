@@ -225,7 +225,8 @@ with the AudioMuse migration still owed, so fresh projection ingestion stays
 paused as above; up to 1.10.2 the source went to `normal` and that hold was
 lifted. After a pre-boundary version, `applied` is restored only while the
 scanned IDs are still canonical: a scan that carries published canonical IDs
-in their legacy form instead (a restored pre-rekey Navidrome database) sends
+in their legacy form instead, more of them than the ones still canonical (a
+restored pre-rekey Navidrome database, not a single track), sends
 the source to `normal` with reason `provider_ids_reverted` and clears the
 applied identity, so the ordinary diff and the projection rebuild from the
 server's IDs. A changed ID set opens a new transition with its own id, the

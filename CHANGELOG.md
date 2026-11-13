@@ -43,7 +43,7 @@ Catalogue
   network, or every phone behind one proxy, keeps or gets its own session: at
   most 4 at once per user and 32 for the shared token and anonymous callers,
   checked atomically. A session of a token or anonymous caller made before the
-  upgrade answers one 410 `bootstrap_required`. A create waits at most three
+  upgrade answers one 410 `bootstrap_required`. A create waits at most eight
   seconds for another create of the same caller, and an analysis session at
   most three seconds for a running projection; either then answers the
   retryable 409 `bootstrap_unavailable` (the analysis one instead of pinning a
@@ -96,7 +96,8 @@ Provider identity
   (`pre_transition_version_after_rekey`) instead of straight to `normal`. If
   the IDs are still canonical (a binary downgrade or a misreported version),
   the inspection restores `applied`. If the scan shows them back in their
-  legacy form (a restored pre-rekey database), the source goes to `normal`
+  legacy form, with the reverted IDs outnumbering the ones still canonical (a
+  restored pre-rekey database, not a single track), the source goes to `normal`
   with reason `provider_ids_reverted` and the applied identity is cleared,
   so the ordinary diff and the projection rebuild from the server's IDs. A
   Jellyfin applied transition that was blocked returns to `applied` when its
