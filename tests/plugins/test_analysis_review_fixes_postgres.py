@@ -110,6 +110,45 @@ def test_enqueue_refusals_and_successes_do_not_count(migrated_db):
     assert _due(db) == [TRACK]
 
 
+def test_a_capped_job_reports_no_retry_at(migrated_db):
+    db = migrated_db
+    _seed(db)
+    _fail_once(db)
+    assert set(store.edge_statuses(db, SOURCE, [TRACK])[TRACK]) == {"status", "retry_at"}
+    for _ in range(store.EDGE_FAILURE_CAP - 1):
+        _fail_once(db)
+    assert store.edge_statuses(db, SOURCE, [TRACK]) == {TRACK: {"status": "failed"}}
+    # Another analyzer: retried after the back-off again, so a retry_at again.
+    _q(db, f"UPDATE {P}edge_profile_jobs SET failure_analyzer='2/lumae-edge-v1/old'")
+    assert "retry_at" in store.edge_statuses(db, SOURCE, [TRACK])[TRACK]
+
+
+def test_an_edge_download_failure_never_counts_toward_the_cap(migrated_db, monkeypatch):
+    mod = load_plugin()
+    db = migrated_db
+    _seed(db)
+    for _ in range(store.EDGE_FAILURE_CAP - 1):
+        _fail_once(db)
+
+    def unreachable(*_a, **_k):
+        raise mod.MediaDownloadError("media server download failed")
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "serve_interactive", lambda *a, **k: 0)
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
+    monkeypatch.setattr(mod, "load_track_file", unreachable)
+    for _ in range(3):  # a day-long outage, a retry after each back-off
+        _q(db, f"UPDATE {P}edge_profile_jobs SET updated_at=now() - interval '7 hours'")
+        jobs, _ready, _pending, _unsupported = store.claim_edge_requests(db, SOURCE, [TRACK])
+        assert mod.analyze_edges_task(jobs, SOURCE, "server-a") == [{"track_id": TRACK, "status": "failed"}]
+        assert _q(db, f"SELECT status, failures, last_error FROM {P}edge_profile_jobs") == [
+            ("failed", store.EDGE_FAILURE_CAP - 1, store.EDGE_DOWNLOAD_UNAVAILABLE)]
+    assert "retry_at" in store.edge_statuses(db, SOURCE, [TRACK])[TRACK]
+    _q(db, f"UPDATE {P}edge_profile_jobs SET updated_at=now() - interval '7 hours'")
+    assert _due(db) == [TRACK]
+
+
 def test_a_request_reads_two_members_of_the_edge_not_its_payload(migrated_db):
     db = migrated_db
     _seed(db)

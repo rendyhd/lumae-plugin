@@ -54,6 +54,10 @@ def waveform_batch(monkeypatch):
     """A serial background batch whose host downloads fail for the ids in ``down``."""
     mod = load_plugin()
     down, charged, released = set(), [], []
+    serving = [False]  # the canary's answer (``_downloads_serving``)
+    monkeypatch.setattr(mod, "test_serving", serving, raising=False)
+    monkeypatch.setattr(mod, "_downloads_serving", lambda *a: serving[0])
+    monkeypatch.setattr(mod, "refresh_status_snapshot", lambda **k: None)
 
     def load(track_id, **_kwargs):
         if track_id in down:
@@ -111,6 +115,28 @@ def test_an_unreadable_file_among_good_ones_is_still_charged(waveform_batch):
     assert summary["failed"] == 3 and "download_breaker" not in summary
 
 
+def test_missing_files_with_the_server_up_are_charged_and_the_batch_goes_on(waveform_batch):
+    mod, down, charged, released, run = waveform_batch
+    mod.test_serving[0] = True  # the canary downloads: the server serves files
+    down.update({"t1", "t2", "t3"})  # three files gone, the only due rows
+    summary = run(["t1", "t2", "t3"])
+    assert [c for c in charged if c[1] == "failed"] == [
+        (t, "failed", "download_unavailable") for t in ("t1", "t2", "t3")]
+    assert released == []
+    assert summary["failed"] == 3 and "download_breaker" not in summary
+
+
+def test_an_on_demand_waveform_batch_has_no_breaker(waveform_batch):
+    mod, down, charged, released, run = waveform_batch
+    down.update({"t1", "t2", "t3", "t4"})  # an outage, the canary failing too
+    tokens = {t: f"tok-{t}" for t in ("t1", "t2", "t3", "t4")}
+    summary = mod.analyze_tracks_task(["t1", "t2", "t3", "t4"], catalog_instance_id=SOURCE,
+                                      server_id="server-a", priority="interactive", attempt_tokens=tokens)
+    assert charged == [(t, "failed", "download_unavailable") for t in ("t1", "t2", "t3", "t4")]
+    assert released == []
+    assert summary["failed"] == 4 and "download_breaker" not in summary
+
+
 def test_a_tripped_batch_backs_the_pass_off(monkeypatch):
     mod = load_plugin()
     states = []
@@ -143,6 +169,140 @@ def test_the_loudness_breaker_records_nothing_when_it_trips():
     assert breaker.tripped and released == [("u0", "rev"), ("u1", "rev"), ("u2", "rev")]
     breaker.settle()
     assert len(recorded) == 2
+
+
+@pytest.fixture
+def loudness_pass(monkeypatch):
+    """A serial loudness walk over t1..t3 whose host downloads fail for the ids
+    in ``down``; ``serving`` is the canary's answer."""
+    mod = load_plugin()
+    lb = mod.loudness_backfill
+    down, recorded, updates, backoffs, serving = set(), [], [], [], [False]
+    rows = [("t1", "r1"), ("t2", "r2"), ("t3", "r3")]
+    db = types.SimpleNamespace(commit=lambda: None, rollback=lambda: None)
+
+    def load(track_id, **_kwargs):
+        if track_id in down:
+            raise mod.MediaDownloadError("media server download failed")
+        raise AssertionError("only failed downloads in this walk")
+
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "get_db", lambda: db)
+    monkeypatch.setattr(mod.parallel_analysis, "current", lambda: None)
+    monkeypatch.setattr(mod, "serve_interactive", lambda *a, **k: 0)
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: False)
+    monkeypatch.setattr(mod, "configured_backfill_limit", lambda: 10)
+    monkeypatch.setattr(mod, "load_track_file", load)
+    monkeypatch.setattr(mod, "_publish_loudness", lambda db, source, measured: 0)
+    monkeypatch.setattr(mod, "_downloads_serving", lambda *a: serving[0])
+    monkeypatch.setattr(mod, "_back_off_pass", lambda db, state, source: backoffs.append((state, source)))
+    monkeypatch.setattr(lb, "state", lambda db, source: {"status": "queued", "cursor": "", "pass_due": True})
+    monkeypatch.setattr(lb, "runtime_available", lambda: True)
+    monkeypatch.setattr(lb, "candidates", lambda db, source, after, size, edges_enabled=False: [
+        row for row in rows if row[0] > (after or "") and row[0] not in recorded])
+    monkeypatch.setattr(lb, "update", lambda db, source, status, **k: updates.append((status, k)))
+    monkeypatch.setattr(lb, "record_failure", lambda db, source, track_id, *a, **k: recorded.append(track_id))
+
+    def run():
+        return mod.loudness_backfill_task("server-a", SOURCE)
+    return down, recorded, updates, backoffs, serving, run
+
+
+def test_missing_loudness_files_with_the_server_up_are_charged_and_the_pass_completes(loudness_pass):
+    down, recorded, updates, backoffs, serving, run = loudness_pass
+    serving[0] = True
+    down.update({"t1", "t2", "t3"})
+    result = run()
+    assert recorded == ["t1", "t2", "t3"]
+    assert result["status"] == "complete" and result["failed"] == 3
+    assert backoffs == [] and updates[-1][0] == "complete"
+
+
+def test_a_loudness_outage_records_nothing_and_waits_for_a_retry(loudness_pass):
+    down, recorded, updates, backoffs, serving, run = loudness_pass
+    down.update({"t1", "t2", "t3"})
+    result = run()
+    assert recorded == []
+    assert result["status"] == "waiting_retry"  # settled: not run again this turn
+    assert backoffs == [("loudness_backfill_state", SOURCE)]
+    assert updates[-1] == ("queued", {"cursor": "", "processed": 0})
+
+
+class _CanaryDb:
+    def __init__(self, track):
+        self.track, self.rolled_back = track, 0
+
+    def cursor(self):
+        canary = self
+
+        class Cursor:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def execute(self, sql, params):
+                self.params = params
+
+            def fetchone(self):
+                return (canary.track,) if canary.track else None
+        return Cursor()
+
+    def rollback(self):
+        self.rolled_back += 1
+
+
+def test_the_canary_downloads_a_published_track_and_removes_it(monkeypatch):
+    mod = load_plugin()
+    removed, loaded = [], []
+    monkeypatch.setattr(mod, "get_db", lambda: _CanaryDb("good"))
+    monkeypatch.setattr(mod, "remove_downloaded_file", removed.append)
+
+    def load(track_id, **_kwargs):
+        loaded.append(track_id)
+        return {"file_path": "/tmp/good", "cleanup_path": "/tmp/good"}
+    monkeypatch.setattr(mod, "load_track_file", load)
+    assert mod._downloads_serving(SOURCE, "server-a", ["t1", "t2", "t3"]) is True
+    assert loaded == ["good"] and removed == ["/tmp/good"]
+
+    monkeypatch.setattr(mod, "load_track_file", lambda *a, **k: (_ for _ in ()).throw(
+        mod.MediaDownloadError("down")))
+    assert mod._downloads_serving(SOURCE, "server-a", ["t1"]) is False
+
+
+def test_without_a_canary_the_provider_ping_decides(monkeypatch):
+    mod = load_plugin()
+    pinged = []
+    monkeypatch.setattr(mod, "get_db", lambda: _CanaryDb(None))
+    monkeypatch.setattr(mod, "load_track_file", lambda *a, **k: pytest.fail("no canary to download"))
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: types.SimpleNamespace(active_server_id=lambda: "srv"))
+
+    class Bridge:
+        answers = True
+
+        def __init__(self, adapter=None):
+            pass
+
+        def probe_server_identity(self, server_id, timeout_seconds=5):
+            pinged.append(server_id)
+            if not Bridge.answers:
+                raise OSError("unreachable")
+            return {"server_version": "1"}
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
+    assert mod._downloads_serving(SOURCE, "server-a", ["t1"]) is True
+    Bridge.answers = False
+    assert mod._downloads_serving(SOURCE, None, ["t1"]) is False
+    assert pinged == ["server-a", "srv"]
+
+
+def test_a_breaker_whose_check_raises_treats_it_as_an_outage():
+    mod = load_plugin()
+    released = []
+    breaker = mod._DownloadBreaker(released.extend, lambda units: 1 / 0)
+    for unit in ("a", "b", "c"):
+        breaker.hold(unit, lambda: pytest.fail("charged in an outage"))
+    assert breaker.tripped and released == ["a", "b", "c"]
 
 
 # --- 14: the download's overall deadline -------------------------------------
@@ -207,6 +367,121 @@ def test_the_edge_walk_keeps_its_cursor_before_a_released_track(monkeypatch):
     result = mod.edge_backfill_task("server-a", SOURCE, deadline=None)
     assert result["status"] == "queued"
     assert saved[-1] == ("queued", {"cursor": "t1", "processed": 2})
+
+
+@pytest.fixture
+def edge_batch(monkeypatch):
+    """Edge jobs whose host downloads fail for the ids in ``down``; records the
+    job updates, and which jobs reached ``fail_edge_job`` (the counted cap)."""
+    mod = load_plugin()
+    down, updates, counted = set(), [], []
+
+    def load(track_id, **_kwargs):
+        if track_id in down:
+            raise mod.MediaDownloadError("media server download failed")
+        return {"track_id": track_id, "file_path": "x.flac", "media_signature": "sig", "cleanup_path": None}
+
+    monkeypatch.setattr(mod, "get_db", lambda: None)
+    monkeypatch.setattr(mod, "report_edge_runtime", lambda *a, **k: None)
+    monkeypatch.setattr(mod, "serve_interactive", lambda *a, **k: 0)
+    monkeypatch.setattr(mod, "maintenance_paused", lambda: False)
+    monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
+    monkeypatch.setattr(mod, "opaque_revision", lambda signature: "rev")
+    monkeypatch.setattr(mod, "load_track_file", load)
+    monkeypatch.setattr(mod, "update_edge_job", lambda db, source, job, status, reason=None: updates.append(
+        (job["track_id"], status, reason)) or True)
+    monkeypatch.setattr(mod, "fail_edge_job", lambda db, source, job, reason: counted.append(
+        (job["track_id"], reason)) or "failed")
+    monkeypatch.setattr(mod, "run_file_analysis", lambda *a, **k: (_ for _ in ()).throw(ValueError("decode")))
+    serving, backoffs = [False], []  # the canary's answer; passes backed off
+    monkeypatch.setattr(mod, "test_serving", serving, raising=False)
+    monkeypatch.setattr(mod, "test_backoffs", backoffs, raising=False)
+    monkeypatch.setattr(mod, "_downloads_serving", lambda *a: serving[0])
+    monkeypatch.setattr(mod, "_back_off_pass", lambda db, state, source: backoffs.append((state, source)))
+
+    def jobs(*ids):
+        return [{"track_id": t, "media_revision": "rev", "job_token": "tok"} for t in ids]
+    return mod, down, updates, counted, jobs
+
+
+def test_an_edge_outage_releases_the_batch_without_counting_toward_the_cap(edge_batch):
+    mod, down, updates, counted, jobs = edge_batch
+    down.update({"t1", "t2", "t3", "t4", "t5"})
+    outcomes = mod.analyze_edges_task(jobs("t1", "t2", "t3", "t4", "t5"), SOURCE, "server-a")
+    assert counted == []  # EDGE_FAILURE_CAP untouched
+    assert sorted(o["track_id"] for o in outcomes) == ["t1", "t2", "t3", "t4", "t5"]
+    assert {o["status"] for o in outcomes} == {"released"}
+    failed = [u for u in updates if u[1] == "failed"]
+    assert failed == [(t, "failed", "edge-enqueue-failed") for t in ("t1", "t2", "t3", "t4", "t5")]
+    # t4 and t5 were never started.
+    assert [u[0] for u in updates if u[1] == "running"] == ["t1", "t2", "t3"]
+
+
+def test_a_failed_edge_download_backs_off_uncounted_but_a_decode_error_counts(edge_batch):
+    mod, down, updates, counted, jobs = edge_batch
+    down.update({"t1"})
+    outcomes = mod.analyze_edges_task(jobs("t1", "t2"), SOURCE, "server-a")
+    # t2's download settles t1's held failure: the file's, not an outage's.
+    assert outcomes == [{"track_id": "t1", "status": "failed"}, {"track_id": "t2", "status": "failed"}]
+    assert ("t1", "failed", mod.EDGE_DOWNLOAD_UNAVAILABLE) in updates
+    # t2 downloaded and failed to decode: that one still counts toward the cap.
+    assert [c[0] for c in counted] == ["t2"]
+
+    # An on-demand single job (no breaker) is not counted either.
+    updates.clear()
+    outcome, state = mod._prepare_edge(jobs("t1")[0], SOURCE, "server-a")
+    assert state is None and outcome == {"track_id": "t1", "status": "failed"}
+    assert updates == [("t1", "running", None), ("t1", "failed", mod.EDGE_DOWNLOAD_UNAVAILABLE)]
+    assert [c[0] for c in counted] == ["t2"]
+
+
+def test_an_edge_outage_stops_the_walk_with_its_cursor_before_the_held_tracks(edge_batch, monkeypatch):
+    mod, down, updates, counted, jobs = edge_batch
+    saved = []
+    down.update({"t2", "t3", "t4", "t5"})
+    monkeypatch.setattr(mod.parallel_analysis, "current", lambda: None)
+    monkeypatch.setattr(mod, "edge_backfill_row", lambda db, source: {"cursor": "a"})
+    monkeypatch.setattr(mod, "edge_backfill_candidates",
+                        lambda db, source, after, size: ["t1", "t2", "t3", "t4", "t5"])
+    monkeypatch.setattr(mod, "update_edge_backfill", lambda db, source, status, **k: saved.append((status, k)))
+    monkeypatch.setattr(mod, "claim_edge_jobs", lambda db, source, ids: (jobs(ids[0]), []))
+    result = mod.edge_backfill_task("server-a", SOURCE, deadline=None)
+    assert result["status"] == "waiting_retry"  # settled, backing off
+    assert mod.test_backoffs == [("edge_backfill_state", SOURCE)]
+    assert saved[-1][0] == "queued" and saved[-1][1]["cursor"] == "t1"
+    assert counted == [("t1", counted[0][1])]  # only t1's decode error counts
+    assert [u[0] for u in updates if u[1] == "running"] == ["t1", "t2", "t3", "t4"]
+    assert [u for u in updates if u[1] == "failed"] == [
+        (t, "failed", "edge-enqueue-failed") for t in ("t2", "t3", "t4")]
+
+
+def test_missing_edge_files_with_the_server_up_back_off_and_the_walk_completes(edge_batch, monkeypatch):
+    mod, down, updates, counted, jobs = edge_batch
+    mod.test_serving[0] = True
+    saved, rows = [], ["t1", "t2", "t3"]
+    down.update(rows)
+    monkeypatch.setattr(mod.parallel_analysis, "current", lambda: None)
+    monkeypatch.setattr(mod, "edge_backfill_row", lambda db, source: {"cursor": ""})
+    monkeypatch.setattr(mod, "edge_backfill_candidates",
+                        lambda db, source, after, size: [t for t in rows if t > (after or "")])
+    monkeypatch.setattr(mod, "update_edge_backfill", lambda db, source, status, **k: saved.append((status, k)))
+    monkeypatch.setattr(mod, "claim_edge_jobs", lambda db, source, ids: (jobs(ids[0]), []))
+    result = mod.edge_backfill_task("server-a", SOURCE, deadline=None)
+    assert result["status"] == "complete" and result["failed"] == 3
+    assert counted == []  # never toward EDGE_FAILURE_CAP
+    assert [u for u in updates if u[1] == "failed"] == [
+        (t, "failed", mod.EDGE_DOWNLOAD_UNAVAILABLE) for t in rows]
+    assert mod.test_backoffs == []
+
+
+def test_an_on_demand_edge_batch_has_no_breaker(edge_batch):
+    mod, down, updates, counted, jobs = edge_batch
+    down.update({"t1", "t2", "t3", "t4"})
+    outcomes = mod.analyze_edges_task(jobs("t1", "t2", "t3", "t4"), SOURCE, "server-a", "interactive")
+    assert outcomes == [{"track_id": t, "status": "failed"} for t in ("t1", "t2", "t3", "t4")]
+    assert [u for u in updates if u[1] == "failed"] == [
+        (t, "failed", mod.EDGE_DOWNLOAD_UNAVAILABLE) for t in ("t1", "t2", "t3", "t4")]
+    assert counted == []
 
 
 def test_reached_stops_before_a_unit_released_in_finish():

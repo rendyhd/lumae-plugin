@@ -86,6 +86,117 @@ def test_a_new_version_sends_an_applied_transition_back_without_discarding_it(mo
     assert transition.row["audiomuse_health"] == "migration_required"
 
 
+def test_a_pre_boundary_version_sends_an_applied_transition_back_to_inspection(monkeypatch):
+    # Up to today an observed pre-canonical release wrote normal over
+    # applied, which lifted the projection hold while the AudioMuse
+    # migration was still owed.
+    transition = TransitionRow(
+        state="applied",
+        transition_id="transition-a",
+        audiomuse_health="migration_required",
+        required_action="run_audiomuse_provider_migration",
+    )
+    guard = transition.install(monkeypatch)
+
+    result = guard.observe_provider_version(
+        IDENTITY_DB, ScriptedProbe("0.63.2"), "server-a", refresh_health=False
+    )
+
+    assert result["state"] == "transition_pending"
+    assert transition.row["state"] == "transition_pending"
+    assert transition.row["detection_reason"] == "pre_transition_version_after_rekey"
+    assert transition.row["required_action"] == "inspect_provider_identity"
+    assert transition.row["transition_id"] == "transition-a"
+    assert transition.row["audiomuse_health"] == "migration_required"
+
+
+@pytest.mark.parametrize("stored", ["transition_pending", "blocked"])
+def test_a_pre_boundary_version_keeps_an_applied_transition_awaiting_inspection(
+    monkeypatch, stored
+):
+    transition = TransitionRow(
+        state=stored,
+        transition_id="transition-a",
+        transition_published=True,
+        current_provider_version="0.64.1",
+        detection_reason="provider_version_boundary",
+        required_action="inspect_provider_identity",
+        detected=True,
+    )
+    guard = transition.install(monkeypatch)
+
+    result = guard.observe_provider_version(
+        IDENTITY_DB, ScriptedProbe("0.63.2"), "server-a", refresh_health=False
+    )
+
+    assert result["state"] == transition.row["state"] == "transition_pending"
+    assert transition.row["transition_id"] == "transition-a"
+    with pytest.raises(guard.ProviderIdentityTransitionPending):
+        guard.assert_analysis_projection_allowed(IDENTITY_DB, ScriptedProbe("0.63.2"), "server-a")
+
+
+def test_a_pre_boundary_version_an_inspection_checked_keeps_applied(monkeypatch):
+    # The refresh found the IDs unchanged at 0.63.2 and restored applied:
+    # the same version observed again is not sent back to inspection.
+    transition = TransitionRow(
+        state="applied",
+        transition_id="transition-a",
+        audiomuse_health="migration_required",
+        current_provider_version="0.63.2",
+        last_checked_provider_version="0.63.2",
+        detection_reason="provider_ids_unchanged",
+        required_action="run_audiomuse_provider_migration",
+    )
+    guard = transition.install(monkeypatch)
+
+    result = guard.observe_provider_version(
+        IDENTITY_DB, ScriptedProbe("0.63.2"), "server-a", refresh_health=False
+    )
+
+    assert result["state"] == "applied"
+    assert transition.writes == 0
+    with pytest.raises(guard.ProviderIdentityTransitionPending) as held:
+        guard.assert_analysis_projection_allowed(IDENTITY_DB, ScriptedProbe("0.63.2"), "server-a")
+    assert held.value.reason == "audiomuse_migration_pending"
+
+
+def test_a_pre_boundary_version_still_clears_a_block_nothing_was_applied_for(monkeypatch):
+    transition = TransitionRow(
+        state="blocked",
+        transition_id="transition-a",
+        transition_published=False,
+        detection_reason="incomplete",
+        required_action="resolve_provider_identity_conflict",
+    )
+    guard = transition.install(monkeypatch)
+
+    result = guard.observe_provider_version(
+        IDENTITY_DB, ScriptedProbe("0.63.2"), "server-a", refresh_health=False
+    )
+
+    assert result["state"] == transition.row["state"] == "normal"
+    assert transition.row["detection_reason"] == "pre_transition_version"
+
+
+@pytest.mark.parametrize(
+    ("state", "transition_id", "published", "was_applied"),
+    [
+        ("applied", "t", False, True),
+        ("applied", None, True, False),
+        ("transition_pending", "t", True, True),
+        ("blocked", "t", True, True),
+        ("transition_pending", "t", False, False),
+        ("blocked", "t", False, False),
+        ("normal", "t", True, False),
+    ],
+)
+def test_which_rows_count_as_applied(state, transition_id, published, was_applied):
+    load_plugin()
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    assert guard.transition_was_applied(state, transition_id, published) is was_applied
+
+
 def test_only_a_row_without_a_transition_id_opens_one_on_observation():
     load_plugin()
     from plugins.LumaeAnalysis import provider_identity_guard as guard
@@ -113,8 +224,9 @@ def test_a_failed_ping_writes_only_its_error_onto_the_state_it_read():
     assert written is True
     [(sql, params)] = db.statements
     assert sql.split(" WHERE ")[0].endswith("SET last_error=%s, updated_at=now()")
-    assert sql.endswith("WHERE catalog_instance_id=%s AND state=%s")
-    assert params == ("ping timed out", "catalog-a", "transition_pending")
+    assert sql.endswith(
+        "WHERE catalog_instance_id=%s AND state=%s AND transition_id IS NOT DISTINCT FROM %s")
+    assert params == ("ping timed out", "catalog-a", "transition_pending", "transition-a")
 
 
 def test_a_verified_observation_is_written_compare_and_set():
@@ -127,8 +239,9 @@ def test_a_verified_observation_is_written_compare_and_set():
         detection_reason="pre_transition_version", required_action=None,
     ) is True
     [(sql, params)] = db.statements
-    assert sql.endswith("WHERE catalog_instance_id=%s AND state=%s")
-    assert params[-2:] == ("catalog-a", "transition_pending")
+    assert sql.endswith(
+        "WHERE catalog_instance_id=%s AND state=%s AND transition_id IS NOT DISTINCT FROM %s")
+    assert params[-3:] == ("catalog-a", "transition_pending", "transition-a")
 
     lost = RecordingDb(rowcount=0)
     assert guard._update_observation(
@@ -183,6 +296,25 @@ def test_a_superseded_verified_observation_holds_the_projection(monkeypatch):
 
     with pytest.raises(guard.ProviderIdentityTransitionPending):
         guard.assert_analysis_projection_allowed(IDENTITY_DB, ScriptedProbe("0.64.0"), "server-a")
+
+
+def test_a_failed_ping_whose_error_write_lost_gates_its_caller_closed(monkeypatch):
+    # The row said applied when this call read it; the error write found
+    # another state (a health check sent the transition back to inspection).
+    transition = LostWrite(
+        state="applied",
+        transition_id="transition-a",
+        audiomuse_health="migration_required",
+    )
+    guard = transition.install(monkeypatch)
+
+    result = guard.observe_provider_version(
+        IDENTITY_DB, ScriptedProbe(RuntimeError("ping timed out")), "server-a"
+    )
+
+    assert transition.writes == 1
+    assert (result["state"], result["stored_state"], result["written"]) == (
+        "transition_pending", "applied", False)
 
 
 def test_a_superseded_failed_ping_reports_nothing_written(monkeypatch):

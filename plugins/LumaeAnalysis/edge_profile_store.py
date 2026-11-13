@@ -423,6 +423,10 @@ EDGE_DECODE_ERROR = 'edge-media-error'
 EDGE_FAILURE_CAP = 5
 # What a failure count is counted under (``failure_analyzer``).
 EDGE_FAILURE_ANALYZER = f"{SCHEMA_VERSION}/{ANALYZER_VERSION}/{METHOD}"
+# The media server could not hand over the file: backs off six hours like any
+# failure but is set by ``update_edge_job``, never ``fail_edge_job``, so a
+# media-server outage cannot spend a job's EDGE_FAILURE_CAP.
+EDGE_DOWNLOAD_UNAVAILABLE = 'edge-download-unavailable'
 
 
 def _edge_capped_sql(alias):
@@ -768,15 +772,17 @@ def edge_statuses(db, catalog_id, ids):
     """Per-track edge state for ``/api/profiles?edge_status=1``.
 
     ``ready`` (a current edge is served), ``pending`` (queued or running),
-    ``failed`` with ``retry_at``, ``unsupported`` (never measurable for this
-    media), or ``absent``.
+    ``failed`` with ``retry_at`` (none for a job at EDGE_FAILURE_CAP, which is
+    retried only once its media or the analyzer changes; the contract's
+    ``retry_at?``), ``unsupported`` (never measurable for this media), or
+    ``absent``.
     """
     ids = list(dict.fromkeys(ids))
     if not ids:
         return {}
     cur = db.cursor()
     cur.execute(f"""SELECT p.track_id, edge.payload IS NOT NULL, j.status, j.updated_at::timestamptz, j.media_revision,
-                           p.media_signature, j.last_error
+                           p.media_signature, j.last_error, j.track_id IS NOT NULL AND {_edge_capped_sql('j')}
         FROM {table('published_source_profiles')} p {edge_join(columns='1 AS payload')}
         LEFT JOIN {table('edge_profile_jobs')} j
           ON j.catalog_instance_id=p.catalog_instance_id AND j.track_id=p.track_id
@@ -784,7 +790,7 @@ def edge_statuses(db, catalog_id, ids):
     rows = cur.fetchall()
     cur.close()
     result = {}
-    for track_id, has_edge, status, updated_at, revision, signature, last_error in rows:
+    for track_id, has_edge, status, updated_at, revision, signature, last_error, capped in rows:
         current = revision is not None and revision == opaque_revision(signature)
         if has_edge:
             result[track_id] = {'status': 'ready'}
@@ -792,6 +798,9 @@ def edge_statuses(db, catalog_id, ids):
             result[track_id] = {'status': 'pending'}
         elif current and status == UNSUPPORTED:
             result[track_id] = {'status': 'unsupported'}
+        elif current and status == 'failed' and capped:
+            # No retry until the media or the analyzer changes (fail_edge_job).
+            result[track_id] = {'status': 'failed'}
         elif current and status == 'failed' and updated_at is not None:
             # Mirrors claim_edge_requests: a refused enqueue is due again at
             # once, any other failure after its six-hour back-off.

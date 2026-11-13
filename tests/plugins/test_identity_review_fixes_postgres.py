@@ -279,6 +279,204 @@ def test_a_block_after_an_applied_transition_restores_it_once_the_ids_match(migr
     assert _transition(db)["audiomuse_health"] == "migration_required"
 
 
+def test_a_pre_boundary_version_after_an_applied_transition_keeps_its_hold(migrated_db):
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    db = migrated_db
+    bridge, source, transition_id = _applied_transition(db)
+    applied = _transition(db)
+
+    # The server that moved to canonical IDs reports a pre-canonical release.
+    bridge.version = "0.63.2"
+    observation = guard.observe_provider_version(db, bridge, "server-a")
+
+    assert observation["state"] == "transition_pending"
+    pending = _transition(db)
+    assert (pending["state"], pending["detection_reason"], pending["required_action"]) == (
+        "transition_pending", "pre_transition_version_after_rekey", "inspect_provider_identity")
+    for key in ("transition_id", "audiomuse_health", "manifest_sha256", "applied_at"):
+        assert pending[key] == applied[key], key
+    with pytest.raises(guard.ProviderIdentityTransitionPending) as held:
+        guard.assert_analysis_projection_allowed(db, bridge, "server-a")
+    assert held.value.reason == "provider_identity_pending"
+
+    # The refresh finds the same IDs: applied again, the migration still owed,
+    # and the checked version observed again leaves it applied.
+    assert _refresh(db, bridge)["change_reason"] == "no_change"
+    restored = _transition(db)
+    assert (restored["state"], restored["transition_id"]) == ("applied", transition_id)
+    assert restored["required_action"] == "run_audiomuse_provider_migration"
+    assert restored["last_checked_provider_version"] == "0.63.2"
+    assert guard.observe_provider_version(db, bridge, "server-a")["state"] == "applied"
+    assert _transition(db)["state"] == "applied"
+    with pytest.raises(guard.ProviderIdentityTransitionPending) as held:
+        guard.assert_analysis_projection_allowed(db, bridge, "server-a")
+    assert held.value.reason == "audiomuse_migration_pending"
+
+
+@pytest.mark.parametrize(
+    ("update", "flagged"),
+    [
+        ("", True),
+        ("state='transition_pending'", True),
+        ("state='blocked'", True),
+        ("state='transition_pending', applied_at=NULL", False),
+        ("state='normal'", False),
+    ],
+)
+def test_an_upgrade_requests_the_projection_check_for_every_applied_transition(
+    migrated_db, update, flagged
+):
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    db = migrated_db
+    _bridge, source, _transition_id = _applied_transition(db)
+    # An applied transition, also one a version observation or a block sent
+    # back to inspection (it keeps its id, manifest and applied_at).
+    if update:
+        _execute(db, f"UPDATE {P}provider_identity_transitions SET {update}")
+
+    guard.require_projection_reconcile(db)
+    db.commit()
+
+    assert guard.projection_reconcile_required(db, source) is flagged
+    db.commit()
+    row = _transition(db)
+    assert guard.transition_was_applied(
+        row["state"], row["transition_id"],
+        row["applied_at"] is not None and row["manifest_sha256"] is not None) is flagged
+
+
+def test_a_jellyfin_transition_blocked_after_it_was_applied_is_restored(migrated_db):
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    db = migrated_db
+    load_plugin()
+    bridge = RacingJellyfinBridge(jellyfin_raw_catalog())
+    _refresh(db, bridge, "server-j")
+    # An applied v2 rekey, then a block (an unsupported release for a while).
+    _execute(db, f"""UPDATE {P}provider_identity_transitions
+                        SET state='blocked', transition_id='t-applied', applied_at=now(),
+                            manifest_sha256='m', audiomuse_health='busy', rekey_contract=%s,
+                            detection_reason='provider_version_unsupported',
+                            required_action='upgrade_jellyfin'""", (V2,))
+    blocked = _transition(db)
+
+    result = guard.observe_provider_version(db, bridge, "server-j", refresh_health=False)
+
+    assert result["state"] == "applied"
+    row = _transition(db)
+    assert (row["state"], row["detection_reason"], row["required_action"]) == (
+        "applied", guard.JELLYFIN_VERIFIED_REASON, None)
+    for key in ("transition_id", "applied_at", "manifest_sha256", "audiomuse_health",
+                "rekey_contract"):
+        assert row[key] == blocked[key], key
+
+    # A block nothing was applied for still clears to normal.
+    _execute(db, f"UPDATE {P}provider_identity_transitions SET state='blocked', "
+                 "applied_at=NULL, detection_reason='provider_version_unsupported'")
+    assert guard.observe_provider_version(
+        db, bridge, "server-j", refresh_health=False)["state"] == "normal"
+
+
+def test_a_block_of_an_applied_transition_keeps_its_counts_and_target_proof(migrated_db):
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    db = migrated_db
+    bridge, source, transition_id = _applied_transition(db)
+    proof_keys = ("counts", "target_fingerprint", "target_scan_count")
+    applied = _transition(db)
+    bridge.version = "0.64.1"
+    guard.observe_provider_version(db, bridge, "server-a")
+    assert _transition(db)["state"] == "transition_pending"
+
+    # TRACK_B is missing: incomplete evidence blocks the catalogue.
+    blocked = guard.inspect_catalog_identity(db, source, [_canonical(TRACK_A)], "0.64.1")
+    db.commit()
+    assert blocked["state"] == "blocked"
+    row = _transition(db)
+    assert (row["state"], row["transition_id"]) == ("blocked", transition_id)
+    for key in proof_keys:
+        assert row[key] == applied[key], key
+
+    # The IDs turn out unchanged: applied again, with the transition's own proof.
+    restored = guard.inspect_catalog_identity(
+        db, source, [_canonical(TRACK_A), TRACK_B], "0.64.1")
+    db.commit()
+    assert (restored["state"], restored["transition_id"]) == ("applied", transition_id)
+    row = _transition(db)
+    for key in (*proof_keys, "manifest_sha256", "first_seq", "last_seq", "applied_at"):
+        assert row[key] == applied[key], key
+
+
+def test_an_observation_never_writes_its_transition_id_over_a_newly_opened_one(
+    migrated_db, second_connection
+):
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    db = migrated_db
+    bridge, source, first_id = _applied_transition(db)
+    bridge.version = "0.64.1"
+    guard.observe_provider_version(db, bridge, "server-a")
+    bridge.probe_error = RuntimeError("ping timed out")
+    guard.observe_provider_version(db, bridge, "server-a")
+    assert (_transition(db)["transition_id"], _transition(db)["last_error"]) == (
+        first_id, "ping timed out")
+    bridge.probe_error = None
+    opened = None
+
+    def open_next_transition():
+        # This observation has read transition_pending with the first id; a
+        # refresh's inspection finds the IDs changed again and opens the next
+        # transition (a new id, the state still transition_pending).
+        nonlocal opened
+        inspection = guard.inspect_catalog_identity(
+            second_connection, source, [_canonical(TRACK_A), _canonical(TRACK_B)], "0.64.1")
+        second_connection.commit()
+        assert inspection["state"] == "transition_pending"
+        opened = _transition(second_connection)
+
+    bridge.before_answer = open_next_transition
+    result = guard.observe_provider_version(db, bridge, "server-a")
+
+    assert opened["transition_id"] not in (None, first_id)
+    assert (result["state"], result["written"]) == ("transition_pending", False)
+    assert _transition(db) == opened
+
+    # A failed ping that read the first id does not write over it either.
+    stale = {**guard._source_state(db, "server-a"), "transition_id": first_id}
+    db.commit()
+    assert guard._record_probe_error(db, stale, RuntimeError("late")) is False
+    db.commit()
+    assert _transition(db) == opened
+
+
+@pytest.mark.parametrize("error_known", [False, True])
+def test_a_projection_waits_when_its_ping_fails_as_the_transition_returns_to_inspection(
+    migrated_db, second_connection, error_known
+):
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    db = migrated_db
+    bridge, _source, _transition_id = _applied_transition(db)
+    if error_known:
+        # The same error is stored already: this call writes nothing, and only
+        # the re-read of the stored state can hold it.
+        _execute(db, f"UPDATE {P}provider_identity_transitions SET last_error='ping timed out'")
+    bridge.probe_error = RuntimeError("ping timed out")
+    # The projection read applied; a health check stores the version change
+    # (the transition kept, the migration still owed) before its ping fails.
+    bridge.before_answer = _commit_from(
+        second_connection,
+        f"UPDATE {P}provider_identity_transitions SET state='transition_pending', "
+        "detection_reason='provider_version_boundary', "
+        "required_action='inspect_provider_identity', detected_at=now()")
+
+    with pytest.raises(guard.ProviderIdentityTransitionPending) as held:
+        guard.assert_analysis_projection_allowed(db, bridge, "server-a")
+    assert held.value.reason == "provider_identity_pending"
+
+
 def test_a_normal_row_gated_for_one_call_gets_its_baselines_under_the_lock(migrated_db):
     """A failed ping no longer writes baselines from its unlocked read; the
     inspection that opens a transition sets them, and its proof starts over."""

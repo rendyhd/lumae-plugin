@@ -368,7 +368,7 @@ def test_library_pass_walks_in_slices_completes_and_resweeps(edge_publication_db
     monkeypatch.setattr(mod, "edge_profiles_enabled", lambda: True)
     monkeypatch.setattr(
         mod, "analyze_edges_task",
-        lambda jobs, source, server, priority="background", budget_seconds=None:
+        lambda jobs, source, server, priority="background", budget_seconds=None, breaker=None:
             runs.append(([job["track_id"] for job in jobs], priority, budget_seconds))
             or [{"track_id": job["track_id"], "status": "ready"} for job in jobs],
     )

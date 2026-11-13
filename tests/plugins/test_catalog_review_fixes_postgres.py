@@ -16,6 +16,13 @@
 8.  A catalogue bootstrap track carries no ``search_text``.
 9.  A failed readiness read keeps the transaction and what the caller wrote.
 10. Shared principals may hold more bootstrap sessions than one user.
+11. The post-publication journal compaction and prune_catalog_storage both
+    lock catalog_state before journal rows; the compaction gives up when
+    catalog_state is busy.
+12. An analysis session creation waits for a running projection only
+    ANALYSIS_LEASE_LOCK_TIMEOUT, and then answers "not ready".
+13. One principal's session creations are serialized for both streams, so
+    the per-principal cap holds under concurrency.
 """
 
 import threading
@@ -549,13 +556,22 @@ def test_catalogue_journal_is_trimmed_after_the_publication_commits(
     # Four entities: the journal keeps eight events (two snapshots).
     for round_ in range(1, 4):
         probed = ProbedDb(migrated_db, second_connection, lambda: source)
+        compaction = []
+        probed.hooks.append((
+            "before", lambda sql: "SAVEPOINT lumae_catalog_compaction" in sql,
+            lambda: compaction.append(len(probed.held)),
+        ))
         changed = {f"track-{index:03d}" for index in range(4)} if round_ % 2 else set()
         catalog.refresh_catalog(
             "server-a", db=probed, bridge=RefreshBridge(_catalogue(4, changed=changed))
         )
-        # Never deleted while the publication holds catalog_state.
-        assert not [sql for sql in probed.held if f"DELETE FROM {P}catalog_changes" in sql], (
-            probed.held
+        # Never deleted while the publication holds catalog_state: only in
+        # the compaction's own short transaction after it commits, which
+        # locks catalog_state before the journal rows (the install's order).
+        assert len(compaction) == 1
+        publication = probed.held[: compaction[0]]
+        assert not [sql for sql in publication if f"DELETE FROM {P}catalog_changes" in sql], (
+            publication
         )
     (floor, head), (low, high, count) = _journal(migrated_db, source)
     assert head == 16
@@ -806,3 +822,244 @@ def test_shared_principals_may_hold_more_bootstrap_sessions(migrated_db, monkeyp
             migrated_db, sessions[0]["session_token"], principal
         )
         create(principal)
+
+
+# ---------------------------------------------------------------------------
+# 11. Journal compaction and the install's prune: one lock order
+# ---------------------------------------------------------------------------
+def _published_journal(db, monkeypatch):
+    monkeypatch.setattr(catalog, "MIN_RETAINED_CHANGE_EVENTS", 1)
+    first = catalog.refresh_catalog("server-a", db=db, bridge=RefreshBridge(_catalogue(4)))
+    source = first["catalog_instance_id"]
+    (floor, head), (_low, _high, count) = _journal(db, source)
+    assert head > 1 and count > 1 and floor < head - 1
+    return source
+
+
+def _lock_timeout(db):
+    with db.cursor() as cur:
+        cur.execute("SELECT current_setting('lock_timeout')")
+        return cur.fetchone()[0]
+
+
+def test_compaction_skips_while_an_install_holds_catalog_state(
+    migrated_db, second_connection, bounded, monkeypatch,
+):
+    source = _published_journal(migrated_db, monkeypatch)
+    before = _journal(migrated_db, source)
+    monkeypatch.setattr(catalog, "CATALOG_COMPACTION_LOCK_TIMEOUT", "200ms")
+    # migrate(): a version bump locks catalog_state early in its transaction.
+    with second_connection.cursor() as cur:
+        cur.execute(
+            f"UPDATE {P}catalog_state SET updated_at=now() WHERE catalog_instance_id=%s",
+            (source,),
+        )
+    with migrated_db.cursor() as cur:
+        catalog._compact_catalog_journal(cur, source, 1)
+    # Skipped without raising; the transaction is usable and the caller's
+    # lock_timeout is back.
+    assert _lock_timeout(migrated_db) == LOCK_TIMEOUT
+    migrated_db.commit()
+    # The install then prunes the journal itself, without a deadlock.
+    catalog.prune_catalog_storage(second_connection, source)
+    second_connection.rollback()
+    assert _journal(migrated_db, source) == before
+
+    # Free, the compaction trims to the retention and moves the floor with it.
+    with migrated_db.cursor() as cur:
+        catalog._compact_catalog_journal(cur, source, 1)
+    migrated_db.commit()
+    (floor, head), (low, high, count) = _journal(migrated_db, source)
+    assert (floor, low, high, count) == (head - 1, head, head, 1)
+
+
+def test_compaction_locks_catalog_state_before_journal_rows(
+    migrated_db, second_connection, bounded, monkeypatch,
+):
+    """Red before the fix: the compaction deleted the journal rows and then
+    waited for catalog_state, so the install's delete of the same rows (under
+    catalog_state) waited for the compaction: a deadlock."""
+    source = _published_journal(migrated_db, monkeypatch)
+    monkeypatch.setattr(catalog, "CATALOG_COMPACTION_LOCK_TIMEOUT", "15s")
+    with second_connection.cursor() as cur:
+        cur.execute(
+            f"UPDATE {P}catalog_state SET updated_at=now() WHERE catalog_instance_id=%s",
+            (source,),
+        )
+    outcome = {}
+
+    def compact():
+        try:
+            with migrated_db.cursor() as cur:
+                catalog._compact_catalog_journal(cur, source, 1)
+            migrated_db.commit()
+        except Exception as exc:  # pragma: no cover - reported below
+            outcome["error"] = exc
+            migrated_db.rollback()
+
+    worker = threading.Thread(target=compact)
+    worker.start()
+    try:
+        _wait_until_waiting(migrated_db.get_backend_pid())
+        # The waiting compaction holds no journal row: the install deletes
+        # them all at once.
+        with second_connection.cursor() as cur:
+            cur.execute("SET LOCAL lock_timeout='1s'")
+            cur.execute(
+                f"DELETE FROM {P}catalog_changes WHERE catalog_instance_id=%s", (source,)
+            )
+        second_connection.commit()
+    finally:
+        second_connection.rollback()
+        worker.join(30)
+    assert not worker.is_alive()
+    assert "error" not in outcome, outcome
+    (_floor, _head), (_low, _high, count) = _journal(migrated_db, source)
+    assert count == 0
+
+
+def test_prune_catalog_storage_locks_catalog_state_before_journal_rows(
+    migrated_db, second_connection, third_connection, bounded, monkeypatch,
+):
+    """Red before the fix: prune deleted journal rows (here: waited for one)
+    before it locked catalog_state, for the floor update only."""
+    source = _published_journal(migrated_db, monkeypatch)
+    # An event of a past epoch, which the prune purges; another transaction
+    # holds it.
+    with third_connection.cursor() as cur:
+        cur.execute(
+            f"UPDATE {P}catalog_changes SET epoch='past-epoch' "
+            "WHERE catalog_instance_id=%s AND seq=1",
+            (source,),
+        )
+        assert cur.rowcount == 1
+    third_connection.commit()
+    with third_connection.cursor() as cur:
+        cur.execute(
+            f"SELECT 1 FROM {P}catalog_changes WHERE catalog_instance_id=%s "
+            "AND epoch='past-epoch' FOR UPDATE",
+            (source,),
+        )
+    outcome = {}
+
+    def prune():
+        try:
+            catalog.prune_catalog_storage(second_connection, source)
+            second_connection.commit()
+        except Exception as exc:  # pragma: no cover - reported below
+            outcome["error"] = exc
+            second_connection.rollback()
+
+    worker = threading.Thread(target=prune)
+    worker.start()
+    try:
+        _wait_until_waiting(second_connection.get_backend_pid())
+        with migrated_db.cursor() as cur:
+            with pytest.raises(errors.LockNotAvailable):
+                cur.execute(
+                    f"SELECT 1 FROM {P}catalog_state WHERE catalog_instance_id=%s "
+                    "FOR UPDATE NOWAIT",
+                    (source,),
+                )
+        migrated_db.rollback()
+    finally:
+        third_connection.rollback()
+        worker.join(30)
+    assert not worker.is_alive()
+    assert "error" not in outcome, outcome
+
+
+# ---------------------------------------------------------------------------
+# 12. An analysis session creation waits for a projection only briefly
+# ---------------------------------------------------------------------------
+def test_analysis_session_creation_gives_up_on_a_running_projection(
+    migrated_db, second_connection, bounded, monkeypatch,
+):
+    assert catalog.ANALYSIS_LEASE_LOCK_TIMEOUT == "3s"
+    monkeypatch.setattr(catalog, "ANALYSIS_LEASE_LOCK_TIMEOUT", "200ms")
+    _seed_source(migrated_db, analysis_generation=1)
+    with migrated_db.cursor() as cur:
+        cur.execute(
+            f"SELECT 1 FROM {P}analysis_state WHERE catalog_instance_id=%s FOR UPDATE",
+            (SOURCE,),
+        )
+    # Red before the fix: this waited (here: the test's 15s) for the projection.
+    with pytest.raises(catalog.CatalogScanError, match="not ready"):
+        catalog.create_bootstrap_session(
+            second_connection, "user:a", stream="analysis", catalog_instance_id=SOURCE
+        )
+    # Rolled back: no lock kept, the connection's own timeout in force, and
+    # the connection usable.
+    assert (
+        second_connection.get_transaction_status()
+        == psycopg2.extensions.TRANSACTION_STATUS_IDLE
+    )
+    assert _lock_timeout(second_connection) == LOCK_TIMEOUT
+    second_connection.rollback()
+    migrated_db.commit()
+    # No orphan lease once the projection commits.
+    assert _row(migrated_db, f"SELECT count(*) FROM {P}stream_bootstrap_sessions", None) == [(0,)]
+    assert catalog.create_bootstrap_session(
+        second_connection, "user:a", stream="analysis", catalog_instance_id=SOURCE
+    )["generation"] == 1
+
+
+def test_locked_analysis_state_restores_the_lock_timeout(migrated_db, bounded):
+    _seed_source(migrated_db, analysis_generation=1)
+    with migrated_db.cursor() as cur:
+        assert catalog._locked_analysis_state(cur, SOURCE)["generation"] == 1
+    assert _lock_timeout(migrated_db) == LOCK_TIMEOUT
+    migrated_db.rollback()
+
+
+# ---------------------------------------------------------------------------
+# 13. The per-principal cap under concurrency
+# ---------------------------------------------------------------------------
+def test_concurrent_analysis_creations_respect_the_principal_cap(
+    migrated_db, second_connection, third_connection, bounded, monkeypatch,
+):
+    """Red before the fix: both creations counted three sessions while they
+    waited for the projection, and both inserted (five sessions, cap four)."""
+    monkeypatch.setattr(catalog, "ANALYSIS_LEASE_LOCK_TIMEOUT", "15s")
+    _seed_source(migrated_db, analysis_generation=1)
+    for _ in range(3):
+        catalog.create_bootstrap_session(
+            migrated_db, "user:a", stream="analysis", catalog_instance_id=SOURCE
+        )
+    # A projection holds analysis_state, so both creations line up behind it.
+    with third_connection.cursor() as cur:
+        cur.execute(
+            f"SELECT 1 FROM {P}analysis_state WHERE catalog_instance_id=%s FOR UPDATE",
+            (SOURCE,),
+        )
+    outcomes = []
+
+    def create(db):
+        try:
+            outcomes.append(catalog.create_bootstrap_session(
+                db, "user:a", stream="analysis", catalog_instance_id=SOURCE
+            ))
+        except Exception as exc:
+            outcomes.append(exc)
+
+    workers = []
+    try:
+        for db in (migrated_db, second_connection):
+            worker = threading.Thread(target=create, args=(db,))
+            worker.start()
+            workers.append(worker)
+            _wait_until_waiting(db.get_backend_pid())
+    finally:
+        third_connection.commit()
+        for worker in workers:
+            worker.join(30)
+    assert not any(worker.is_alive() for worker in workers)
+    created = [item for item in outcomes if isinstance(item, dict)]
+    refused = [item for item in outcomes if isinstance(item, catalog.CatalogScanError)]
+    assert (len(created), len(refused)) == (1, 1), outcomes
+    assert "Too many active" in str(refused[0])
+    assert _row(
+        migrated_db,
+        f"SELECT count(*) FROM {P}stream_bootstrap_sessions WHERE principal_key='user:a'",
+        None,
+    ) == [(4,)]

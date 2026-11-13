@@ -27,7 +27,7 @@ from .edge_profiles import (
 )
 from .edge_profile_store import (
     migrate_edge_profiles, edge_join, claim_edge_jobs, update_edge_job, fail_edge_job,
-    publish_edge_profile, edge_backfill_candidates, edge_profile_status,
+    EDGE_DOWNLOAD_UNAVAILABLE, publish_edge_profile, edge_backfill_candidates, edge_profile_status,
     claim_edge_requests, record_edge_runtime, edge_worker_runtime, is_unsupported_failure,
     UNSUPPORTED as EDGE_UNSUPPORTED, mark_edge_jobs_waiting, claim_waiting_edge_jobs,
     edge_queue_counts, next_edge_backfill, update_edge_backfill, arm_edge_backfill,
@@ -4596,19 +4596,31 @@ def edge_backfill_api():
 
 
 def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="background",
-                       budget_seconds=EDGE_BACKGROUND_BUDGET_SECONDS):
+                       budget_seconds=EDGE_BACKGROUND_BUDGET_SECONDS, breaker=None):
     """Compute edges for claimed jobs, one file at a time.
 
     A background batch serves on-demand work before each track and
     releases its unstarted jobs once ``budget_seconds`` have passed (None: no
-    budget), so it never holds the plugin's task slot for long.
+    budget), so it never holds the plugin's task slot for long. A background
+    batch's failed host downloads go through an ``_edge_breaker`` (the serial
+    pass's, or the batch's own): an outage releases the rest uncounted. An
+    on-demand batch has none: each failed download backs off on its own.
     """
     report_edge_runtime()
     outcomes = []
     background = priority != "interactive"
+    own_breaker = breaker is None and background
+    if own_breaker:
+        breaker = _edge_breaker(outcomes.append, serving=_serving_check(catalog_instance_id, server_id))
     deadline = time.monotonic() + budget_seconds if background and budget_seconds else None
     jobs = list(jobs)[:100]
     for index, job in enumerate(jobs):
+        if breaker is not None and breaker.tripped:
+            # A media-server outage: the rest is released, due again at once.
+            for rest in jobs[index:]:
+                update_edge_job(get_db(), catalog_instance_id, rest, "failed", "edge-enqueue-failed")
+                outcomes.append({"track_id": rest["track_id"], "status": EDGE_RELEASED})
+            break
         if background:
             serve_interactive()
             if (deadline is not None and time.monotonic() > deadline) or _edge_work_stopped():
@@ -4616,7 +4628,7 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="backgroun
                     update_edge_job(get_db(), catalog_instance_id, rest, "failed", "edge-enqueue-failed")
                     outcomes.append({"track_id": rest["track_id"], "status": EDGE_RELEASED})
                 break
-        outcome, state = _prepare_edge(job, catalog_instance_id, server_id)
+        outcome, state = _prepare_edge(job, catalog_instance_id, server_id, breaker=breaker)
         if state is not None:
             try:
                 payload, error = run_file_analysis(loudness_v1.analyze_edge_file, state["path"],
@@ -4626,15 +4638,23 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="backgroun
             outcome = _finish_edge(state, payload, error)
         if outcome is not None:
             outcomes.append(outcome)
+    if own_breaker:
+        breaker.settle()
     return outcomes
 
 
-def _prepare_edge(job, catalog_instance_id, server_id, defer=False):
+def _prepare_edge(job, catalog_instance_id, server_id, defer=False, breaker=None):
     """An edge job's start and download (WP1b's split of ``analyze_edges_task``).
 
     ``(outcome, None)`` when it settled here (None: another worker has the
-    job), or ``(None, state)`` with the downloaded file for the analysis and
-    ``_finish_edge``. Database and host calls only: the turn's own thread.
+    job, or ``breaker`` holds its failed download), or ``(None, state)`` with
+    the downloaded file for the analysis and ``_finish_edge``. Database and
+    host calls only: the turn's own thread.
+
+    A failed host download is the media server's, not the file's: it never
+    counts toward EDGE_FAILURE_CAP (``_edge_download_failed``), and with a
+    ``breaker`` (an ``_edge_breaker``) it is held until a later download
+    works or the pass ends, or released once the breaker trips.
     """
     if not update_edge_job(get_db(), catalog_instance_id, job, "running"):
         return None, None
@@ -4649,8 +4669,16 @@ def _prepare_edge(job, catalog_instance_id, server_id, defer=False):
                                                server_id=server_id, **({"defer": True} if defer else {}))
         if not info or opaque_revision(info.get("media_signature")) != job["media_revision"]:
             raise ValueError("edge-source-replaced")
+    except MediaDownloadError:
+        _rollback_if_possible(get_db())
+        if breaker is None:
+            return _edge_download_failed(state), None
+        breaker.hold(state, lambda: breaker.record(_edge_download_failed(state)))
+        return None, None
     except Exception as exc:
         return _finish_edge(state, None, exc), None
+    if breaker is not None and info.get("download") is None:
+        breaker.settle()  # the host downloaded this file: the server is up
     # LN.4a: whole-track loudness from the same decode, beside the edge payload.
     state["path"] = info["file_path"]
     state["kwargs"] = {"catalog_instance_id": catalog_instance_id, "track_id": job["track_id"],
@@ -4729,6 +4757,49 @@ def _release_edge(state):
             remove_downloaded_file(state["info"].get("cleanup_path"))
 
 
+def _edge_download_failed(state):
+    """An edge whose host download failed: backs off six hours like any
+    failure, uncounted (``EDGE_DOWNLOAD_UNAVAILABLE``), so a media-server
+    outage never spends the job's EDGE_FAILURE_CAP."""
+    update_edge_job(get_db(), state["catalog_instance_id"], state["job"], "failed", EDGE_DOWNLOAD_UNAVAILABLE)
+    return {"track_id": state["job"]["track_id"], "status": "failed"}
+
+
+def _edge_breaker(record, release=lambda track_ids: None, serving=None):
+    """An edge pass's ``_DownloadBreaker``; its units are ``_prepare_edge``
+    states. A settled failure backs off uncounted (``_edge_download_failed``);
+    a trip releases the held jobs (``_release_edge``: due again at once) and
+    hands their track ids to ``release``, so the walk's cursor stays before
+    them. Every outcome goes to ``record``. ``serving``: ``_serving_check``,
+    given the held track ids."""
+    def trip(states):
+        for state in states:
+            _release_edge(state)
+            record({"track_id": state["job"]["track_id"], "status": EDGE_RELEASED})
+        release([state["job"]["track_id"] for state in states])
+    breaker = _DownloadBreaker(trip, serving and (
+        lambda states: serving([state["job"]["track_id"] for state in states])))
+    breaker.record = record
+    return breaker
+
+
+def _release_held_edges(breaker):
+    """A pass that raised: its held download failures are released, due again
+    at once (never recorded); returns their track ids."""
+    held, breaker.held = breaker.held, []
+    for state, _charge in held:
+        try:
+            _release_edge(state)
+        except Exception:
+            _rollback_if_possible(get_db())
+            logger.warning("lumae_analysis could not release a held edge job", exc_info=True)
+    return [state["job"]["track_id"] for state, _charge in held]
+
+
+def _count_edge(counts, outcome):
+    counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+
+
 def edge_backfill_task(server_id, catalog_instance_id, deadline=None, shared=False):
     """One library-pass slice: edges for published tracks until the slice's
     deadline, then yield.
@@ -4751,6 +4822,7 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None, shared=Fal
     row = edge_backfill_row(db, catalog_instance_id) or {}
     cursor = row.get("cursor") or ""
     started = not cursor
+    breaker = None
     try:
         ids = edge_backfill_candidates(db, catalog_instance_id, cursor, EDGE_BACKFILL_PAGE_SIZE)
         if not ids:
@@ -4763,6 +4835,9 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None, shared=Fal
         if pool is not None and pool.parallel:
             return _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, pass_deadline)
         reached, counts, stopped = cursor, {}, False
+        breaker = _edge_breaker(lambda outcome: _count_edge(counts, outcome),
+                                serving=_serving_check(catalog_instance_id, server_id))
+        held_from = None  # the cursor before the first held download failure
         while ids and not stopped:
             for track_id in ids:
                 # Before the first track too: production's pass ran 81 s on
@@ -4773,13 +4848,23 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None, shared=Fal
                 jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
                 released = False
                 for outcome in analyze_edges_task(jobs, catalog_instance_id, server_id,
-                                                  budget_seconds=remaining):
+                                                  budget_seconds=remaining, breaker=breaker):
                     counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
                     released = released or outcome["status"] == EDGE_RELEASED
+                if breaker.tripped:
+                    # A media-server outage: the held tracks were released,
+                    # due again, before the cursor; the pass stops.
+                    reached = reached if held_from is None else held_from
+                    stopped = True
+                    break
                 if released:
                     # Due again at once: the cursor stays before it, and the
                     # pass stops (its slice is used, or edge work stopped).
                     break
+                if not breaker.held:
+                    held_from = None
+                elif held_from is None:
+                    held_from = reached
                 reached = track_id
                 if _edge_work_stopped():
                     stopped = True
@@ -4787,6 +4872,7 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None, shared=Fal
             if stopped or reached != ids[-1] or time.monotonic() >= pass_deadline:
                 break
             ids = edge_backfill_candidates(get_db(), catalog_instance_id, reached, EDGE_BACKFILL_PAGE_SIZE)
+        breaker.settle()
         processed = sum(counts.values())
         if not ids:
             # The walk reached the end inside this turn.
@@ -4794,9 +4880,12 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None, shared=Fal
                                  next_retry_hours=EDGE_BACKFILL_RESWEEP_HOURS, completed=True)
             return {"status": "complete", "processed": processed, **counts}
         update_edge_backfill(db, catalog_instance_id, "queued", cursor=reached, processed=processed)
-        return {"status": "queued", "processed": processed, **counts}
+        return _queued_pass(db, "edge_backfill_state", catalog_instance_id,
+                            {"processed": processed, **counts}, breaker)
     except Exception as exc:
         _rollback_if_possible(db)
+        if breaker is not None:
+            _release_held_edges(breaker)
         update_edge_backfill(db, catalog_instance_id, "failed", error=exc)
         raise
 
@@ -4828,12 +4917,15 @@ def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, d
     """
     counts, limit = {}, analysis_time_limit_seconds()
     released = set()  # units released in prepare or finish: the cursor stays before them
+    # A media-server outage releases the held tracks, due again: the cursor stays before them.
+    breaker = _edge_breaker(lambda outcome: _count_edge(counts, outcome), released.update,
+                            _serving_check(catalog_instance_id, server_id))
 
     def prepare(track_id):
         jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
         if not jobs:
             return None
-        outcome, state = _prepare_edge(jobs[0], catalog_instance_id, server_id, defer=True)
+        outcome, state = _prepare_edge(jobs[0], catalog_instance_id, server_id, defer=True, breaker=breaker)
         if state is None:
             if outcome is not None:
                 counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
@@ -4853,15 +4945,23 @@ def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, d
             released.add(track_id)
             counts["released"] = counts.get("released", 0) + 1
             return
+        if state["info"].get("download") is not None:
+            breaker.settle()  # Lumae's own download fetched this file
         outcome = _finish_edge(state, payload, error)
         counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
 
     report_edge_runtime()
-    report = parallel_analysis.run(
-        _paged(ids, lambda last: edge_backfill_candidates(get_db(), catalog_instance_id, last,
-                                                          EDGE_BACKFILL_PAGE_SIZE)),
-        prepare, finish, pool=pool, deadline=deadline,
-        between=_serve_between_edges)
+    try:
+        report = parallel_analysis.run(
+            _paged(ids, lambda last: edge_backfill_candidates(get_db(), catalog_instance_id, last,
+                                                              EDGE_BACKFILL_PAGE_SIZE)),
+            prepare, finish, pool=pool, deadline=deadline,
+            between=lambda: _serve_between_edges() and not breaker.tripped)
+    except Exception:
+        _rollback_if_possible(get_db())
+        _release_held_edges(breaker)
+        raise
+    breaker.settle()
     processed = sum(counts.values())
     if report.stopped is None and not report.cancelled and not released:
         # The walk reached the end inside this turn.
@@ -4871,7 +4971,8 @@ def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, d
     reached = _reached_unreleased(report, released)
     update_edge_backfill(db, catalog_instance_id, "queued", cursor=cursor if reached is None else reached,
                          processed=processed)
-    return {"status": "queued", "processed": processed, **counts}
+    return _queued_pass(db, "edge_backfill_state", catalog_instance_id, {"processed": processed, **counts},
+                        breaker)
 
 
 # Multi-worker plan R4: a shared pass takes this many tracks per analysis
@@ -5001,12 +5102,16 @@ def _edge_pass_shared(db, server_id, catalog_instance_id, deadline):
         refilter=lambda conn, ids: edge_due_among(conn, catalog_instance_id, ids),
         complete=complete_edge_pass_sql)
 
+    # A media-server outage hands the held tracks back, due again.
+    breaker = _edge_breaker(lambda outcome: _count_edge(counts, outcome), feed.cancelled.extend,
+                            _serving_check(catalog_instance_id, server_id))
+
     def prepare(track_id):
         feed.started(track_id)
         jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
         if not jobs:
             return None
-        outcome, state = _prepare_edge(jobs[0], catalog_instance_id, server_id, defer=True)
+        outcome, state = _prepare_edge(jobs[0], catalog_instance_id, server_id, defer=True, breaker=breaker)
         if state is None:
             if outcome is not None:
                 counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
@@ -5026,15 +5131,20 @@ def _edge_pass_shared(db, server_id, catalog_instance_id, deadline):
             feed.cancelled.append(track_id)
             counts["released"] = counts.get("released", 0) + 1
             return
+        if state["info"].get("download") is not None:
+            breaker.settle()  # Lumae's own download fetched this file
         outcome = _finish_edge(state, payload, error)
         counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
 
     report_edge_runtime(park=False)
     try:
         parallel_analysis.run(iter(feed), prepare, finish, pool=pool, deadline=deadline,
-                              between=_serve_between_edges)
+                              between=lambda: _serve_between_edges() and not breaker.tripped)
+        breaker.settle()
     except Exception as exc:
         _rollback_if_possible(db)
+        # Held download failures were never recorded: released and handed back.
+        feed.cancelled.extend(_release_held_edges(breaker))
         _close_feed(db, feed)
         update_edge_backfill(db, catalog_instance_id, "failed", error=exc)
         raise
@@ -5046,7 +5156,8 @@ def _edge_pass_shared(db, server_id, catalog_instance_id, deadline):
     if feed.why == shared_pass.OUT and not processed:
         # Other runners hold the rest of the pass: nothing for this one now.
         return {"status": "coalesced", "processed": 0}
-    return {"status": "queued", "processed": processed, **counts}
+    return _queued_pass(db, "edge_backfill_state", catalog_instance_id, {"processed": processed, **counts},
+                        breaker)
 
 
 def next_loudness_backfill(db, server_id=None, shared=False):
@@ -5101,7 +5212,7 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None, shared
             return _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, due, page_size,
                                            edges_enabled, pass_deadline, result)
         reached = cursor
-        breaker = _loudness_breaker(result)
+        breaker = _loudness_breaker(result, serving=_serving_check(catalog_instance_id, server_id))
         held_from = None  # the cursor before the first held download failure
         while due:
             measured = []
@@ -5118,8 +5229,8 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None, shared
                     break
                 if outcome != "held":
                     result[outcome] += 1
-                    if not breaker.held:
-                        held_from = None
+                if not breaker.held:
+                    held_from = None  # a download worked, or the canary did: they were charged
                 reached = track_id
             failed = _publish_loudness(db, catalog_instance_id, measured)
             result["ready"] -= failed
@@ -5136,7 +5247,7 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None, shared
                                      next_retry_hours=loudness_backfill.RESWEEP_HOURS, completed=True)
             return {**result, "status": "complete"}
         loudness_backfill.update(db, catalog_instance_id, "queued", cursor=reached, processed=result["processed"])
-        return {**result, "status": "queued"}
+        return _queued_pass(db, "loudness_backfill_state", catalog_instance_id, result, breaker)
     except Exception as exc:
         _rollback_if_possible(db)
         loudness_backfill.update(db, catalog_instance_id, "failed", error=exc)
@@ -5177,8 +5288,9 @@ def _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revisi
         if breaker is None:
             return _finish_loudness(state, None, exc, None), None
         _rollback_if_possible(db)
+        # ``error=exc``: Python unbinds ``exc`` when this block ends, before a settle charges it.
         breaker.hold((track_id, media_revision),
-                     lambda: breaker.count(_finish_loudness(state, None, exc, None)))
+                     lambda error=exc: breaker.count(_finish_loudness(state, None, error, None)))
         return "held", None
     except Exception as exc:
         return _finish_loudness(state, None, exc, None), None
@@ -5187,11 +5299,12 @@ def _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revisi
     return None, state
 
 
-def _loudness_breaker(result, release=lambda items: None):
+def _loudness_breaker(result, release=lambda items: None, serving=None):
     """A loudness pass's ``_DownloadBreaker``: a settled failure is counted in
     ``result``; a trip records nothing, so the tracks stay due, and
-    ``release(items)`` keeps the pass's cursor before them."""
-    breaker = _DownloadBreaker(release)
+    ``release(items)`` keeps the pass's cursor before them. ``serving``:
+    ``_serving_check``, given the held track ids."""
+    breaker = _DownloadBreaker(release, serving and (lambda items: serving([item[0] for item in items])))
     breaker.count = lambda outcome: result.__setitem__(outcome, result[outcome] + 1)
     return breaker
 
@@ -5228,7 +5341,8 @@ def _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, du
     """
     measured, limit = [], analysis_time_limit_seconds()
     released = set()  # track ids left due (a refused own download, an outage): the cursor stays before them
-    breaker = _loudness_breaker(result, lambda items: released.update(item[0] for item in items))
+    breaker = _loudness_breaker(result, lambda items: released.update(item[0] for item in items),
+                                _serving_check(catalog_instance_id, server_id))
 
     def prepare(item):
         track_id, media_revision = item
@@ -5281,7 +5395,7 @@ def _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, du
     reached = _reached_unreleased(report, released, lambda unit: unit[0])
     loudness_backfill.update(db, catalog_instance_id, "queued", cursor=cursor if reached is None else reached[0],
                              processed=result["processed"])
-    return {**result, "status": "queued"}
+    return _queued_pass(db, "loudness_backfill_state", catalog_instance_id, result, breaker)
 
 
 def _loudness_pass_shared(db, server_id, catalog_instance_id, deadline, result):
@@ -5312,7 +5426,7 @@ def _loudness_pass_shared(db, server_id, catalog_instance_id, deadline, result):
         complete=loudness_backfill.complete_sql)
 
     # A media-server outage hands the held tracks back, due again.
-    breaker = _loudness_breaker(result, feed.cancelled.extend)
+    breaker = _loudness_breaker(result, feed.cancelled.extend, _serving_check(catalog_instance_id, server_id))
 
     def prepare(item):
         feed.started(item)
@@ -5355,6 +5469,9 @@ def _loudness_pass_shared(db, server_id, catalog_instance_id, deadline, result):
         publish()
     except Exception as exc:
         _rollback_if_possible(db)
+        # Held download failures were never recorded: handed back, not finished.
+        held, breaker.held = breaker.held, []
+        feed.cancelled.extend(unit for unit, _charge in held)
         _close_feed(db, feed)
         loudness_backfill.update(db, catalog_instance_id, "failed", error=exc)
         raise
@@ -5363,9 +5480,9 @@ def _loudness_pass_shared(db, server_id, catalog_instance_id, deadline, result):
     shared_pass.end_slice(db, table("loudness_backfill_state"), catalog_instance_id, result["processed"])
     if feed.why == shared_pass.ENDED:
         return {**result, "status": "complete"}
-    if feed.why == shared_pass.OUT and not result["processed"]:
+    if feed.why == shared_pass.OUT and not result["processed"] and not breaker.tripped:
         return {**result, "status": "coalesced"}
-    return {**result, "status": "queued"}
+    return _queued_pass(db, "loudness_backfill_state", catalog_instance_id, result, breaker)
 
 
 def _publish_loudness(db, catalog_instance_id, measured):
@@ -5758,25 +5875,44 @@ DOWNLOAD_BREAKER_STATUS = "deferred_download_unavailable"
 
 
 class _DownloadBreaker:
-    """A pass's run of failed host downloads. Each failure is held: charged as
-    today once a later download in the pass succeeds or the pass ends, and
-    handed to ``release`` uncharged once DOWNLOAD_BREAKER_LIMIT fail in a row,
-    which trips the breaker and stops the pass (LUM-007's per-file budget
-    stays for a file that fails among good ones)."""
+    """A background pass's run of failed host downloads. Each failure is held:
+    charged as today once a later download in the pass succeeds or the pass
+    ends. Once DOWNLOAD_BREAKER_LIMIT fail in a row, ``serving(held units)``
+    (``_downloads_serving``: a canary download) tells files that are gone from
+    an outage: the server still serves files, so the held failures are
+    charged and the pass goes on; otherwise they are handed to ``release``
+    uncharged, which trips the breaker and stops the pass (LUM-007's per-file
+    budget stays for a file that fails among good ones). No ``serving``: an
+    outage."""
 
-    def __init__(self, release):
+    def __init__(self, release, serving=None):
         self.release = release
+        self.serving = serving
         self.held = []  # (unit, charge)
         self.tripped = False
 
     def hold(self, unit, charge):
         self.held.append((unit, charge))
         if len(self.held) >= DOWNLOAD_BREAKER_LIMIT:
+            if self._serving():
+                logger.info("lumae_analysis: %d downloads in a row failed but the media server serves "
+                            "files; the failures are the files'", len(self.held))
+                self.settle()
+                return unit
             held, self.held = self.held, []
             self.tripped = True
             logger.warning("lumae_analysis: %d downloads in a row failed; the pass stops", len(held))
             self.release([held_unit for held_unit, _charge in held])
         return unit
+
+    def _serving(self):
+        if self.serving is None:
+            return False
+        try:
+            return bool(self.serving([held_unit for held_unit, _charge in self.held]))
+        except Exception:
+            logger.warning("lumae_analysis could not check the media server", exc_info=True)
+            return False
 
     def settle(self):
         """A download worked, or the pass ended: the held failures were the files'."""
@@ -5785,7 +5921,93 @@ class _DownloadBreaker:
             charge()
 
 
-def _waveform_breaker(catalog_instance_id):
+def _downloads_serving(catalog_instance_id, server_id, held_track_ids):
+    """Whether the source's media server still serves files although
+    DOWNLOAD_BREAKER_LIMIT downloads failed in a row (``_DownloadBreaker``).
+
+    A canary: a track of the source that downloaded before (it has a
+    published waveform), not among ``held_track_ids`` and a different one on
+    each check, downloaded the way a pass downloads and removed at once. No
+    canary (nothing published yet, or it left the catalogue): the provider's
+    bounded ping answers. Never raises; an error means an outage."""
+    db, track_id = None, None
+    try:
+        db = get_db()
+        track_id = _canary_track(db, catalog_instance_id, held_track_ids)
+    except Exception:
+        _rollback_if_possible(db)
+        logger.warning("lumae_analysis could not choose a download canary", exc_info=True)
+    if track_id is not None:
+        info = None
+        try:
+            info = load_track_file(track_id, catalog_instance_id=catalog_instance_id, server_id=server_id)
+        except Exception:
+            return False
+        finally:
+            _rollback_if_possible(db)  # end the read: nothing was written
+            if info:
+                try:
+                    remove_downloaded_file(info.get("cleanup_path"))
+                except Exception:
+                    logger.warning("lumae_analysis could not remove a canary download", exc_info=True)
+        if info:
+            return True
+    try:
+        adapter = get_core_adapter()
+        ProviderCatalogBridge(adapter).probe_server_identity(server_id or adapter.active_server_id())
+        return True
+    except Exception:
+        return False
+
+
+def _canary_track(db, catalog_instance_id, exclude):
+    """A published track of the source outside ``exclude``, from a random
+    point of its ids, so repeated checks try different files."""
+    if not catalog_instance_id:
+        return None
+    start = os.urandom(8).hex()
+    with db.cursor() as cur:
+        for bound in ("AND track_id >= %s", ""):
+            cur.execute(
+                f"""SELECT track_id FROM {table('published_source_profiles')}
+                     WHERE catalog_instance_id=%s AND NOT (track_id = ANY(%s)) {bound}
+                     ORDER BY track_id LIMIT 1""",
+                (catalog_instance_id, [str(item) for item in exclude], *((start,) if bound else ())))
+            row = cur.fetchone()
+            if row:
+                return row[0]
+    return None
+
+
+def _serving_check(catalog_instance_id, server_id):
+    """A breaker's ``serving``: ``_downloads_serving`` for the source."""
+    return lambda held_track_ids: _downloads_serving(catalog_instance_id, server_id, held_track_ids)
+
+
+def _back_off_pass(db, state_table, catalog_instance_id):
+    """A pass whose download breaker tripped waits BACKFILL_ABORT_RETRY_SECONDS
+    (as the waveform pass does) instead of running again at once."""
+    with db.cursor() as cur:
+        cur.execute(
+            f"""UPDATE {table(state_table)}
+                   SET next_retry_at=GREATEST(COALESCE(next_retry_at, now()),
+                                              now() + make_interval(secs => %s))
+                 WHERE catalog_instance_id=%s""",
+            (float(BACKFILL_ABORT_RETRY_SECONDS), catalog_instance_id))
+    db.commit()
+
+
+def _queued_pass(db, state_table, catalog_instance_id, result, breaker):
+    """An edge or loudness pass's result when its walk did not reach the end:
+    ``queued``, or after a media-server outage tripped its ``breaker``
+    ``waiting_retry`` (settled) with the pass backing off (``_back_off_pass``)."""
+    if not breaker.tripped:
+        return {**result, "status": "queued"}
+    _back_off_pass(db, state_table, catalog_instance_id)
+    return {**result, "status": "waiting_retry"}
+
+
+def _waveform_breaker(catalog_instance_id, server_id=None):
     """A waveform batch's breaker: its units are the tracks' result dicts,
     each with its ``token``; a trip releases them uncounted."""
     def release(results):
@@ -5798,7 +6020,8 @@ def _waveform_breaker(catalog_instance_id):
         for result in results:
             result.pop("token", None)
             result["status"] = DOWNLOAD_BREAKER_STATUS
-    return _DownloadBreaker(release)
+    serving = _serving_check(catalog_instance_id, server_id)
+    return _DownloadBreaker(release, lambda results: serving([result["track_id"] for result in results]))
 
 
 def hook_track_id(song):
@@ -6253,7 +6476,9 @@ def analyze_tracks_task(
             "skipped": 0,
             "deferred": len(ids),
         }
-    breaker = _waveform_breaker(catalog_instance_id)
+    # Background work only: an on-demand batch is charged per track as before
+    # (a trip turned a phone's requests into ``missing`` and re-admitted them).
+    breaker = _waveform_breaker(catalog_instance_id, server_id) if priority == "background" else None
     if pool is not None:
         results, attempted = _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id,
                                                       attempt_tokens, deadline, breaker)
@@ -6261,7 +6486,7 @@ def analyze_tracks_task(
     results = []
     attempted = 0
     for index, track_id in enumerate(ids):
-        if breaker.tripped:
+        if breaker is not None and breaker.tripped:
             # A media-server outage: the rest wait uncounted (LUM-007).
             remaining = ids[index:]
             release_pending(
@@ -6333,7 +6558,8 @@ def analyze_tracks_task(
         _safe_progress("analyzing volume and ramps", current=index + 1, total=len(ids))
         if priority == "background" and catalog_instance_id:
             heartbeat_profile_backfill(catalog_instance_id)
-    breaker.settle()
+    if breaker is not None:
+        breaker.settle()
     return _tracks_summary(results, attempted, catalog_instance_id, priority, breaker)
 
 
@@ -6352,7 +6578,7 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
     results, attempted, paused = [], [0], [False]
     limit = analysis_time_limit_seconds()
     tokens = attempt_tokens or {}
-    breaker = breaker or _waveform_breaker(catalog_instance_id)
+    breaker = breaker or _waveform_breaker(catalog_instance_id, server_id)
 
     def between():
         serve_interactive()
