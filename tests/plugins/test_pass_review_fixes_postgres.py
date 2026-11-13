@@ -221,12 +221,14 @@ def test_the_canary_is_a_track_with_a_published_waveform_never_a_held_one(source
 
 def test_without_a_published_waveform_the_canary_comes_from_the_catalogue(source_db):
     mod, db = source_db
-    for track in ("t1", "t2", "t3", "t4"):
+    for track in ("t1", "t2", "t3", "t4", "t5"):
         _track(db, track)
     with db.cursor() as cur:
         cur.execute(f"UPDATE {P}catalog_tracks SET available=FALSE WHERE track_id='t3'")
         # Another generation's row is not the published catalogue.
         cur.execute(f"UPDATE {P}catalog_tracks SET published_generation=2 WHERE track_id='t4'")
+        # A podcast or video item: available, but no pass analyses it.
+        cur.execute(f"UPDATE {P}catalog_tracks SET analysis_eligible=FALSE WHERE track_id='t5'")
     db.commit()
     assert _canaries(mod, db, ["t1"]) == {"t2"}
 

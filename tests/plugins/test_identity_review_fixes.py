@@ -199,21 +199,25 @@ def test_which_rows_count_as_applied(state, transition_id, published, was_applie
 
 LEGACY_A = "e3b7fc2ae9447bbec37a13bf916e3cf6"
 LEGACY_B = "a3b7fc2ae9447bbec37a13bf916e3cf7"
+LEGACY_C = "b3b7fc2ae9447bbec37a13bf916e3cf8"
+LEGACY_D = "c3b7fc2ae9447bbec37a13bf916e3cf9"
 
 
 @pytest.mark.parametrize(
     ("scanned", "reverted"),
     [
         # Binary-only downgrade: the canonical IDs stay.
-        (["A", "B"], False),
+        (["A", "B", "C", "D"], False),
         # The pre-rekey database restored: legacy forms instead of canonical.
-        ([LEGACY_A, LEGACY_B], True),
-        # One track reverted is exact evidence too.
-        ([LEGACY_A, "B"], True),
+        ([LEGACY_A, LEGACY_B, LEGACY_C, LEGACY_D], True),
+        # A restore with a few ordinary removals and additions.
+        ([LEGACY_A, LEGACY_B, LEGACY_C, "f" * 32], True),
+        # One track reverted among others still canonical is not a restore.
+        ([LEGACY_A, "B", "C", "D"], False),
         # Both forms of a track in one scan: a conflict, not a reversal.
-        ([LEGACY_A, "A", LEGACY_B], False),
+        ([LEGACY_A, "A", LEGACY_B, LEGACY_C, LEGACY_D], False),
         # Ordinary removals and additions are not evidence.
-        (["A", "f" * 32], False),
+        (["A", "B", "C", "f" * 32], False),
     ],
 )
 def test_which_scans_show_ids_reverted_to_legacy(scanned, reverted):
@@ -224,6 +228,8 @@ def test_which_scans_show_ids_reverted_to_legacy(scanned, reverted):
     canonical = {
         "A": canonicalize_navidrome_id(LEGACY_A).value,
         "B": canonicalize_navidrome_id(LEGACY_B).value,
+        "C": canonicalize_navidrome_id(LEGACY_C).value,
+        "D": canonicalize_navidrome_id(LEGACY_D).value,
     }
     published = list(canonical.values())
     scan = [canonical.get(value, value) for value in scanned]

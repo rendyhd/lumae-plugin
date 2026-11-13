@@ -1084,7 +1084,12 @@ def test_the_principal_lock_wait_is_bounded(
 ):
     """Red before the fix: the create waited (here: the test's 15s) for the
     principal's other create."""
-    assert catalog.BOOTSTRAP_PRINCIPAL_LOCK_TIMEOUT == "3s"
+    assert catalog.BOOTSTRAP_PRINCIPAL_LOCK_TIMEOUT == "8s"
+    # A create queued behind the principal's analysis create, which holds the
+    # principal lock through its own analysis-lease wait, must outlast it.
+    assert int(catalog.BOOTSTRAP_PRINCIPAL_LOCK_TIMEOUT.rstrip("s")) > 2 * int(
+        catalog.ANALYSIS_LEASE_LOCK_TIMEOUT.rstrip("s")
+    )
     monkeypatch.setattr(catalog, "BOOTSTRAP_PRINCIPAL_LOCK_TIMEOUT", "200ms")
     _seed_source(migrated_db, analysis_generation=1)
     _hold_principal_lock(migrated_db, "bearer")

@@ -380,6 +380,36 @@ def test_the_canary_downloads_into_a_directory_of_its_own(monkeypatch, tmp_path,
         assert kept.read() == b"in flight"
 
 
+@pytest.mark.parametrize("works", [True, False])
+def test_a_canary_whose_rollback_raises_still_cleans_up(monkeypatch, tmp_path, works):
+    """Red before the fix: the rollback ran first in the finally; a session
+    that died during the download skipped the cleanup and raised."""
+    mod = load_plugin()
+    monkeypatch.setattr(mod.config, "TEMP_DIR", str(tmp_path / "host-temp"), raising=False)
+    monkeypatch.setattr(mod.analysis_download, "_root", lambda host_temp_dir=None: str(tmp_path / "downloads"))
+
+    class DeadDb(_CanaryDb):
+        def rollback(self):
+            raise RuntimeError("the database session died")
+    monkeypatch.setattr(mod, "get_db", lambda: DeadDb("busy"))
+    removed, used = [], []
+    monkeypatch.setattr(mod, "remove_downloaded_file", removed.append)
+
+    def load(track_id, directory=None, **_kwargs):
+        used.append(directory)
+        path = os.path.join(directory, f"{track_id}.flac")
+        with open(path, "wb") as out:
+            out.write(b"canary")
+        if not works:
+            raise mod.MediaDownloadError("down")
+        return {"file_path": path, "cleanup_path": path}
+    monkeypatch.setattr(mod, "load_track_file", load)
+    assert mod._downloads_serving(SOURCE, "server-a", ["t1"]) is works
+    [directory] = used
+    assert not os.path.exists(directory)
+    assert removed == ([os.path.join(directory, "busy.flac")] if works else [])
+
+
 def test_a_breaker_whose_check_raises_treats_it_as_an_outage():
     mod = load_plugin()
     released = []

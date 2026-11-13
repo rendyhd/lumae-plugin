@@ -58,7 +58,10 @@ CATALOG_COMPACTION_MAX_BATCHES = 20
 ANALYSIS_LEASE_LOCK_TIMEOUT = "3s"
 # How long a bootstrap session creation waits for another creation of the
 # same principal (BOOTSTRAP_PRINCIPAL_LOCK) before it answers "retry shortly".
-BOOTSTRAP_PRINCIPAL_LOCK_TIMEOUT = "3s"
+# More than twice ANALYSIS_LEASE_LOCK_TIMEOUT plus a margin: an analysis create
+# holds the principal lock through its whole analysis-lease wait, and a create
+# of the same caller queued behind it must not give up first.
+BOOTSTRAP_PRINCIPAL_LOCK_TIMEOUT = "8s"
 # SQLSTATEs of a lock wait given up: lock_timeout, and deadlock victim.
 LOCK_NOT_AVAILABLE = "55P03"
 DEADLOCK_DETECTED = "40P01"

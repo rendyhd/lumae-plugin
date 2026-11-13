@@ -379,7 +379,36 @@ def test_the_upgrade_request_locks_the_catalogue_before_the_transition_row(
     assert _transition(db)["projection_reconcile_required"] is True
 
 
-def _restored_legacy_database(db, version):
+def test_the_upgrade_request_locks_every_catalogue_in_id_order(
+    migrated_db, second_connection
+):
+    """Red before the fix: with only the higher-id source applied, the install
+    locked its catalog_state row alone, then the lower one in
+    prune_catalog_storage: against a process locking by id, a deadlock."""
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    db = migrated_db
+    _bridge, source, _transition_id = _applied_transition(db)
+    _execute(db, f"INSERT INTO {P}catalog_sources (catalog_instance_id, "
+                 "current_core_server_id, provider_type, server_name, is_default, "
+                 "rebind_status) VALUES ('0', 'server-z', 'jellyfin', 'Z', FALSE, "
+                 "'active')")
+    _execute(db, f"INSERT INTO {P}catalog_state (catalog_instance_id, "
+                 "current_core_server_id, provider_type, catalog_epoch) "
+                 "VALUES ('0', 'server-z', 'jellyfin', 'epoch-z')")
+    with db.cursor() as cur:
+        cur.execute(f"SELECT catalog_instance_id FROM {P}catalog_state "
+                    "ORDER BY catalog_instance_id")
+        assert [row[0] for row in cur.fetchall()] == ["0", source]
+    db.commit()
+
+    assert guard.require_projection_reconcile(db) == 1
+    with second_connection.cursor() as other:
+        other.execute(f"SELECT catalog_instance_id FROM {P}catalog_state "
+                      "FOR UPDATE SKIP LOCKED")
+        assert other.fetchall() == []
+    second_connection.rollback()
+    db.rollback()
     """Applied, then Navidrome reports ``version`` with its pre-rekey IDs."""
     from plugins.LumaeAnalysis import provider_identity_guard as guard
 

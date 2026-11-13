@@ -131,12 +131,20 @@ def _ids_reverted_to_legacy(published_ids, scanned_ids) -> bool:
     The rekey check run backwards: a scanned legacy ID whose canonical form
     is published, while that canonical ID is no longer in the scan, is exact
     codec evidence that the server's IDs changed back (its pre-rekey database
-    restored). One such track is enough; a scan that has both forms of a
-    track is a conflict, not a reversal, and is not counted as one. A
-    binary-only downgrade keeps the canonical IDs and has none.
+    restored). A restore reverts the library, not one track: the reverted
+    IDs must outnumber the published canonical IDs still in the scan
+    unchanged, so a single legacy ID among canonical ones is not a reversal.
+    A scan that has both forms of a track is a conflict, not a reversal, and
+    is not counted as one. A binary-only downgrade keeps the canonical IDs
+    and has none.
     """
     published = {str(value) for value in published_ids}
     scanned = {str(value) for value in scanned_ids}
+    still_canonical = 0
+    for kept_id in scanned & published:
+        kept = canonicalize_navidrome_id(kept_id)
+        if kept.recognized and not kept.changed:
+            still_canonical += 1
     reverted = both_forms = 0
     for scanned_id in scanned - published:
         converted = canonicalize_navidrome_id(scanned_id)
@@ -146,7 +154,7 @@ def _ids_reverted_to_legacy(published_ids, scanned_ids) -> bool:
             both_forms += 1
         else:
             reverted += 1
-    return reverted > 0 and both_forms == 0
+    return both_forms == 0 and reverted > still_canonical
 
 
 def migrate_provider_identity(db):
@@ -310,9 +318,10 @@ def require_projection_reconcile(db):
     (the projection is then owed) or opens the next transition (one extra
     projection check, which is harmless).
 
-    Locks in the order of a refresh: the catalogues' ``catalog_state`` rows
-    first (by ``catalog_instance_id``, as prune_catalog_storage does later in
-    the same install transaction), then their transition rows. A refresh
+    Locks in the order of a refresh: when a transition was applied, all
+    ``catalog_state`` rows first (by ``catalog_instance_id``, as
+    prune_catalog_storage does later in the same install transaction), then
+    the applied transition rows. A refresh
     inspecting a transition_pending or blocked row holds ``catalog_state``
     and waits for the transition row (inspect_catalog_identity,
     catalog._confirm_catalog_identity); locking the transition row first
@@ -330,13 +339,20 @@ def require_projection_reconcile(db):
           JOIN {t('provider_identity_transitions')} p USING (catalog_instance_id)
          WHERE {_was_applied_sql('p')}
          ORDER BY c.catalog_instance_id
-           FOR UPDATE OF c
         """
     )
     locked = [str(row[0]) for row in cur.fetchall() or ()]
     if not locked:
         cur.close()
         return 0
+    # All catalog_state rows, in id order, as prune_catalog_storage locks them
+    # later in the install: locking only the applied sources' rows first (S2,
+    # then S1 in prune) inverted the order against a process locking by id.
+    cur.execute(
+        f"SELECT catalog_instance_id FROM {t('catalog_state')} "
+        "ORDER BY catalog_instance_id FOR UPDATE"
+    )
+    cur.fetchall()
     cur.execute(
         f"""
         UPDATE {t('provider_identity_transitions')} p

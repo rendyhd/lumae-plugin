@@ -5956,7 +5956,6 @@ def _downloads_serving(catalog_instance_id, server_id, held_track_ids):
         except Exception:
             return False
         finally:
-            _rollback_if_possible(db)  # end the read: nothing was written
             if info:
                 try:
                     remove_downloaded_file(info.get("cleanup_path"))
@@ -5964,6 +5963,10 @@ def _downloads_serving(catalog_instance_id, server_id, held_track_ids):
                     logger.warning("lumae_analysis could not remove a canary download", exc_info=True)
             if directory:
                 shutil.rmtree(directory, ignore_errors=True)
+            try:
+                _rollback_if_possible(db)  # end the read: nothing was written
+            except Exception:
+                logger.warning("lumae_analysis could not end the canary's read", exc_info=True)
         if info:
             return True
     try:
@@ -5996,6 +5999,7 @@ def _canary_track(db, catalog_instance_id, exclude):
                             ON c.catalog_instance_id=t.catalog_instance_id
                            AND c.published_generation=t.published_generation
                          WHERE t.catalog_instance_id=%s AND t.available=TRUE
+                           AND t.analysis_eligible=TRUE
                            AND NOT (t.track_id = ANY(%s)) {tier} {bound}
                          ORDER BY t.track_id LIMIT 1""",
                     (catalog_instance_id, excluded, *((start,) if bound else ())))
