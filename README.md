@@ -211,16 +211,12 @@ the whole object back — the POST replaces every stored setting.
   its §8.
 * **`AUTH_ENABLED=false`:** see Offline bulk copy, above, and
   `docs/contracts/LUMAE_SYNC_CONTRACT.md` §1.2.
-* **Friend Album Discovery** (`plugins/FederatedAlbums/`) is a separate,
-  private-development plugin excluded from the public manifest; see its own
-  [README](plugins/FederatedAlbums/README.md).
 
 ## Layout
 
 * `manifest.json` - the AudioMuse plugin catalog.
 * `plugins/LumaeAnalysis/plugin.json` - the plugin metadata and release list.
 * `plugins/LumaeAnalysis/*.py` - the plugin code.
-* `plugins/FederatedAlbums/*.py` - the friend-album plugin code (private development).
 * `dist/lumae_analysis/` - published Lumae release zip files.
 * `tests/plugins/test_lumae_analysis.py` - local regression tests.
 * `CHANGELOG.md` - release history.

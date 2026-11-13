@@ -17,7 +17,7 @@ spec.loader.exec_module(builder)
 
 @pytest.fixture
 def release_root(tmp_path):
-    for folder in ("LumaeAnalysis", "FederatedAlbums"):
+    for folder in ("LumaeAnalysis",):
         target = tmp_path / "plugins" / folder
         target.mkdir(parents=True)
         shutil.copyfile(

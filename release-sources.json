@@ -3,10 +3,6 @@
     "LumaeAnalysis": {
       "mode": "source",
       "version": "1.10.2"
-    },
-    "FederatedAlbums": {
-      "mode": "private",
-      "reason": "Requires a host with scoped plugin bearer authentication; source is under qualification."
     }
   }
 }
