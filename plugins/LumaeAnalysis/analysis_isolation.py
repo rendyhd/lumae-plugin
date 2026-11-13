@@ -984,9 +984,30 @@ _pooled = None
 _dedicated_lock = threading.Lock()
 _dedicated_slots = set()
 _dedicated = threading.local()
-# Set when a worker could not start: this process then analyzes in-process
-# instead of paying the start-up timeout again for every file.
+# ``(reason, monotonic time)`` when a worker could not start: this process
+# then analyzes in-process instead of paying the start-up timeout again for
+# every file, and tries a worker again after UNAVAILABLE_RETRY_SECONDS.
 _unavailable = None
+UNAVAILABLE_RETRY_SECONDS = 600
+
+
+def _unavailable_reason():
+    """Why workers are not started now, or None (the cool-down is over)."""
+    global _unavailable
+    state = _unavailable
+    if state is None:
+        return None
+    if time.monotonic() - state[1] >= UNAVAILABLE_RETRY_SECONDS:
+        if _unavailable is state:
+            _unavailable = None
+        return None
+    return state[0]
+
+
+def _check_available():
+    reason = _unavailable_reason()
+    if reason is not None:
+        raise _WorkerUnavailable(reason)
 
 
 def _forget_after_fork():
@@ -1244,14 +1265,12 @@ def _checkout(startup_timeout):
         if slot.worker is not None and not slot.worker.alive():
             slot.close()
         if slot.worker is None:
-            if _unavailable is not None:
-                raise _WorkerUnavailable(_unavailable)
+            _check_available()
             slot.worker = _Worker(startup_timeout, nice=slot.nice)
         slot.worker.healthy = False
         return slot.worker, slot
     if not _pool_lock.acquire(blocking=False):
-        if _unavailable is not None:
-            raise _WorkerUnavailable(_unavailable)
+        _check_available()
         return _Worker(startup_timeout), False
     try:
         worker = _pooled
@@ -1263,8 +1282,7 @@ def _checkout(startup_timeout):
                 worker.kill(0)
             worker = None
         if worker is None:
-            if _unavailable is not None:
-                raise _WorkerUnavailable(_unavailable)
+            _check_available()
             worker = _pooled = _Worker(startup_timeout)
     except BaseException:
         _pool_lock.release()
@@ -1404,11 +1422,12 @@ def _run_exec(target, path, kwargs, reference, plugin_package, facts, limit_seco
         try:
             worker, pooled = _checkout(startup)
         except _WorkerUnavailable as exc:
-            if _unavailable is None:
-                _unavailable = str(exc)
+            if _unavailable_reason() is None:
+                _unavailable = (str(exc), time.monotonic())
                 logger.warning(
                     "lumae_analysis analysis worker unavailable (%s); this process "
-                    "analyzes in-process without the hard time limit", exc,
+                    "analyzes in-process without the hard time limit for %d s, then "
+                    "tries a worker again", exc, UNAVAILABLE_RETRY_SECONDS,
                 )
             if slot is not None and slot.cancelled():
                 # Cancelled while the worker failed to start: no in-process

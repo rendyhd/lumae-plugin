@@ -116,6 +116,10 @@ def validate_mutation(body):
         _timestamp(body.get("at"))
     else:
         raise ValueError("Invalid operation")
+    try:  # NaN or Infinity anywhere would fail in jsonb: a 400, not a 500
+        json.dumps(body, allow_nan=False)
+    except ValueError:
+        raise ValueError("Numbers must be finite") from None
     return body
 
 

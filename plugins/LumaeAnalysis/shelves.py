@@ -117,6 +117,10 @@ def validate_mutation(body):
                 _text(record.get("visitId"), "search visit")
     else:
         raise ValueError("Invalid operation")
+    try:  # NaN or Infinity anywhere would fail in jsonb: a 400, not a 500
+        json.dumps(body, allow_nan=False)
+    except ValueError:
+        raise ValueError("Numbers must be finite") from None
     return body
 
 
@@ -271,8 +275,11 @@ def purge_expired_shelf_mutations(db, batch_rows=RETENTION_BATCH_ROWS, max_batch
                 break
             _lock_scopes(cur, [(principal, catalog_id) for principal, catalog_id, _, _ in rows])
             cur.execute(
-                f"DELETE FROM {relation} WHERE ctid = ANY(%s::text[]::tid[])",
-                ([row[3] for row in rows],),
+                # Repeat the age filter: a ctid freed and reused since the
+                # SELECT must never delete a newer row.
+                f"DELETE FROM {relation} WHERE ctid = ANY(%s::text[]::tid[]) "
+                "AND created_at < now() - %s::interval",
+                ([row[3] for row in rows], f"{RECEIPT_RETENTION_DAYS} days"),
             )
             deleted += cur.rowcount
         db.commit()

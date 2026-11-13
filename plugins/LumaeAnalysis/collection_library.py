@@ -6,7 +6,7 @@ import re
 from urllib.parse import quote
 
 import requests as http_requests
-from flask import Response, jsonify, request, stream_with_context
+from flask import Response, jsonify, request
 
 from plugin.api import config, get_db, logger, table
 
@@ -1002,25 +1002,62 @@ def _stream_response(upstream):
         finally:
             upstream.close()
 
+    # The generator touches only ``upstream``: no request context is kept
+    # alive, so the request's database connection is released at teardown
+    # instead of being held for the whole stream.
     response = Response(
-        stream_with_context(generate()),
+        generate(),
         status=upstream.status_code,
         headers=_stream_headers(upstream),
     )
     response.call_on_close(upstream.close)
+    _end_read_transaction()
     return response
 
 
-def _resolve_art_target(item_id, size, provider_type, module=None):
+def _end_read_transaction():
+    """End the request's read transaction before a long streaming response."""
+    try:
+        get_db().commit()
+    except Exception:
+        logger.warning("Could not end the read transaction before streaming", exc_info=True)
+
+
+def _mirror_cover_art_id(catalog_instance_id, track_id):
+    """The track's cover art id from the published catalogue mirror, or None."""
+    if not catalog_instance_id:
+        return None
+    cur = get_db().cursor()
+    try:
+        cur.execute(
+            f"SELECT t.cover_art_id FROM {table('catalog_tracks')} t "
+            f"JOIN {table('catalog_state')} c USING (catalog_instance_id) "
+            "WHERE t.catalog_instance_id=%s AND t.published_generation=c.published_generation "
+            "AND t.track_id=%s LIMIT 1",
+            (str(catalog_instance_id), str(track_id)),
+        )
+        row = cur.fetchone()
+    except Exception:
+        get_db().rollback()
+        logger.warning("Could not read the mirrored cover id for %s", track_id)
+        return None
+    finally:
+        cur.close()
+    return str(row[0]) if row and row[0] else None
+
+
+def _resolve_art_target(item_id, size, provider_type, module=None, catalog_instance_id=None):
     provider_type = str(provider_type or "").lower()
     if provider_type == "navidrome":
         base, auth, bound = _navidrome_access(module)
-        cover_id = item_id
-        try:
-            song = (bound._navidrome_request("getSong", {"id": item_id}) or {}).get("song") or {}
-            cover_id = str(song.get("coverArt") or item_id)
-        except Exception:
-            logger.warning("Could not resolve Navidrome cover id for %s", item_id)
+        cover_id = _mirror_cover_art_id(catalog_instance_id, item_id)
+        if not cover_id:
+            cover_id = item_id
+            try:
+                song = (bound._navidrome_request("getSong", {"id": item_id}) or {}).get("song") or {}
+                cover_id = str(song.get("coverArt") or item_id)
+            except Exception:
+                logger.warning("Could not resolve Navidrome cover id for %s", item_id)
         return (
             f"{base}/rest/getCoverArt.view",
             {},
@@ -1113,8 +1150,9 @@ def _proxy_art(target):
     }
     if upstream.headers.get("ETag"):
         headers_out["ETag"] = upstream.headers["ETag"]
-    response = Response(stream_with_context(generate()), status=200, headers=headers_out)
+    response = Response(generate(), status=200, headers=headers_out)
     response.call_on_close(upstream.close)
+    _end_read_transaction()
     return response
 
 
@@ -1217,7 +1255,8 @@ def register_collection_library_routes(bp, require_enabled):
             response = _proxy_art(_with_source_module(
                 catalog_instance_id,
                 provider_type,
-                lambda module: _resolve_art_target(item_id, size, provider_type, module),
+                lambda module: _resolve_art_target(
+                    item_id, size, provider_type, module, catalog_instance_id=catalog_instance_id),
             ))
             return response if response is not None else ("", 404)
         except CatalogScopeError as exc:

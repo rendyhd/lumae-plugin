@@ -12,6 +12,7 @@ from plugin.api import table
 
 from . import migrations
 from .edge_profiles import (
+    ANALYZER_VERSION,
     METHOD,
     SCHEMA_VERSION,
     V3_ENDING_KEY,
@@ -110,6 +111,26 @@ def migrate_edge_profiles(db):
         cur,
         f"CREATE INDEX IF NOT EXISTS {table('edge_profiles')}_v3_pending_idx "
         f"ON {table('edge_profiles')} (catalog_instance_id, track_id) WHERE profile_digest_v3 IS NULL",
+    )
+    # Failures of one media under one analyzer (``fail_edge_job``): at
+    # EDGE_FAILURE_CAP the job is retried only once its media, the analyzer or
+    # the schema changes. Additive; older releases ignore them.
+    migrations.ensure_columns(
+        cur, table('edge_profile_jobs'),
+        "failures INTEGER NOT NULL DEFAULT 0",
+        "failure_analyzer TEXT",
+    )
+    # The settings poll's per-source job counts (edge_profile_status) read
+    # these instead of every job row of the source (one per track).
+    migrations.ensure_index(
+        cur,
+        f"CREATE INDEX IF NOT EXISTS {table('edge_profile_jobs')}_source_active_idx "
+        f"ON {table('edge_profile_jobs')} (catalog_instance_id) WHERE status IN ('pending', 'running')",
+    )
+    migrations.ensure_index(
+        cur,
+        f"CREATE INDEX IF NOT EXISTS {table('edge_profile_jobs')}_source_failed_idx "
+        f"ON {table('edge_profile_jobs')} (catalog_instance_id, updated_at) WHERE status='failed'",
     )
     cur.close()
 
@@ -267,19 +288,21 @@ def claim_edge_requests(db, catalog_id, ids, priority='background'):
     """
     priority = 'interactive' if priority == 'interactive' else 'background'
     cur = db.cursor()
-    cur.execute(f"""SELECT p.track_id, p.media_signature, edge.payload, edge.v3_recheck
-        FROM {table('published_source_profiles')} p {edge_join(columns='e.payload, e.v3_recheck')}
+    # Only the two members read here, never the whole stored edge.
+    cur.execute(f"""SELECT p.track_id, p.media_signature, edge.edge_schema, edge.edge_method, edge.v3_recheck
+        FROM {table('published_source_profiles')} p {edge_join(columns=(
+            "e.payload->'schema_version' AS edge_schema, "
+            "e.payload->'measurement'->>'method' AS edge_method, e.v3_recheck"))}
         WHERE p.catalog_instance_id=%s AND p.track_id=ANY(%s)
         ORDER BY p.track_id""", (catalog_id, list(dict.fromkeys(ids))[:100]))
     rows = cur.fetchall()
     accepted, ready, pending, unsupported = [], [], [], []
-    for track_id, signature, payload, recheck in rows:
+    for track_id, signature, edge_schema, edge_method, recheck in rows:
         revision = opaque_revision(signature)
         if not revision:
             continue
         # An edge to measure again for its music end (v3_recheck) is not ready.
-        if (payload and not recheck and payload.get('schema_version') == SCHEMA_VERSION
-                and payload.get('measurement', {}).get('method') == METHOD):
+        if not recheck and edge_schema == SCHEMA_VERSION and edge_method == METHOD:
             ready.append(track_id)
             continue
         token = str(uuid.uuid4())
@@ -293,13 +316,15 @@ def claim_edge_requests(db, catalog_id, ids, priority='background'):
                 -- second decode error can retire the job (fail_edge_job).
                 last_error=CASE WHEN job.media_revision<>EXCLUDED.media_revision
                                   OR job.status<>'failed' THEN NULL ELSE job.last_error END,
+                failures=CASE WHEN job.media_revision<>EXCLUDED.media_revision THEN 0 ELSE job.failures END,
                 priority=EXCLUDED.priority, updated_at=now()
             WHERE job.media_revision<>EXCLUDED.media_revision
                OR (job.status IN ('pending', 'running') AND job.updated_at < now()-interval '30 minutes')
                OR (job.status='failed' AND job.last_error='edge-enqueue-failed'
                    AND job.updated_at < now()-interval '2 seconds')
                OR (job.status NOT IN ('pending', 'running', 'unsupported')
-                   AND job.updated_at < now()-interval '6 hours')
+                   AND job.updated_at < now()-interval '6 hours'
+                   AND NOT {_edge_capped_sql('job')})
             RETURNING job_token""", (catalog_id, track_id, revision, token, priority))
         if cur.fetchone():
             accepted.append({'track_id': track_id, 'media_revision': revision, 'job_token': token})
@@ -392,21 +417,43 @@ def update_edge_job(db, catalog_id, job, status, reason=None):
 
 # W3: the reason of a decoder data error (``analysis_isolation.EDGE_FAILURE_REASONS``).
 EDGE_DECODE_ERROR = 'edge-media-error'
+# A job that failed this many times for the same media under the same analyzer
+# and schema is not retried until one of them changes (as loudness_backfill
+# parks a track after its last back-off step).
+EDGE_FAILURE_CAP = 5
+# What a failure count is counted under (``failure_analyzer``).
+EDGE_FAILURE_ANALYZER = f"{SCHEMA_VERSION}/{ANALYZER_VERSION}/{METHOD}"
+# The media server could not hand over the file: backs off six hours like any
+# failure but is set by ``update_edge_job``, never ``fail_edge_job``, so a
+# media-server outage cannot spend a job's EDGE_FAILURE_CAP.
+EDGE_DOWNLOAD_UNAVAILABLE = 'edge-download-unavailable'
+
+
+def _edge_capped_sql(alias):
+    """SQL: the job row ``alias`` failed EDGE_FAILURE_CAP times for its media
+    under the current analyzer (its media is compared by the caller)."""
+    return (f"({alias}.status='failed' AND {alias}.failures >= {int(EDGE_FAILURE_CAP)}"
+            f" AND {alias}.failure_analyzer = '{EDGE_FAILURE_ANALYZER}'"
+            f" AND {alias}.last_error IS DISTINCT FROM 'edge-enqueue-failed')")
 
 
 def fail_edge_job(db, catalog_id, job, reason):
     """Mark a running job failed, or unsupported (terminal for its media) when it
     is a decode error that already failed the same media once (W3): those were
-    downloaded whole and retried every six hours."""
+    downloaded whole and retried every six hours. Counts the media's failures
+    under this analyzer: at EDGE_FAILURE_CAP the six-hourly retry stops."""
     reason = str(reason)[:160] if reason else None
     decode = bool(reason and reason.startswith(EDGE_DECODE_ERROR))
     cur = db.cursor()
     cur.execute(f"""UPDATE {table('edge_profile_jobs')}
         SET status=CASE WHEN %s AND last_error LIKE %s THEN %s ELSE 'failed' END,
+            failures=CASE WHEN failure_analyzer IS NOT DISTINCT FROM %s THEN failures + 1 ELSE 1 END,
+            failure_analyzer=%s,
             last_error=%s, updated_at=now()
         WHERE catalog_instance_id=%s AND track_id=%s AND media_revision=%s AND job_token=%s
           AND status IN ('pending', 'running')
-        RETURNING status""", (decode, EDGE_DECODE_ERROR + '%', UNSUPPORTED, reason, catalog_id,
+        RETURNING status""", (decode, EDGE_DECODE_ERROR + '%', UNSUPPORTED,
+                              EDGE_FAILURE_ANALYZER, EDGE_FAILURE_ANALYZER, reason, catalog_id,
                               job['track_id'], job['media_revision'], job['job_token']))
     row = cur.fetchone()
     db.commit()
@@ -478,7 +525,8 @@ def publish_edge_profile(db, catalog_id, job, payload, signature):
     # stored (K6); an edge publication is served in full to every client.
     record_profile_change(cur, catalog_id, job['track_id'], 'ready', serialize_profile(*legacy),
                           edge_ref=journal_edge_ref(payload['profile_digest'], kept=False))
-    cur.execute(f"""UPDATE {table('edge_profile_jobs')} SET status='ready', last_error=NULL, updated_at=now()
+    cur.execute(f"""UPDATE {table('edge_profile_jobs')} SET status='ready', last_error=NULL, failures=0,
+            updated_at=now()
         WHERE catalog_instance_id=%s AND track_id=%s AND job_token=%s""",
                 (catalog_id, job['track_id'], job['job_token']))
     db.commit()
@@ -491,23 +539,27 @@ def edge_profile_status(db, catalog_id):
 
     Source-scoped aggregates: published edge profiles, jobs in progress,
     failed jobs, the most recent failed job's ``last_error`` (free text;
-    callers redact it) and the latest published edge's ``updated_at``. The
-    edge count and the latest edge come from one index-only scan of
-    ``(catalog_instance_id, updated_at)``; the jobs table is small. Never
-    mutates anything.
+    callers redact it) and the latest published edge's ``updated_at`` (UTC
+    ``...Z``). The edge count and the latest edge come from one index-only
+    scan of ``(catalog_instance_id, updated_at)`` (the page shows the exact
+    count); the job counts from the partial indexes of the source's active
+    and failed jobs, never from its job rows (one per track). Never mutates
+    anything.
     """
+    jobs = table('edge_profile_jobs')
     cur = db.cursor()
     cur.execute(f"""
-        SELECT edges.ready, jobs.active, jobs.failed, jobs.last_error, edges.last_success_at
+        SELECT edges.ready,
+               (SELECT count(*) FROM {jobs}
+                 WHERE catalog_instance_id=%s AND status IN ('pending', 'running')) AS active,
+               (SELECT count(*) FROM {jobs} WHERE catalog_instance_id=%s AND status='failed') AS failed,
+               (SELECT last_error FROM {jobs}
+                 WHERE catalog_instance_id=%s AND status='failed'
+                 ORDER BY updated_at DESC LIMIT 1) AS last_error,
+               edges.last_success_at::timestamptz
           FROM (SELECT count(*) AS ready, max(updated_at) AS last_success_at
-                  FROM {table('edge_profiles')} WHERE catalog_instance_id=%s) edges,
-               (SELECT count(*) FILTER (WHERE status IN ('pending', 'running')) AS active,
-                       count(*) FILTER (WHERE status='failed') AS failed,
-                       (SELECT last_error FROM {table('edge_profile_jobs')}
-                         WHERE catalog_instance_id=%s AND status='failed'
-                         ORDER BY updated_at DESC LIMIT 1) AS last_error
-                  FROM {table('edge_profile_jobs')} WHERE catalog_instance_id=%s) jobs
-    """, (catalog_id, catalog_id, catalog_id))
+                  FROM {table('edge_profiles')} WHERE catalog_instance_id=%s) edges
+    """, (catalog_id, catalog_id, catalog_id, catalog_id))
     row = cur.fetchone()
     cur.close()
     ready, active, failed, last_error, last_success_at = row or (0, 0, 0, None, None)
@@ -516,7 +568,7 @@ def edge_profile_status(db, catalog_id):
         "active": int(active or 0),
         "failed": int(failed or 0),
         "last_error": str(last_error) if last_error else None,
-        "last_success_at": last_success_at.isoformat() if last_success_at else None,
+        "last_success_at": _utc_iso(last_success_at),
     }
 
 
@@ -529,7 +581,8 @@ def _edge_due_sql():
     # one row and seq-scanned the jobs per track (AUD-14). The payload is NOT
     # NULL and a track has at most one job and one edge, so the meaning is
     # unchanged. An edge flagged for a music-end recheck (SF.3) is due like a
-    # missing one.
+    # missing one. A job of the published media that failed EDGE_FAILURE_CAP
+    # times under this analyzer is not due at all (``fail_edge_job``).
     return f"""{table('published_source_profiles')} p
         WHERE p.catalog_instance_id=%s AND p.media_signature IS NOT NULL
           AND NOT EXISTS (SELECT 1 FROM {table('edge_profiles')} e
@@ -539,9 +592,12 @@ def _edge_due_sql():
           AND NOT EXISTS (SELECT 1 FROM {table('edge_profile_jobs')} j
                            WHERE j.catalog_instance_id=p.catalog_instance_id
                              AND j.track_id=p.track_id
-                             AND j.updated_at >= now()-interval '6 hours'
-                             AND NOT (j.status='failed'
-                                      AND j.last_error IS NOT DISTINCT FROM 'edge-enqueue-failed'))"""
+                             AND ((j.updated_at >= now()-interval '6 hours'
+                                   AND NOT (j.status='failed'
+                                            AND j.last_error IS NOT DISTINCT FROM 'edge-enqueue-failed'))
+                                  OR ({_edge_capped_sql('j')}
+                                      AND j.media_revision = 'sha256:' || encode(sha256(convert_to(
+                                          p.media_signature::text, 'UTF8')), 'hex'))))"""
 
 
 def edge_backfill_candidates(db, catalog_id, after='', limit=100):
@@ -716,15 +772,17 @@ def edge_statuses(db, catalog_id, ids):
     """Per-track edge state for ``/api/profiles?edge_status=1``.
 
     ``ready`` (a current edge is served), ``pending`` (queued or running),
-    ``failed`` with ``retry_at``, ``unsupported`` (never measurable for this
-    media), or ``absent``.
+    ``failed`` with ``retry_at`` (none for a job at EDGE_FAILURE_CAP, which is
+    retried only once its media or the analyzer changes; the contract's
+    ``retry_at?``), ``unsupported`` (never measurable for this media), or
+    ``absent``.
     """
     ids = list(dict.fromkeys(ids))
     if not ids:
         return {}
     cur = db.cursor()
     cur.execute(f"""SELECT p.track_id, edge.payload IS NOT NULL, j.status, j.updated_at::timestamptz, j.media_revision,
-                           p.media_signature, j.last_error
+                           p.media_signature, j.last_error, j.track_id IS NOT NULL AND {_edge_capped_sql('j')}
         FROM {table('published_source_profiles')} p {edge_join(columns='1 AS payload')}
         LEFT JOIN {table('edge_profile_jobs')} j
           ON j.catalog_instance_id=p.catalog_instance_id AND j.track_id=p.track_id
@@ -732,7 +790,7 @@ def edge_statuses(db, catalog_id, ids):
     rows = cur.fetchall()
     cur.close()
     result = {}
-    for track_id, has_edge, status, updated_at, revision, signature, last_error in rows:
+    for track_id, has_edge, status, updated_at, revision, signature, last_error, capped in rows:
         current = revision is not None and revision == opaque_revision(signature)
         if has_edge:
             result[track_id] = {'status': 'ready'}
@@ -740,6 +798,9 @@ def edge_statuses(db, catalog_id, ids):
             result[track_id] = {'status': 'pending'}
         elif current and status == UNSUPPORTED:
             result[track_id] = {'status': 'unsupported'}
+        elif current and status == 'failed' and capped:
+            # No retry until the media or the analyzer changes (fail_edge_job).
+            result[track_id] = {'status': 'failed'}
         elif current and status == 'failed' and updated_at is not None:
             # Mirrors claim_edge_requests: a refused enqueue is due again at
             # once, any other failure after its six-hour back-off.

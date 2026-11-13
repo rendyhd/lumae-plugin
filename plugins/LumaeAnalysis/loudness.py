@@ -204,6 +204,8 @@ def analyze_blocks(
         for block_start in range(0, block.shape[1], MAX_FILTER_BLOCK_FRAMES):
             _check_deadline(deadline)
             pcm = block[:, block_start : block_start + MAX_FILTER_BLOCK_FRAMES]
+            if not np.all(np.isfinite(pcm)):
+                raise ValueError("non-finite decoded audio")
             frame_count = int(pcm.shape[1])
             if total_frames + frame_count > max_frames:
                 raise ProfileResourceLimitError(
@@ -289,6 +291,11 @@ def _decode_sample_format(channels):
     return "fltp" if channels <= PLANAR_MAX_CHANNELS else "flt"
 
 
+# The waveform pass joins decoded frames to about this many
+# (``edge_profiles.coalesce_blocks``): the profile is the same whatever the block size.
+COALESCE_FRAMES = 8192
+
+
 def _frame_blocks(resampler, frame, channels):
     """Yield the resampled audio as channel-first float32 blocks."""
     for converted in resampler.resample(frame):
@@ -349,6 +356,8 @@ def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS, ob
             rate=sample_rate,
         )
 
+        from .edge_profiles import coalesce_blocks
+
         def decoded_blocks():
             for frame in container.decode(stream):
                 _check_deadline(deadline)
@@ -358,7 +367,7 @@ def analyze_file(path, *, deadline_seconds=DEFAULT_ANALYSIS_DEADLINE_SECONDS, ob
             yield from _frame_blocks(resampler, None, channels)
 
         return analyze_blocks(
-            decoded_blocks(),
+            coalesce_blocks(decoded_blocks(), COALESCE_FRAMES),
             sample_rate,
             channel_count=channels,
             deadline=deadline,

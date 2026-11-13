@@ -43,7 +43,7 @@ def library(tick, monkeypatch, tmp_path):
     state = types.SimpleNamespace(mod=mod, db=db, downloads=[], tags=[], tmp=tmp_path,
                                   source=_write(tmp_path / "song.flac", seconds=8.0))
 
-    def load(track_id, catalog_instance_id=None, server_id=None, defer=False):
+    def load(track_id, catalog_instance_id=None, server_id=None, defer=False, **_kwargs):
         state.downloads.append(track_id)
         copy = tmp_path / "downloads" / f"{track_id}-{len(state.downloads)}.flac"
         copy.parent.mkdir(exist_ok=True)
@@ -170,7 +170,7 @@ def own_download(tick, monkeypatch, tmp_path):
     _track(db, "track-a")
     fetched, hosted = [], []
 
-    def fetch(target, cancelled=None, session=None):
+    def fetch(target, cancelled=None, session=None, deadline_seconds=None):
         fetched.append(dict(target.params))
         with open(target.path, "wb") as out:
             out.write(b"fLaC")
@@ -227,7 +227,7 @@ def test_a_refused_download_falls_back_to_the_host_for_a_while(own_download, mon
     configure({"u": "lumae", "t": "token", "s": "salt"})
     attempts = []
 
-    def refuse(target, cancelled=None, session=None):
+    def refuse(target, cancelled=None, session=None, deadline_seconds=None):
         attempts.append(1)
         raise analysis_download.DownloadError("download refused (HTTP 501)")
 

@@ -531,8 +531,14 @@ def run(units, prepare, finish, *, pool=None, deadline=None, between=None):
             job = pool.collect(wait)
             if job is not None:
                 settle(job)
-    finally:
-        _cancel_in_flight(pool, in_flight, settle, finish, report)
+    except BaseException:
+        # The other files in flight still finish; the first error is the one raised.
+        try:
+            _cancel_in_flight(pool, in_flight, settle, finish, report)
+        except Exception:  # noqa: BLE001 - the error already raised wins
+            logger.exception("lumae_analysis could not finish a cancelled analysis file")
+        raise
+    _cancel_in_flight(pool, in_flight, settle, finish, report)
     return report
 
 
@@ -543,9 +549,19 @@ def _cancel_in_flight(pool, in_flight, settle, finish, report):
     """Cancel the files still in flight and finish each: a file that completed
     meanwhile keeps its result, the rest end ``Cancelled``. A file that does
     not stop within CANCEL_JOIN_SECONDS is abandoned and finished as
-    ``Cancelled`` too; its thread's late answer is ignored."""
+    ``Cancelled`` too; its thread's late answer is ignored. Every file is
+    finished even when a ``finish`` raises; the first such error is raised
+    after the last."""
     if not in_flight:
         return
+    errors = []
+
+    def guarded(call, *args):
+        try:
+            call(*args)
+        except Exception as exc:  # noqa: BLE001 - raised after every file finished
+            errors.append(exc)
+
     for _index, job in list(in_flight.values()):
         pool.cancel(job)
     give_up = time.monotonic() + CANCEL_JOIN_SECONDS
@@ -555,10 +571,12 @@ def _cancel_in_flight(pool, in_flight, settle, finish, report):
             break
         job = pool.collect(min(left, 0.5))
         if job is not None:
-            settle(job)
+            guarded(settle, job)
     if in_flight:
         logger.warning("lumae_analysis %d analysis file(s) did not stop when cancelled", len(in_flight))
         for _index, job in list(in_flight.values()):
             in_flight.pop(id(job), None)
             report.cancelled.append(job.unit)
-            finish(job.unit, job.context, None, Cancelled())
+            guarded(finish, job.unit, job.context, None, Cancelled())
+    if errors:
+        raise errors[0]

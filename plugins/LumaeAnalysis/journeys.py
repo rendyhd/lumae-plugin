@@ -31,6 +31,9 @@ JOURNEYS_SCHEMA_VERSION = 1
 JOURNEY_VERSION = 1
 MAX_JOURNEY_BYTES = 1_500_000
 MAX_REQUEST_BYTES = 2 * MAX_JOURNEY_BYTES
+# A changes page stops adding records past this many bytes of journey and
+# credits JSON (it always holds at least one record).
+MAX_CHANGES_PAGE_BYTES = 8_000_000
 STATUSES = ("in-progress", "finished")
 ENTRY_STATES = ("pending", "played")
 OUTCOMES = ("ended", "skipped", "heard")
@@ -261,19 +264,31 @@ def rekey_journeys(cur, catalog_id, mapping):
         ("journey_records", ("principal", "catalog_id", "id"), "journey"),
         ("journey_mutations", ("principal", "catalog_id", "id"), "response"),
     )
+    old_ids = sorted(str(key) for key in mapping)
+    if not old_ids:
+        return
+
+    def mentions(column):
+        # An exact, server-side test that some string value or object key
+        # anywhere in ``column`` is an old id (``?|`` matches a string
+        # scalar, an array's strings and an object's keys), so only the
+        # bodies that need a rewrite are sent here.
+        return (f"{column} IS NOT NULL AND EXISTS (SELECT 1 FROM "
+                f"jsonb_path_query({column}, 'strict $.**') node WHERE node ?| %s::text[])")
+
     affected = set()
     for name, _, payload_column in tables:
-        cur.execute(f"SELECT principal,{payload_column} FROM {table(name)} "
-                    f"WHERE catalog_id=%s AND {payload_column} IS NOT NULL", (catalog_id,))
-        affected.update(row[0] for row in cur.fetchall() if _replace_exact(row[1], mapping) != row[1])
+        cur.execute(f"SELECT DISTINCT principal FROM {table(name)} "
+                    f"WHERE catalog_id=%s AND {mentions(payload_column)}", (catalog_id, old_ids))
+        affected.update(row[0] for row in cur.fetchall())
     if not affected:
         return
     _lock_scopes(cur, [(principal, catalog_id) for principal in affected])
     for name, key_columns, payload_column in tables:
         # Read again under the locks: a mutation may have committed meanwhile.
         cur.execute(f"SELECT {','.join(key_columns)},{payload_column} FROM {table(name)} "
-                    f"WHERE catalog_id=%s AND principal=ANY(%s) AND {payload_column} IS NOT NULL",
-                    (catalog_id, sorted(affected)))
+                    f"WHERE catalog_id=%s AND principal=ANY(%s) AND {mentions(payload_column)}",
+                    (catalog_id, sorted(affected), old_ids))
         for row in cur.fetchall():
             rewritten = _replace_exact(row[-1], mapping)
             if rewritten == row[-1]:
@@ -328,12 +343,23 @@ def register_journey_routes(bp):
             return jsonify(error=str(error)), 400
         scope = (current_principal(), catalog)
         with get_db().cursor() as cur:
-            cur.execute(f"""SELECT id,revision,deleted,journey,credits,seq FROM {table('journey_records')}
-                WHERE principal=%s AND catalog_id=%s AND seq>%s ORDER BY seq LIMIT %s""", (*scope, cursor, limit + 1))
+            # A page also stops once its records reach MAX_CHANGES_PAGE_BYTES
+            # (always at least one record): a short page with hasMore and the
+            # cursor of its last record. Only the records sent are loaded.
+            cur.execute(f"""SELECT id,revision,deleted,journey,credits,seq,candidates FROM (
+                SELECT page.*, sum(size) OVER (ORDER BY seq) AS running, count(*) OVER () AS candidates
+                  FROM (SELECT id,revision,deleted,seq,
+                               octet_length(COALESCE(journey::text,''))+octet_length(credits::text) AS size
+                          FROM {table('journey_records')}
+                         WHERE principal=%s AND catalog_id=%s AND seq>%s ORDER BY seq LIMIT %s) page) sized
+                JOIN {table('journey_records')} r USING (id,revision,deleted,seq)
+                WHERE r.principal=%s AND r.catalog_id=%s AND (running<=%s OR running=size)
+                ORDER BY seq""", (*scope, cursor, limit + 1, *scope, MAX_CHANGES_PAGE_BYTES))
             rows = cur.fetchall()
         page = rows[:limit]
         response = jsonify(records=[_record(*r[:5]) for r in page],
-                           cursor=page[-1][5] if page else cursor, hasMore=len(rows) > limit)
+                           cursor=page[-1][5] if page else cursor,
+                           hasMore=bool(rows) and len(page) < rows[0][6])
         response.headers["Cache-Control"] = "private, no-store"
         return response
 

@@ -125,6 +125,38 @@ def inspect_track_id_sets(previous_ids: Iterable[str], current_ids: Iterable[str
     )
 
 
+def _ids_reverted_to_legacy(published_ids, scanned_ids) -> bool:
+    """Whether the scan carries published canonical IDs in their legacy form.
+
+    The rekey check run backwards: a scanned legacy ID whose canonical form
+    is published, while that canonical ID is no longer in the scan, is exact
+    codec evidence that the server's IDs changed back (its pre-rekey database
+    restored). A restore reverts the library, not one track: the reverted
+    IDs must outnumber the published canonical IDs still in the scan
+    unchanged, so a single legacy ID among canonical ones is not a reversal.
+    A scan that has both forms of a track is a conflict, not a reversal, and
+    is not counted as one. A binary-only downgrade keeps the canonical IDs
+    and has none.
+    """
+    published = {str(value) for value in published_ids}
+    scanned = {str(value) for value in scanned_ids}
+    still_canonical = 0
+    for kept_id in scanned & published:
+        kept = canonicalize_navidrome_id(kept_id)
+        if kept.recognized and not kept.changed:
+            still_canonical += 1
+    reverted = both_forms = 0
+    for scanned_id in scanned - published:
+        converted = canonicalize_navidrome_id(scanned_id)
+        if not (converted.recognized and converted.changed) or converted.value not in published:
+            continue
+        if converted.value in scanned:
+            both_forms += 1
+        else:
+            reverted += 1
+    return both_forms == 0 and reverted > still_canonical
+
+
 def migrate_provider_identity(db):
     cur = db.cursor()
     cur.execute(
@@ -238,16 +270,96 @@ def migrate_provider_identity(db):
     cur.close()
 
 
+# The states an applied transition is stored in while it waits for an
+# inspection: a new (or pre-boundary) provider version, or a block, sends it
+# back without discarding its id, manifest and ``applied_at``
+# (_starts_new_transition), and inspect_catalog_identity restores ``applied``
+# when the IDs are unchanged.
+_APPLIED_AWAITING_INSPECTION = (
+    ProviderIdentityTransitionState.TRANSITION_PENDING.value,
+    ProviderIdentityTransitionState.BLOCKED.value,
+)
+
+
+def _published_sql(alias):
+    """SQL: the row carries a published transition (manifest and ``applied_at``)."""
+    return f"({alias}.applied_at IS NOT NULL AND {alias}.manifest_sha256 IS NOT NULL)"
+
+
+def transition_was_applied(state, transition_id, published):
+    """Whether the row's transition was applied and still stands.
+
+    Stored ``applied``, or stored ``transition_pending``/``blocked`` with its
+    transition id and a published transition (``published``: ``applied_at``
+    and ``manifest_sha256`` both set, as ``_published_sql`` reads them).
+    ``_was_applied_sql`` is the same rule for a statement.
+    """
+    return bool(transition_id) and (
+        state == ProviderIdentityTransitionState.APPLIED.value
+        or (state in _APPLIED_AWAITING_INSPECTION and bool(published))
+    )
+
+
+def _was_applied_sql(alias):
+    """``transition_was_applied`` as an SQL condition on the row ``alias``."""
+    awaiting = ", ".join(f"'{state}'" for state in _APPLIED_AWAITING_INSPECTION)
+    return (
+        f"({alias}.transition_id IS NOT NULL"
+        f" AND ({alias}.state='{ProviderIdentityTransitionState.APPLIED.value}'"
+        f" OR ({alias}.state IN ({awaiting}) AND {_published_sql(alias)})))"
+    )
+
+
 def require_projection_reconcile(db):
-    """Persist an upgrade-safe request to compare carried and current projections."""
+    """Persist an upgrade-safe request to compare carried and current projections.
+
+    Every applied transition gets it, also one a version observation or a
+    block has sent back to inspection: the inspection restores ``applied``
+    (the projection is then owed) or opens the next transition (one extra
+    projection check, which is harmless).
+
+    Locks in the order of a refresh: when a transition was applied, all
+    ``catalog_state`` rows first (by ``catalog_instance_id``, as
+    prune_catalog_storage does later in the same install transaction), then
+    the applied transition rows. A refresh
+    inspecting a transition_pending or blocked row holds ``catalog_state``
+    and waits for the transition row (inspect_catalog_identity,
+    catalog._confirm_catalog_identity); locking the transition row first
+    and then reaching prune_catalog_storage closed a cycle with it. A row
+    that becomes applied after the catalogue rows are locked is not flagged:
+    its own publication leaves AudioMuse health to be checked, and the
+    recheck projects then.
+    """
 
     cur = db.cursor()
     cur.execute(
         f"""
-        UPDATE {t('provider_identity_transitions')}
-           SET projection_reconcile_required=TRUE, updated_at=now()
-         WHERE state='applied'
+        SELECT c.catalog_instance_id
+          FROM {t('catalog_state')} c
+          JOIN {t('provider_identity_transitions')} p USING (catalog_instance_id)
+         WHERE {_was_applied_sql('p')}
+         ORDER BY c.catalog_instance_id
         """
+    )
+    locked = [str(row[0]) for row in cur.fetchall() or ()]
+    if not locked:
+        cur.close()
+        return 0
+    # All catalog_state rows, in id order, as prune_catalog_storage locks them
+    # later in the install: locking only the applied sources' rows first (S2,
+    # then S1 in prune) inverted the order against a process locking by id.
+    cur.execute(
+        f"SELECT catalog_instance_id FROM {t('catalog_state')} "
+        "ORDER BY catalog_instance_id FOR UPDATE"
+    )
+    cur.fetchall()
+    cur.execute(
+        f"""
+        UPDATE {t('provider_identity_transitions')} p
+           SET projection_reconcile_required=TRUE, updated_at=now()
+         WHERE p.catalog_instance_id = ANY(%s) AND {_was_applied_sql('p')}
+        """,
+        (locked,),
     )
     changed = max(int(getattr(cur, "rowcount", 0) or 0), 0)
     cur.close()
@@ -333,7 +445,8 @@ def _source_state(db, server_id, for_update=False):
                p.baseline_integrity, p.audiomuse_health, p.manifest_sha256,
                p.catalog_instance_id IS NOT NULL, p.baseline_catalog_generation,
                p.baseline_analysis_generation, p.detected_at IS NOT NULL,
-               s.provider_type, s.provider_server_id
+               s.provider_type, s.provider_server_id,
+               {_published_sql('p')}
           FROM {t('catalog_sources')} s
           LEFT JOIN {t('catalog_state')} c USING (catalog_instance_id)
           LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
@@ -386,7 +499,16 @@ def _source_state(db, server_id, for_update=False):
                 "provider_server_id": str(row[25]) if row[25] else None,
             }
         )
+    if len(row) > 26:
+        # For transition_was_applied: a transition sent back to inspection.
+        source["transition_published"] = bool(row[26])
     return source
+
+
+def _source_was_applied(source):
+    return transition_was_applied(
+        source.get("state"), source.get("transition_id"), source.get("transition_published")
+    )
 
 
 def _ensure_transition_row(db, source):
@@ -408,10 +530,95 @@ def _ensure_transition_row(db, source):
 
 
 def _starts_new_transition(source, state):
-    return state == ProviderIdentityTransitionState.TRANSITION_PENDING.value and (
-        not source.get("transition_id")
-        or source.get("state") == ProviderIdentityTransitionState.APPLIED.value
+    # An applied transition that a new provider version sends back to
+    # inspection keeps its identity, manifest and AudioMuse health:
+    # inspect_catalog_identity restores ``applied`` when the IDs are
+    # unchanged and opens the next transition only when they changed. Up to
+    # 1.10.2 this opened it at once, and the unchanged inspection then set
+    # ``normal`` while the AudioMuse migration was still outstanding.
+    return (
+        state == ProviderIdentityTransitionState.TRANSITION_PENDING.value
+        and not source.get("transition_id")
     )
+
+
+def _caller_gate(source, state, superseded):
+    """The state the caller is gated on.
+
+    ``superseded``: the stored state changed between this call's read and its
+    write (a rekey publication, another observer), so the write was skipped
+    and that change stands. The call still fails closed, as after a failed
+    probe: a published catalogue is gated as ``transition_pending`` for this
+    caller only, so a refresh inspects the ID sets under the row lock and a
+    projection waits.
+    """
+    if (
+        superseded
+        and source["catalog_generation"] > 0
+        and state
+        not in (
+            ProviderIdentityTransitionState.TRANSITION_PENDING.value,
+            ProviderIdentityTransitionState.BLOCKED.value,
+        )
+    ):
+        return ProviderIdentityTransitionState.TRANSITION_PENDING.value
+    return state
+
+
+def _row_written(cur):
+    """Whether a compare-and-set UPDATE matched its row (a cursor double
+    without a row count is taken to have written)."""
+    return getattr(cur, "rowcount", 1) != 0
+
+
+def _probe_error_changes(source, last_error):
+    """Whether a failed probe's error differs from the stored one."""
+    if any(key not in source for key in _OBSERVED_KEYS) or not source["transition_exists"]:
+        return True
+    return (source["last_error"] or None) != (str(last_error)[:1000] if last_error else None)
+
+
+# The row an observation read, by state and transition id. The state alone
+# is not enough: an inspection that opens the next transition of a
+# was-applied ``transition_pending`` row gives it a new id and keeps the
+# state, and a write keyed on the state alone put the old id back over the
+# new transition's baselines and proof (its publication then failed on the
+# manifest primary key for good).
+_COMPARE_AND_SET = (
+    "WHERE catalog_instance_id=%s AND state=%s AND transition_id IS NOT DISTINCT FROM %s"
+)
+
+
+def _compare_and_set_params(source):
+    return (
+        source["catalog_instance_id"],
+        source.get("state") or ProviderIdentityTransitionState.NORMAL.value,
+        source.get("transition_id"),
+    )
+
+
+def _record_probe_error(db, source, last_error):
+    """Store a failed probe's error and nothing else.
+
+    The rest of the row was read without a lock and may be stale by now, so
+    none of it is written back; a state that changed since the read keeps its
+    own ``last_error`` too. Returns whether the row was written.
+    """
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        UPDATE {t('provider_identity_transitions')}
+           SET last_error=%s, updated_at=now()
+         {_COMPARE_AND_SET}
+        """,
+        (
+            str(last_error)[:1000] if last_error else None,
+            *_compare_and_set_params(source),
+        ),
+    )
+    written = _row_written(cur)
+    cur.close()
+    return written
 
 
 _OBSERVED_KEYS = (
@@ -472,6 +679,15 @@ def _update_observation(
     required_action,
     last_error=None,
 ):
+    """Write an observation; returns whether the row was written.
+
+    Compare-and-set on the state ``source`` was read with: the read takes no
+    lock, so a state committed since (a rekey publication's ``applied``)
+    wins and nothing is written. A failed probe (``last_error``) is not
+    evidence and stores only its error.
+    """
+    if last_error:
+        return _record_probe_error(db, source, last_error)
     transition_id = source.get("transition_id")
     starts_new_transition = _starts_new_transition(source, state)
     if starts_new_transition:
@@ -504,9 +720,9 @@ def _update_observation(
                applied_at=CASE WHEN %s THEN NULL ELSE applied_at END,
                detected_at=CASE WHEN %s='transition_pending'
                    THEN COALESCE(detected_at, now()) ELSE detected_at END,
-               last_error=%s,
+               last_error=NULL,
                updated_at=now()
-         WHERE catalog_instance_id=%s
+         {_COMPARE_AND_SET}
         """,
         (
             transition_id,
@@ -528,11 +744,12 @@ def _update_observation(
             starts_new_transition,
             starts_new_transition,
             state,
-            str(last_error)[:1000] if last_error else None,
-            source["catalog_instance_id"],
+            *_compare_and_set_params(source),
         ),
     )
+    written = _row_written(cur)
     cur.close()
+    return written
 
 
 def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=True):
@@ -600,9 +817,17 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
             "required_action": source.get("required_action"),
             "last_error": exc,
         }
-        if _observation_changes(source, **observation):
-            _update_observation(db, source, **observation)
-            written = True
+        # Only the error is written, and only onto the state this call read
+        # (_record_probe_error): a rekey publication that committed
+        # ``applied`` while the ping was failing is not overwritten.
+        if _probe_error_changes(source, exc):
+            if _update_observation(db, source, **observation) is not False:
+                written = True
+            else:
+                # The row changed since this call read it (a health check
+                # sent an applied transition back to inspection, a rekey
+                # publication): its read state is stale, so gate closed.
+                gate_state = _caller_gate(source, gate_state, True)
         if commit:
             db.commit()
         return {
@@ -624,9 +849,11 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
             "detection_reason": "provider_type_changed",
             "required_action": "set_up_new_catalogue",
         }
+        # A lost compare-and-set needs nothing more here: the caller is
+        # gated as blocked either way.
         if _observation_changes(source, **observation):
-            _update_observation(db, source, **observation)
-            written = True
+            if _update_observation(db, source, **observation) is not False:
+                written = True
         if commit:
             db.commit()
         return {
@@ -649,7 +876,7 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
             ProviderIdentityTransitionState.TRANSITION_PENDING.value,
             ProviderIdentityTransitionState.BLOCKED.value,
         )
-        if after_boundary is False:
+        if after_boundary is False and not _source_was_applied(source):
             next_state = ProviderIdentityTransitionState.NORMAL.value
             reason = "pre_transition_version"
             action = None
@@ -666,8 +893,22 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
                 action = None
             reason = reason or "provider_ids_checked"
         else:
+            # A pre-boundary version reaches this branch only for an applied
+            # transition: a server that moved to canonical IDs reports a
+            # pre-canonical release (a downgrade, or a misreported version).
+            # Writing ``normal`` lifted the projection hold while the AudioMuse
+            # migration could still be owed; like any other new version it is
+            # sent back to inspection, keeping its identity, and the
+            # inspection restores ``applied`` when the IDs are unchanged. Once
+            # an inspection has checked that version, the branch above keeps
+            # ``applied``.
             next_state = ProviderIdentityTransitionState.TRANSITION_PENDING.value
-            reason = "provider_version_boundary" if after_boundary else "provider_version_uncertain"
+            if after_boundary is False:
+                reason = "pre_transition_version_after_rekey"
+            elif after_boundary:
+                reason = "provider_version_boundary"
+            else:
+                reason = "provider_version_uncertain"
             action = "inspect_provider_identity"
 
     observation = {
@@ -676,9 +917,12 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
         "detection_reason": reason,
         "required_action": action,
     }
+    superseded = False
     if _observation_changes(source, **observation):
-        _update_observation(db, source, **observation)
-        written = True
+        if _update_observation(db, source, **observation) is False:
+            superseded = True
+        else:
+            written = True
     audiomuse_health = source.get("audiomuse_health")
     if refresh_health and next_state == ProviderIdentityTransitionState.APPLIED.value:
         adapter = getattr(bridge, "core", None)
@@ -697,7 +941,7 @@ def observe_provider_version(db, bridge, server_id, commit=True, refresh_health=
         db.commit()
     return {
         **source,
-        "state": next_state,
+        "state": _caller_gate(source, next_state, superseded),
         "current_provider_version": current_version,
         "observation": "verified",
         "provider_identity": identity,
@@ -766,6 +1010,9 @@ def _update_jellyfin_observation(db, source, *, state, current_version, detectio
     a new one. Entering ``transition_pending`` from any other state opens a
     new transition id. ``blocked`` resets any target proof: a rekey must be
     proven again by two scans of the verified server.
+
+    Compare-and-set on the state and transition id ``source`` was read with,
+    as ``_update_observation``; returns whether the row was written.
     """
     stored_state = source.get("state") or ProviderIdentityTransitionState.NORMAL.value
     normal = state == ProviderIdentityTransitionState.NORMAL.value
@@ -806,7 +1053,7 @@ def _update_jellyfin_observation(db, source, *, state, current_version, detectio
                checked_at=now(),
                last_error=%s,
                updated_at=now()
-         WHERE catalog_instance_id=%s
+         {_COMPARE_AND_SET}
         """,
         (
             transition_id,
@@ -832,11 +1079,12 @@ def _update_jellyfin_observation(db, source, *, state, current_version, detectio
             state,
             opens or normal,
             str(last_error)[:1000] if last_error else None,
-            source["catalog_instance_id"],
+            *_compare_and_set_params(source),
         ),
     )
+    written = _row_written(cur)
     cur.close()
-    return transition_id
+    return written
 
 
 def _bind_jellyfin_server(db, source, server_identity_id):
@@ -882,16 +1130,14 @@ def _observe_jellyfin(db, bridge, probe, server_id, source, written, *, commit, 
             and stored_state == ProviderIdentityTransitionState.NORMAL.value
         ):
             gate_state = ProviderIdentityTransitionState.TRANSITION_PENDING.value
-        observation = {
-            "state": stored_state,
-            "current_version": source.get("current_provider_version"),
-            "detection_reason": source.get("detection_reason"),
-            "required_action": source.get("required_action"),
-            "last_error": exc,
-        }
-        if _jellyfin_observation_changes(source, **observation):
-            _update_jellyfin_observation(db, source, **observation)
-            written = True
+        # Only the error, and only onto the state this call read: a rekey
+        # publication that committed meanwhile is not overwritten.
+        if _probe_error_changes(source, exc):
+            if _record_probe_error(db, source, exc):
+                written = True
+            else:
+                # The row changed since the read: gate closed, as above.
+                gate_state = _caller_gate(source, gate_state, True)
         if commit:
             db.commit()
         return {
@@ -942,6 +1188,15 @@ def _observe_jellyfin(db, bridge, probe, server_id, source, written, *, commit, 
             if action == _UNVERIFIED_ACTION:
                 # Its real action comes back with the AudioMuse health check.
                 action = None
+        elif _source_was_applied(source):
+            # An applied transition blocked for a while (another server, an
+            # unsupported release) by the catalogue's own server again: the
+            # rekey it applied stands, and so does the projection hold until
+            # AudioMuse is ready. ``normal`` discarded both. The real action
+            # comes back with the AudioMuse health check.
+            next_state, reason, action = (
+                ProviderIdentityTransitionState.APPLIED.value, JELLYFIN_VERIFIED_REASON, None
+            )
         else:
             next_state, reason, action = (
                 ProviderIdentityTransitionState.NORMAL.value, JELLYFIN_VERIFIED_REASON, None
@@ -952,9 +1207,12 @@ def _observe_jellyfin(db, bridge, probe, server_id, source, written, *, commit, 
         "detection_reason": reason,
         "required_action": action,
     }
+    superseded = False
     if _jellyfin_observation_changes(source, **observation):
-        _update_jellyfin_observation(db, source, **observation)
-        written = True
+        if _update_jellyfin_observation(db, source, **observation):
+            written = True
+        else:
+            superseded = True
     audiomuse_health = source.get("audiomuse_health")
     if refresh_health and next_state == ProviderIdentityTransitionState.APPLIED.value:
         adapter = getattr(bridge, "core", None)
@@ -969,7 +1227,7 @@ def _observe_jellyfin(db, bridge, probe, server_id, source, written, *, commit, 
         db.commit()
     return {
         **source,
-        "state": next_state,
+        "state": _caller_gate(source, next_state, superseded),
         "current_provider_version": observed_version,
         "provider_server_id": provider_server_id,
         "observation": "verified",
@@ -996,7 +1254,9 @@ def inspect_catalog_identity(
         SELECT COALESCE(c.published_generation, 0),
                COALESCE(a.projection_generation, 0),
                p.transition_id, p.state, p.current_provider_version,
-               p.target_fingerprint, p.target_scan_count
+               p.target_fingerprint, p.target_scan_count,
+               {_published_sql('p')},
+               p.audiomuse_health
           FROM {t('catalog_state')} c
           LEFT JOIN {t('analysis_state')} a USING (catalog_instance_id)
           JOIN {t('provider_identity_transitions')} p USING (catalog_instance_id)
@@ -1015,6 +1275,14 @@ def inspect_catalog_identity(
     observed_version = str(current_version or state_row[4] or "").strip() or None
     previous_target_fingerprint = str(state_row[5]) if state_row[5] else None
     previous_target_scan_count = int(state_row[6] or 0)
+    stored_state = str(state_row[3] or "normal")
+    # The row's transition was published: it is still ``applied``, or a new
+    # provider version (or a block) sent it back to inspection, which keeps
+    # its id, manifest and ``applied_at`` (_starts_new_transition).
+    was_applied = transition_was_applied(
+        stored_state, transition_id, len(state_row) > 7 and bool(state_row[7])
+    )
+    stored_health = str(state_row[8]) if len(state_row) > 8 and state_row[8] else None
     if generation == 0:
         cur.execute(
             f"""
@@ -1042,7 +1310,30 @@ def inspect_catalog_identity(
     ).hexdigest()
 
     if inspection.status == "unchanged":
-        preserve_applied = str(state_row[3] or "normal") == "applied" and bool(transition_id)
+        # The same IDs: an applied transition stays applied, with the
+        # AudioMuse health it had and the action that health still requires
+        # (as refresh_audiomuse_health writes it), so the analysis projection
+        # stays held until AudioMuse has migrated.
+        #
+        # A pre-canonical version can also mean the server's old database
+        # was restored: the legacy IDs are back. The check above cannot see
+        # that (it looks for legacy IDs that became canonical), and restoring
+        # ``applied`` then held every projection for good: AudioMuse's
+        # mapping is keyed on the legacy IDs again and never matches the
+        # carried canonical links. Such a row goes ``normal`` and drops its
+        # applied identity, as up to 1.10.2, so the ordinary diff and the
+        # projection rebuild from the server's IDs.
+        reverted = (
+            was_applied
+            and is_after_last_known_pre_canonical_version(observed_version) is False
+            and _ids_reverted_to_legacy(previous_ids, current_track_ids)
+        )
+        preserve_applied = was_applied and not reverted
+        action = (
+            "run_audiomuse_provider_migration"
+            if preserve_applied and stored_health != "ready"
+            else None
+        )
         cur.execute(
             f"""
             UPDATE {t('provider_identity_transitions')}
@@ -1054,7 +1345,7 @@ def inspect_catalog_identity(
                    last_checked_provider_version=COALESCE(%s, current_provider_version),
                    baseline_catalog_generation=%s,
                    baseline_analysis_generation=%s,
-                   detection_reason='provider_ids_unchanged', required_action=NULL,
+                   detection_reason='provider_ids_unchanged', required_action=%s,
                    counts=CASE WHEN %s THEN counts ELSE %s::jsonb END,
                    target_fingerprint=CASE WHEN %s THEN target_fingerprint ELSE %s END,
                    target_scan_count=CASE WHEN %s THEN target_scan_count ELSE 0 END,
@@ -1071,6 +1362,7 @@ def inspect_catalog_identity(
                 observed_version,
                 generation,
                 analysis_generation,
+                action,
                 preserve_applied,
                 json.dumps(inspection.counts(), sort_keys=True),
                 preserve_applied,
@@ -1080,17 +1372,48 @@ def inspect_catalog_identity(
                 catalog_instance_id,
             ),
         )
+        if reverted:
+            # The manifest table keeps the transition (its history).
+            cur.execute(
+                f"""
+                UPDATE {t('provider_identity_transitions')}
+                   SET detection_reason='provider_ids_reverted',
+                       first_seq=NULL, last_seq=NULL,
+                       analysis_baseline='{{}}'::jsonb, baseline_integrity=NULL,
+                       audiomuse_health=NULL, manifest_sha256=NULL, applied_at=NULL
+                 WHERE catalog_instance_id=%s
+                """,
+                (catalog_instance_id,),
+            )
         next_state = "applied" if preserve_applied else "normal"
-        action = None
         stable_scan_count = previous_target_scan_count if preserve_applied else 0
     else:
         next_state = "blocked" if inspection.status in ("conflict", "incomplete") else "transition_pending"
-        transition_id = transition_id or str(uuid.uuid4())
-        stable_scan_count = (
-            previous_target_scan_count + 1
-            if previous_target_fingerprint == target_fingerprint
-            else 1
-        )
+        # A published transition is finished: IDs that changed again open the
+        # next one, with its own id (the manifest keeps the old one), the
+        # current generations as baselines and a proof that starts over. A
+        # block keeps the applied identity, so IDs that turn out unchanged
+        # restore ``applied`` above.
+        opens = was_applied and next_state == "transition_pending"
+        # A ``normal`` row reaches this branch through a caller-only gate (a
+        # failed ping, a lost compare-and-set); its baselines are set here,
+        # under the row lock, as a verified observation sets them, and it has
+        # no proof under way either.
+        rebase = opens or stored_state == "normal"
+        # A block of an applied transition keeps the counts and target proof
+        # of the transition it applied: IDs found unchanged later restore
+        # ``applied`` with them, and they must agree with its manifest and seq
+        # range, not describe the scan that blocked.
+        keeps_applied_proof = was_applied and next_state == "blocked"
+        transition_id = str(uuid.uuid4()) if opens or not transition_id else transition_id
+        if keeps_applied_proof:
+            stable_scan_count = previous_target_scan_count
+        else:
+            stable_scan_count = (
+                previous_target_scan_count + 1
+                if previous_target_fingerprint == target_fingerprint and not rebase
+                else 1
+            )
         action = (
             "resolve_provider_identity_conflict"
             if next_state == "blocked"
@@ -1102,9 +1425,21 @@ def inspect_catalog_identity(
                SET transition_id=%s, state=%s,
                    current_provider_version=COALESCE(%s, current_provider_version),
                    detection_reason=%s, required_action=%s,
-                   counts=%s::jsonb, target_fingerprint=%s,
+                   counts=COALESCE(%s::jsonb, counts), target_fingerprint=%s,
                    target_scan_count=%s,
-                   detected_at=COALESCE(detected_at, now()), checked_at=now(),
+                   baseline_catalog_generation=CASE
+                       WHEN %s THEN %s ELSE baseline_catalog_generation END,
+                   baseline_analysis_generation=CASE
+                       WHEN %s THEN %s ELSE baseline_analysis_generation END,
+                   first_seq=CASE WHEN %s THEN NULL ELSE first_seq END,
+                   last_seq=CASE WHEN %s THEN NULL ELSE last_seq END,
+                   analysis_baseline=CASE WHEN %s THEN '{{}}'::jsonb ELSE analysis_baseline END,
+                   baseline_integrity=CASE WHEN %s THEN NULL ELSE baseline_integrity END,
+                   audiomuse_health=CASE WHEN %s THEN NULL ELSE audiomuse_health END,
+                   manifest_sha256=CASE WHEN %s THEN NULL ELSE manifest_sha256 END,
+                   applied_at=CASE WHEN %s THEN NULL ELSE applied_at END,
+                   detected_at=CASE WHEN %s THEN now() ELSE COALESCE(detected_at, now()) END,
+                   checked_at=now(),
                    last_error=NULL, updated_at=now()
              WHERE catalog_instance_id=%s
             """,
@@ -1114,9 +1449,22 @@ def inspect_catalog_identity(
                 observed_version,
                 inspection.status,
                 action,
-                json.dumps(inspection.counts(), sort_keys=True),
-                target_fingerprint,
+                # Read under the row lock above, so kept as they are stored.
+                None if keeps_applied_proof else json.dumps(inspection.counts(), sort_keys=True),
+                previous_target_fingerprint if keeps_applied_proof else target_fingerprint,
                 stable_scan_count,
+                rebase,
+                generation,
+                rebase,
+                analysis_generation,
+                opens,
+                opens,
+                opens,
+                opens,
+                opens,
+                opens,
+                opens,
+                opens,
                 catalog_instance_id,
             ),
         )
@@ -1151,6 +1499,13 @@ def assert_analysis_projection_allowed(db, bridge, server_id):
             "Provider identity is unresolved; the previous Lumae analysis projection is preserved"
         )
     source = _source_state(db, server_id)
+    if source and source.get("state") in _APPLIED_AWAITING_INSPECTION:
+        # Stored since the observation (a health check sent an applied
+        # transition back to inspection while this call's ping hung): the
+        # observation's gate is stale, and the stored state holds.
+        raise ProviderIdentityTransitionPending(
+            "Provider identity is unresolved; the previous Lumae analysis projection is preserved"
+        )
     if (
         source
         and source.get("state") == ProviderIdentityTransitionState.APPLIED.value

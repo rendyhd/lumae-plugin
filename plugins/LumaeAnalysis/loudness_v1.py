@@ -116,11 +116,20 @@ class _TruePeak:
         self.history_frames = int(math.ceil(len(self.filter) / factor)) + 1
         self.history = np.zeros((channels, self.history_frames))
         self.peak = 0.0
+        # Every oversampled value is one polyphase branch's taps times input samples, so
+        # its magnitude is at most max|input| times the largest branch's sum of |taps|.
+        # The margin covers the rounding of the filter's sums and of this bound.
+        self.gain = max(float(np.sum(np.abs(self.filter[phase::factor]))) for phase in range(factor))
+        self.gain *= 1.0 + 1e-9
 
     def add(self, pcm):
         extended = np.concatenate([self.history, pcm], axis=1)
         start, stop = self.history_frames * self.factor, (self.history_frames + pcm.shape[1]) * self.factor
         for channel in extended:
+            # Only the running maximum is kept: a channel whose bound cannot exceed it
+            # leaves it unchanged, so its oversampling is skipped (the history still moves).
+            if float(np.max(np.abs(channel), initial=0.0)) * self.gain <= self.peak:
+                continue
             upsampled = upfirdn(self.filter, channel, up=self.factor)[start:stop]
             if upsampled.size:
                 self.peak = max(self.peak, float(np.max(np.abs(upsampled))))

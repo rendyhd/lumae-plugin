@@ -57,7 +57,10 @@ _SCHEME_PROSE = (
 # The rest of an unquoted file path. Music file names contain spaces, so a
 # path runs to the next ": ", quote, " (" or the end rather than to the next
 # space. A quoted path is matched whole first.
-_PATH_REST = r"(?:(?! \()[^\"'<>|:]|:(?!\s|$))*"
+# A " (Deluxe)" group inside a name is part of the path when the path goes on after
+# it ("/", "\" or ".ext"); a " (exit 1)." after the path is prose.
+_PATH_PAREN = r" \([^()\"'<>|:]{1,64}\)(?=[/\\]|\.\w)"
+_PATH_REST = r"(?:(?! \()[^\"'<>|:]|:(?!\s|$)|" + _PATH_PAREN + r")*"
 _PATH_START = r"(?:/|~/|[A-Za-z]:\\|\\\\|file://)"
 
 _PATTERNS = (
@@ -102,12 +105,43 @@ _PATTERNS = (
     # Userinfo in any URL: scheme://user:password@host -> scheme://[redacted]@host.
     # One inner space is allowed: the text is whitespace-collapsed, so a line
     # break inside the userinfo ("user:\npass@") became one.
+    # A password may itself hold "@", "/", "?" or "#" (postgresql://u:p@ss@db/x,
+    # u:pa/ss@db): the first "@" that is followed by a host (no "@", "/", "?" or
+    # "#" before the path starts) ends the userinfo. A port ("host:8080/x?e=a@b")
+    # is not a password. Every scan is bounded, so no start rescans the line.
     (
         re.compile(
-            r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31}://)"
-            r"[^\s/?#@\"'<>]+(?: [^\s/?#@\"'<>]+)?@"
+            r"(?i)(?<![a-z0-9+.-])([a-z][a-z0-9+.-]{0,31}://)(?:"
+            r"[^\s/?#@\"'<>:]{1,64}:(?!\d{1,5}(?:[/?#]|\s|$))[^\s\"'<>]{0,200}?@"
+            r"(?=[^\s@/?#\"'<>]{0,255}(?:[/?#]|\s|$))"
+            r"|[^\s/?#@\"'<>]+(?: [^\s/?#@\"'<>]+)?@)"
         ),
         r"\1" + REDACTED + "@",
+    ),
+    # Subsonic credentials as a dict repr ({'u': 'admin', 'p': 'hunter2'}): the exact
+    # keys p (password), t (token) and s (salt), quoted. The user name u is no secret.
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_.-])([\"'])([tsp])\1(\s*:\s*)(?:\"[^\"]*\"|'[^']*')"
+        ),
+        r"\1\2\1\3" + REDACTED,
+    ),
+    # The same keys in a query string without its "?" (p=hunter2&u=admin): only
+    # when another key=value follows, so "p=0.05" in prose stays.
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_.-])([tsp]=)[^&;#?\s\"'<>]*(?=&" + _KEY + r"{1,64}=)"
+        ),
+        r"\1" + REDACTED,
+    ),
+    # A command-line option with its value after a space (--password hunter2).
+    (
+        re.compile(
+            r"(?<![A-Za-z0-9_.-])(--(?=[A-Za-z0-9_-]{0,64}?" + _SECRET_WORD + r")"
+            r"[A-Za-z0-9_-]{1,64} +)(?!-|" + _MASKED + r"|(?i:is|was|are|not|must|cannot|"
+            r"required|missing|expired|invalid)\b)(?:\"[^\"]*\"|'[^']*'|[^\s\"']+)"
+        ),
+        r"\1" + REDACTED,
     ),
     # Secret query parameters: ?t=..&s=..&p=.., &token=.., ?api_key=.. A
     # value stops at the next separator or "?", so a parameter after it, or a
@@ -128,7 +162,9 @@ _PATTERNS = (
         re.compile(
             r"(?<!" + _KEY + r")" + _SECRET_KEY_AHEAD + r"(" + _KEY + r"{1,64})"
             r"(\\?[\"']?\s*[:=]\s*)(?!" + _MASKED + r")"
-            r"(?:\"[^\"]*\"|'[^']*'|\\\"[^\"\\]*\\\"|\\?[\"']?[^\s,;&\"'}\])\\]+)"
+            # An unquoted value runs to whitespace (it may hold "," ";" ")" ...), minus
+            # the closers and separators that end the enclosing text.
+            r"(?:\"[^\"]*\"|'[^']*'|\\\"[^\"\\]*\\\"|\\?[\"']?[^\s\"']*[^\s\"'}\])\\,;])"
         ),
         r"\1\2" + REDACTED,
     ),
@@ -136,10 +172,15 @@ _PATTERNS = (
     # home-relative and absolute POSIX paths with at least two segments. A
     # path inside a URL follows its host, so it is not matched here.
     (re.compile(r"(?i)(?<![\w/])file://" + _PATH_REST), PATH),
-    (re.compile(r"(?i)(?<![\w\\])[a-z]:\\" + _PATH_REST), PATH),
+    (re.compile(r"(?i)(?<![\w\\/])[a-z]:(?:\\|/(?!/))" + _PATH_REST), PATH),
     (re.compile(r"(?<!\\)\\\\[^\s\\\"'<>|]+\\" + _PATH_REST), PATH),
     (re.compile(r"(?<![\w.:/~\\-])~/" + _PATH_REST), PATH),
+    # "./music/A/a.flac" and "../music/A/a.flac".
+    (re.compile(r"(?<![\w.:/~\\-])\.{1,2}/[^\s/\"'<>|:]+/" + _PATH_REST), PATH),
+    # A path after a label ("input:/mnt/music/a.flac"), but not after a port or a
+    # time ("host:5432/db/x" ends in a digit, so it is not at a "/" start here).
     (re.compile(r"(?<![\w.:/\\-])/[^\s/\"'<>|:]+/" + _PATH_REST), PATH),
+    (re.compile(r"(?<=[A-Za-z_-]:)/[^\s/\"'<>|:]+/" + _PATH_REST), PATH),
     # JSON Web Tokens.
     (
         re.compile(

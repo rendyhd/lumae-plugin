@@ -800,7 +800,7 @@ def test_library_item_ids_refuse_dot_only_ids(monkeypatch):
                         lambda item_id, provider, module=None: called.append(item_id)
                         or (None, ("unsupported", 501)))
     monkeypatch.setattr(library, "_resolve_art_target",
-                        lambda item_id, size, provider, module=None: called.append(item_id))
+                        lambda item_id, size, provider, module=None, **_: called.append(item_id))
     app = Flask(__name__)
     blueprint = Blueprint("library_ids", __name__)
     library.register_collection_library_routes(blueprint, lambda view: view)

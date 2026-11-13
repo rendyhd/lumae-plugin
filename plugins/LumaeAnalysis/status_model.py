@@ -177,11 +177,15 @@ def persist_analysis_summary(cur, catalog_instance_id, generation):
                    summary_updated_at=clock_timestamp()
              WHERE a.catalog_instance_id=%s
                AND a.summary_generation IS DISTINCT FROM %s
+               -- Newest wins: a concurrent publication already moved the projection
+               -- on, so an older generation's counts must not replace its summary.
+               AND a.projection_generation = %s
             RETURNING 1
         )
         SELECT count(*) FROM analysis_summary
         """,
-        (catalog_instance_id, generation, generation, catalog_instance_id, generation),
+        (catalog_instance_id, generation, generation, catalog_instance_id, generation,
+         generation),
     )
 
 

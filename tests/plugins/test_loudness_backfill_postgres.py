@@ -231,7 +231,7 @@ def plugin(migrated_db, monkeypatch, tmp_path):
     monkeypatch.setattr(mod, "serve_interactive", lambda *a, **k: 0)
     monkeypatch.setattr(mod, "run_file_analysis", lambda analyzer, path, **kw: analyzer(path, **kw))
 
-    def load(track_id, catalog_instance_id=None, server_id=None):
+    def load(track_id, catalog_instance_id=None, server_id=None, **_kwargs):
         if track_id not in files:
             return None
         return {"file_path": str(files[track_id][0]), "media_signature": "catalog-media:" + files[track_id][1],

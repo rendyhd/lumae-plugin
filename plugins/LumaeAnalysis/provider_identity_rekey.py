@@ -481,6 +481,7 @@ def _copy_analysis_generation(
     )
     old_links = _load_analysis_links(cur, catalog_instance_id, previous_generation)
     new_links = {}
+    carried = []
     for old_id, link in old_links.items():
         new_id = track_mapping.get(old_id, old_id)
         if new_id not in target_track_ids:
@@ -488,33 +489,43 @@ def _copy_analysis_generation(
         if new_id in new_links:
             raise ValueError("Analysis links collide after provider-ID rekey")
         new_links[new_id] = {**link, "provider_track_id": new_id}
+        carried.append((old_id, new_id))
 
-    sql = f"""
-        INSERT INTO {t('track_analysis_links')}
-            (catalog_instance_id, projection_generation, provider_track_id,
-             analysis_id, status, match_tier, algorithm, decision_threshold,
-             distance, evidence_complete, conflict_flags, review_state)
-        VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-    """
-    params = [
-        (
-            catalog_instance_id,
-            next_generation,
-            track_id,
-            link["analysis_id"],
-            link["status"],
-            link["match_tier"],
-            link["algorithm"],
-            link["decision_threshold"],
-            link["distance"],
-            link["evidence_complete"],
-            json.dumps(link["conflict_flags"], sort_keys=True, separators=(",", ":")),
-            link["review_state"],
+    if new_links:
+        # One statement for the generation: a statement per link was about
+        # 100k round trips under the catalogue and analysis row locks. Which
+        # link is carried, and under which ID, is still decided above; the
+        # statement copies the stored values of exactly those links (flags
+        # that are not a list are written as [], as _load_analysis_links
+        # reads them).
+        carried.sort()
+        cur.execute(
+            f"""
+            INSERT INTO {t('track_analysis_links')}
+                (catalog_instance_id, projection_generation, provider_track_id,
+                 analysis_id, status, match_tier, algorithm, decision_threshold,
+                 distance, evidence_complete, conflict_flags, review_state)
+            SELECT l.catalog_instance_id, %s, carried.new_id, l.analysis_id,
+                   l.status, l.match_tier, l.algorithm, l.decision_threshold,
+                   l.distance, COALESCE(l.evidence_complete, FALSE),
+                   CASE WHEN jsonb_typeof(l.conflict_flags)='array'
+                        THEN l.conflict_flags ELSE '[]'::jsonb END,
+                   l.review_state
+              FROM {t('track_analysis_links')} l
+              JOIN unnest(%s::text[], %s::text[]) AS carried(old_id, new_id)
+                ON carried.old_id=l.provider_track_id
+             WHERE l.catalog_instance_id=%s AND l.projection_generation=%s
+            """,
+            (
+                next_generation,
+                [old_id for old_id, _new_id in carried],
+                [new_id for _old_id, new_id in carried],
+                catalog_instance_id,
+                previous_generation,
+            ),
         )
-        for track_id, link in sorted(new_links.items())
-    ]
-    if params:
-        cur.executemany(sql, params)
+        if getattr(cur, "rowcount", len(new_links)) != len(new_links):
+            raise ValueError("Carried analysis links do not match the stored links")
     # Statistics for the new generation before commit, as the projection
     # does (P2-2). Without them _load_relationship_inputs can plan a quadratic
     # nested loop after a rekey. Same order: analysis_items, then links.
@@ -530,20 +541,25 @@ def _copy_analysis_generation(
     for old_id in sorted(set(old_links) - set(target_track_ids) - set(track_mapping)):
         changes.append(("analysis_link", old_id, "delete", None))
 
-    next_seq = int(head_seq)
-    for entity_type, entity_id, operation, payload in changes:
-        next_seq += 1
-        cur.execute(
-            f"""
-            INSERT INTO {t('analysis_changes')}
-                (catalog_instance_id, epoch, seq, generation, entity_type,
-                 entity_id, operation, payload)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s::jsonb)
-            """,
+    # The same rows and sequence numbers as one INSERT per change, a page per
+    # statement (catalog._insert_rows).
+    from .catalog import _insert_rows
+
+    first_seq = int(head_seq) + 1
+    _insert_rows(
+        cur,
+        f"""
+        INSERT INTO {t('analysis_changes')}
+            (catalog_instance_id, epoch, seq, generation, entity_type,
+             entity_id, operation, payload)
+        VALUES %s
+        """,
+        "(%s, %s, %s, %s, %s, %s, %s, %s::jsonb)",
+        (
             (
                 catalog_instance_id,
                 epoch,
-                next_seq,
+                seq,
                 next_generation,
                 entity_type,
                 entity_id,
@@ -551,9 +567,13 @@ def _copy_analysis_generation(
                 json.dumps(payload, sort_keys=True, separators=(",", ":"))
                 if payload is not None
                 else None,
-            ),
-        )
-    return next_seq, new_links
+            )
+            for seq, (entity_type, entity_id, operation, payload) in enumerate(
+                changes, first_seq
+            )
+        ),
+    )
+    return int(head_seq) + len(changes), new_links
 
 
 def inspect_audiomuse_health(cur, adapter, server_id, expected_links):
@@ -638,6 +658,7 @@ def _publish_provider_identity_rekey(
         _estimate_snapshot_bytes,
         _insert_generation_rows,
         _insert_relationship_rows,
+        _insert_rows,
         _published_fingerprints,
         canonical_json,
         catalog_scope_evidence,
@@ -652,8 +673,19 @@ def _publish_provider_identity_rekey(
         raise ValueError("Normalized target no longer matches its stable-scan fingerprint")
     contract = spec.contract if spec else CONTRACT_V1
     change_reason = spec.change_reason if spec else REKEY_REASON
+    scope = catalog_scope_evidence(normalized, spec.provider_type if spec else "navidrome")
 
     cur = db.cursor()
+    # catalog_sources before catalog_state: the order of every statement that
+    # locks both (FOR SHARE OF s, c, a in relationship_build; the ordinary
+    # publication in catalog.py). After catalog_state, this update could
+    # deadlock with one of them. Same transaction: a failed publication rolls
+    # it back (publish_provider_identity_rekey).
+    cur.execute(
+        f"UPDATE {t('catalog_sources')} SET provider_instance_fp=%s, "
+        "library_scope_fp=%s, updated_at=now() WHERE catalog_instance_id=%s",
+        (scope["provider_instance_fp"], scope["library_scope_fp"], catalog_instance_id),
+    )
     cur.execute(
         f"""
         SELECT published_generation, catalog_epoch, catalog_head_seq,
@@ -786,25 +818,18 @@ def _publish_provider_identity_rekey(
     }
     if spec is not None:
         evidence.update(spec.base_evidence)
-    next_seq = head_seq
     first_seq = head_seq + 1
-    for event in plan.events:
-        next_seq += 1
-        event_evidence = evidence
-        if spec is not None and spec.event_evidence and event.operation == "rekey":
-            event_evidence = {**evidence, **spec.event_evidence(event)}
-        cur.execute(
-            f"""
-            INSERT INTO {t('catalog_changes')}
-                (catalog_instance_id, epoch, seq, generation, entity_type,
-                 entity_id, operation, change_reason, old_entity_id, payload,
-                 evidence, writer_generation)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)
-            """,
-            (
+    last_seq = head_seq + len(plan.events)
+
+    def journal_rows():
+        for seq, event in enumerate(plan.events, first_seq):
+            event_evidence = evidence
+            if spec is not None and spec.event_evidence and event.operation == "rekey":
+                event_evidence = {**evidence, **spec.event_evidence(event)}
+            yield (
                 catalog_instance_id,
                 epoch,
-                next_seq,
+                seq,
                 next_generation,
                 event.entity_type,
                 event.entity_id,
@@ -814,15 +839,27 @@ def _publish_provider_identity_rekey(
                 canonical_json(event.payload) if event.payload is not None else None,
                 canonical_json(event_evidence),
                 JOURNAL_WRITER_GENERATION,
-            ),
-        )
-    last_seq = next_seq
+            )
+
+    # The same rows and sequence numbers as one INSERT per event, a page per
+    # statement: these run under the catalog_state and analysis_state locks.
+    _insert_rows(
+        cur,
+        f"""
+        INSERT INTO {t('catalog_changes')}
+            (catalog_instance_id, epoch, seq, generation, entity_type,
+             entity_id, operation, change_reason, old_entity_id, payload,
+             evidence, writer_generation)
+        VALUES %s
+        """,
+        "(%s, %s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s::jsonb, %s)",
+        journal_rows(),
+    )
 
     counts = {
         entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER
     }
     coverage = _coverage(normalized)
-    scope = catalog_scope_evidence(normalized, spec.provider_type if spec else "navidrome")
     field_support = {
         name: "observed" if value["present"] else "not_observed"
         for name, value in coverage.items()
@@ -872,11 +909,6 @@ def _publish_provider_identity_rekey(
             len(carried_links),
             catalog_instance_id,
         ),
-    )
-    cur.execute(
-        f"UPDATE {t('catalog_sources')} SET provider_instance_fp=%s, "
-        "library_scope_fp=%s, updated_at=now() WHERE catalog_instance_id=%s",
-        (scope["provider_instance_fp"], scope["library_scope_fp"], catalog_instance_id),
     )
     cur.execute(
         f"""

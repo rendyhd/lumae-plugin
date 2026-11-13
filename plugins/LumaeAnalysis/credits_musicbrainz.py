@@ -21,6 +21,7 @@ from .credits_store import HTTP_CACHE_TTL_DAYS
 USER_AGENT = "Lumae-Analysis-Credits/1 (+https://github.com/rendyhd/lumae-plugin)"
 BASE_URL = "https://musicbrainz.org/ws/2/"
 LOCK_ID = 1280658765
+MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 RELEASE_INC = "artist-credits+recordings+release-groups+artist-rels+recording-level-rels+work-rels+work-level-rels"
 RECORDING_INC = "artist-credits+artist-rels+work-rels+work-level-rels"
 
@@ -114,31 +115,15 @@ class Client:
             try:
                 response = self.http.get(BASE_URL + path, params=params,
                     headers={"User-Agent": USER_AGENT, "Accept": "application/json"}, timeout=(5, 20),
-                    allow_redirects=False)
+                    allow_redirects=False, stream=True)
             except requests.RequestException as exc:
                 raise MusicBrainzDeferred("MusicBrainz service unavailable", 60) from exc
-            if response.status_code in (429, 503) or response.status_code >= 500:
-                delay = retry_after(response.headers.get("Retry-After"), 60)
-                cur.execute(f"UPDATE {table('credits_http_control')} SET next_request_at=clock_timestamp()+(%s*interval '1 second') WHERE singleton=1", (delay,))
-                self.db.commit()
-                raise MusicBrainzDeferred("MusicBrainz requested backoff", delay)
-            if response.status_code in (301, 308):
-                target = urlparse(urljoin(BASE_URL + path, response.headers.get("Location", "")))
-                parts = target.path.strip("/").split("/")
-                if (not entity_id or target.scheme != "https" or target.netloc != "musicbrainz.org"
-                        or len(parts) != 4 or parts[:3] != ["ws", "2", entity] or not mbid(parts[3])):
-                    raise MusicBrainzDeferred("Unverified MusicBrainz identity redirect", 3600)
-                payload = {"redirect_mbid": mbid(parts[3])}
-            elif response.status_code == 404:
-                payload = {}
-            elif response.status_code != 200:
-                raise MusicBrainzDeferred(f"MusicBrainz response {response.status_code}", 3600)
-            else:
-                if len(response.content) > 8 * 1024 * 1024:
-                    raise MusicBrainzDeferred("MusicBrainz response exceeded bounded size", 3600)
-                payload = response.json()
-                if not isinstance(payload, dict):
-                    raise MusicBrainzDeferred("MusicBrainz response was not an object", 3600)
+            try:
+                payload = self._payload(response, entity, entity_id, path, cur)
+            finally:
+                close = getattr(response, "close", None)
+                if close is not None:
+                    close()
             # The cache only spans one album's deferrals and retries: matching
             # publishes what it needs, and a full release is up to megabytes.
             cur.execute(f"""INSERT INTO {table('credits_http_cache')}(request_key,payload,expires_at)
@@ -152,6 +137,44 @@ class Client:
             cur.execute("SELECT pg_advisory_unlock(%s)", (LOCK_ID,))
             cur.close()
             self.db.commit()
+
+    def _payload(self, response, entity, entity_id, path, cur):
+        """The response's payload; the body is read with a running size cap."""
+        if response.status_code in (429, 503) or response.status_code >= 500:
+            delay = retry_after(response.headers.get("Retry-After"), 60)
+            cur.execute(f"UPDATE {table('credits_http_control')} SET next_request_at=clock_timestamp()+(%s*interval '1 second') WHERE singleton=1", (delay,))
+            self.db.commit()
+            raise MusicBrainzDeferred("MusicBrainz requested backoff", delay)
+        if response.status_code in (301, 308):
+            target = urlparse(urljoin(BASE_URL + path, response.headers.get("Location", "")))
+            parts = target.path.strip("/").split("/")
+            if (not entity_id or target.scheme != "https" or target.netloc != "musicbrainz.org"
+                    or len(parts) != 4 or parts[:3] != ["ws", "2", entity] or not mbid(parts[3])):
+                raise MusicBrainzDeferred("Unverified MusicBrainz identity redirect", 3600)
+            return {"redirect_mbid": mbid(parts[3])}
+        if response.status_code == 404:
+            return {}
+        if response.status_code != 200:
+            raise MusicBrainzDeferred(f"MusicBrainz response {response.status_code}", 3600)
+        iter_content = getattr(response, "iter_content", None)
+        if iter_content is None:  # a client whose responses are already read
+            if len(response.content) > MAX_RESPONSE_BYTES:
+                raise MusicBrainzDeferred("MusicBrainz response exceeded bounded size", 3600)
+            payload = response.json()
+        else:
+            chunks, size = [], 0
+            try:
+                for chunk in iter_content(chunk_size=64 * 1024):
+                    size += len(chunk)
+                    if size > MAX_RESPONSE_BYTES:
+                        raise MusicBrainzDeferred("MusicBrainz response exceeded bounded size", 3600)
+                    chunks.append(chunk)
+            except requests.RequestException as exc:  # as when get() read the body
+                raise MusicBrainzDeferred("MusicBrainz service unavailable", 60) from exc
+            payload = json.loads(b"".join(chunks))  # a ValueError, as response.json() raised
+        if not isinstance(payload, dict):
+            raise MusicBrainzDeferred("MusicBrainz response was not an object", 3600)
+        return payload
 
 
 def _quoted(value):

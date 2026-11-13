@@ -105,7 +105,12 @@ migration runs the same idempotent cleanup so installations created before
 
 Catalogue, analysis, profile, and relationship change journals retain at least
 1,000 events and normally enough events for two complete logical snapshots.
-Compaction advances each stream's floor atomically. A client whose cursor falls
+Compaction advances each stream's floor atomically. From 1.11.0 the catalogue
+journal is compacted after a publication in transactions of at most 5,000
+events, up to 20 of them; each locks `catalog_state` before the journal rows
+and gives up after a second, leaving the rest to the next publication or to
+`prune_catalog_storage`, which locks `catalog_state` and then
+`analysis_state` before it deletes anything. A client whose cursor falls
 below that floor receives `bootstrap_required` through the existing cursor
 contract and cannot silently miss changes.
 
@@ -209,6 +214,32 @@ as a normal atomic analysis generation. Health reports `ready`,
 `migration_required`, `busy`, or `repair_required`; the ordinary AudioMuse
 Provider Migration is sufficient. `repair_required` is reserved for internally
 contradictory mappings, not a valid change in canonical analysis grouping.
+
+From 1.11.0 an applied transition survives a later version change. A new
+Navidrome version observed after the transition was applied (also one from
+before the canonical-ID boundary, reason
+`pre_transition_version_after_rekey`) sends it back to inspection, keeping
+its transition id, manifest and `applied_at`: admission is closed until the
+next refresh inspects the exact track-ID sets. Unchanged IDs restore `applied`
+with the AudioMuse migration still owed, so fresh projection ingestion stays
+paused as above; up to 1.10.2 the source went to `normal` and that hold was
+lifted. After a pre-boundary version, `applied` is restored only while the
+scanned IDs are still canonical: a scan that carries published canonical IDs
+in their legacy form instead, more of them than the ones still canonical (a
+restored pre-rekey Navidrome database, not a single track), sends
+the source to `normal` with reason `provider_ids_reverted` and clears the
+applied identity, so the ordinary diff and the projection rebuild from the
+server's IDs. A changed ID set opens a new transition with its own id, the
+current generations as baselines and a proof that starts over; the old
+manifest stays downloadable. A block of an applied transition keeps its
+counts and target fingerprint, and the upgrade's projection check covers a
+transition stored pending or blocked this way; it locks the `catalog_state`
+rows before the transition rows, in a refresh's order. A failed ping writes only `last_error`, never the
+state. Every observation write is compare-and-set on the state and the
+transition id it read, so a slow observer cannot write an old id over a
+transition an inspection has just opened; a call whose write lost holds its
+gate closed, as does a projection whose re-read finds the transition pending
+or blocked.
 
 ## Jellyfin moves (1.6.0)
 

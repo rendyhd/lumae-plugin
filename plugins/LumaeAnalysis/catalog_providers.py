@@ -215,6 +215,23 @@ def _has_complete_library_memberships(catalog):
     )
 
 
+def _navidrome_section(response, key, missing):
+    """``response[key]`` of a Navidrome answer; a scan that cannot read it fails.
+
+    AudioMuse's request helper answers None for a timeout, an HTTP error and a
+    Subsonic ``failed`` envelope. Read as an empty page, that ended the song
+    walk early, and every song not yet read was published as deleted.
+    """
+    section = response.get(key) if isinstance(response, dict) else None
+    if not isinstance(section, dict):
+        raise CatalogProviderError(
+            f"Navidrome did not return {missing}. The incomplete catalogue was not "
+            "published and the previous catalogue remains available; check Navidrome "
+            "access."
+        )
+    return section
+
+
 def _fetch_navidrome(module, core, server_id):
     request = getattr(module, "_navidrome_request", None)
     if not callable(request):
@@ -283,8 +300,13 @@ def _fetch_navidrome(module, core, server_id):
     tracks = []
     if len(albums_by_id) <= NAVIDROME_SMALL_SCOPE_ALBUM_LIMIT:
         for album_id in albums_by_id:
-            payload = request("getAlbum", {"id": album_id}) or {}
-            hydrated_album = dict(payload.get("album") or {})
+            hydrated_album = dict(
+                _navidrome_section(
+                    request("getAlbum", {"id": album_id}),
+                    "album",
+                    "one of the albums it listed",
+                )
+            )
             songs = hydrated_album.pop("song", []) if hydrated_album else []
             if hydrated_album:
                 hydrated_album["_lumae_library_ids"] = sorted(album_library_ids[album_id])
@@ -308,8 +330,11 @@ def _fetch_navidrome(module, core, server_id):
             response = request(
                 "search3",
                 {"query": "", "songCount": page_size, "songOffset": offset},
-            ) or {}
-            page = ((response.get("searchResult3") or {}).get("song") or [])
+            )
+            # An answered page past the last song is an empty searchResult3.
+            page = _navidrome_section(
+                response, "searchResult3", f"its songs from position {offset}"
+            ).get("song") or []
             if isinstance(page, dict):
                 page = [page]
             for song in page:

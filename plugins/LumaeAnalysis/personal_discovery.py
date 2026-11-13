@@ -8,6 +8,9 @@ from . import migrations
 from .collection_manager import current_principal, collections_enabled
 
 SCHEMA_VERSION = 1
+RECEIPT_RETENTION_DAYS = 30
+RETENTION_BATCH_ROWS = 5_000
+RETENTION_MAX_BATCHES = 20
 FIELDS = {
     "album": {"title", "artist", "aliases", "verification", "releaseGroupId", "releaseId"},
     "want": {"albumId", "intent", "note", "addedAt", "source", "explanation", "acquiredAt", "canonicalKey"},
@@ -124,6 +127,12 @@ def migrate(db):
         cur.execute(f"""CREATE TABLE IF NOT EXISTS {table('discovery_receipts')} (
             principal TEXT NOT NULL, id TEXT NOT NULL, fingerprint TEXT NOT NULL,
             payload JSONB NOT NULL, status INTEGER NOT NULL, PRIMARY KEY(principal,id))""")
+        # Retention (purge_expired_discovery_receipts). now() is stable, so this
+        # is a fast default: no table rewrite, and receipts written before the
+        # column existed are dated to this upgrade and expire 30 days later.
+        migrations.ensure_columns(cur, table("discovery_receipts"), "created_at TIMESTAMPTZ NOT NULL DEFAULT now()")
+        migrations.ensure_index(cur, f"""CREATE INDEX IF NOT EXISTS lumae_discovery_receipts_created_idx
+            ON {table('discovery_receipts')} (created_at)""")
         cur.execute(f"""CREATE TABLE IF NOT EXISTS {table('discovery_aliases')} (
             principal TEXT NOT NULL, kind TEXT NOT NULL, alias TEXT NOT NULL, target TEXT NOT NULL,
             PRIMARY KEY(principal,kind,alias))""")
@@ -204,6 +213,29 @@ def mutate(db, user, body):
             payload, status = {"epoch": epoch, "cursor": head, "record": new, "alias": body["recordId"] if duplicate else None}, 200
         cur.execute(f"INSERT INTO {table('discovery_receipts')}(principal,id,fingerprint,payload,status) VALUES(%s,%s,%s,%s::jsonb,%s)", (user, body["id"], fingerprint, json.dumps(payload), status))
         return payload, status
+
+
+def purge_expired_discovery_receipts(cur, batch_rows=RETENTION_BATCH_ROWS, max_batches=RETENTION_MAX_BATCHES):
+    """Delete mutation receipts older than ``RECEIPT_RETENTION_DAYS``, oldest
+    first, in bounded batches selected then deleted by ``ctid`` (the delete
+    repeats the age filter). Runs in the caller's transaction; the caller
+    commits. A replay of a purged mutation id is applied again, as after any
+    receipt TTL. Returns the number of receipts deleted."""
+    deleted = 0
+    relation = table("discovery_receipts")
+    interval = f"{RECEIPT_RETENTION_DAYS} days"
+    for _ in range(max_batches):
+        cur.execute(f"SELECT ctid::text FROM {relation} WHERE created_at < now() - %s::interval "
+                    "ORDER BY created_at LIMIT %s", (interval, batch_rows))
+        rows = cur.fetchall()
+        if not rows:
+            break
+        cur.execute(f"DELETE FROM {relation} WHERE ctid = ANY(%s::text[]::tid[]) "
+                    "AND created_at < now() - %s::interval", ([row[0] for row in rows], interval))
+        deleted += cur.rowcount
+        if len(rows) < batch_rows:
+            break
+    return deleted
 
 
 def page(db, user, args, bootstrap=False):

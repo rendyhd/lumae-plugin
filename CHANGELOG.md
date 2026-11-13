@@ -7,6 +7,136 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## 1.11.0 (2026-11-13)
+
+The findings of the 2026-11-13 bug and performance review, and of a second
+read of those fixes. AudioMuse 3.2.0 is still the minimum, and phones need no
+update.
+
+A media server that stops handing over files no longer spends the library's
+retries.
+
+- After three failed downloads in a row in a background waveform, loudness or
+  edge pass, the runner test-downloads one other track of the same source from
+  its published catalogue, one with a published profile first and otherwise
+  any available track, never one of the failing ones, into a temporary
+  directory of its own. Only a catalogue holding nothing but the failing
+  tracks is checked with a provider ping instead. If the test works, the
+  failures belong to those files and are charged as before. If not,
+  it is an outage: the tracks are released uncounted, the pass waits 60 s
+  (`waiting_retry`) and its cursor stays before them. On-demand requests have
+  no breaker.
+- A failed edge download backs off six hours without counting
+  (`edge-download-unavailable`). A decode or analysis failure still counts, and
+  five of them for one media revision under one analyzer stop the retries until
+  the media or the analyzer changes. `edge_status` reports such a job `failed`
+  with no `retry_at`.
+- A pause in the middle of a slice releases its edge jobs instead of failing
+  them, and a walk keeps its cursor before the tracks it released.
+
+Catalogue
+
+- A Navidrome scan that gets no answer for a page of songs or a listed album
+  fails, instead of publishing the rest of the library as deleted.
+- Bootstrap sessions are counted per caller (`user:<name>`, the installation
+  token, or anonymous), no longer per client address, so a phone that changes
+  network, or every phone behind one proxy, keeps or gets its own session: at
+  most 4 at once per user and 32 for the shared token and anonymous callers,
+  checked atomically. A session of a token or anonymous caller made before the
+  upgrade answers one 410 `bootstrap_required`. A create waits at most eight
+  seconds for another create of the same caller, and an analysis session at
+  most three seconds for a running projection; either then answers the
+  retryable 409 `bootstrap_unavailable` (the analysis one instead of pinning a
+  generation being pruned). A catalogue session still waits for a publication
+  as before.
+- `/api/catalog/changes` accepts a proven v2 `server_id` alias with a valid
+  cursor; a client still sending the alias got 410 every time. The bootstrap
+  track rows no longer carry the server's internal `search_text`.
+- Session creation and publication take `catalog_sources` and
+  `catalog_state` in one order, and journal compaction and
+  `prune_catalog_storage` take `catalog_state` before the journal rows:
+  `prune_catalog_storage` locks `catalog_state` and then `analysis_state`
+  before it deletes anything. Compaction moves at most 5,000 events per
+  transaction, up to 20 transactions after a publication; each waits at most
+  a second for `catalog_state` and otherwise leaves the rest to the next
+  publication or prune, instead of deadlocking with an install. The identity
+  inspection no longer holds `catalog_state` for a whole build.
+- The journal is written in batches and compacted after publication, and the
+  snapshot size is measured once, not at all on a refresh without changes.
+
+Runner, passes and analysis
+
+- A repeated `POST /api/analyze` for a track a runner is analysing keeps that
+  analysis instead of superseding it. A body that is not an object, or `ids`
+  that are not a list of strings, answers 400 `invalid_analyze_request`.
+- Bookkeeping no longer resets a failed preparation's back-off; the refresh
+  cadence asks once per period; a skipped refresh and a relationship build
+  waiting for its inputs settle instead of repeating.
+- A parallel waveform batch is K × 10 tracks again, not 10. State timestamps
+  are real UTC whatever the database session's time zone.
+- Decoder residue below the noise floor counts as digital zero, so Opus files
+  with silent edges get an edge profile. Non-finite samples fail the waveform
+  analysis. True-peak oversampling is skipped where it cannot raise the peak
+  and small decoded frames are joined; stored results are unchanged.
+- A leftover download is no longer kept because its process id was reused; a
+  worker that failed to start is retried after ten minutes; a finish that
+  raises no longer strands the other files in flight.
+- A relationship step's budget starts after its checkpoint is loaded, its
+  input read takes two payload members instead of the whole payload, a claim
+  made right after a publication is kept, and the install migration takes no
+  stream-state lock.
+
+Provider identity
+
+- An applied Navidrome transition stays applied across a new provider
+  version: the version closes admission until the next refresh inspects the
+  IDs; unchanged IDs restore `applied` with the AudioMuse migration still owed,
+  and a changed ID set opens a new transition. A version from before the
+  canonical-ID boundary goes back to inspection too
+  (`pre_transition_version_after_rekey`) instead of straight to `normal`. If
+  the IDs are still canonical (a binary downgrade or a misreported version),
+  the inspection restores `applied`. If the scan shows them back in their
+  legacy form, with the reverted IDs outnumbering the ones still canonical (a
+  restored pre-rekey database, not a single track), the source goes to `normal`
+  with reason `provider_ids_reverted` and the applied identity is cleared,
+  so the ordinary diff and the projection rebuild from the server's IDs. A
+  Jellyfin applied transition that was blocked returns to `applied` when its
+  server answers again, and a block keeps the applied transition's counts and
+  target.
+- One rule says whether a transition was applied, and the upgrade's
+  projection check covers one stored pending or blocked for a while. That
+  check locks the catalogue rows before the transition rows, as a refresh
+  does, so it no longer deadlocks with one.
+- Observations are written compare-and-set on the state and the transition id,
+  so a slow observer can no longer write an old id over a transition an
+  inspection has just opened. A failed ping writes only its error; one whose
+  write lost, and a projection whose re-read finds a pending or blocked
+  transition, hold.
+- A deselected Jellyfin library is deleted at once; a rekey keeps the moved
+  file's own tags; rekey journals are written in batches, and a rekey
+  publication updates `catalog_sources` before it locks `catalog_state`.
+
+Collections, pages and the rest
+
+- Malformed bodies answer 400 instead of 500: a collection body that is not an
+  object, an item that is not an object or a position out of range, and NaN or
+  Infinity in a shelf, Vibe, cover or Undertone mutation.
+- A journeys changes page also ends once its records reach 8,000,000 bytes,
+  always with at least one record, `hasMore` and the cursor of its last record.
+- The collections page writes in batches of 500 and moves only changed rows;
+  the Undertone and collections pages escape every record field. The item
+  membership probe uses its index; previews and artwork release the request's
+  database connection before streaming.
+- Personal-discovery receipts expire after 30 days, and the retention task
+  goes on when that purge fails.
+- The settings and database-state pages show a state they cannot read as
+  unavailable, roll back after a failed read and read each state once.
+  Redaction masks more credential and path shapes.
+
+Repository: the Friend Album Discovery plugin (`plugins/FederatedAlbums`) is
+removed with its tests. It was private development and never in the public
+manifest, so no published archive changes.
+
 ## 1.10.2 (2026-11-06)
 
 Similar albums and artists have results.

@@ -112,6 +112,14 @@
   },
   "versions": [
     {
+      "version": "1.11.0",
+      "min_core_version": "3.2.0",
+      "changelog": "Fixes from a review of the whole plugin. A music server that stops handing over files no longer costs tracks their retries: after three failed downloads in a row a background pass test-downloads another track of the library, and if that fails too it waits a minute and leaves the tracks for later. A song that cannot get its edge profile stops being retried after five failures. A Navidrome scan that misses a page of songs fails instead of publishing the rest of the library as deleted, and an applied Navidrome or Jellyfin ID change stays applied through a version change or a brief block (a Navidrome server whose old IDs are back from a restored database is followed instead). Opus files with silent edges get an edge profile. Phones signed in with the installation token or without sign-in keep their catalogue download when their address changes, and malformed requests answer 400 instead of an error page.",
+      "imageUrl": "",
+      "checksum": "730023ccdf166da58a93c204d36405cf",
+      "sourceUrl": "https://raw.githubusercontent.com/rendyhd/lumae-plugin/main/dist/lumae_analysis/lumae_analysis_1.11.0.zip"
+    },
+    {
       "version": "1.10.2",
       "min_core_version": "3.2.0",
       "changelog": "Similar albums and artists have results. Every album and artist had an empty list, so Lumae's \"Sonically similar\" rows never appeared: AudioMuse's index answers with its own item ids, and the build looked them up as the music server's track ids. The next build replaces the lists and phones take them on their next sync, with no app update.",

@@ -494,10 +494,17 @@ def plan(cur, *, catalog_instance_id, server_id, previous_generation, raw, adapt
     stored = _held_rows(cur, catalog_instance_id)
     published = _published_tracks(cur, catalog_instance_id, previous_generation)
     current = {_raw_id(row, "Id"): row for row in raw.get("tracks") or [] if _raw_id(row, "Id")}
-    scanned = {
-        _raw_id(row, "id", "Id", "ItemId") for row in raw.get("libraries") or []
-        if isinstance(row, dict)
-    }
+    # The libraries this scan walked. "libraries" also lists those deselected
+    # in AudioMuse, whose tracks are ordinary deletions, never held. A raw
+    # catalogue without the key is read as before: every listed library.
+    walked = raw.get("scanned_library_ids")
+    if walked is not None:
+        scanned = {str(value) for value in walked}
+    else:
+        scanned = {
+            _raw_id(row, "id", "Id", "ItemId") for row in raw.get("libraries") or []
+            if isinstance(row, dict)
+        }
     continuity.release = {
         track_id for track_id in stored if track_id in current or track_id not in published
     }
@@ -697,15 +704,22 @@ def persist(cur, catalog_instance_id, continuity, rekeyed=()):
         if track_id not in release
     ]
     if rows:
-        cur.executemany(
+        # A page per statement, and a track already held is rewritten only
+        # when its fingerprint becomes known: this runs on every refresh, for
+        # every held track, and in a rekey under the publication's row locks.
+        from .catalog import _insert_rows
+
+        _insert_rows(
+            cur,
             f"""
             INSERT INTO {t('jellyfin_missing_tracks')} AS held
                 (catalog_instance_id, track_id, missing_since, fingerprint_id)
-            VALUES (%s, %s, %s, %s)
+            VALUES %s
             ON CONFLICT (catalog_instance_id, track_id) DO UPDATE
-               SET fingerprint_id=COALESCE(held.fingerprint_id, EXCLUDED.fingerprint_id),
-                   updated_at=now()
+               SET fingerprint_id=EXCLUDED.fingerprint_id, updated_at=now()
+             WHERE held.fingerprint_id IS NULL AND EXCLUDED.fingerprint_id IS NOT NULL
             """,
+            "(%s, %s, %s, %s)",
             rows,
         )
 

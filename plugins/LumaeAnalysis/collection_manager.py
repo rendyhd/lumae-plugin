@@ -767,6 +767,7 @@ def _restore_principal_collections(cur, principal, collections):
     restored = []
     item_count = 0
     staged_changes = []
+    catalogs = {}
     # Lock every existing collection of the chunk first, in the shared order
     # (_MULTI_COLLECTION_LOCK_ORDER), so a chunk and a rekey cannot deadlock.
     existing = sorted({source["id"] for source in collections if not source.get("create", True)})
@@ -791,7 +792,7 @@ def _restore_principal_collections(cur, principal, collections):
                 restored.append(locked)
                 continue
         for item in source["items"]:
-            _upsert_item(cur, principal, collection_id, item)
+            _upsert_item(cur, principal, collection_id, item, catalogs=catalogs)
         if source["items"]:
             cur.execute(
                 f"UPDATE {collections_table()} SET revision = revision + 1, updated_at = now() "
@@ -1581,7 +1582,30 @@ def _clean_collection_body(body, partial=False):
     return name, description
 
 
+def _body_error():
+    """A 400 response when the request's JSON body is not an object, else None."""
+    body = request.get_json(silent=True)
+    if body and not isinstance(body, dict):
+        return jsonify({"error": "The request body must be a JSON object."}), 400
+    return None
+
+
+_MAX_POSITION = 2**31 - 1  # collection_items.position is an INTEGER
+
+
+def _item_position(value):
+    try:
+        position = int(value or 0)
+    except OverflowError:
+        raise ValueError("Item position is out of range.") from None
+    if position > _MAX_POSITION:
+        raise ValueError("Item position is out of range.")
+    return max(position, 0)
+
+
 def _normalize_item(raw):
+    if not isinstance(raw, dict):
+        raise ValueError("Every item must be an object.")
     kind = str(raw.get("kind") or "").lower()
     if kind not in {"album", "track"}:
         raise ValueError("Item kind must be album or track.")
@@ -1608,7 +1632,7 @@ def _normalize_item(raw):
         "artist": str(raw.get("artist") or "").strip(),
         "album": str(raw.get("album") or "").strip() or None,
         "cover_item_id": str(raw.get("cover_item_id") or "").strip() or None,
-        "position": max(int(raw.get("position") or 0), 0),
+        "position": _item_position(raw.get("position")),
         # K10: the catalogue the item was chosen from; None lets _upsert_item
         # keep the stored one or use the install's only catalogue.
         "catalog_instance_id": catalog_instance_id,
@@ -1619,7 +1643,22 @@ class ForeignItemConflict(Exception):
     pass
 
 
-def _upsert_item(cur, principal, collection_id, item, remap=True):
+def _sole_catalog(cur, catalogs=None):
+    """The install's only catalogue, else None; cached in ``catalogs`` (a
+    dict the caller keeps for one request) so a batch resolves it once."""
+    if catalogs is not None and "sole" in catalogs:
+        return catalogs["sole"]
+    cur.execute("SELECT to_regclass(%s) IS NOT NULL", (table("catalog_sources"),))
+    sole = None
+    if (cur.fetchone() or (False,))[0]:
+        cur.execute(f"SELECT {sole_catalog_sql()}")
+        sole = (cur.fetchone() or (None,))[0]
+    if catalogs is not None:
+        catalogs["sole"] = sole
+    return sole
+
+
+def _upsert_item(cur, principal, collection_id, item, remap=True, catalogs=None):
     """Write one normalised item into a locked collection.
 
     When another item of the collection already holds the same membership
@@ -1636,16 +1675,16 @@ def _upsert_item(cur, principal, collection_id, item, remap=True):
     items = collection_items_table()
     if item.get("catalog_instance_id") is None:
         cur.execute(
-            f"SELECT (SELECT catalog_instance_id FROM {items} WHERE principal = %s AND id = %s), "
-            "to_regclass(%s) IS NOT NULL",
-            (principal, item["id"], table("catalog_sources")),
+            f"SELECT catalog_instance_id FROM {items} WHERE principal = %s AND id = %s",
+            (principal, item["id"]),
         )
-        stored, has_sources = cur.fetchone() or (None, False)
-        if stored is None and has_sources:
-            cur.execute(f"SELECT {sole_catalog_sql()}")
-            stored = (cur.fetchone() or (None,))[0]
+        stored = (cur.fetchone() or (None,))[0]
+        if stored is None:
+            stored = _sole_catalog(cur, catalogs)
         item["catalog_instance_id"] = stored
-    scope = "AND catalog_instance_id IS NOT DISTINCT FROM %s"
+    # The exact expression of the scoped unique indexes, so each probe is an
+    # index lookup ('' is never stored, so this equals IS NOT DISTINCT FROM).
+    scope = "AND COALESCE(catalog_instance_id, '') = COALESCE(%s, '')"
     if item["kind"] == "track":
         cur.execute(
             f"SELECT id FROM {items} "
@@ -1774,6 +1813,8 @@ def register_collection_routes(bp):
     @bp.post("/api/collections")
     @require_collections_enabled
     def collection_create():
+        if (bad := _body_error()) is not None:
+            return bad
         body = request.get_json(silent=True) or {}
         collection_id = str(body.get("id") or uuid.uuid4())
 
@@ -1837,6 +1878,8 @@ def register_collection_routes(bp):
     @bp.patch("/api/collections/<collection_id>")
     @require_collections_enabled
     def collection_update(collection_id):
+        if (bad := _body_error()) is not None:
+            return bad
         body = request.get_json(silent=True) or {}
 
         def mutate(cur, principal):
@@ -1871,6 +1914,8 @@ def register_collection_routes(bp):
     @bp.delete("/api/collections/<collection_id>")
     @require_collections_enabled
     def collection_delete(collection_id):
+        if (bad := _body_error()) is not None:
+            return bad
         body = request.get_json(silent=True) or {}
 
         def mutate(cur, principal):
@@ -1901,6 +1946,8 @@ def register_collection_routes(bp):
     @bp.put("/api/collections/<collection_id>/items/<item_id>")
     @require_collections_enabled
     def collection_item_upsert(collection_id, item_id):
+        if (bad := _body_error()) is not None:
+            return bad
         body = dict(request.get_json(silent=True) or {})
         body["id"] = item_id
         return _write_items(collection_id, [body], 200)
@@ -1908,6 +1955,8 @@ def register_collection_routes(bp):
     @bp.post("/api/collections/<collection_id>/items/batch")
     @require_collections_enabled
     def collection_items_batch(collection_id):
+        if (bad := _body_error()) is not None:
+            return bad
         body = request.get_json(silent=True) or {}
         items = body.get("items") or []
         if not isinstance(items, list) or len(items) > 500:
@@ -1930,8 +1979,10 @@ def register_collection_routes(bp):
                 return _error("revision_conflict", 409, current=current)
             remap = not contract_v2()
             conflicts = []
+            catalogs = {}
             for item in items:
-                existing_id = _upsert_item(cur, principal, collection_id, item, remap=remap)
+                existing_id = _upsert_item(cur, principal, collection_id, item, remap=remap,
+                                           catalogs=catalogs)
                 if existing_id is not None:
                     conflicts.append({"item_id": item["id"], "existing_item_id": existing_id})
             if conflicts:
@@ -1969,6 +2020,8 @@ def register_collection_routes(bp):
     @bp.delete("/api/collections/<collection_id>/items/<item_id>")
     @require_collections_enabled
     def collection_item_delete(collection_id, item_id):
+        if (bad := _body_error()) is not None:
+            return bad
         body = request.get_json(silent=True) or {}
 
         def mutate(cur, principal):
@@ -2013,6 +2066,8 @@ def register_collection_routes(bp):
     @bp.delete("/api/collections/<collection_id>/items/batch")
     @require_collections_enabled
     def collection_items_batch_delete(collection_id):
+        if (bad := _body_error()) is not None:
+            return bad
         body = request.get_json(silent=True) or {}
         raw_item_ids = body.get("item_ids")
         if not isinstance(raw_item_ids, list):

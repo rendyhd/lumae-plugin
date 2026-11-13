@@ -474,6 +474,9 @@ def fetch_catalog(module, error_type=RuntimeError):
                     artist_ids.add(str(artist["Id"]))
     return {
         "libraries": libraries,
+        # The libraries walked above. "libraries" lists every library Jellyfin
+        # reports, also those deselected in AudioMuse and never read.
+        "scanned_library_ids": sorted(selected),
         "albums": [albums[key] for key in sorted(albums)],
         "tracks": [tracks[key] for key in sorted(tracks)],
         "artist_cover_art": artist_cover_art(

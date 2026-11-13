@@ -42,10 +42,4 @@ python scripts/benchmark_relationship_inputs.py --tracks 100000 --output relatio
 
 ## Friend Album Discovery
 
-Federation remains `private-development` and is excluded from the public manifest. A host without `set_bearer_authenticator` can register/install the plugin, but pairing-token creation fails closed with a specific missing-capability response. Declared minimum core versions alone do not promise that extension exists.
-
-Connections and all derived catalogue/artwork operations are owner-scoped. Sync requests return HTTP 202 after recording durable work. A one-minute worker schedule recovers failed dispatch or worker loss; publication rechecks the connection owner and token after network access. A sync is limited to 300 seconds (checked between network chunks/pages), 400 pages, 100,000 albums, 6 MiB per page and 64 MiB total transfer. Repeated cursors, empty continuing pages and duplicate album identities fail without replacing the prior cache. Socket/DNS behavior can add time outside cooperative checks.
-
-Text search uses indexed prefix tokens in SQL. Similarity uses indexed LSH bands to select at most 512 full fingerprints, then the existing Album Dynamics scorer. The shortlist is approximate and can miss a globally best result; shared golden fixtures guard the scoring math. This avoids full-catalogue fingerprint transfer and per-album instance-ID queries.
-
-On Core 3, choose `FEDERATED_ALBUMS_SERVER_ID` before the first projection when multiple servers exist. The choice is persisted and provider IDs map through that server's `track_server_map`; incidental changes to the active server cannot mix libraries. Changing the selected catalogue requires an explicit migration/rebuild procedure, not silently following a request's active server.
+The Friend Album Discovery plugin was removed.

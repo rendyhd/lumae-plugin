@@ -49,7 +49,7 @@ def test_edge_status_counts_one_source_and_reads_its_latest_edge(migrated_db):
     _seed(migrated_db)
     assert edge_profile_store.edge_profile_status(migrated_db, "src-a") == {
         "ready": 3, "active": 2, "failed": 2, "last_error": "newest",
-        "last_success_at": "2026-09-03T10:00:00",
+        "last_success_at": "2026-09-03T10:00:00Z",
     }
     with migrated_db.cursor() as cur:
         cur.execute(f"INSERT INTO {P}catalog_sources (catalog_instance_id, current_core_server_id, "

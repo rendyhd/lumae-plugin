@@ -520,14 +520,26 @@ def merge_into_raw(cur, catalog_instance_id, raw, aliases=None):
 
 
 def rekey(cur, catalog_instance_id, track_mapping):
-    """Move stored tags with a Jellyfin fingerprint rekey (same file)."""
+    """Move stored tags with a Jellyfin fingerprint rekey (same file).
+
+    Tags already read under the new ID are the file's current ones (and what
+    ``merge_into_raw`` published): they stay and the old row goes. The old
+    row moves only where the new ID has none of its own.
+    """
     if not track_mapping:
         return
     olds = sorted(track_mapping)
     news = [track_mapping[old] for old in olds]
     cur.execute(
-        f"DELETE FROM {t('jellyfin_file_tags')} WHERE catalog_instance_id=%s AND track_id = ANY(%s)",
-        (catalog_instance_id, news),
+        f"""
+        DELETE FROM {t('jellyfin_file_tags')} target
+         USING unnest(%s::text[], %s::text[]) AS mapped(old_id, new_id)
+         WHERE target.catalog_instance_id=%s AND target.track_id=mapped.old_id
+           AND EXISTS (SELECT 1 FROM {t('jellyfin_file_tags')} own
+                        WHERE own.catalog_instance_id=target.catalog_instance_id
+                          AND own.track_id=mapped.new_id)
+        """,
+        (olds, news, catalog_instance_id),
     )
     cur.execute(
         f"""

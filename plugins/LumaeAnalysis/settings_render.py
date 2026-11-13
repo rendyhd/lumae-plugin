@@ -21,8 +21,40 @@ registered in ``sys.modules``.
 """
 
 import sys
+import threading
 
 _pkg = sys.modules[__package__]
+
+# One settings render reads each source and each per-source state once. The
+# status route is polled every 5-30 s and each panel used to repeat the same
+# reads. ``render_settings_status_panels`` opens the cache; a panel called on
+# its own (tests, other callers) finds none and reads directly.
+_render_local = threading.local()
+
+
+def _memo(key, compute):
+    cache = getattr(_render_local, "cache", None)
+    if cache is None:
+        return compute()
+    if key not in cache:
+        cache[key] = compute()
+    return cache[key]
+
+
+def _sources(db=None):
+    """``resolve_catalog_source`` once per render."""
+    return _memo(
+        ("sources",),
+        lambda: _pkg.resolve_catalog_source(db if db is not None else _pkg.get_db()),
+    )
+
+
+def _rollback():
+    """Restore the request transaction after a failed read (psycopg2 aborts it)."""
+    try:
+        _pkg._rollback_if_possible(_pkg.get_db())
+    except Exception:
+        _pkg.logger.debug("lumae_analysis could not roll back after a failed read", exc_info=True)
 
 
 def _v3_readiness_sources():
@@ -33,19 +65,24 @@ def _v3_readiness_sources():
     if db is None:
         return []
     policy = _pkg.dedup_policy()
-    return [
+    pairs = [
         (
             source,
             _pkg.v3_release_readiness(db, compatibility, source, policy),
         )
-        for source in _pkg.resolve_catalog_source(db)
+        for source in _sources(db)
     ]
+    if any(readiness.get("status") == "readiness_unavailable" for _source, readiness in pairs):
+        # v3_release_readiness swallows the SQL error; the transaction stays aborted.
+        _rollback()
+    return pairs
 
 
 def _render_basic_source_analysis_panel():
     try:
-        sources = _pkg.resolve_catalog_source(_pkg.get_db())
+        sources = _sources()
     except Exception:
+        _rollback()
         _pkg.logger.exception("lumae_analysis could not render basic source analysis")
         sources = []
     cards = []
@@ -133,6 +170,7 @@ def render_v3_readiness_panel():
     try:
         sources = _pkg._v3_readiness_sources()
     except Exception:
+        _rollback()
         _pkg.logger.exception("lumae_analysis could not render AudioMuse 3 readiness")
         return _pkg._render_basic_source_analysis_panel()
     if not sources:
@@ -246,8 +284,9 @@ def render_v3_readiness_panel():
 def render_relationship_status_panel():
     try:
         db = _pkg.get_db()
-        sources = _pkg.resolve_catalog_source(db)
+        sources = _sources(db)
     except Exception:
+        _rollback()
         _pkg.logger.exception("lumae_analysis could not render relationship preparation")
         return ""
     if not sources:
@@ -257,16 +296,18 @@ def render_relationship_status_panel():
     for source in sources:
         catalog_instance_id = source["catalog_instance_id"]
         try:
-            state = _pkg.relationship_status(db, catalog_instance_id)
-        except Exception as exc:
+            state = _memo(
+                ("relationship", catalog_instance_id),
+                lambda: _pkg.relationship_status(db, catalog_instance_id),
+            )
+        except Exception:
+            _rollback()
             _pkg.logger.exception(
                 "lumae_analysis could not read relationship status for %s",
                 catalog_instance_id,
             )
-            state = {
-                "status": "failed",
-                "last_error": str(exc),
-            }
+            # A failed read is not a failed build: say the status is unknown.
+            state = {"status": "unreadable"}
         status = str(state.get("status") or "not_initialized")
         catalog_generation = int(source.get("catalog", {}).get("generation") or 0)
         analysis_generation = int(source.get("analysis", {}).get("generation") or 0)
@@ -331,6 +372,16 @@ def render_relationship_status_panel():
                   never falls back to an unbounded all-pairs scan.</span>
               </div>
             """
+        elif status == "unreadable":
+            status_label = "Status unavailable"
+            status_class = "lumae-source-state-working"
+            summary = """
+              <div class="lumae-notice lumae-notice-warning" role="status">
+                <strong>The relationship status could not be read.</strong>
+                <span>This is a read problem, not a failed build. The panel updates on the
+                  next refresh.</span>
+              </div>
+            """
         elif status == "failed":
             status_label = "Needs attention"
             status_class = "lumae-source-state-danger"
@@ -393,6 +444,11 @@ def render_relationship_status_panel():
     """
 
 
+def _committed_counts(source):
+    return _memo(("profile_counts", source["catalog_instance_id"]),
+                 lambda: _pkg._committed_profile_counts(source))
+
+
 def _published_track_count(source):
     entity_counts = (source.get("catalog") or {}).get("entity_counts") or {}
     value = entity_counts.get("track")
@@ -402,10 +458,16 @@ def _published_track_count(source):
 
 
 def render_source_preparation_sections(batch_size):
-    workers = _pkg.configured_background_workers()
     try:
-        sources = _pkg.resolve_catalog_source(_pkg.get_db())
+        workers = _pkg.configured_background_workers()
     except Exception:
+        _rollback()
+        _pkg.logger.exception("lumae_analysis could not read the background workers setting")
+        workers = _pkg.parallel_analysis.DEFAULT_SETTING
+    try:
+        sources = _sources()
+    except Exception:
+        _rollback()
         _pkg.logger.exception("lumae_analysis could not render source preparation")
         return "", ""
     catalogue_cards = []
@@ -418,12 +480,14 @@ def render_source_preparation_sections(batch_size):
         server_kind = _pkg.escape(_pkg.provider_display_name(source.get("provider_type")))
         # The settings poll reads the committed snapshot (P2-1). The live
         # aggregate runs only when no snapshot describes this generation.
-        counts = _pkg._committed_profile_counts(source) or _pkg.analysis_status_counts(
+        counts = _committed_counts(source) or _pkg.analysis_status_counts(
             catalog_instance_id=catalog_instance_id,
             server_id=server_id,
         )
-        state = _pkg.preparation_state(catalog_instance_id)
-        backfill = _pkg.profile_backfill_state(catalog_instance_id)
+        state = _memo(("preparation", catalog_instance_id),
+                      lambda: _pkg.preparation_state(catalog_instance_id))
+        backfill = _memo(("backfill", catalog_instance_id),
+                         lambda: _pkg.profile_backfill_state(catalog_instance_id))
         published_tracks = _pkg._published_track_count(source)
         total = int(counts["total_with_files"])
         ready = int(counts["ready_current"])
@@ -636,7 +700,7 @@ def render_provider_identity_panel():
     db = None
     try:
         db = _pkg.get_db()
-        sources = _pkg.resolve_catalog_source(db) if db is not None else []
+        sources = _sources(db) if db is not None else []
         rows = []
         for source in sources:
             transition = _pkg.provider_transition_health(db, source["catalog_instance_id"])
@@ -805,7 +869,8 @@ def _readiness_stream_status(source):
     paused = _pkg.maintenance_paused()
 
     try:
-        prep = _pkg.preparation_state(catalog_instance_id)
+        prep = _memo(("preparation", catalog_instance_id),
+                     lambda: _pkg.preparation_state(catalog_instance_id))
     except Exception:
         _pkg._rollback_if_possible(_pkg.get_db())
         prep = None
@@ -813,7 +878,8 @@ def _readiness_stream_status(source):
     prep_stalled = bool(prep) and prep.get("status") in ("queued", "running") and not prep_active
 
     try:
-        backfill = _pkg.profile_backfill_state(catalog_instance_id)
+        backfill = _memo(("backfill", catalog_instance_id),
+                         lambda: _pkg.profile_backfill_state(catalog_instance_id))
     except Exception:
         _pkg._rollback_if_possible(_pkg.get_db())
         backfill = None
@@ -822,16 +888,19 @@ def _readiness_stream_status(source):
         bool(backfill) and backfill.get("status") in ("queued", "running") and not backfill_active
     )
 
-    counts = _pkg._committed_profile_counts(source)
+    counts = _committed_counts(source)
 
     try:
-        edge = _pkg.edge_profile_status(_pkg.get_db(), catalog_instance_id)
+        edge =_pkg.edge_profile_status(_pkg.get_db(), catalog_instance_id)
     except Exception:
         _pkg._rollback_if_possible(_pkg.get_db())
         edge = None
 
     try:
-        relationship = _pkg.relationship_status(_pkg.get_db(), catalog_instance_id)
+        relationship = _memo(
+            ("relationship", catalog_instance_id),
+            lambda: _pkg.relationship_status(_pkg.get_db(), catalog_instance_id),
+        )
     except Exception:
         _pkg._rollback_if_possible(_pkg.get_db())
         relationship = None
@@ -994,8 +1063,9 @@ def _readiness_stream_status(source):
 
 def render_readiness_streams_panel():
     try:
-        sources = _pkg.resolve_catalog_source(_pkg.get_db())
+        sources = _sources()
     except Exception:
+        _rollback()
         _pkg.logger.exception("lumae_analysis could not render per-stream readiness")
         return ""
     if not sources:
@@ -1219,6 +1289,11 @@ def _runner_reason(row):
     return _RUNNER_REASONS.get(reason, reason.replace("_", " ") or "starting")
 
 
+def _runner_online(row):
+    age = row.get("heartbeat_age_seconds")
+    return age is not None and float(age) < _pkg.runner.WORKER_ONLINE_SECONDS
+
+
 def _runner_row_html(role, label, purpose, row):
     if not row:
         state = ("not seen yet; it starts with the next AudioMuse restart"
@@ -1370,7 +1445,12 @@ def render_reconcile_status_panel():
             """
         )
     journal_html = "".join(journal) or "<li>No meaningful background actions recorded yet.</li>"
-    working = bool(running) or any(row.get("current_action") for row in rows.values())
+    # A dead runner's last current_action and a running journal event it left
+    # behind are not work: count them only while a runner heartbeat is fresh.
+    online_rows = [row for row in [*rows.values(), *(snapshot.get("workers") or [])]
+                   if _runner_online(row)]
+    working = (bool(running) and bool(online_rows)) or any(
+        row.get("current_action") for row in online_rows)
     return f"""
       <section class="lumae-panel" aria-label="Background work"
         data-lumae-active="{str(working).lower()}">
@@ -1393,18 +1473,23 @@ def render_reconcile_status_panel():
 
 
 def render_settings_status_panels(batch_size):
-    readiness_html = _pkg.render_v3_readiness_panel()
-    relationships_html = _pkg.render_relationship_status_panel()
-    catalogue_html, waveform_html = _pkg.render_source_preparation_sections(batch_size)
-    return {
-        "readiness": readiness_html,
-        "relationships": relationships_html,
-        "catalogue": catalogue_html,
-        "waveform": waveform_html,
-        "reconcile": _pkg.render_reconcile_status_panel(),
-        "identity": _pkg.render_provider_identity_panel(),
-        "stream_status": _pkg.render_readiness_streams_panel(),
-    }
+    previous = getattr(_render_local, "cache", None)
+    _render_local.cache = {}
+    try:
+        readiness_html = _pkg.render_v3_readiness_panel()
+        relationships_html = _pkg.render_relationship_status_panel()
+        catalogue_html, waveform_html = _pkg.render_source_preparation_sections(batch_size)
+        return {
+            "readiness": readiness_html,
+            "relationships": relationships_html,
+            "catalogue": catalogue_html,
+            "waveform": waveform_html,
+            "reconcile": _pkg.render_reconcile_status_panel(),
+            "identity": _pkg.render_provider_identity_panel(),
+            "stream_status": _pkg.render_readiness_streams_panel(),
+        }
+    finally:
+        _render_local.cache = previous
 
 
 def render_publication_repair_form():

@@ -217,7 +217,7 @@ def _work_summary(cur):
             SELECT CASE WHEN next_retry_at > now() THEN 'retry' ELSE 'ready' END,
                    retry_count, next_retry_at
               FROM {_work_table('relationship_state')}
-             WHERE status IN ('queued', 'failed', 'waiting_for_index')
+             WHERE status IN ('queued', 'failed', 'waiting_for_index', 'waiting_for_inputs')
                 OR (status='running' AND updated_at < now() - interval '2 minutes')
             UNION ALL
             SELECT CASE WHEN next_retry_at > now() THEN 'retry' ELSE 'ready' END,
@@ -263,7 +263,7 @@ def _work_summary(cur):
             UNION ALL
             -- A re-check of an unchanged album (S7) is idle work: it never
             -- makes a runner due; a sweep takes it.
-            SELECT CASE WHEN rechecks>0 THEN 'idle'
+            SELECT CASE WHEN rechecks>0 AND priority=0 THEN 'idle'
                         WHEN not_before>now() THEN 'retry' ELSE 'ready' END,
                    attempts,not_before
               FROM {_work_table('credits_jobs')}
@@ -468,7 +468,7 @@ def finish_event(db, event_id, status, *, phase, summary=None, error=None, next_
             event_id,
         ),
     )
-    _trim_events(cur)
+    _trim_events(cur, event_id)
     _count_units(cur, event_id)
     cur.close()
     db.commit()
@@ -502,13 +502,17 @@ def record_event(db, action, server_id, catalog_instance_id, status, *, phase,
         ),
     )
     event_id = cur.fetchone()[0]
-    _trim_events(cur)
+    _trim_events(cur, event_id)
     _count_units(cur, event_id)
     cur.close()
     db.commit()
 
 
-def _trim_events(cur):
+def _trim_events(cur, keep_event_id=None):
+    """Trim finished events beyond the retention window. Running events are never
+    trimmed; ``keep_event_id`` is the event that just finished, which a long run
+    outlasting 1,000 newer events would otherwise rank out of the journal in its own
+    ``finish_event`` before ``_count_units`` counts it."""
     cur.execute(
         f"""
         DELETE FROM {events_table()} e
@@ -526,8 +530,10 @@ def _trim_events(cur):
                 OR (position > %s AND finished_at < now() - make_interval(hours => %s))
          ) expired
          WHERE e.event_id=expired.event_id
+           AND e.status <> 'running'
+           AND e.event_id IS DISTINCT FROM %s
         """,
-        (EVENT_RETENTION_MAX, EVENT_RETENTION_MIN, EVENT_RETENTION_HOURS),
+        (EVENT_RETENTION_MAX, EVENT_RETENTION_MIN, EVENT_RETENTION_HOURS, keep_event_id),
     )
 
 
@@ -632,7 +638,7 @@ def read_reconcile_status(db):
                WHERE status IN ('queued','failed','running')
               UNION ALL
               SELECT 'relationships' FROM {_work_table('relationship_state')}
-               WHERE status IN ('queued','failed','waiting_for_index','running')
+               WHERE status IN ('queued','failed','waiting_for_index','waiting_for_inputs','running')
               UNION ALL
               SELECT 'volume and ramps' FROM {_work_table('profile_backfill_state')}
                WHERE status IN ('queued','failed','running')
@@ -941,6 +947,8 @@ def id_rewrite_in_progress(cur):
         SELECT EXISTS (SELECT 1 FROM pg_locks
                         WHERE locktype='advisory' AND granted AND objsubid=1
                           AND pid <> pg_backend_pid()
+                          AND database = (SELECT oid FROM pg_database
+                                           WHERE datname = current_database())
                           AND ((classid::bigint << 32) | objid::bigint) = %s)
         """,
         (PROVIDER_MIGRATION_LOCK_KEY,),

@@ -203,7 +203,11 @@ def request_album(db, catalog_id, album_id, priority=0):
     jobs = table('credits_jobs')
     cur.execute(f"""INSERT INTO {jobs}(catalog_instance_id,album_id,input_fp,priority)
         VALUES(%s,%s,%s,%s) ON CONFLICT(catalog_instance_id,album_id) DO UPDATE SET
-        input_fp=excluded.input_fp,priority=GREATEST({jobs}.priority,excluded.priority),
+        input_fp=excluded.input_fp,
+        priority=CASE WHEN {jobs}.status IN('pending','failed','running')
+                THEN GREATEST({jobs}.priority,excluded.priority)
+            WHEN {jobs}.input_fp<>excluded.input_fp OR {jobs}.expires_at<=now()
+                THEN excluded.priority ELSE {jobs}.priority END,
         status=CASE WHEN {jobs}.input_fp<>excluded.input_fp
             OR {jobs}.expires_at<=now() THEN 'pending' ELSE {jobs}.status END,
         not_before=CASE WHEN {jobs}.input_fp<>excluded.input_fp
@@ -216,7 +220,7 @@ def request_album(db, catalog_id, album_id, priority=0):
         lease_until=CASE WHEN {jobs}.input_fp<>excluded.input_fp THEN NULL ELSE {jobs}.lease_until END,
         attempts=CASE WHEN {jobs}.input_fp<>excluded.input_fp THEN 0 ELSE {jobs}.attempts END
         WHERE {jobs}.input_fp<>excluded.input_fp OR {jobs}.expires_at<=now()
-           OR {jobs}.priority<excluded.priority""",
+           OR ({jobs}.priority<excluded.priority AND {jobs}.status IN('pending','failed','running'))""",
                 (catalog_id, album_id, album["input_fp"], max(0, min(int(priority), 10))))
     cur.close()
     db.commit()
