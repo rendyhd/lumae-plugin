@@ -403,7 +403,7 @@ def test_temporarily_unavailable_inputs_do_not_corrupt_completed_checkpoint(rela
     with db.cursor() as cur:
         cur.execute("UPDATE plugin_lumae_analysis__analysis_state SET status='running'")
     db.commit()
-    assert advance(db)['status'] == 'queued'
+    assert advance(db)['status'] == 'waiting_for_inputs'
     with db.cursor() as cur:
         cur.execute("UPDATE plugin_lumae_analysis__analysis_state SET status='complete'")
     db.commit()

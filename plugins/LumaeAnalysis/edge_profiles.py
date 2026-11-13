@@ -45,6 +45,15 @@ ZERO_CDB = -32768
 MAX_SOURCE_RATE = 384_000
 MAX_SECONDS = 6553.6
 BLOCK_FRAMES = 65_536
+# Source samples this small (-300 dBFS, the floor the power series already
+# treats as numerical zero) are digital zero: FFmpeg's float decoders (Opus)
+# leave denormal residue instead of exact zeros after silence, which no
+# integer PCM can hold and centidB cannot represent as a peak.
+SAMPLE_ZERO_FLOOR = 1e-15
+# analyze_edge_file hands the pass decoded frames joined to about this many
+# (an Opus or MP3 frame alone is 960-1152); every measurement is the same
+# whatever the block size.
+COALESCE_FRAMES = 8192
 TRUE_PEAK_OVERSAMPLE = 4
 CROSSOVER_HZ = (150, 2500)
 # PyAV is not pinned: any release at or above this floor is accepted once its
@@ -183,6 +192,39 @@ def _q15(value):
 def _check_deadline(deadline):
     if deadline is not None and time.monotonic() >= deadline:
         raise EdgeAnalysisTimeout("edge analysis deadline exceeded")
+
+
+def coalesce_blocks(blocks, frames):
+    """Channel-first ``blocks`` joined to at least ``frames`` frames each.
+
+    Decoded Opus, AAC and MP3 frames hold 960-1152 frames; a consumer whose
+    result does not depend on block boundaries (continuous filter state,
+    sample-wise accumulation: this pass and ``loudness.analyze_blocks``) then
+    runs its per-block work far less often. A block of another shape is passed
+    on alone, for the consumer to refuse. Closing this generator closes
+    ``blocks``.
+    """
+    pending, count = [], 0
+    try:
+        for block in blocks:
+            shape = getattr(block, "shape", ())
+            if len(shape) != 2 or (pending and shape[0] != pending[0].shape[0]):
+                if pending:
+                    yield pending[0] if len(pending) == 1 else np.concatenate(pending, axis=1)
+                    pending, count = [], 0
+                yield block
+                continue
+            pending.append(block)
+            count += shape[1]
+            if count >= frames:
+                yield pending[0] if len(pending) == 1 else np.concatenate(pending, axis=1)
+                pending, count = [], 0
+        if pending:
+            yield pending[0] if len(pending) == 1 else np.concatenate(pending, axis=1)
+    finally:
+        close = getattr(blocks, "close", None)
+        if close is not None:
+            close()
 
 
 _QUALIFYING = threading.local()
@@ -686,6 +728,9 @@ def _stream(av, blocks, sample_rate, channel_layout, deadline, *, capacity_secon
             pcm = np.ascontiguousarray(block[:, offset:offset + BLOCK_FRAMES])
             if not np.all(np.isfinite(pcm)):
                 raise EdgeProfileError("non-finite source PCM")
+            residue = (np.abs(pcm) < SAMPLE_ZERO_FLOOR) & (pcm != 0)
+            if residue.any():
+                pcm = np.where(residue, np.float32(0), pcm)
             if peaks.total + pcm.shape[1] > int(MAX_SECONDS * sample_rate):
                 raise EdgeProfileError("edge duration limit exceeded")
             peak = np.max(np.abs(pcm), axis=0)
@@ -833,8 +878,11 @@ def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, de
             # loudness.PLANAR_MAX_CHANNELS). analyze_edge_blocks rejects every
             # layout but mono and stereo before this generator runs.
             converter = av.AudioResampler(format="fltp", layout=layout, rate=rate)
+            # Joined decoded frames; at most an eighth of a second, so the
+            # second pass still stops within its window's capacity (D9).
+            join = min(COALESCE_FRAMES, max(1, rate // 8)) if isinstance(rate, int) else 1
 
-            def blocks():
+            def decoded():
                 for frame in container.decode(stream):
                     _check_deadline(deadline)
                     if observer is not None:
@@ -844,7 +892,13 @@ def analyze_edge_file(path, *, catalog_instance_id, track_id, media_revision, de
                 for converted in converter.resample(None):
                     yield converted.to_ndarray()
 
+            def blocks():
+                return coalesce_blocks(decoded(), join)
+
             def reread():
+                return coalesce_blocks(redecoded(), join)
+
+            def redecoded():
                 # D9's second pass decodes the same file again from the start,
                 # through its own handle and the same conversion.
                 with open(path, "rb") as again:

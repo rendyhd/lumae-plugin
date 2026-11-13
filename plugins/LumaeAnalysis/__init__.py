@@ -728,19 +728,33 @@ def want_scheduled_catalog_refreshes(db):
     hours = catalog_refresh_hours()
     if not hours:
         return 0
+    period = int(hours * 3600)
     cur = db.cursor()
     cur.execute(
         f"""
-        UPDATE {table('catalog_state')} c SET refresh_wanted_at=now(), updated_at=now()
-          FROM {table('catalog_sources')} s
-         WHERE s.catalog_instance_id=c.catalog_instance_id AND s.rebind_status='active'
+        SELECT c.catalog_instance_id
+          FROM {table('catalog_state')} c
+          JOIN {table('catalog_sources')} s USING (catalog_instance_id)
+         WHERE s.rebind_status='active'
            AND c.refresh_wanted_at IS NULL AND c.status='complete'
            AND c.completed_at < now() - make_interval(secs => %s)
-        RETURNING c.catalog_instance_id
+         ORDER BY 1
         """,
-        (int(hours * 3600),),
+        (period,),
     )
-    count = len(cur.fetchall())
+    due = [row[0] for row in cur.fetchall()]
+    count = 0
+    for catalog_instance_id in due:
+        # completed_at moves only on success: a per-catalogue mark keeps a
+        # failing or waiting refresh to one attempt per period.
+        if not runner.claim_mark(cur, f"catalog_refresh:{catalog_instance_id}", period):
+            continue
+        cur.execute(
+            f"UPDATE {table('catalog_state')} SET refresh_wanted_at=now(), updated_at=now() "
+            "WHERE catalog_instance_id=%s AND refresh_wanted_at IS NULL",
+            (catalog_instance_id,),
+        )
+        count += cur.rowcount
     cur.close()
     db.commit()
     return count
@@ -908,6 +922,9 @@ def wanted_catalog_refresh_task(server_id, catalog_instance_id):
         return {"status": "failed", "catalog_instance_id": catalog_instance_id,
                 "error": str(exc)[:500]}
     status = str((result or {}).get("status") or "")
+    if status == "skipped":
+        # The source awaits rebinding: a kept request would rerun every turn.
+        _satisfy_catalog_refresh_wants(catalog_instance_id, started)
     if status in ("paused", "skipped"):
         return result
     return {**(result or {}), "status": "complete"}
@@ -996,7 +1013,7 @@ def next_relationship_run(db=None, server_id=None):
          WHERE s.rebind_status='active'
            AND ((r.status='queued'
                  AND (r.next_retry_at IS NULL OR r.next_retry_at <= now()))
-                OR (r.status IN ('failed', 'waiting_for_index')
+                OR (r.status IN ('failed', 'waiting_for_index', 'waiting_for_inputs')
                     AND (r.next_retry_at IS NULL OR r.next_retry_at <= now()))
                 OR (r.status='running' AND r.updated_at
                     < now() - interval '2 minutes'))
@@ -1213,6 +1230,23 @@ def _run_reconcile_action(
                 _rollback_if_possible(db)
                 logger.exception("lumae_analysis could not record deferred reconcile work")
             return result
+        if action == "relationships" and result_status == "waiting_for_inputs":
+            # The build stored when its inputs are worth checking again; keep
+            # that retry rather than clearing it to minute cadence.
+            try:
+                update_work_retry(db, action, catalog_instance_id, failed=False, keep_next_retry=True)
+                with db.cursor() as cur:
+                    cur.execute(f"SELECT next_retry_at FROM {table('relationship_state')} "
+                                "WHERE catalog_instance_id=%s", (catalog_instance_id,))
+                    row = cur.fetchone()
+                db.commit()
+                finish_event(db, event_id, "deferred", phase="waiting for published inputs",
+                             summary=_reconcile_result_summary(result),
+                             next_retry_at=row[0] if row else None)
+            except Exception:
+                _rollback_if_possible(db)
+                logger.exception("lumae_analysis could not record deferred reconcile work")
+            return result
         if action == "relationships" and result_status == "queued":
             # A committed checkpoint is continuation work, not a failed build
             # or a published generation. Keep minute cadence without backoff.
@@ -1424,7 +1458,8 @@ def catalog_reconcile_task():
 # not run again in the same turn.
 _SETTLED_STATUSES = frozenset((
     "current", "coalesced", "paused", "deferred", "failed", "failure", "error",
-    "waiting_retry", "waiting_for_index", "already_finalized", "superseded",
+    "waiting_retry", "waiting_for_index", "waiting_for_inputs", "already_finalized", "superseded",
+    "skipped",
 ))
 # Actions whose "complete" ends their work for now (an analysis run's
 # "complete" is one run of several).
@@ -1728,7 +1763,9 @@ def enqueue_required_catalog_preparations(db=None, server_id=None):
         if not requires_publication:
             continue
         try:
-            if not claim_preparation(source, db=db):
+            # A failed run keeps its retry ladder (next_preparation_run
+            # retries it when due); a re-claim would reset it every pass.
+            if not claim_preparation(source, db=db, keep_backoff=True):
                 continue
             requested += 1
         except Exception:
@@ -1843,6 +1880,21 @@ def collection_retention_task():
         _rollback_if_possible(db)
         logger.exception("lumae_analysis collection retention cleanup failed")
         return task_message({"status": "error"}, collection_retention_sentence({"status": "error"}))
+    # Discovery receipts are purged on their own: the purges above have each
+    # committed already, and a discovery table or created_at column that an
+    # interrupted install hook never added must not turn their work into a
+    # failed task. The next daily run retries it.
+    discovery_deleted = 0
+    purge_discovery = getattr(personal_discovery, "purge_expired_discovery_receipts", None)
+    try:
+        if purge_discovery is not None:
+            with db.cursor() as cur:
+                discovery_deleted = int(purge_discovery(cur) or 0)
+            db.commit()
+    except Exception:
+        discovery_deleted = 0
+        _rollback_if_possible(db)
+        logger.exception("lumae_analysis discovery receipt cleanup failed")
     result = {
         "status": "ok",
         "collection_mutations_deleted": mutations_deleted,
@@ -1853,6 +1905,7 @@ def collection_retention_task():
         "journey_mutations_deleted": journey_deleted,
         "cover_mutations_deleted": cover_deleted,
         "cover_images_deleted": cover_images_deleted,
+        "discovery_receipts_deleted": discovery_deleted,
     }
     return task_message(result, collection_retention_sentence(result))
 
@@ -2312,6 +2365,27 @@ def fetch_profile_rows(ids, catalog_instance_id=None):
     return rows
 
 
+def fetch_profile_status_rows(ids, catalog_instance_id=None):
+    """The attempt columns only: no ramps and no edge payload, for callers
+    that read a track's status."""
+    if not ids:
+        return []
+    db = get_db()
+    cur = db.cursor()
+    cur.execute(
+        f"""
+        SELECT track_id, status, last_error, analyzer_ver, media_signature
+          FROM {source_profiles_table() if catalog_instance_id else profiles_table()}
+         WHERE {"catalog_instance_id=%s AND " if catalog_instance_id else ""}track_id = ANY(%s)
+        """,
+        (catalog_instance_id, ids) if catalog_instance_id else (ids,),
+    )
+    columns = [desc[0] for desc in cur.description]
+    rows = [dict(zip(columns, row)) for row in cur.fetchall()]
+    cur.close()
+    return rows
+
+
 def fetch_published_profile_rows(ids, catalog_instance_id, edge_schema=2):
     if not ids:
         return []
@@ -2352,7 +2426,7 @@ def serialize_ready_profile(row):
 
 
 def split_analyze_ids(ids, catalog_instance_id=None):
-    rows = fetch_profile_rows(ids, catalog_instance_id=catalog_instance_id)
+    rows = fetch_profile_status_rows(ids, catalog_instance_id=catalog_instance_id)
     by_id = {row["track_id"]: row for row in rows}
     accepted = []
     already_ready = []
@@ -2498,6 +2572,41 @@ def record_interactive_profiles(ids, catalog_instance_id):
         mark_profiles_waiting(db, catalog_instance_id, tokens)
         wake_runners(db, "interactive_profiles", commit=True)
     return tokens
+
+
+def rewait_interactive_profiles(db, catalog_instance_id, ids):
+    """A repeated on-demand request for attempts already ``pending_interactive``:
+    keep each token, and mark it waiting again only when no live runner holds
+    its claim (a claimed one is being analysed). Returns the ids marked."""
+    if not ids:
+        return []
+    claimed = ", ".join(f"('{role}', '{marker}')" for role, marker in RUNNER_CLAIM_MARKERS.items())
+    cur = db.cursor()
+    try:
+        cur.execute(
+            f"""UPDATE {source_profiles_table()} p SET last_error=%s
+                 WHERE p.catalog_instance_id=%s AND p.track_id=ANY(%s)
+                   AND p.status='pending_interactive' AND p.attempt_token IS NOT NULL
+                   AND COALESCE(p.last_error <> ALL(%s), TRUE)
+                   AND NOT EXISTS (
+                       SELECT 1 FROM (VALUES {claimed}) c(role, marker)
+                         JOIN {runner.state_table()} r ON r.role=c.role
+                        WHERE c.marker=p.last_error
+                          AND r.heartbeat_at > now() - make_interval(secs => %s))
+             RETURNING p.track_id""",
+            (RUNNER_WAITING_MARKER, catalog_instance_id, list(ids), list(WAITING_MARKERS),
+             float(runner.WORKER_ONLINE_SECONDS)),
+        )
+        marked = [row[0] for row in cur.fetchall()]
+        if marked:
+            wake_runners(db, "interactive_profiles")
+        db.commit()
+        return marked
+    except Exception:
+        _rollback_if_possible(db)
+        raise
+    finally:
+        cur.close()
 
 
 def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=False):
@@ -2657,19 +2766,23 @@ def _own_download(item_id, catalog_instance_id, server_id, provider_type, media_
         info["download"] = resolved
         return info
     try:
-        analysis_download.fetch(resolved)
+        # A stalled stream gives up at the per-file limit, not never.
+        analysis_download.fetch(resolved, deadline_seconds=analysis_time_limit_seconds())
     except analysis_download.DownloadError as exc:
         _refuse_own_download(catalog_instance_id, exc)
         return None
     return info
 
 
-def fetch_track_file(info):
+def fetch_track_file(info, limit=None):
     """Fetch a deferred download (an analysis thread; no host or database
-    call); returns the file's path. Raises ``DownloadError``."""
+    call); returns the file's path. Raises ``DownloadError``. ``limit``: the
+    per-file limit (read on the turn's thread), the download's overall
+    deadline too; None for none."""
     target = info.get("download")
     if target is not None:
-        analysis_download.fetch(target, cancelled=analysis_isolation.current_cancelled)
+        analysis_download.fetch(target, cancelled=analysis_isolation.current_cancelled,
+                                deadline_seconds=limit)
     return info["file_path"]
 
 
@@ -3393,10 +3506,10 @@ def catalog_health():
 
 
 def _catalog_principal_key():
-    username = getattr(g, "auth_user", None)
-    if username:
-        return f"user:{username}"
-    return f"client:{request.remote_addr or 'unknown'}"
+    # Not the client address: a phone that changes network, or every phone
+    # behind a reverse proxy, would share or lose its session. The 256-bit
+    # session token is what binds a non-user caller's session.
+    return _bootstrap_caller()
 
 
 def _private_json(payload, status=200, no_store=True):
@@ -3413,14 +3526,8 @@ def _catalog_error(code, message, status):
 
 
 def _json_body(max_bytes=16_384):
-    if request.content_length and request.content_length > max_bytes:
-        raise ValueError("Request body is too large")
-    body = request.get_json(silent=True)
-    if body is None:
-        return {}
-    if not isinstance(body, dict):
-        raise ValueError("JSON body must be an object")
-    return body
+    # The bounded read: a chunked body has no Content-Length to check.
+    return _v2_body(max_bytes)
 
 
 def _preparation_api_payload(source, state=None):
@@ -3898,9 +4005,13 @@ def profiles():
         row["track_id"]: row
         for row in fetch_published_profile_rows(ids, source_id, edge_schema)
     }
+    # Attempts matter only for ids with no published profile.
     attempts = {
         row["track_id"]: row
-        for row in fetch_profile_rows(ids, catalog_instance_id=source_id)
+        for row in fetch_profile_status_rows(
+            [track_id for track_id in ids if track_id not in published],
+            catalog_instance_id=source_id,
+        )
     }
     ready = []
     failed = []
@@ -4244,11 +4355,16 @@ def analyze():
             503,
         )
     body = request.get_json(silent=True) or {}
+    raw_ids = body.get("ids", []) if isinstance(body, dict) else None
+    # A malformed body is the client's error, not a 500 (a string would be
+    # split into characters).
+    if not isinstance(raw_ids, list) or any(not isinstance(i, str) for i in raw_ids):
+        return _catalog_error("invalid_analyze_request", "ids must be a list of track IDs", 400)
     try:
         source = resolve_profile_source(catalog_instance_id=body.get("catalog_instance_id"))
     except (KeyError, ValueError, CatalogScanError) as exc:
         return _catalog_error("source_required", str(exc), 409)
-    ids = parse_ids(",".join(body.get("ids", [])))[:MAX_INTERACTIVE_PROFILE_IDS]
+    ids = parse_ids(",".join(raw_ids))[:MAX_INTERACTIVE_PROFILE_IDS]
     catalog_instance_id = source["catalog_instance_id"]
     accepted, already_ready, already_pending = split_analyze_ids(
         ids, catalog_instance_id=catalog_instance_id
@@ -4256,7 +4372,15 @@ def analyze():
     # A library catch-up may already have marked these rows pending. They are
     # recorded on demand too, so the runner serves them first: current
     # playback is never trapped behind an hours-long library backfill (R6).
-    record_interactive_profiles(accepted + already_pending, catalog_instance_id)
+    # An on-demand attempt already in flight keeps its token: a new one would
+    # drop the analysis a runner is doing as superseded.
+    in_flight = {row["track_id"] for row in fetch_profile_status_rows(
+        already_pending, catalog_instance_id=catalog_instance_id)
+        if row.get("status") == "pending_interactive"}
+    record_interactive_profiles(
+        accepted + [track_id for track_id in already_pending if track_id not in in_flight],
+        catalog_instance_id)
+    rewait_interactive_profiles(get_db(), catalog_instance_id, sorted(in_flight))
     return jsonify(
         {
             "accepted": accepted,
@@ -4487,10 +4611,10 @@ def analyze_edges_task(jobs, catalog_instance_id, server_id, priority="backgroun
     for index, job in enumerate(jobs):
         if background:
             serve_interactive()
-            if deadline is not None and time.monotonic() > deadline:
+            if (deadline is not None and time.monotonic() > deadline) or _edge_work_stopped():
                 for rest in jobs[index:]:
                     update_edge_job(get_db(), catalog_instance_id, rest, "failed", "edge-enqueue-failed")
-                    outcomes.append({"track_id": rest["track_id"], "status": "released"})
+                    outcomes.append({"track_id": rest["track_id"], "status": EDGE_RELEASED})
                 break
         outcome, state = _prepare_edge(job, catalog_instance_id, server_id)
         if state is not None:
@@ -4515,9 +4639,12 @@ def _prepare_edge(job, catalog_instance_id, server_id, defer=False):
     if not update_edge_job(get_db(), catalog_instance_id, job, "running"):
         return None, None
     state = {"job": job, "catalog_instance_id": catalog_instance_id, "info": None}
+    if _edge_work_stopped():
+        # Paused or edges off meanwhile: not the job's failure (a failure
+        # locked it out for six hours). Released, due again at once.
+        _release_edge(state)
+        return {"track_id": job["track_id"], "status": EDGE_RELEASED}, None
     try:
-        if maintenance_paused() or not edge_profiles_enabled():
-            raise ValueError("edge-worker-unavailable")
         info = state["info"] = load_track_file(job["track_id"], catalog_instance_id=catalog_instance_id,
                                                server_id=server_id, **({"defer": True} if defer else {}))
         if not info or opaque_revision(info.get("media_signature")) != job["media_revision"]:
@@ -4564,6 +4691,33 @@ def _finish_edge(state, payload, error):
             remove_downloaded_file(info.get("cleanup_path"))
 
 
+EDGE_RELEASED = "released"
+
+
+def _edge_work_stopped():
+    """Edge work stops: maintenance is paused or this process cannot compute edges."""
+    return maintenance_paused() or not edge_profiles_enabled()
+
+
+def _serve_between_edges():
+    """``_serve_between`` for an edge pass: it stops taking tracks once edge
+    work stops, as the waveform batch does at a pause."""
+    serve_interactive()
+    return not _edge_work_stopped()
+
+
+def _reached_unreleased(report, released, track_id=lambda unit: unit):
+    """``report.reached()``, stopping before a unit the pass released (track
+    ids in ``released``; due again at once): ``run`` counts a unit done
+    before ``finish`` releases it."""
+    last = None
+    for index, unit in enumerate(report.taken):
+        if index not in report.done or track_id(unit) in released:
+            break
+        last = unit
+    return last
+
+
 def _release_edge(state):
     """An edge whose analysis never finished (its pass raised, or Lumae's own
     download was refused): released, due again at once, like a background
@@ -4608,8 +4762,8 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None, shared=Fal
         pool = parallel_analysis.current()
         if pool is not None and pool.parallel:
             return _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, pass_deadline)
-        reached, counts = cursor, {}
-        while ids:
+        reached, counts, stopped = cursor, {}, False
+        while ids and not stopped:
             for track_id in ids:
                 # Before the first track too: production's pass ran 81 s on
                 # average against its 30 s (AUD-20).
@@ -4617,11 +4771,20 @@ def edge_backfill_task(server_id, catalog_instance_id, deadline=None, shared=Fal
                 if remaining <= 0:
                     break
                 jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
+                released = False
                 for outcome in analyze_edges_task(jobs, catalog_instance_id, server_id,
                                                   budget_seconds=remaining):
                     counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+                    released = released or outcome["status"] == EDGE_RELEASED
+                if released:
+                    # Due again at once: the cursor stays before it, and the
+                    # pass stops (its slice is used, or edge work stopped).
+                    break
                 reached = track_id
-            if reached != ids[-1] or time.monotonic() >= pass_deadline:
+                if _edge_work_stopped():
+                    stopped = True
+                    break
+            if stopped or reached != ids[-1] or time.monotonic() >= pass_deadline:
                 break
             ids = edge_backfill_candidates(get_db(), catalog_instance_id, reached, EDGE_BACKFILL_PAGE_SIZE)
         processed = sum(counts.values())
@@ -4664,6 +4827,7 @@ def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, d
     raised (released, due again at once) is reached again next turn.
     """
     counts, limit = {}, analysis_time_limit_seconds()
+    released = set()  # units released in prepare or finish: the cursor stays before them
 
     def prepare(track_id):
         jobs, _ready = claim_edge_jobs(get_db(), catalog_instance_id, [track_id])
@@ -4673,17 +4837,20 @@ def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, d
         if state is None:
             if outcome is not None:
                 counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+                if outcome["status"] == EDGE_RELEASED:
+                    released.add(track_id)
             return None
         info, path, kwargs = state["info"], state["path"], state["kwargs"]
-        return (lambda: (fetch_track_file(info), run_file_analysis(
+        return (lambda: (fetch_track_file(info, limit), run_file_analysis(
             loudness_v1.analyze_edge_file, path, limit_seconds=limit, **kwargs))[1]), state
 
-    def finish(_track_id, state, payload, error):
+    def finish(track_id, state, payload, error):
         if isinstance(error, analysis_download.DownloadError):
             _refuse_own_download(catalog_instance_id, error)
             error = parallel_analysis.Cancelled()
         if isinstance(error, parallel_analysis.Cancelled):
             _release_edge(state)
+            released.add(track_id)
             counts["released"] = counts.get("released", 0) + 1
             return
         outcome = _finish_edge(state, payload, error)
@@ -4694,14 +4861,14 @@ def _edge_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, ids, d
         _paged(ids, lambda last: edge_backfill_candidates(get_db(), catalog_instance_id, last,
                                                           EDGE_BACKFILL_PAGE_SIZE)),
         prepare, finish, pool=pool, deadline=deadline,
-        between=_serve_between)
+        between=_serve_between_edges)
     processed = sum(counts.values())
-    if report.stopped is None and not report.cancelled:
+    if report.stopped is None and not report.cancelled and not released:
         # The walk reached the end inside this turn.
         update_edge_backfill(db, catalog_instance_id, "complete", cursor="", processed=processed,
                              next_retry_hours=EDGE_BACKFILL_RESWEEP_HOURS, completed=True)
         return {"status": "complete", "processed": processed, **counts}
-    reached = report.reached()
+    reached = _reached_unreleased(report, released)
     update_edge_backfill(db, catalog_instance_id, "queued", cursor=cursor if reached is None else reached,
                          processed=processed)
     return {"status": "queued", "processed": processed, **counts}
@@ -4843,9 +5010,11 @@ def _edge_pass_shared(db, server_id, catalog_instance_id, deadline):
         if state is None:
             if outcome is not None:
                 counts[outcome["status"]] = counts.get(outcome["status"], 0) + 1
+                if outcome["status"] == EDGE_RELEASED:
+                    feed.cancelled.append(track_id)  # handed back, due again
             return None
         info, path, kwargs = state["info"], state["path"], state["kwargs"]
-        return (lambda: (fetch_track_file(info), run_file_analysis(
+        return (lambda: (fetch_track_file(info, limit), run_file_analysis(
             loudness_v1.analyze_edge_file, path, limit_seconds=limit, **kwargs))[1]), state
 
     def finish(track_id, state, payload, error):
@@ -4863,7 +5032,7 @@ def _edge_pass_shared(db, server_id, catalog_instance_id, deadline):
     report_edge_runtime(park=False)
     try:
         parallel_analysis.run(iter(feed), prepare, finish, pool=pool, deadline=deadline,
-                              between=_serve_between)
+                              between=_serve_between_edges)
     except Exception as exc:
         _rollback_if_possible(db)
         _close_feed(db, feed)
@@ -4932,22 +5101,34 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None, shared
             return _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, due, page_size,
                                            edges_enabled, pass_deadline, result)
         reached = cursor
+        breaker = _loudness_breaker(result)
+        held_from = None  # the cursor before the first held download failure
         while due:
             measured = []
             for track_id, media_revision in due:
                 serve_interactive()
                 if time.monotonic() >= pass_deadline:
                     break
-                outcome = _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured)
-                result[outcome] += 1
+                outcome = _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured,
+                                            breaker)
+                if outcome == "held":
+                    held_from = reached if held_from is None else held_from
+                if breaker.tripped:
+                    reached = held_from  # a media-server outage: they stay due, before the cursor
+                    break
+                if outcome != "held":
+                    result[outcome] += 1
+                    if not breaker.held:
+                        held_from = None
                 reached = track_id
             failed = _publish_loudness(db, catalog_instance_id, measured)
             result["ready"] -= failed
             result["failed"] += failed
-            if reached != due[-1][0] or time.monotonic() >= pass_deadline:
+            if breaker.tripped or reached != due[-1][0] or time.monotonic() >= pass_deadline:
                 break
             due = loudness_backfill.candidates(db, catalog_instance_id, reached, page_size,
                                                edges_enabled=edges_enabled)
+        breaker.settle()
         result["processed"] = result["ready"] + result["failed"]
         if not due:
             # The walk reached the end inside this turn.
@@ -4962,10 +5143,12 @@ def loudness_backfill_task(server_id, catalog_instance_id, deadline=None, shared
         raise
 
 
-def _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured):
+def _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revision, measured,
+                      breaker=None):
     """``ready`` (its measurement appended to ``measured``) or ``failed`` for one track: one
-    download, one decode."""
-    outcome, state = _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revision)
+    download, one decode (``held``: see ``_prepare_loudness``)."""
+    outcome, state = _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revision,
+                                       **({"breaker": breaker} if breaker is not None else {}))
     if outcome is not None:
         return outcome
     try:
@@ -4975,9 +5158,12 @@ def _measure_loudness(db, catalog_instance_id, server_id, track_id, media_revisi
     return _finish_loudness(state, record, error, measured)
 
 
-def _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revision, defer=False):
+def _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revision, defer=False,
+                      breaker=None):
     """A loudness measurement's download (WP1b's split of ``_measure_loudness``):
-    ``("failed", None)`` or ``(None, state)``; the turn's own thread."""
+    ``("failed", None)`` or ``(None, state)``; the turn's own thread. With a
+    ``breaker`` (a ``_loudness_breaker``) a failed host download is ``("held", None)``:
+    recorded once the breaker settles, never when it trips."""
     state = {"db": db, "catalog_instance_id": catalog_instance_id, "track_id": track_id,
              "media_revision": media_revision, "info": None}
     try:
@@ -4987,9 +5173,27 @@ def _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revisi
         db.commit()
         if not info or opaque_revision(info.get("media_signature")) != media_revision:
             raise ValueError("loudness-source-replaced")
+    except MediaDownloadError as exc:
+        if breaker is None:
+            return _finish_loudness(state, None, exc, None), None
+        _rollback_if_possible(db)
+        breaker.hold((track_id, media_revision),
+                     lambda: breaker.count(_finish_loudness(state, None, exc, None)))
+        return "held", None
     except Exception as exc:
         return _finish_loudness(state, None, exc, None), None
+    if breaker is not None and info.get("download") is None:
+        breaker.settle()  # the host downloaded this file: the server is up
     return None, state
+
+
+def _loudness_breaker(result, release=lambda items: None):
+    """A loudness pass's ``_DownloadBreaker``: a settled failure is counted in
+    ``result``; a trip records nothing, so the tracks stay due, and
+    ``release(items)`` keeps the pass's cursor before them."""
+    breaker = _DownloadBreaker(release)
+    breaker.count = lambda outcome: result.__setitem__(outcome, result[outcome] + 1)
+    return breaker
 
 
 def _finish_loudness(state, record, error, measured):
@@ -5023,16 +5227,19 @@ def _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, du
     the pass raised is not counted and keeps the cursor before it.
     """
     measured, limit = [], analysis_time_limit_seconds()
+    released = set()  # track ids left due (a refused own download, an outage): the cursor stays before them
+    breaker = _loudness_breaker(result, lambda items: released.update(item[0] for item in items))
 
     def prepare(item):
         track_id, media_revision = item
         outcome, state = _prepare_loudness(db, catalog_instance_id, server_id, track_id, media_revision,
-                                           defer=True)
+                                           defer=True, breaker=breaker)
         if state is None:
-            result[outcome] += 1
+            if outcome != "held":
+                result[outcome] += 1
             return None
         info = state["info"]
-        return (lambda: (fetch_track_file(info), run_file_analysis(
+        return (lambda: (fetch_track_file(info, limit), run_file_analysis(
             loudness_v1.measure_file, info["file_path"], limit_seconds=limit))[1]), state
 
     def publish():
@@ -5041,30 +5248,37 @@ def _loudness_pass_parallel(pool, db, server_id, catalog_instance_id, cursor, du
         result["failed"] += failed
         measured.clear()
 
-    def finish(_item, state, record, error):
+    def finish(item, state, record, error):
         if isinstance(error, analysis_download.DownloadError):
             _refuse_own_download(catalog_instance_id, error)
             error = parallel_analysis.Cancelled()
         if isinstance(error, parallel_analysis.Cancelled):
             if state["info"]:
                 remove_downloaded_file(state["info"].get("cleanup_path"))
+            released.add(item[0])
             return
+        if state["info"].get("download") is not None:
+            breaker.settle()  # Lumae's own download fetched this file
         result[_finish_loudness(state, record, error, measured)] += 1
         if len(measured) >= page_size:
             publish()
 
+    def between():
+        return _serve_between() and not breaker.tripped
+
     report = parallel_analysis.run(
         _paged(due, lambda last: loudness_backfill.candidates(db, catalog_instance_id, last[0], page_size,
                                                               edges_enabled=edges_enabled)),
-        prepare, finish, pool=pool, deadline=deadline, between=_serve_between)
+        prepare, finish, pool=pool, deadline=deadline, between=between)
+    breaker.settle()
     publish()
     result["processed"] = result["ready"] + result["failed"]
-    if report.stopped is None and not report.cancelled:
+    if report.stopped is None and not report.cancelled and not released:
         # The walk reached the end inside this turn.
         loudness_backfill.update(db, catalog_instance_id, "complete", cursor="", processed=result["processed"],
                                  next_retry_hours=loudness_backfill.RESWEEP_HOURS, completed=True)
         return {**result, "status": "complete"}
-    reached = report.reached()
+    reached = _reached_unreleased(report, released, lambda unit: unit[0])
     loudness_backfill.update(db, catalog_instance_id, "queued", cursor=cursor if reached is None else reached[0],
                              processed=result["processed"])
     return {**result, "status": "queued"}
@@ -5097,16 +5311,20 @@ def _loudness_pass_shared(db, server_id, catalog_instance_id, deadline, result):
             conn, catalog_instance_id, ids, edges_enabled=edges_enabled),
         complete=loudness_backfill.complete_sql)
 
+    # A media-server outage hands the held tracks back, due again.
+    breaker = _loudness_breaker(result, feed.cancelled.extend)
+
     def prepare(item):
         feed.started(item)
         track_id, media_revision = item
         outcome, state = _prepare_loudness(db, catalog_instance_id, server_id, track_id,
-                                           media_revision, defer=True)
+                                           media_revision, defer=True, breaker=breaker)
         if state is None:
-            result[outcome] += 1
+            if outcome != "held":
+                result[outcome] += 1
             return None
         info = state["info"]
-        return (lambda: (fetch_track_file(info), run_file_analysis(
+        return (lambda: (fetch_track_file(info, limit), run_file_analysis(
             loudness_v1.measure_file, info["file_path"], limit_seconds=limit))[1]), state
 
     def publish():
@@ -5124,13 +5342,16 @@ def _loudness_pass_shared(db, server_id, catalog_instance_id, deadline, result):
                 remove_downloaded_file(state["info"].get("cleanup_path"))
             feed.cancelled.append(item)
             return
+        if state["info"].get("download") is not None:
+            breaker.settle()  # Lumae's own download fetched this file
         result[_finish_loudness(state, record, error, measured)] += 1
         if len(measured) >= page_size:
             publish()
 
     try:
         parallel_analysis.run(iter(feed), prepare, finish, pool=pool, deadline=deadline,
-                              between=_serve_between)
+                              between=lambda: _serve_between() and not breaker.tripped)
+        breaker.settle()
         publish()
     except Exception as exc:
         _rollback_if_possible(db)
@@ -5185,9 +5406,12 @@ def serve_interactive(limit=None):
     A helper serves none (multi-worker plan R1): the on-demand claims are the
     role's, and the leader serves them between its own files.
     """
-    global _serving_interactive
+    global _serving_interactive, _interactive_failed_at
     if _serving_interactive or runner.HELPING.get() or maintenance_paused():
         return 0
+    if (_interactive_failed_at is not None
+            and time.monotonic() - _interactive_failed_at < INTERACTIVE_FAILURE_BACKOFF_SECONDS):
+        return 0  # its claims wait again; no hot retry between every file
     limit = limit or INTERACTIVE_PROFILE_CHUNK_SIZE
     _serving_interactive = True
     served = 0
@@ -5214,12 +5438,23 @@ def serve_interactive(limit=None):
         if db is not None:
             _rollback_if_possible(db)
         logger.exception("lumae_analysis could not serve on-demand work")
+        _interactive_failed_at = time.monotonic()
+        role = runner.ROLE.get()
+        if db is not None and role in RUNNER_CLAIM_MARKERS:
+            # The claims not served yet (this runner's only: a call serves
+            # them all, and a helper serves none) wait again at once, not for
+            # the stale recovery's half hour.
+            _safe_release_runner_claims(db, role)
     finally:
         _serving_interactive = False
     return served
 
 
 _serving_interactive = False
+# After a failed serve_interactive, on-demand work waits this long before this
+# runner tries again (any other runner may take it meanwhile).
+INTERACTIVE_FAILURE_BACKOFF_SECONDS = 30
+_interactive_failed_at = None
 
 
 def claim_waiting_profiles(db, limit):
@@ -5325,8 +5560,9 @@ def interactive_demand_pending(db):
 
 
 def analyze_one_track(track_id, catalog_instance_id=None, server_id=None,
-                      attempt_token=None, priority="background"):
-    outcome, state = _prepare_track(track_id, catalog_instance_id, server_id, attempt_token, priority)
+                      attempt_token=None, priority="background", breaker=None):
+    outcome, state = _prepare_track(track_id, catalog_instance_id, server_id, attempt_token, priority,
+                                    **({"breaker": breaker} if breaker is not None else {}))
     if outcome is not None:
         return outcome
     try:
@@ -5364,7 +5600,8 @@ def _analyse_track_file(state, limit_seconds=None):
         media_revision=opaque_revision(state["info"]["media_signature"]))
 
 
-def _prepare_track(track_id, catalog_instance_id, server_id, attempt_token, priority, defer=False):
+def _prepare_track(track_id, catalog_instance_id, server_id, attempt_token, priority, defer=False,
+                   breaker=None):
     """A waveform's claim and download (WP1b's split of ``analyze_one_track``).
 
     ``(outcome, None)`` when it settled here, or ``(None, state)`` with the
@@ -5400,9 +5637,20 @@ def _prepare_track(track_id, catalog_instance_id, server_id, attempt_token, prio
             **({"defer": True} if defer else {}),
         )
     except MediaDownloadError as exc:
-        return complete(object(), "failed", str(exc), failure_code="download_unavailable"), None
+        def charge(message=str(exc)):
+            return complete(object(), "failed", message, failure_code="download_unavailable")
+        if breaker is None:
+            return charge(), None
+        held = {"track_id": track_id, "status": "failed", "token": attempt_token}
+
+        def charge_held():
+            held.pop("token", None)
+            held.update(charge())
+        return breaker.hold(held, charge_held), None
     if info is None:
         return complete(object(), "skipped_no_file", "missing file path", failure_code="media_unavailable"), None
+    if breaker is not None and info.get("download") is None:
+        breaker.settle()  # the host downloaded this file: the server is up
     state = {"track_id": track_id, "catalog_instance_id": catalog_instance_id, "server_id": server_id,
              "attempt_token": attempt_token, "priority": priority, "info": info, "complete": complete,
              "bundle": bool(catalog_instance_id) and _bundle_edges(info.get("media_signature"))}
@@ -5501,6 +5749,56 @@ def _release_track(state, reason):
                         count_failure=False)
     finally:
         remove_downloaded_file(state["info"].get("cleanup_path"))
+
+
+# A batch stops once this many host downloads fail in a row: a media-server
+# outage, not the files, so their retry budgets are not charged.
+DOWNLOAD_BREAKER_LIMIT = 3
+DOWNLOAD_BREAKER_STATUS = "deferred_download_unavailable"
+
+
+class _DownloadBreaker:
+    """A pass's run of failed host downloads. Each failure is held: charged as
+    today once a later download in the pass succeeds or the pass ends, and
+    handed to ``release`` uncharged once DOWNLOAD_BREAKER_LIMIT fail in a row,
+    which trips the breaker and stops the pass (LUM-007's per-file budget
+    stays for a file that fails among good ones)."""
+
+    def __init__(self, release):
+        self.release = release
+        self.held = []  # (unit, charge)
+        self.tripped = False
+
+    def hold(self, unit, charge):
+        self.held.append((unit, charge))
+        if len(self.held) >= DOWNLOAD_BREAKER_LIMIT:
+            held, self.held = self.held, []
+            self.tripped = True
+            logger.warning("lumae_analysis: %d downloads in a row failed; the pass stops", len(held))
+            self.release([held_unit for held_unit, _charge in held])
+        return unit
+
+    def settle(self):
+        """A download worked, or the pass ended: the held failures were the files'."""
+        held, self.held = self.held, []
+        for _unit, charge in held:
+            charge()
+
+
+def _waveform_breaker(catalog_instance_id):
+    """A waveform batch's breaker: its units are the tracks' result dicts,
+    each with its ``token``; a trip releases them uncounted."""
+    def release(results):
+        release_pending([result["track_id"] for result in results],
+                        catalog_instance_id=catalog_instance_id,
+                        reason="The media server's downloads failed",
+                        tokens={result["track_id"]: result.pop("token") for result in results
+                                if result.get("token")},
+                        count_failure=False)
+        for result in results:
+            result.pop("token", None)
+            result["status"] = DOWNLOAD_BREAKER_STATUS
+    return _DownloadBreaker(release)
 
 
 def hook_track_id(song):
@@ -5721,6 +6019,7 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
                 server_id=server_id,
             )
         except Exception as exc:
+            _rollback_if_possible(get_db())
             logger.exception(
                 "lumae_analysis could not start relationship enrichment after analysis"
             )
@@ -5751,6 +6050,7 @@ def finalize_analysis_run_task(server_id, catalog_instance_id, run_id):
             "relationships": relationship_result,
         }
     except Exception as exc:
+        _rollback_if_possible(get_db())  # an aborted transaction would mask ``exc``
         update_analysis_run(
             catalog_instance_id,
             run_id,
@@ -5865,7 +6165,7 @@ def _analyze_song_hook(song):
 
 
 def profile_task_disposition(track_id, catalog_instance_id=None, server_id=None, priority="background"):
-    rows = fetch_profile_rows([track_id], catalog_instance_id=catalog_instance_id)
+    rows = fetch_profile_status_rows([track_id], catalog_instance_id=catalog_instance_id)
     row = rows[0] if rows else None
     if not row:
         return "analyze"
@@ -5953,13 +6253,27 @@ def analyze_tracks_task(
             "skipped": 0,
             "deferred": len(ids),
         }
+    breaker = _waveform_breaker(catalog_instance_id)
     if pool is not None:
         results, attempted = _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id,
-                                                      attempt_tokens, deadline)
-        return _tracks_summary(results, attempted, catalog_instance_id, priority)
+                                                      attempt_tokens, deadline, breaker)
+        return _tracks_summary(results, attempted, catalog_instance_id, priority, breaker)
     results = []
     attempted = 0
     for index, track_id in enumerate(ids):
+        if breaker.tripped:
+            # A media-server outage: the rest wait uncounted (LUM-007).
+            remaining = ids[index:]
+            release_pending(
+                remaining,
+                catalog_instance_id=catalog_instance_id,
+                reason="The media server's downloads failed",
+                tokens=attempt_tokens,
+                count_failure=False,
+            )
+            results.extend({"track_id": item_id, "status": DOWNLOAD_BREAKER_STATUS}
+                           for item_id in remaining)
+            break
         _safe_progress("analyzing volume and ramps", current=index, total=len(ids))
         if deadline is not None and time.monotonic() >= deadline:
             remaining = ids[index:]
@@ -6013,15 +6327,18 @@ def analyze_tracks_task(
                 server_id=server_id,
                 attempt_token=attempt_tokens.get(track_id) if catalog_instance_id else None,
                 priority=priority,
+                breaker=breaker,
             )
         )
         _safe_progress("analyzing volume and ramps", current=index + 1, total=len(ids))
         if priority == "background" and catalog_instance_id:
             heartbeat_profile_backfill(catalog_instance_id)
-    return _tracks_summary(results, attempted, catalog_instance_id, priority)
+    breaker.settle()
+    return _tracks_summary(results, attempted, catalog_instance_id, priority, breaker)
 
 
-def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_tokens, deadline):
+def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_tokens, deadline,
+                             breaker=None):
     """A background waveform batch on the turn's K analysis threads (WP1b):
     ``(results, attempted)``.
 
@@ -6035,6 +6352,7 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
     results, attempted, paused = [], [0], [False]
     limit = analysis_time_limit_seconds()
     tokens = attempt_tokens or {}
+    breaker = breaker or _waveform_breaker(catalog_instance_id)
 
     def between():
         serve_interactive()
@@ -6043,7 +6361,7 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
         if maintenance_paused():
             paused[0] = True
             return False
-        return True
+        return not breaker.tripped
 
     def prepare(track_id):
         _safe_progress("analyzing volume and ramps", current=len(results), total=len(ids))
@@ -6058,11 +6376,11 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
         attempted[0] += 1
         outcome, state = _prepare_track(track_id, catalog_instance_id, server_id,
                                         tokens.get(track_id) if catalog_instance_id else None, "background",
-                                        defer=True)
+                                        defer=True, breaker=breaker)
         if outcome is not None:
             results.append(outcome)
             return None
-        return (lambda: (fetch_track_file(state["info"]), _analyse_track_file(state, limit))[1]), state
+        return (lambda: (fetch_track_file(state["info"], limit), _analyse_track_file(state, limit))[1]), state
 
     def finish(track_id, state, result, error):
         reason = "The Lumae runner's slice was used"
@@ -6075,20 +6393,27 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
             _release_track(state, reason)
             results.append({"track_id": track_id, "status": "deferred_tick_deadline"})
         else:
+            if state["info"].get("download") is not None:
+                breaker.settle()  # Lumae's own download fetched this file
             results.append(_finish_track(state, result, error))
         _safe_progress("analyzing volume and ramps", current=len(results), total=len(ids))
         if catalog_instance_id:
             heartbeat_profile_backfill(catalog_instance_id)
 
     report = parallel_analysis.run(ids, prepare, finish, pool=pool, deadline=deadline, between=between)
+    breaker.settle()
     remaining = ids[len(report.taken):]
     if remaining:
-        status = "skipped_maintenance_paused" if paused[0] else "deferred_tick_deadline"
+        if paused[0]:
+            status, reason = "skipped_maintenance_paused", "Lumae background maintenance was paused during the batch"
+        elif breaker.tripped:
+            status, reason = DOWNLOAD_BREAKER_STATUS, "The media server's downloads failed"
+        else:
+            status, reason = "deferred_tick_deadline", "The Lumae runner's slice was used"
         release_pending(
             remaining,
             catalog_instance_id=catalog_instance_id,
-            reason=("Lumae background maintenance was paused during the batch" if paused[0]
-                    else "The Lumae runner's slice was used"),
+            reason=reason,
             tokens=attempt_tokens,
             count_failure=False,
         )
@@ -6096,7 +6421,7 @@ def _analyze_tracks_parallel(pool, ids, catalog_instance_id, server_id, attempt_
     return results, attempted[0]
 
 
-def _tracks_summary(results, attempted, catalog_instance_id, priority):
+def _tracks_summary(results, attempted, catalog_instance_id, priority, breaker=None):
     summary = {
         "attempted": attempted,
         "ready": sum(1 for result in results if result["status"] == "ready"),
@@ -6106,8 +6431,11 @@ def _tracks_summary(results, attempted, catalog_instance_id, priority):
         "promoted": sum(1 for result in results if result["status"] == "promoted"),
         "failed": sum(1 for result in results if result["status"] == "failed"),
         "skipped": sum(1 for result in results if result["status"].startswith("skipped")),
-        "deferred": sum(1 for result in results if result["status"] == "deferred_tick_deadline"),
+        "deferred": sum(1 for result in results
+                        if result["status"] in ("deferred_tick_deadline", DOWNLOAD_BREAKER_STATUS)),
     }
+    if breaker is not None and breaker.tripped:
+        summary["download_breaker"] = True
     if catalog_instance_id:
         finalize_preparation_if_settled(catalog_instance_id)
         if priority != "background":
@@ -6256,7 +6584,10 @@ def find_backfill_ids(
     server_id=None,
     include_failed=False,
 ):
-    batch_limit = normalize_backfill_limit(limit or configured_backfill_limit())
+    # Only the admin setting is clamped (configured_backfill_limit): an
+    # explicit limit is honoured, so a parallel batch of K x 10 keeps K
+    # threads busy (background_batch_limit).
+    batch_limit = max(1, int(limit)) if limit else configured_backfill_limit()
     ids = []
     rows = fetch_backfill_rows(
         batch_limit,
@@ -6470,7 +6801,8 @@ def profile_backfill_state(catalog_instance_id, db=None):
     cur.execute(
         f"""
         SELECT server_id, status, processed_profiles, queued_profiles,
-               last_error, started_at, completed_at, updated_at, next_retry_at
+               last_error, started_at::timestamptz, completed_at::timestamptz,
+               updated_at::timestamptz, next_retry_at::timestamptz
           FROM {profile_backfill_state_table()}
          WHERE catalog_instance_id=%s
         """,
@@ -6487,13 +6819,29 @@ def profile_backfill_state(catalog_instance_id, db=None):
         "processed_profiles": int(row[2] or 0),
         "queued_profiles": int(row[3] or 0),
         "last_error": str(row[4]) if row[4] else None,
-        "started_at": str(row[5]) if row[5] else None,
-        "completed_at": str(row[6]) if row[6] else None,
-        "updated_at": str(row[7]) if row[7] else None,
+        "started_at": _utc_text(row[5]),
+        "completed_at": _utc_text(row[6]),
+        "updated_at": _utc_text(row[7]),
         # LUM-017 (P3-9): when this is set the worker is deliberately
         # cooling down after a transient failure, not idle or stuck.
-        "next_retry_at": str(row[8]) if row[8] else None,
+        "next_retry_at": _utc_text(row[8]),
     }
+
+
+def _utc_text(value):
+    """UTC ``...Z`` text for a ``TIMESTAMP`` column selected ``::timestamptz``.
+
+    The state tables' ``TIMESTAMP`` columns hold the session's local time
+    (written with ``now()``); the cast reads them in the session's zone, so
+    the text is real UTC whatever the zone (as ``edge_profile_store._utc_iso``).
+    """
+    if value is None:
+        return None
+    if not hasattr(value, "astimezone"):
+        return str(value)
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat().replace("+00:00", "Z")
 
 
 def profile_backfill_is_active(state, now=None):
@@ -6781,6 +7129,15 @@ def profile_backfill_task(server_id, catalog_instance_id, deadline=None, shared=
         finally:
             _forget_waveform(held)
         analysed = len(ids) - int((result or {}).get("deferred") or 0)
+        if (result or {}).get("download_breaker"):
+            # A media-server outage: the batch's tracks wait uncounted, and the
+            # pass backs off instead of trying the next batch at once.
+            update_profile_backfill_state(
+                catalog_instance_id, server_id, "queued",
+                processed_increment=analysed, last_error="download_unavailable",
+                retry_after_seconds=BACKFILL_ABORT_RETRY_SECONDS,
+            )
+            return {**result, "status": "waiting_retry", "processed": analysed, "queued_next": False}
         next_ids = find_backfill_ids(
             1,
             catalog_instance_id=catalog_instance_id,
@@ -6812,6 +7169,9 @@ def profile_backfill_task(server_id, catalog_instance_id, deadline=None, shared=
             **result,
         }
     except Exception as exc:
+        # A PostgreSQL error leaves the transaction aborted: the writes below
+        # would raise and mask it.
+        _rollback_if_possible(get_db())
         if claimed_ids:
             try:
                 release_pending(
@@ -6965,12 +7325,24 @@ def helper_profile_batch_task(server_id, catalog_instance_id, deadline=None):
             "WHERE catalog_instance_id=%s",
             (int(analysed), catalog_instance_id),
         )
+        if (result or {}).get("download_breaker"):
+            # A media-server outage: the source's pass backs off for the
+            # helpers too (the leader's running batch sets its own retry).
+            cur.execute(
+                f"""UPDATE {profile_backfill_state_table()}
+                       SET next_retry_at=GREATEST(COALESCE(next_retry_at, now()),
+                                                  now() + make_interval(secs => %s))
+                     WHERE catalog_instance_id=%s AND status IN ('queued', 'failed')""",
+                (float(BACKFILL_ABORT_RETRY_SECONDS), catalog_instance_id),
+            )
     db.commit()
+    if (result or {}).get("download_breaker"):
+        return {**result, "status": "waiting_retry", "processed": analysed}
     return {**(result or {}), "status": "queued", "processed": analysed}
 
 
 def backfill_missing_profiles(limit=None, catalog_instance_id=None, server_id=None):
-    requested_limit = limit or configured_backfill_limit()
+    requested_limit = normalize_backfill_limit(limit or configured_backfill_limit())
     source = (
         resolve_profile_source(
             catalog_instance_id=catalog_instance_id, server_id=server_id,
@@ -7067,7 +7439,8 @@ def preparation_state(catalog_instance_id, db=None):
         SELECT server_id, status, phase, queued_profiles, profile_jobs,
                target_plugin_version, target_catalog_builder_version,
                worker_plugin_version, worker_catalog_builder_version,
-               last_error, started_at, completed_at, updated_at
+               last_error, started_at::timestamptz, completed_at::timestamptz,
+               updated_at::timestamptz
           FROM {preparation_state_table()}
          WHERE catalog_instance_id=%s
         """,
@@ -7089,9 +7462,9 @@ def preparation_state(catalog_instance_id, db=None):
         "worker_plugin_version": str(row[7]) if row[7] else None,
         "worker_catalog_builder_version": int(row[8]) if row[8] is not None else None,
         "last_error": str(row[9]) if row[9] else None,
-        "started_at": str(row[10]) if row[10] else None,
-        "completed_at": str(row[11]) if row[11] else None,
-        "updated_at": str(row[12]) if row[12] else None,
+        "started_at": _utc_text(row[10]),
+        "completed_at": _utc_text(row[11]),
+        "updated_at": _utc_text(row[12]),
     }
 
 
@@ -7135,9 +7508,14 @@ def preparation_is_active(state, now=None):
         return True
 
 
-def claim_preparation(source, db=None):
-    """Atomically admit one preparation run for an exact catalogue source."""
+def claim_preparation(source, db=None, keep_backoff=False):
+    """Atomically admit one preparation run for an exact catalogue source.
+
+    ``keep_backoff``: leave a failed run alone (the runner's bookkeeping):
+    ``next_preparation_run`` retries it when its retry is due, and a re-claim
+    would reset its ladder. An explicit request re-queues it at once."""
     db = db or get_db()
+    backoff = f" AND {preparation_state_table()}.status <> 'failed'" if keep_backoff else ""
     cur = db.cursor()
     cur.execute(
         f"""
@@ -7156,8 +7534,8 @@ def claim_preparation(source, db=None):
             worker_plugin_version=NULL, worker_catalog_builder_version=NULL,
             last_error=NULL, started_at=now(), completed_at=NULL,
             retry_count=0, next_retry_at=NULL, updated_at=now()
-        WHERE {preparation_state_table()}.status NOT IN ('queued', 'running')
-           OR {preparation_state_table()}.updated_at < now() - interval '{PREPARATION_STALE_HOURS} hours'
+        WHERE ({preparation_state_table()}.status NOT IN ('queued', 'running')
+           OR {preparation_state_table()}.updated_at < now() - interval '{PREPARATION_STALE_HOURS} hours'){backoff}
         RETURNING catalog_instance_id
         """,
         (
@@ -7302,7 +7680,9 @@ def update_preparation_state(
 
 def finalize_preparation_if_settled(catalog_instance_id):
     state = preparation_state(catalog_instance_id)
-    if not state or state["status"] not in ("running", "profiles_queued"):
+    # Only a legacy ``profiles_queued`` row settles here: ``running`` means
+    # prepare_lumae_task is mid-refresh, not that its profiles settled.
+    if not state or state["status"] != "profiles_queued":
         return state
     counts = analysis_status_counts(
         catalog_instance_id=catalog_instance_id,
@@ -7397,6 +7777,7 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
         except Exception as exc:
             # The catalogue is already safe and usable. Enrichment failures
             # remain visible in their own state and never roll readiness back.
+            _rollback_if_possible(get_db())
             logger.exception("lumae_analysis could not start background profile enrichment")
             profile_result = {"queued": False, "coalesced": False, "error": str(exc)}
         try:
@@ -7406,6 +7787,7 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
                 server_id=resolved_server_id,
             )
         except Exception as exc:
+            _rollback_if_possible(get_db())
             logger.exception(
                 "lumae_analysis could not start background relationship enrichment"
             )
@@ -7422,6 +7804,7 @@ def prepare_lumae_task(server_id=None, catalog_instance_id=None):
             "preparation": preparation_state(resolved_catalog_instance_id),
         }
     except Exception as exc:
+        _rollback_if_possible(get_db())  # an aborted transaction would mask ``exc``
         if resolved_catalog_instance_id and resolved_server_id:
             update_preparation_state(
                 resolved_catalog_instance_id,
@@ -8274,7 +8657,12 @@ def _next_shared_source(db, action):
                 f"""SELECT st.server_id, st.catalog_instance_id
                       FROM {profile_backfill_state_table()} st
                       JOIN {table('catalog_sources')} s USING (catalog_instance_id)
-                     WHERE s.rebind_status='active' AND st.status IN ('queued', 'running', 'failed')
+                     WHERE s.rebind_status='active'
+                       -- As the leader's next_profile_backfill_run: a source
+                       -- cooling down has nothing due for a helper either.
+                       AND (st.status='running'
+                            OR (st.status IN ('queued', 'failed')
+                                AND (st.next_retry_at IS NULL OR st.next_retry_at <= now())))
                      ORDER BY st.updated_at, st.catalog_instance_id LIMIT 1"""
             )
             row = cur.fetchone()

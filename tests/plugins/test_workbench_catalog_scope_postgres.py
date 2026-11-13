@@ -598,7 +598,7 @@ def test_a_mixed_catalogue_collection_streams_and_shows_art_per_item(workbench, 
                         lambda catalog, provider, build: build(None))
     monkeypatch.setattr(library, "_resolve_stream_target", lambda item_id, provider, module=None: (
         seen.append(("stream", item_id, provider)) or (None, ("stopped", 502))))
-    monkeypatch.setattr(library, "_resolve_art_target", lambda item_id, size, provider, module=None: (
+    monkeypatch.setattr(library, "_resolve_art_target", lambda item_id, size, provider, module=None, **_: (
         seen.append(("art", item_id, provider))))
     monkeypatch.setattr(library, "_proxy_art", lambda target: None)
     assert call("POST", "/api/collections", {"id": "mix", "name": "Mix"}).status_code == 201

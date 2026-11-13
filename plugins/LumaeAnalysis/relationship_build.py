@@ -25,6 +25,7 @@ import uuid
 import numpy as np
 from psycopg2.extras import execute_values
 
+from . import migrations
 from .catalog import CatalogScanError, canonical_json, opaque_cursor
 
 log = logging.getLogger("lumae.relationships")
@@ -41,6 +42,19 @@ def t(name):
 
 class InputsChanged(CatalogScanError):
     pass
+
+
+class InputsNotPublished(InputsChanged):
+    """No published catalogue and sonic analysis to start (or resume) from.
+
+    Unlike inputs that move under a running build, nothing is gained by trying
+    again at once: the build waits for a publication to queue it, or for its
+    retry time."""
+
+
+# How long a build that found no published inputs waits before it looks again
+# (a publication queues it sooner through claim_relationship_preparation).
+WAITING_FOR_INPUTS_RETRY_SECONDS = 300
 
 
 # The identity fields a staged build must share with the live inputs to be
@@ -97,6 +111,11 @@ def migrate_relationship_builds(cur):
             PRIMARY KEY (catalog_instance_id, track_id)
         )
     """)
+    # Every step reads the staged tracks in input order.
+    migrations.ensure_index(cur, f"""
+        CREATE INDEX IF NOT EXISTS {t('relationship_build_tracks_order_idx')}
+        ON {t('relationship_build_tracks')} (catalog_instance_id, input_order)
+    """)
 
 
 def pack_entity(entity):
@@ -136,6 +155,21 @@ def unpack_entity(blob):
                 return [decode(item) for item in value]
             return value
         return decode(json.loads(archive["metadata"].tobytes().decode("utf-8")))
+
+
+class PackedEntities(dict):
+    """Entity blobs by key, unpacked on first read (``[key]``) and kept.
+
+    A scoring step reads only the entities it scores and their candidates, not
+    the whole checkpoint. Read entities by ``[key]``; other accessors see the
+    blobs of entities not read yet."""
+
+    def __getitem__(self, key):
+        value = dict.__getitem__(self, key)
+        if not isinstance(value, dict):
+            value = unpack_entity(value)
+            dict.__setitem__(self, key, value)
+        return value
 
 
 def analysis_inputs_digest(cur, source_id, generation):
@@ -197,7 +231,7 @@ def input_state(cur, source_id, lock=False):
     row = cur.fetchone()
     if (not row or row[1] != 'active' or row[4] != 'complete'
             or row[7] != 'complete' or int(row[2]) <= 0 or int(row[5]) <= 0):
-        raise InputsChanged("Waiting for published catalogue and sonic analysis inputs")
+        raise InputsNotPublished("Waiting for published catalogue and sonic analysis inputs")
     analysis_generation = int(row[5])
     return {
         "server_id": row[0], "catalog_generation": int(row[2]), "catalog_epoch": row[3],
@@ -213,7 +247,10 @@ class Build:
     def __init__(self, db, source_id, progress, batch_size, time_budget_seconds):
         self.db, self.source_id, self.callback = db, source_id, progress
         self.batch_size = max(1, min(int(batch_size), 1024))
-        self.deadline = time.monotonic() + max(0.01, float(time_budget_seconds))
+        # The budget is for work: its clock starts once the step has loaded
+        # its checkpoint (start_clock), so a reload never eats it.
+        self.time_budget = max(0.01, float(time_budget_seconds))
+        self.deadline = None
         self.work = 0
         self.diagnostics = {"timings_ms": {}, "counts": {}}
         self.active_phase = "claiming"
@@ -239,8 +276,14 @@ class Build:
             log.debug("relationship phase finished source=%s phase=%s duration_ms=%s counts=%s",
                      self.source_id, phase, elapsed, self.diagnostics["counts"])
 
+    def start_clock(self):
+        """Start the step's time budget, once, after its checkpoint is loaded."""
+        if self.deadline is None:
+            self.deadline = time.monotonic() + self.time_budget
+
     def exhausted(self):
-        return self.work >= self.batch_size or time.monotonic() >= self.deadline
+        return self.work >= self.batch_size or (
+            self.deadline is not None and time.monotonic() >= self.deadline)
 
     def report(self, phase, current=None, total=None):
         # Only call at committed boundaries: the existing callback commits get_db().
@@ -267,7 +310,12 @@ class Build:
                 self.diagnostics['timings_ms'], self.diagnostics['counts'])
 
     def verify_inputs(self, cur, lock=False):
-        identity, analysis_generation = input_state(cur, self.source_id, lock=lock)
+        try:
+            identity, analysis_generation = input_state(cur, self.source_id, lock=lock)
+        except InputsNotPublished as exc:
+            # The inputs moved under this build: that restarts it (queued),
+            # it is not a build that cannot start.
+            raise InputsChanged(str(exc)) from exc
         self.live_identity = identity
         if identity == self.identity:
             # An equal digest means the current generation holds the same inputs.
@@ -329,13 +377,27 @@ class Build:
     def fingerprints(self, cur):
         from . import catalog_enrichment as e
         self.report("Loading relationship inputs")
-        cur.execute(f"SELECT inputs_ready FROM {t('relationship_builds')} WHERE catalog_instance_id=%s",
+        cur.execute(f"SELECT inputs_ready, track_count, album_count, artist_count "
+                    f"FROM {t('relationship_builds')} WHERE catalog_instance_id=%s",
                     (self.source_id,))
-        inputs_ready = cur.fetchone()[0]
+        inputs_ready, *staged_counts = cur.fetchone()
         if inputs_ready:
             with self.timed('input_checkpoint_loading'):
-                cur.execute(f"SELECT input_payload, embedding FROM {t('relationship_build_tracks')} "
-                            "WHERE catalog_instance_id=%s ORDER BY input_order", (self.source_id,))
+                # Only the tracks of entities still to fingerprint: a fingerprint
+                # reads all of its entity's tracks, in input order, and no other.
+                cur.execute(f"""
+                    SELECT input_payload, embedding FROM {t('relationship_build_tracks')} bt
+                     WHERE catalog_instance_id=%s
+                       AND ((album_key IS NOT NULL AND NOT EXISTS (
+                                SELECT 1 FROM {t('relationship_build_entities')} d
+                                 WHERE d.catalog_instance_id=bt.catalog_instance_id
+                                   AND d.entity_type='album' AND d.entity_id=bt.album_key))
+                            OR NOT EXISTS (
+                                SELECT 1 FROM {t('relationship_build_entities')} d
+                                 WHERE d.catalog_instance_id=bt.catalog_instance_id
+                                   AND d.entity_type='artist' AND d.entity_id=bt.artist_key))
+                     ORDER BY input_order
+                """, (self.source_id,))
                 tracks = [{**payload, 'embedding': np.frombuffer(bytes(blob), dtype='<f4')}
                           for payload, blob in cur.fetchall()]
         else:
@@ -353,9 +415,14 @@ class Build:
                 if self.analysis_generation != loaded_generation:
                     raise InputsChanged("Sonic analysis generation advanced while loading inputs")
         self.db.commit()
-        album_keys = {f"{r['artist'].lower()}::{r['album'].lower()}" for r in tracks if r['album']}
-        artist_keys = {r['artist'].lower() for r in tracks}
-        self.diagnostics['counts'].update(tracks=len(tracks), albums=len(album_keys), artists=len(artist_keys))
+        if inputs_ready:
+            # Counted over all staged tracks when they were staged.
+            track_count, album_count, artist_count = (int(n) for n in staged_counts)
+        else:
+            album_keys = {f"{r['artist'].lower()}::{r['album'].lower()}" for r in tracks if r['album']}
+            artist_keys = {r['artist'].lower() for r in tracks}
+            track_count, album_count, artist_count = len(tracks), len(album_keys), len(artist_keys)
+        self.diagnostics['counts'].update(tracks=track_count, albums=album_count, artists=artist_count)
         # The mapping is generation-pinned and idempotent across a partial insert.
         # Each statement is bounded; no published rows are touched here.
         if not inputs_ready:
@@ -367,7 +434,8 @@ class Build:
                     "WHERE catalog_instance_id=%s", (self.source_id,))
         completed = set(cur.fetchall())
         self.db.commit()
-        total = len(album_keys) + len(artist_keys)
+        self.start_clock()
+        total = album_count + artist_count
         done = len(completed)
         self.report("Calculating relationship fingerprints", done, total)
         iterator = e._iter_relationship_entities(tracks, completed)
@@ -420,10 +488,10 @@ class Build:
                         f"FROM {t('relationship_build_entities')} WHERE catalog_instance_id=%s "
                         "ORDER BY entity_type, entity_id", (self.source_id,))
             rows = cur.fetchall()
-            entities = {kind: {} for kind in ('album', 'artist')}
+            entities = {kind: PackedEntities() for kind in ('album', 'artist')}
             pending = []
             for kind, key, blob, result_fp in rows:
-                entities[kind][key] = unpack_entity(blob)
+                entities[kind][key] = blob
                 if result_fp is None:
                     pending.append((kind, key))
             # In input order, so a candidate cap keeps the same entities each time.
@@ -438,9 +506,17 @@ class Build:
         self.db.commit()
         completed = {kind: sum(r[0] == kind and r[3] is not None for r in rows)
                      for kind in entities}
+        # Load the candidate index (AudioMuse's IVF) before the clock starts:
+        # its first load is setup, like the checkpoint, not scoring work.
+        prepare = getattr(candidate_lookup, 'prepare', None)
+        if pending and callable(prepare):
+            with self.timed("candidate_lookup"):
+                prepare()
+        self.start_clock()
         for kind, key in pending:
-            # Loading a large checkpoint can consume the time budget. Still
-            # complete one bounded entity so repeated resumes cannot livelock.
+            # The budget starts after loading, but a step that fingerprinted
+            # first may have spent it. Still complete one bounded entity so
+            # repeated resumes cannot livelock.
             if self.work > 0 and self.exhausted():
                 break
             entity = entities[kind][key]
@@ -533,13 +609,21 @@ class Build:
                 UPDATE {t('relationship_state')} SET relationship_schema_version=%s, algorithm_version=%s,
                     scoring_revision=%s,
                     source_catalog_generation=%s, source_analysis_generation=%s,
-                    result_generation=%s, head_seq=%s, status='complete', album_count=%s, artist_count=%s,
+                    result_generation=%s, head_seq=%s, status=%s, album_count=%s, artist_count=%s,
+                    next_retry_at=CASE WHEN %s THEN NULL
+                        ELSE now() + make_interval(secs => %s) END,
                     completed_at=now(), last_error=NULL, updated_at=now()
                  WHERE catalog_instance_id=%s
             """, (e.RELATIONSHIP_SCHEMA_VERSION, e.RELATIONSHIP_ALGORITHM_VERSION,
                   self.identity['scoring_revision'],
                   self.identity['catalog_generation'], self.analysis_generation,
-                  generation, head_seq + changes, counts['albums'], counts['artists'], self.source_id))
+                  generation, head_seq + changes,
+                  # Settled with the publication, under its locks: a rebuild
+                  # claimed after this commit is not overwritten (see the
+                  # 'complete' branch of run_relationship_build).
+                  'complete' if self.inputs_current else 'queued',
+                  counts['albums'], counts['artists'],
+                  self.inputs_current, e.RELATIONSHIP_MIN_GAP_SECONDS, self.source_id))
             e.compact_change_journal(
                 cur, catalog_instance_id=self.source_id, state_table='relationship_state',
                 changes_table='relationship_changes', epoch_column='epoch', floor_column='floor_seq',
@@ -593,10 +677,14 @@ def run_relationship_build(source_id, *, db, candidate_lookup, progress=None,
             # finished its staged inputs after newer ones arrived (SQ.2) stays
             # queued: its generation is published, and the next build starts.
             # W2: the next build of newer inputs waits the minimum gap after
-            # the generation just published.
+            # the generation just published. A publication in this step settled
+            # all this in its own transaction; only a resumed complete build
+            # (still 'running' from initialize) is settled here, so a rebuild
+            # claimed since (queued) is never overwritten.
             cur.execute(f"UPDATE {t('relationship_state')} SET status=%s, "
                         "source_analysis_generation=%s, next_retry_at=CASE WHEN %s THEN NULL "
-                        "ELSE now() + make_interval(secs => %s) END WHERE catalog_instance_id=%s",
+                        "ELSE now() + make_interval(secs => %s) END "
+                        "WHERE catalog_instance_id=%s AND status='running'",
                         ('complete' if build.inputs_current else 'queued',
                          build.analysis_generation, build.inputs_current,
                          e.RELATIONSHIP_MIN_GAP_SECONDS, source_id))
@@ -615,7 +703,8 @@ def run_relationship_build(source_id, *, db, candidate_lookup, progress=None,
         code = getattr(exc, 'pgcode', None)
         message = getattr(getattr(exc, 'diag', None), 'message_primary', None) or str(exc)
         build.diagnostics['error'] = {"phase": build.active_phase, "sqlstate": code, "message": message[:1000]}
-        status = ('queued' if isinstance(exc, InputsChanged) or code in ('55P03', '40P01')
+        status = ('waiting_for_inputs' if isinstance(exc, InputsNotPublished)
+                  else 'queued' if isinstance(exc, InputsChanged) or code in ('55P03', '40P01')
                   else 'waiting_for_index' if isinstance(exc, e.RelationshipIndexUnavailable) else 'failed')
         log.warning("relationship build stopped source=%s phase=%s sqlstate=%s status=%s error=%s",
                     source_id, build.active_phase, code, status, message[:1000])
@@ -624,11 +713,16 @@ def run_relationship_build(source_id, *, db, candidate_lookup, progress=None,
             cur.execute(f"UPDATE {t('relationship_builds')} SET progress=%s::jsonb, updated_at=now() "
                         "WHERE catalog_instance_id=%s AND build_id=%s",
                         (canonical_json(build.diagnostics), source_id, build.build_id))
-        cur.execute(f"UPDATE {t('relationship_state')} SET status=%s, last_error=%s, updated_at=now() "
+        # A build without published inputs is not due again until its retry
+        # time, unless a publication queues it first (claim_relationship_preparation).
+        cur.execute(f"UPDATE {t('relationship_state')} SET status=%s, last_error=%s, updated_at=now(), "
+                    "next_retry_at=CASE WHEN %s THEN now() + make_interval(secs => %s) "
+                    "ELSE next_retry_at END "
                     "WHERE catalog_instance_id=%s",
-                    (status, f"{build.active_phase}{f' [SQLSTATE {code}]' if code else ''}: {message}"[:2000], source_id))
+                    (status, f"{build.active_phase}{f' [SQLSTATE {code}]' if code else ''}: {message}"[:2000],
+                     status == 'waiting_for_inputs', WAITING_FOR_INPUTS_RETRY_SECONDS, source_id))
         db.commit()
-        if status in ('queued', 'waiting_for_index'):
+        if status in ('queued', 'waiting_for_index', 'waiting_for_inputs'):
             return {"catalog_instance_id": source_id, "status": status, "reason": message[:1000]}
         raise
     finally:

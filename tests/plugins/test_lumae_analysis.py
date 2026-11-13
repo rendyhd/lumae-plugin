@@ -1192,7 +1192,7 @@ def test_bootstrap_session_api_keeps_token_out_of_url_and_private_cache(monkeypa
     assert response.get_json()["session_token"] == "secret-session-token"
     assert response.headers["Cache-Control"] == "private, no-store"
     assert captured["server_id"] == "server-a"
-    assert captured["principal"].startswith("client:")
+    assert captured["principal"] == "anonymous"
 
 
 def test_bootstrap_session_uses_published_generation_during_refresh(monkeypatch):
@@ -1885,7 +1885,7 @@ def test_collection_restore_adds_new_records_and_sync_changes_without_overwrite(
     monkeypatch.setattr(
         collections,
         "_upsert_item",
-        lambda cur, principal, collection_id, item: upserts.append((principal, collection_id, item.copy())),
+        lambda cur, principal, collection_id, item, **_: upserts.append((principal, collection_id, item.copy())),
     )
     monkeypatch.setattr(
         collections,
@@ -2196,7 +2196,7 @@ def test_profiles_endpoint_splits_ready_missing_and_failed(monkeypatch):
     monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
     monkeypatch.setattr(
         mod,
-        "fetch_profile_rows",
+        "fetch_profile_status_rows",
         lambda ids, catalog_instance_id=None: rows,
     )
     monkeypatch.setattr(
@@ -2254,7 +2254,7 @@ def test_analyze_endpoint_promotes_pending_and_records_them_for_the_runner(monke
     monkeypatch.setattr(mod, "resolve_profile_source", lambda **_kwargs: source)
     monkeypatch.setattr(
         mod,
-        "fetch_profile_rows",
+        "fetch_profile_status_rows",
         lambda ids, catalog_instance_id=None: rows,
     )
     monkeypatch.setattr(
@@ -3956,7 +3956,7 @@ def test_background_task_skips_ready_and_interactively_promoted_tracks(monkeypat
     }
     monkeypatch.setattr(
         mod,
-        "fetch_profile_rows",
+        "fetch_profile_status_rows",
         lambda ids, catalog_instance_id=None: [rows[ids[0]]],
     )
     monkeypatch.setattr(mod, "catalog_media_signature", lambda *_args, **_kwargs: "catalog-media:same")
@@ -4374,7 +4374,7 @@ def test_builder_upgrade_records_one_coalesced_catalogue_preparation(monkeypatch
     monkeypatch.setattr(
         mod,
         "claim_preparation",
-        lambda selected, db=None: claimed.append((selected, db)) or True,
+        lambda selected, db=None, keep_backoff=False: claimed.append((selected, db)) or True,
     )
     result = mod.enqueue_required_catalog_preparations(db=object())
 
@@ -4829,6 +4829,92 @@ def test_navidrome_catalog_joins_large_folder_scope_onto_search_rows_without_n_p
     assert all(endpoint != "getAlbum" for endpoint, _params in calls)
 
 
+def _navidrome_song_walk_module(second_page):
+    """33 albums (the search3 path) and one full page of 500 songs, then
+    ``second_page`` as the answer to the next page."""
+
+    class Module:
+        @staticmethod
+        def list_libraries():
+            return [{"id": "folder-a", "name": "Music"}]
+
+        @staticmethod
+        def _get_target_music_folder_ids():
+            return None
+
+        @staticmethod
+        def _navidrome_request(endpoint, params=None):
+            if endpoint == "getAlbumList2":
+                return {"albumList2": {"album": [
+                    {"id": f"album-{index}", "name": f"Album {index}"} for index in range(33)
+                ]}}
+            if endpoint == "search3":
+                if params["songOffset"] == 0:
+                    return {"searchResult3": {"song": [
+                        {"id": f"track-{index}", "title": f"Track {index}",
+                         "albumId": f"album-{index % 33}"}
+                        for index in range(500)
+                    ]}}
+                assert params["songOffset"] == 500
+                return second_page
+            if endpoint == "getArtists":
+                return {"artists": {"index": []}}
+            raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
+
+    return Module()
+
+
+@pytest.mark.parametrize("failed_page", [None, {"status": "ok"}])
+def test_navidrome_catalog_fails_when_a_song_page_is_not_answered(failed_page):
+    """AudioMuse's request helper answers None for a timeout, an HTTP error
+    and a Subsonic failure. Read as the end of the songs, the rest of the
+    library was published as deleted."""
+    from plugins.LumaeAnalysis.catalog_providers import CatalogProviderError, _fetch_navidrome
+
+    with pytest.raises(CatalogProviderError, match="did not return its songs from position 500"):
+        _fetch_navidrome(_navidrome_song_walk_module(failed_page), object(), "server-a")
+
+
+def test_navidrome_catalog_ends_the_song_walk_at_an_answered_empty_page():
+    from plugins.LumaeAnalysis.catalog_providers import _fetch_navidrome
+
+    result = _fetch_navidrome(
+        _navidrome_song_walk_module({"status": "ok", "searchResult3": {}}), object(), "server-a"
+    )
+
+    assert len(result["tracks"]) == 500
+
+
+def test_navidrome_catalog_fails_when_a_listed_album_is_not_answered():
+    from plugins.LumaeAnalysis.catalog_providers import CatalogProviderError, _fetch_navidrome
+
+    class Module:
+        @staticmethod
+        def list_libraries():
+            return [{"id": "folder-a", "name": "Music"}]
+
+        @staticmethod
+        def _get_target_music_folder_ids():
+            return None
+
+        @staticmethod
+        def _navidrome_request(endpoint, params=None):
+            if endpoint == "getAlbumList2":
+                return {"albumList2": {"album": [
+                    {"id": "album-a", "name": "A"}, {"id": "album-b", "name": "B"},
+                ]}}
+            if endpoint == "getAlbum":
+                if params["id"] == "album-b":
+                    return None
+                return {"album": {"id": "album-a", "name": "A", "song": [
+                    {"id": "track-a", "title": "Song", "albumId": "album-a"},
+                ]}}
+            raise AssertionError(f"Unexpected Navidrome endpoint: {endpoint}")
+
+    with pytest.raises(CatalogProviderError, match="did not return one of the albums it listed"):
+        _fetch_navidrome(Module(), object(), "server-a")
+
+
 def _artist_art_module(get_artists, folders=("folder-a", "folder-b"), target=None):
     calls = []
 
@@ -5039,9 +5125,11 @@ def _portrait_refresh(monkeypatch, previous_art, published_art, current_art):
     )
 
     artist_changes = {
-        params[5]: json.loads(params[8])
-        for sql, params in db.executed
-        if "INSERT INTO plugin_lumae_analysis__catalog_changes" in sql and params[4] == "artist"
+        row[5]: json.loads(row[8])
+        for sql, rows in db.executed
+        if "INSERT INTO plugin_lumae_analysis__catalog_changes" in sql
+        for row in rows  # the journal is written a page per statement
+        if row[4] == "artist"
     }
     inserted = next(
         (
@@ -6413,9 +6501,10 @@ def test_one_track_fingerprint_change_emits_one_scoped_event(changed_payload):
     )
 
     change_inserts = [
-        params
-        for sql, params in db.executed
+        row
+        for sql, rows in db.executed
         if sql.lstrip().startswith("INSERT INTO") and "catalog_changes" in sql
+        for row in rows  # the journal is written a page per statement
     ]
     assert result["changes"] == 1
     assert result["change_counts"]["by_entity"]["track"]["total"] == 1
@@ -6988,6 +7077,8 @@ class ReadinessCursor:
             self.rows = [self.db.link_counts]
         elif "FROM task_status" in sql:
             self.rows = list(self.db.tasks)
+        elif "SAVEPOINT lumae_readiness_read" in sql:
+            self.rows = []  # the reads run inside a savepoint
         else:
             raise AssertionError(f"Unexpected readiness SQL: {sql}")
 
@@ -7867,10 +7958,12 @@ def test_database_state_explains_an_uninitialized_database():
             "message": "AudioMuse did not provide a database connection.",
         }
     ]
-    assert "No published Lumae catalogue yet" in body
-    assert "run Prepare Lumae" in body
+    # A failed read is not an empty installation (review finding 1).
+    assert "No published Lumae catalogue yet" not in body
+    assert "run Prepare Lumae" not in body
+    assert "could not be read" in body
     assert "diagnostic queries database_unavailable" in body
-    assert "app sync not ready" in body
+    assert "app sync unavailable" in body
 
 
 def test_database_state_page_renders_partial_state_without_exposing_rows(monkeypatch):

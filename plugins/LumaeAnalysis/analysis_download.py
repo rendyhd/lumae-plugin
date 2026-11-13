@@ -25,6 +25,7 @@ import os
 import re
 import shutil
 import tempfile
+import time
 
 import requests as http_requests
 
@@ -38,7 +39,7 @@ CHUNK_BYTES = 256 * 1024
 MAX_BYTES = 8 * 1024 * 1024 * 1024
 # A Subsonic error comes back as HTTP 200 with an XML or JSON body.
 _ERROR_TYPES = ("text/xml", "application/xml", "application/json", "text/html", "text/plain")
-_PID_DIR = re.compile(r"^task-(\d+)$")
+_PID_DIR = re.compile(r"^task-(\d+)(?:-(\d+))?$")
 
 
 class DownloadError(RuntimeError):
@@ -70,9 +71,29 @@ def _root(host_temp_dir=None):
     return base
 
 
+def _start_time(pid):
+    """A process's start time (Linux ``/proc/<pid>/stat`` field 22, clock ticks
+    since boot), or None where there is no such file."""
+    try:
+        with open(f"/proc/{int(pid)}/stat", "rb") as stat:
+            data = stat.read()
+        return int(data[data.rindex(b")") + 2:].split()[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _directory_name(pid=None):
+    """``task-<pid>-<start time>``: a later process given the same PID (a
+    restarted container's usually is) never takes a dead one's directory for
+    its own. ``task-<pid>`` where the start time cannot be read."""
+    pid = os.getpid() if pid is None else pid
+    started = _start_time(pid)
+    return f"task-{pid}" if started is None else f"task-{pid}-{started}"
+
+
 def task_directory(host_temp_dir=None):
     """This process's download directory (created), outside ``host_temp_dir``."""
-    path = os.path.join(_root(host_temp_dir), f"task-{os.getpid()}")
+    path = os.path.join(_root(host_temp_dir), _directory_name())
     os.makedirs(path, mode=0o700, exist_ok=True)
     return path
 
@@ -87,17 +108,42 @@ def _alive(pid):
     return True
 
 
+def _leftover(pid, started, own):
+    """Whether ``task-<pid>[-<started>]`` belongs to no running process."""
+    if pid == os.getpid():
+        # This process's own directory is never a leftover; another one with
+        # its PID (an older name, another start time) is a dead process's.
+        return own is not None and own != (pid, started)
+    if not _alive(pid):
+        return True
+    # A live process with that PID: a leftover when its start time shows it is
+    # another process. Without a start time on either side, it is kept.
+    current = _start_time(pid)
+    return started is not None and current is not None and current != started
+
+
 def remove_leftovers(host_temp_dir=None):
-    """Remove the download directories of task processes that are gone; returns how many."""
+    """Remove the download directories of task processes that are gone; returns how many.
+
+    A directory is a dead process's when no process has its PID, or the
+    process that has it started at another time (PID reuse), or it carries
+    this process's PID under another name (a restart that got the same PID).
+    """
     root = _root(host_temp_dir)
     removed = 0
     try:
         names = os.listdir(root)
     except OSError:
         return 0
+    own_started = _start_time(os.getpid())
+    own = None if own_started is None else (os.getpid(), own_started)
     for name in names:
         match = _PID_DIR.match(name)
-        if not match or int(match.group(1)) == os.getpid() or _alive(int(match.group(1))):
+        if not match:
+            continue
+        pid = int(match.group(1))
+        started = int(match.group(2)) if match.group(2) is not None else None
+        if not _leftover(pid, started, own):
             continue
         shutil.rmtree(os.path.join(root, name), ignore_errors=True)
         removed += 1
@@ -122,12 +168,16 @@ def resolve(stream_target, provider_type, item_id, directory):
     return Target(url, headers, params, file_path(directory, item_id))
 
 
-def fetch(target, cancelled=None, session=None):
+def fetch(target, cancelled=None, session=None, deadline_seconds=None):
     """Write the target's file to ``target.path``; returns the path.
 
     ``cancelled()`` is checked between chunks (a parallel pass that raises
-    stops a long download). Raises ``DownloadError``; a partial file is removed.
+    stops a long download). ``deadline_seconds`` bounds the whole download
+    (a server that trickles bytes never stalls long enough for the read
+    timeout); callers pass the per-file analysis limit. Raises
+    ``DownloadError``; a partial file is removed.
     """
+    give_up = None if deadline_seconds is None else time.monotonic() + max(1.0, float(deadline_seconds))
     http = session or http_requests
     try:
         response = http.get(target.url, params=target.params, headers=target.headers,
@@ -145,6 +195,8 @@ def fetch(target, cancelled=None, session=None):
             for chunk in response.iter_content(chunk_size=CHUNK_BYTES):
                 if cancelled is not None and cancelled():
                     raise DownloadError("download cancelled")
+                if give_up is not None and time.monotonic() >= give_up:
+                    raise DownloadError("download exceeded the per-file analysis limit")
                 if not chunk:
                     continue
                 written += len(chunk)

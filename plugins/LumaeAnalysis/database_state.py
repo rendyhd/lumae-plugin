@@ -1344,7 +1344,7 @@ def _source_html(source):
             {_metric("Analysis journal rows", _count(journals["analysis"]["rows"]))}
             {_metric("Analysis head / floor", f'{_number(journals["analysis"]["head"])} / {_number(journals["analysis"]["floor"])}')}
             {_metric("Active bootstrap leases", _count(journals["bootstrap_leases"]["active"]))}
-            {_metric("Completed bootstraps", _count(journals["bootstrap_leases"]["completed"]))}
+            {_metric("Completed, awaiting cleanup", _count(journals["bootstrap_leases"]["completed"]))}
           </div>
         </section>
 
@@ -1371,8 +1371,11 @@ def render_database_state(snapshot):
     total_usable = _total((row.get("links") or {}).get("usable") for row in sources)
     total_profiles = _total((row.get("profiles") or {}).get("published") for row in sources)
     ready_sources = sum(1 for row in sources if _app_sync_ready(row))
+    # A failed source read is not an empty installation: never print it as zeros.
+    read_failed = snapshot.get("status") in ("unavailable", "database_unavailable")
     overall_app_state = (
-        "ready" if sources and ready_sources == len(sources) else "not ready"
+        UNAVAILABLE_TEXT if read_failed
+        else "ready" if sources and ready_sources == len(sources) else "not ready"
     )
     empty_sources = [
         row
@@ -1382,7 +1385,16 @@ def render_database_state(snapshot):
     ]
     compatibility = snapshot.get("core") or {}
     source_html = "".join(_source_html(source) for source in sources)
-    if not source_html:
+    if not source_html and read_failed:
+        source_html = """
+          <section class="db-empty" role="alert">
+            <h2>The Lumae catalogue could not be read</h2>
+            <p>The database or its source list was unavailable, so nothing is known about the
+              published catalogue. This is not an empty installation. See the errors above, then
+              refresh the snapshot.</p>
+          </section>
+        """
+    elif not source_html:
         source_html = """
           <section class="db-empty">
             <h2>No published Lumae catalogue yet</h2>
@@ -1416,6 +1428,8 @@ def render_database_state(snapshot):
               and refresh required data.</span>
           </section>
         """
+    elif read_failed:
+        readiness_notice = ""
     elif sources and ready_sources < len(sources):
         readiness_notice = """
           <section class="db-alert" role="status">
@@ -1537,11 +1551,11 @@ def render_database_state(snapshot):
         {partial_notice}
         {global_errors_html}
         <section class="db-summary" aria-label="Database summary">
-          {_metric("Sources", _number(len(sources)))}
-          {_metric("App-ready sources", f"{ready_sources} / {len(sources)}", "ready" if ready_sources == len(sources) and sources else "danger")}
-          {_metric("Published tracks", _number(total_tracks), "ready" if total_tracks else "danger")}
-          {_metric("Usable sonic links", _count(total_usable), "ready" if total_usable else "")}
-          {_metric("Published waveform profiles", _count(total_profiles), "ready" if total_profiles else "")}
+          {_metric("Sources", UNAVAILABLE_TEXT if read_failed else _number(len(sources)))}
+          {_metric("App-ready sources", UNAVAILABLE_TEXT if read_failed else f"{ready_sources} / {len(sources)}", "" if read_failed else "ready" if ready_sources == len(sources) and sources else "danger")}
+          {_metric("Published tracks", UNAVAILABLE_TEXT if read_failed else _number(total_tracks), "" if read_failed else "ready" if total_tracks else "danger")}
+          {_metric("Usable sonic links", UNAVAILABLE_TEXT if read_failed else _count(total_usable), "" if read_failed else "ready" if total_usable else "")}
+          {_metric("Published waveform profiles", UNAVAILABLE_TEXT if read_failed else _count(total_profiles), "" if read_failed else "ready" if total_profiles else "")}
           {_metric("Query / workflow errors", _number(total_errors), "danger" if total_errors else "")}
         </section>
         {source_html}

@@ -41,6 +41,13 @@ MAX_HELD_RETENTION_MULTIPLIER = 4
 JOURNAL_WRITER_GENERATION = 2
 # P2-3: advisory lock namespace (hashtext) serializing catalogue publishers.
 CATALOG_PUBLICATION_LOCK = "lumae.catalog_publication"
+# Unexpired catalogue/analysis bootstrap sessions per principal. "bearer" and
+# "anonymous" are every phone of an installation-token or no-auth install
+# together (the session token, not the principal, binds a session), so they
+# share a larger allowance than one signed-in user.
+MAX_PRINCIPAL_BOOTSTRAP_SESSIONS = 4
+MAX_SHARED_BOOTSTRAP_SESSIONS = 32
+SHARED_BOOTSTRAP_PRINCIPALS = ("bearer", "anonymous")
 
 CATALOG_GENERATION_TABLES = (
     "catalog_libraries",
@@ -1730,6 +1737,23 @@ def _state_counts(value):
     return {}
 
 
+def _snapshot_row_bytes(row):
+    """Encoded size of one normalized row, as ``canonical_json`` writes it.
+
+    Every value of a normalized row went through ``_text`` or
+    ``_safe_payload`` when the row was built, so the second pass
+    ``canonical_json`` makes changes nothing; it was most of the 20 s the
+    estimate took per 100k tracks. A row the encoder refuses takes that path.
+    """
+    try:
+        encoded = json.dumps(
+            row, ensure_ascii=False, sort_keys=True, separators=(",", ":"), allow_nan=False
+        )
+    except (TypeError, ValueError):
+        encoded = canonical_json(row)
+    return len(encoded.encode("utf-8"))
+
+
 def _estimate_snapshot_bytes(normalized):
     """Estimate encoded transfer size without serializing one catalogue-wide value."""
     row_groups = (
@@ -1739,7 +1763,7 @@ def _estimate_snapshot_bytes(normalized):
         normalized["entity_libraries"],
     )
     return sum(
-        len(canonical_json(row).encode("utf-8")) + SNAPSHOT_ENTITY_OVERHEAD_BYTES
+        _snapshot_row_bytes(row) + SNAPSHOT_ENTITY_OVERHEAD_BYTES
         for rows in row_groups
         for row in rows
     )
@@ -1820,7 +1844,73 @@ def _lock_publication_state(cur, catalog_instance_id, expected):
     return state
 
 
-def _after_publication(db, catalog_instance_id, generation):
+def _confirm_catalog_identity(
+    db, catalog_instance_id, normalized, observation, target_fingerprint
+):
+    """Write this scan's identity verdict under the catalog_state row lock.
+
+    The refresh inspected the scan before its build and rolled that verdict
+    back to release the row lock it took. The publisher lock kept the
+    published generation since, so the same inspection reaches the same
+    verdict here, and it commits with the publication as it always did.
+    Should it not, nothing is published.
+    """
+    inspection = inspect_catalog_identity(
+        db,
+        catalog_instance_id,
+        [row["track_id"] for row in normalized["tracks"]],
+        observation.get("current_provider_version"),
+        target_fingerprint,
+    )
+    if inspection.get("state") in ("transition_pending", "blocked"):
+        raise CatalogScanError("Provider identity changed while this scan was running")
+
+
+def _compact_catalog_journal(cur, catalog_instance_id, retention_limit):
+    """Trim the catalogue journal to its retention, after a publication commits.
+
+    The expired events used to be deleted under the catalog_state row lock.
+    Here only the floor update takes that lock, as the last statement. The
+    delete and the floor commit together and a reader takes the floor and its
+    events in one statement (P1-7), so no reader pairs an old floor with a
+    trimmed journal.
+
+    Runs under the publisher lock: the epoch and head read here stay fixed,
+    and no publisher (whose epoch rotation deletes the journal under
+    catalog_state) can meet this delete in the opposite lock order. When
+    another publisher holds the lock, this one skips: that publication
+    compacts, or the next one, or maintenance (prune_catalog_storage).
+    """
+    cur.execute(
+        "SELECT pg_try_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+        (CATALOG_PUBLICATION_LOCK, str(catalog_instance_id)),
+    )
+    locked = cur.fetchone()
+    if not (locked and locked[0]):
+        return
+    cur.execute(
+        f"SELECT catalog_epoch, catalog_head_seq, catalog_floor_seq "
+        f"FROM {t('catalog_state')} WHERE catalog_instance_id=%s",
+        (catalog_instance_id,),
+    )
+    state = cur.fetchone()
+    if state is None:
+        return
+    compact_change_journal(
+        cur,
+        catalog_instance_id=catalog_instance_id,
+        state_table="catalog_state",
+        changes_table="catalog_changes",
+        epoch_column="catalog_epoch",
+        floor_column="catalog_floor_seq",
+        epoch=state[0],
+        head_seq=state[1],
+        retention_limit=retention_limit,
+        current_floor=state[2],
+    )
+
+
+def _after_publication(db, catalog_instance_id, generation, journal_retention=None):
     """Storage work of a publication, after it commits (P2-3).
 
     Each step is its own short transaction, so catalog_state is not held while
@@ -1832,11 +1922,14 @@ def _after_publication(db, catalog_instance_id, generation):
     * superseded generations. Bootstrap leases are created under the
       catalog_state row lock, so every lease on an older generation committed
       before the publication took that lock, and later leases pin the new
-      generation.
+      generation;
+    * catalogue journal events past ``journal_retention``, when it is given
+      (see _compact_catalog_journal).
 
     Best effort, like the status summary. What a failure leaves goes with the
     next publication, or with maintenance: compact_enrichment_storage sweeps
-    the edges and prune_catalog_storage the generations at install.
+    the edges and prune_catalog_storage the generations and the journal at
+    install.
 
     Before those, published profiles the new generation lacks but its diff
     did not name are withdrawn (_withdraw_orphaned_profiles), so the sweep
@@ -1855,6 +1948,13 @@ def _after_publication(db, catalog_instance_id, generation):
             lambda cur: prune_snapshot_generations(cur, catalog_instance_id, "catalog", generation),
         ),
     )
+    if journal_retention is not None:
+        steps += (
+            (
+                "compact the catalogue journal",
+                lambda cur: _compact_catalog_journal(cur, catalog_instance_id, journal_retention),
+            ),
+        )
     for label, step in steps:
         try:
             cur = db.cursor()
@@ -2178,7 +2278,7 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
         server_id = servers[0]["server_id"]
     server = provider_bridge.require_server(server_id)
     server_name = provider_display_name(server["provider_type"])
-    ensure_catalog_sources(db, bridge=provider_bridge)
+    _sources, sources_written = _ensure_catalog_sources(db, provider_bridge)
     cur = db.cursor()
     cur.execute(
         f"SELECT catalog_instance_id FROM {t('catalog_sources')} "
@@ -2190,6 +2290,10 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
         cur.close()
         raise CatalogScanError("Catalogue source is not initialized or is awaiting continuity review")
     catalog_instance_id = str(source[0])
+    if sources_written:
+        # The observation below pings the provider before it commits: no
+        # catalog_sources row lock may wait for the network.
+        db.commit()
     identity_observation = observe_provider_version(
         db,
         provider_bridge,
@@ -2255,7 +2359,6 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
             cur.close()
         normalized = normalize_provider_catalog(raw, server["provider_type"])
         counts = {entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER}
-        snapshot_estimated_bytes = _estimate_snapshot_bytes(normalized)
         if counts["track"] == 0:
             raise CatalogScanError(
                 f"{server_name} returned no usable tracks. The empty catalogue was not "
@@ -2350,7 +2453,6 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
             counts = {
                 entity: len(normalized[ENTITY_COLLECTIONS[entity]]) for entity in ENTITY_ORDER
             }
-            snapshot_estimated_bytes = _estimate_snapshot_bytes(normalized)
             rekeyed = _jellyfin_rekey_step(
                 db,
                 continuity=continuity,
@@ -2376,6 +2478,7 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
         # The version observation is the admission gate. A trusted pre-transition
         # release can legitimately lose tracks or change library scope; treating
         # those removals as incomplete rekey evidence permanently blocks refresh.
+        identity_target_fingerprint = None
         if identity_state in ("transition_pending", "blocked") and continuity is None:
             from .provider_identity_rekey import (
                 publish_provider_identity_rekey,
@@ -2383,6 +2486,14 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
             )
 
             identity_target_fingerprint = target_scan_fingerprint(normalized)
+            # The inspection locks the catalog_state row and writes its
+            # verdict, without committing. In a savepoint: a verdict that
+            # lets the ordinary publication continue is rolled back, which
+            # releases that row lock for the build (P2-3) and keeps the
+            # publisher lock. _confirm_catalog_identity writes it again
+            # under the row lock, so it still commits with the publication.
+            cur = db.cursor()
+            cur.execute("SAVEPOINT lumae_identity_inspection")
             identity_inspection = inspect_catalog_identity(
                 db,
                 catalog_instance_id,
@@ -2390,6 +2501,10 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
                 identity_observation.get("current_provider_version"),
                 identity_target_fingerprint,
             )
+            if identity_inspection.get("state") not in ("transition_pending", "blocked"):
+                cur.execute("ROLLBACK TO SAVEPOINT lumae_identity_inspection")
+            cur.execute("RELEASE SAVEPOINT lumae_identity_inspection")
+            cur.close()
             if identity_inspection.get("state") in ("transition_pending", "blocked"):
                 if (
                     identity_inspection.get("state") == "transition_pending"
@@ -2526,7 +2641,25 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
         }
 
         if change_reason == "no_change":
+            # Nothing is published, so the stored estimate still describes
+            # the snapshot a bootstrap transfers. Only publishers write it,
+            # and this one holds the publisher lock. A catalogue published
+            # before the estimate existed (0) is measured once.
+            cur.execute(
+                f"SELECT snapshot_estimated_bytes FROM {t('catalog_state')} "
+                "WHERE catalog_instance_id=%s",
+                (catalog_instance_id,),
+            )
+            stored_estimate = cur.fetchone()
+            snapshot_estimated_bytes = int(
+                (stored_estimate[0] if stored_estimate else 0) or 0
+            ) or _estimate_snapshot_bytes(normalized)
             _lock_publication_state(cur, catalog_instance_id, base_state)
+            if identity_target_fingerprint:
+                _confirm_catalog_identity(
+                    db, catalog_instance_id, normalized, identity_observation,
+                    identity_target_fingerprint,
+                )
             duration_ms = max(0, round((time.monotonic() - scan_started) * 1000))
             cur.execute(
                 f"""
@@ -2597,6 +2730,9 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
                 result["jellyfin_continuity"] = continuity.counts()
             return result
 
+        # Measured once, for the rows this generation holds, and only when a
+        # generation is written.
+        snapshot_estimated_bytes = _estimate_snapshot_bytes(normalized)
         search_folded = None
         for entity_type in ENTITY_ORDER:
             rows = normalized[ENTITY_COLLECTIONS[entity_type]]
@@ -2614,30 +2750,37 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
         publication_epoch = str(uuid.uuid4()) if fingerprint_rebase else str(locked_epoch)
         next_seq = 0 if fingerprint_rebase else int(locked_head)
         # A rebase skips the diff, so it journals nothing here; its old epoch
-        # is deleted under the row lock below.
-        for entity_type, entity_id, operation, payload, _reactivated in ordered_changes:
-            next_seq += 1
-            cur.execute(
-                f"""
-                INSERT INTO {t("catalog_changes")}
-                    (catalog_instance_id, epoch, seq, generation, entity_type,
-                     entity_id, operation, change_reason, payload,
-                     writer_generation)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)
-                """,
-                (
-                    catalog_instance_id,
-                    publication_epoch,
-                    next_seq,
-                    generation,
-                    entity_type,
-                    entity_id,
-                    operation,
-                    change_reason,
-                    _json_param(payload) if payload is not None else None,
-                    JOURNAL_WRITER_GENERATION,
-                ),
+        # is deleted under the row lock below. A page of events per
+        # statement, like the generation rows.
+        journal_rows = (
+            (
+                catalog_instance_id,
+                publication_epoch,
+                seq,
+                generation,
+                entity_type,
+                entity_id,
+                operation,
+                change_reason,
+                _json_param(payload) if payload is not None else None,
+                JOURNAL_WRITER_GENERATION,
             )
+            for seq, (entity_type, entity_id, operation, payload, _reactivated)
+            in enumerate(ordered_changes, next_seq + 1)
+        )
+        _insert_rows(
+            cur,
+            f"""
+            INSERT INTO {t("catalog_changes")}
+                (catalog_instance_id, epoch, seq, generation, entity_type,
+                 entity_id, operation, change_reason, payload,
+                 writer_generation)
+            VALUES %s
+            """,
+            "(%s, %s, %s, %s, %s, %s, %s, %s, %s::jsonb, %s)",
+            journal_rows,
+        )
+        next_seq += len(ordered_changes)
         from .profile_publication import (
             plan_catalog_invalidation,
             withdraw_catalog_changes,
@@ -2649,10 +2792,27 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
             cur, catalog_instance_id, generation, ordered_changes,
             full_reconcile=fingerprint_rebase,
         )
+        # catalog_sources before catalog_state: the order of every statement
+        # that locks both (FOR SHARE OF s, c, a in relationship_build). After
+        # catalog_state, this update could deadlock with one of them.
+        cur.execute(
+            f"UPDATE {t('catalog_sources')} SET provider_instance_fp=%s, "
+            "library_scope_fp=%s, updated_at=now() WHERE catalog_instance_id=%s",
+            (
+                scope["provider_instance_fp"],
+                scope["library_scope_fp"],
+                catalog_instance_id,
+            ),
+        )
         # Lock catalog_state only now. Admissions and completions that ran
         # meanwhile used the previous generation; the withdrawal below sees
         # what they committed.
         _lock_publication_state(cur, catalog_instance_id, base_state)
+        if identity_target_fingerprint:
+            _confirm_catalog_identity(
+                db, catalog_instance_id, normalized, identity_observation,
+                identity_target_fingerprint,
+            )
         if fingerprint_rebase:
             cur.execute(
                 f"DELETE FROM {t('catalog_changes')} WHERE catalog_instance_id=%s",
@@ -2718,30 +2878,9 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
             "snapshot_estimated_bytes": snapshot_estimated_bytes,
         }
         cur.execute(
-            f"UPDATE {t('catalog_sources')} SET provider_instance_fp=%s, "
-            "library_scope_fp=%s, updated_at=now() WHERE catalog_instance_id=%s",
-            (
-                scope["provider_instance_fp"],
-                scope["library_scope_fp"],
-                catalog_instance_id,
-            ),
-        )
-        cur.execute(
             f"UPDATE {t('catalog_scans')} SET status='complete', completed_at=now(), "
             "progress=%s::jsonb WHERE scan_id=%s",
             (_json_param(progress), scan_id),
-        )
-        compact_change_journal(
-            cur,
-            catalog_instance_id=catalog_instance_id,
-            state_table="catalog_state",
-            changes_table="catalog_changes",
-            epoch_column="catalog_epoch",
-            floor_column="catalog_floor_seq",
-            epoch=publication_epoch,
-            head_seq=next_seq,
-            retention_limit=change_journal_retention_limit(sum(counts.values())),
-            purge_other_epochs=publication_epoch != str(locked_epoch),
         )
         # P1-2: the profile journal keeps two libraries of events; follow the
         # library size as each generation publishes, not only at startup.
@@ -2752,7 +2891,14 @@ def _refresh_catalog_once(server_id=None, db=None, bridge=None):
             jellyfin_continuity.persist(cur, catalog_instance_id, continuity)
         cur.close()
         db.commit()
-        _after_publication(db, catalog_instance_id, generation)
+        # The journal is trimmed after the commit, not under catalog_state.
+        # (An epoch rotation already deleted the old epoch's events above.)
+        _after_publication(
+            db,
+            catalog_instance_id,
+            generation,
+            journal_retention=change_journal_retention_limit(sum(counts.values())),
+        )
         # P2-1: readiness reads these counts instead of scanning the library.
         # Counted after the commit, so catalog_state is not held meanwhile.
         refresh_status_summary(db, catalog_instance_id, getattr(provider_bridge, "core", None))
@@ -2946,7 +3092,13 @@ def read_change_page(
 
 def resolve_catalog_source(db, server_id=None, catalog_instance_id=None, lock=False):
     cur = db.cursor()
-    suffix = " FOR UPDATE OF s, c" if lock else ""
+    # ``lock`` takes the catalog_state row only: the lock a catalogue lease
+    # needs (see _after_publication). catalog_sources stays unlocked: nothing
+    # a lease stores is protected by its lock, and FOR UPDATE on it conflicts
+    # with the key-share lock of every insert into a table that references
+    # the source (edge payloads, the profile stream state), which writers
+    # take while they hold catalog_state: the opposite order.
+    suffix = " FOR UPDATE OF c" if lock else ""
     # Stable catalogue identity wins when both identifiers are supplied. After
     # a proven v2→v3 rebind, an older client or queued task may still send the
     # synthetic v2 server ID. Querying by that obsolete ID first would hide the
@@ -3147,6 +3299,40 @@ def _parse_page_token(session_token, value):
         raise ValueError("Malformed or invalid bootstrap page token") from exc
 
 
+def bootstrap_session_limit(principal_key):
+    """Unexpired bootstrap sessions ``principal_key`` may hold at once."""
+    if str(principal_key) in SHARED_BOOTSTRAP_PRINCIPALS:
+        return MAX_SHARED_BOOTSTRAP_SESSIONS
+    return MAX_PRINCIPAL_BOOTSTRAP_SESSIONS
+
+
+def _locked_analysis_state(cur, catalog_instance_id):
+    """Share-lock the analysis_state row and return what it publishes now.
+
+    The projection holds this row FOR UPDATE from before it writes a
+    generation until it commits, and prunes superseded generations in that
+    transaction. A lease read without the lock could pin a generation whose
+    rows that uncommitted prune already deleted, and serve an empty snapshot.
+    With it, either the lease commits first and the prune sees it, or this
+    read waits for the projection and pins the generation it published.
+    FOR SHARE: session creations do not wait for each other.
+    """
+    cur.execute(
+        f"SELECT projection_generation, analysis_epoch, analysis_head_seq, "
+        f"item_count, mapped_track_count FROM {t('analysis_state')} "
+        "WHERE catalog_instance_id=%s FOR SHARE",
+        (catalog_instance_id,),
+    )
+    row = cur.fetchone() or (0, "", 0, 0, 0)
+    return {
+        "generation": int(row[0] or 0),
+        "epoch": str(row[1] or ""),
+        "head_seq": int(row[2] or 0),
+        "item_count": int(row[3] or 0),
+        "mapped_track_count": int(row[4] or 0),
+    }
+
+
 def create_bootstrap_session(
     db,
     principal_key,
@@ -3157,7 +3343,17 @@ def create_bootstrap_session(
 ):
     if stream not in ("catalog", "analysis"):
         raise ValueError("Unknown bootstrap stream")
-    sources = resolve_catalog_source(db, server_id=server_id, catalog_instance_id=catalog_instance_id, lock=True)
+    # A lease is created under the row lock its stream's publisher holds
+    # when it prunes superseded generations: catalog_state for the catalogue,
+    # analysis_state for the analysis projection (below). An analysis lease
+    # never takes catalog_state, so a running projection, which holds
+    # analysis_state until it commits, cannot make it block admissions.
+    sources = resolve_catalog_source(
+        db,
+        server_id=server_id,
+        catalog_instance_id=catalog_instance_id,
+        lock=stream == "catalog",
+    )
     if len(sources) != 1:
         raise ValueError("An explicit server_id is required when multiple sources exist")
     source = sources[0]
@@ -3167,6 +3363,14 @@ def create_bootstrap_session(
     if int(state.get("generation") or 0) <= 0:
         raise CatalogScanError(f"{stream.capitalize()} bootstrap is not ready")
     cur = db.cursor()
+    if stream == "analysis":
+        # Before the session rows below: the projection also locks
+        # analysis_state first and expired sessions second.
+        state = _locked_analysis_state(cur, source["catalog_instance_id"])
+        if state["generation"] <= 0:
+            cur.close()
+            db.commit()  # a refusal keeps no row lock
+            raise CatalogScanError("Analysis bootstrap is not ready")
     cur.execute(f"DELETE FROM {t('stream_bootstrap_sessions')} WHERE expires_at <= now() OR completed_at IS NOT NULL")
     cur.execute(
         f"SELECT COUNT(*) FROM {t('stream_bootstrap_sessions')} "
@@ -3174,8 +3378,9 @@ def create_bootstrap_session(
         (principal_key,),
     )
     active_count = int((cur.fetchone() or (0,))[0])
-    if active_count >= 4:
+    if active_count >= bootstrap_session_limit(principal_key):
         cur.close()
+        db.commit()  # a refusal keeps no row lock
         raise CatalogScanError("Too many active bootstrap sessions")
     token = secrets.token_urlsafe(32)
     generation = state["generation"]
@@ -3293,6 +3498,10 @@ def bootstrap_page(
             "projection_generation",
         )
     vector_exclusions = " - 'musicnn_vector' - 'clap_vector'" if stream == "analysis" and entity_type == "item" else ""
+    if stream == "catalog" and entity_type == "track":
+        # The workbench search text (LUM-016) is server-internal: derived from
+        # fields the DTO already carries, and not part of a change event.
+        vector_exclusions = " - 'search_text'"
     cur.execute(
         f"""
         SELECT {id_column},
@@ -3361,7 +3570,20 @@ def release_bootstrap_session(db, session_token, principal_key):
 def read_catalog_changes(db, cursor_value, server_id=None, catalog_instance_id=None, limit=500):
     cursor = parse_opaque_cursor(cursor_value)
     expected_id = catalog_instance_id or cursor["catalog_instance_id"]
-    sources = resolve_catalog_source(db, server_id=server_id, catalog_instance_id=None if server_id else expected_id)
+    try:
+        # Both identifiers, as create_bootstrap_session passes them: the
+        # catalogue identity finds the source, and a server_id that is its
+        # proven v2 alias is accepted (see resolve_catalog_source). By
+        # server_id alone, a client still sending the alias got 410 forever.
+        sources = resolve_catalog_source(
+            db, server_id=server_id, catalog_instance_id=expected_id
+        )
+    except KeyError:
+        if not server_id:
+            raise
+        # Not this catalogue's server: answer as before, from the server
+        # alone (unknown: 410; another catalogue's: the 400 below).
+        sources = resolve_catalog_source(db, server_id=server_id)
     if len(sources) != 1:
         raise ValueError("An explicit server_id is required when multiple sources exist")
     source = sources[0]
@@ -3470,8 +3692,18 @@ def _new_catalog_instance_id():
 
 
 def ensure_catalog_sources(db, bridge=None):
-    """Create source identities for the currently visible core servers."""
+    """Create source identities for the currently visible core servers.
+
+    Never commits: ``migrate`` calls it inside its one transaction.
+    """
+    return _ensure_catalog_sources(db, bridge)[0]
+
+
+def _ensure_catalog_sources(db, bridge=None):
+    """``ensure_catalog_sources``, plus whether it wrote a source row (and so
+    holds row locks until the caller commits)."""
     provider_bridge = bridge or ProviderCatalogBridge()
+    written = False
     cur = db.cursor()
     cur.execute(
         f"SELECT catalog_instance_id, current_core_server_id, provider_type, rebind_status FROM {t('catalog_sources')}"
@@ -3505,7 +3737,7 @@ def ensure_catalog_sources(db, bridge=None):
             )
             results.append({**legacy, "candidate_core_server_id": candidate["server_id"]})
             cur.close()
-            return results
+            return results, True
 
     for server in servers:
         source = by_server.get(server["server_id"])
@@ -3555,24 +3787,32 @@ def ensure_catalog_sources(db, bridge=None):
                 "provider_type": server["provider_type"],
                 "rebind_status": "active",
             }
+            written = True
         else:
             # A catalogue keeps the server type it was created for. If
             # AudioMuse later names another type for the same server, the
             # refresh and the identity guard stop instead of re-typing it
             # (always a new setup, never a switch: D-JF.2).
+            # Only a changed name or default is written: every refresh calls
+            # this, and an unconditional update locked each source row (and
+            # left a dead tuple) until the caller's next commit.
             cur.execute(
                 f"UPDATE {t('catalog_sources')} SET server_name=%s, "
-                "is_default=%s, updated_at=now() WHERE catalog_instance_id=%s",
+                "is_default=%s, updated_at=now() WHERE catalog_instance_id=%s "
+                "AND (server_name IS DISTINCT FROM %s OR is_default IS DISTINCT FROM %s)",
                 (
                     server["name"],
                     server["is_default"],
                     source["catalog_instance_id"],
+                    server["name"],
+                    server["is_default"],
                 ),
             )
+            written = written or int(getattr(cur, "rowcount", 0) or 0) > 0
         results.append(source)
 
     cur.close()
-    return results
+    return results, written
 
 
 def accept_legacy_rebind(db, catalog_instance_id, core_server_id, evidence):

@@ -13,6 +13,7 @@ from . import status_model
 
 
 CONTRACT_REVISION = 1
+_SAVEPOINT = "lumae_readiness_read"
 CATALOG_SEMANTIC_CONTRACTS = [
     "provider_track_ids_v1",
     "complete_catalog_generation_v1",
@@ -135,6 +136,51 @@ def _catalogue_admission(source):
     )
 
 
+def _open_savepoint(db):
+    """A savepoint around the readiness reads; its cursor, or None.
+
+    A failed read aborts the request's transaction, and every later read on
+    it fails too. Rolling back to a savepoint undoes only these reads, so
+    whatever the caller did before (its own savepoint, a ``SET LOCAL``, a
+    write it has not committed) is kept. An autocommit connection has no
+    transaction to abort and gets no savepoint.
+    """
+    if getattr(db, "autocommit", False) is True:
+        return None
+    cur = db.cursor()
+    cur.execute(f"SAVEPOINT {_SAVEPOINT}")
+    return cur
+
+
+def _release_savepoint(cur):
+    if cur is not None:
+        cur.execute(f"RELEASE SAVEPOINT {_SAVEPOINT}")
+        cur.close()
+
+
+def _undo_failed_reads(db, cur):
+    """Leave the transaction usable after a failed readiness read.
+
+    Without a savepoint to return to (it could not be opened, or the
+    connection broke) the transaction is rolled back: nothing written in an
+    aborted transaction can still be committed.
+    """
+    if cur is not None:
+        try:
+            cur.execute(f"ROLLBACK TO SAVEPOINT {_SAVEPOINT}")
+            cur.execute(f"RELEASE SAVEPOINT {_SAVEPOINT}")
+            cur.close()
+            return
+        except Exception:
+            pass
+    rollback = getattr(db, "rollback", None)
+    if callable(rollback):
+        try:
+            rollback()
+        except Exception:
+            pass
+
+
 def v3_release_readiness(
     db,
     compatibility,
@@ -187,7 +233,9 @@ def v3_release_readiness(
             },
         }
 
+    savepoint = None
     try:
+        savepoint = _open_savepoint(db)
         summary = status_model.read_summary(db, source)
         coverage = _coverage(db, source, summary)
         link_coverage = _link_coverage(
@@ -196,7 +244,9 @@ def v3_release_readiness(
             coverage["eligible_track_count"],
             summary,
         )
+        _release_savepoint(savepoint)
     except Exception:
+        _undo_failed_reads(db, savepoint)
         analysis_admission = _stream_admission(
             False,
             ANALYSIS_SEMANTIC_CONTRACTS,

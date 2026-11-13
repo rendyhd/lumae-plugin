@@ -35,6 +35,7 @@ No host imports at module level, so it loads in tests without a host.
 """
 
 import logging
+import math
 import os
 import select
 import socket
@@ -45,6 +46,21 @@ from collections import namedtuple
 from contextvars import ContextVar
 
 logger = logging.getLogger("lumae_analysis.runner")
+
+
+def _readable(conn, seconds):
+    """Whether ``conn`` (anything with ``fileno()``) is readable within ``seconds``.
+
+    poll, not select, where there is one: a busy host process can hold
+    descriptors >= 1024, which select() refuses on Linux. Windows has no poll.
+    """
+    if hasattr(select, "poll"):
+        poller = select.poll()
+        poller.register(conn, select.POLLIN | select.POLLERR | select.POLLHUP)
+        return bool(poller.poll(max(0, math.ceil(seconds * 1000))))
+    readable, _, _ = select.select([conn], [], [], seconds)
+    return bool(readable)
+
 
 ROLE_SERVER = "server"
 ROLE_WORKER = "worker"
@@ -552,8 +568,7 @@ class Runner:
                 return "wake"
             if self._take_notifies(poll=False):
                 return "notify"
-            readable, _, _ = select.select([self._conn], [], [], min(1.0, remaining))
-            if readable and self._take_notifies(poll=True):
+            if _readable(self._conn, min(1.0, remaining)) and self._take_notifies(poll=True):
                 return "notify"
         return "stopped"
 

@@ -663,58 +663,40 @@ def migrate_enrichment(db):
 
     cur.execute(f"SELECT catalog_instance_id FROM {t('catalog_sources')} ORDER BY catalog_instance_id")
     source_ids = [str(row[0]) for row in cur.fetchall()]
+    versions = (RELATIONSHIP_SCHEMA_VERSION, RELATIONSHIP_ALGORITHM_VERSION,
+                RELATIONSHIP_SCORING_REVISION)
     for catalog_instance_id in source_ids:
-        _profile_stream_state(cur, catalog_instance_id, for_update=True)
+        # Ensure the row exists without locking it: migrate() holds its locks
+        # to the end, and publishers lock catalog_state before the stream state.
+        _profile_stream_state(cur, catalog_instance_id)
+        # Neither statement touches (or locks) a row that is already current:
+        # ON CONFLICT DO UPDATE locks the row even when its WHERE is false.
         cur.execute(
             f"""
             INSERT INTO {t("relationship_state")}
                 (catalog_instance_id, relationship_schema_version,
                  algorithm_version, scoring_revision, epoch)
             VALUES (%s, %s, %s, %s, %s)
-            ON CONFLICT (catalog_instance_id) DO UPDATE SET
-                relationship_schema_version=CASE
-                    WHEN {t("relationship_state")}.result_generation = 0
-                    THEN EXCLUDED.relationship_schema_version
-                    ELSE {t("relationship_state")}.relationship_schema_version
-                END,
-                algorithm_version=CASE
-                    WHEN {t("relationship_state")}.result_generation = 0
-                    THEN EXCLUDED.algorithm_version
-                    ELSE {t("relationship_state")}.algorithm_version
-                END,
-                scoring_revision=CASE
-                    WHEN {t("relationship_state")}.result_generation = 0
-                    THEN EXCLUDED.scoring_revision
-                    ELSE {t("relationship_state")}.scoring_revision
-                END,
-                status=CASE
-                    WHEN {t("relationship_state")}.relationship_schema_version
-                           <> EXCLUDED.relationship_schema_version
-                      OR {t("relationship_state")}.algorithm_version
-                           <> EXCLUDED.algorithm_version
-                      OR {t("relationship_state")}.scoring_revision
-                           <> EXCLUDED.scoring_revision
-                    THEN 'stale'
-                    ELSE {t("relationship_state")}.status
-                END,
-                updated_at=CASE
-                    WHEN {t("relationship_state")}.relationship_schema_version
-                           <> EXCLUDED.relationship_schema_version
-                      OR {t("relationship_state")}.algorithm_version
-                           <> EXCLUDED.algorithm_version
-                      OR {t("relationship_state")}.scoring_revision
-                           <> EXCLUDED.scoring_revision
-                    THEN now()
-                    ELSE {t("relationship_state")}.updated_at
-                END
+            ON CONFLICT (catalog_instance_id) DO NOTHING
             """,
-            (
-                catalog_instance_id,
-                RELATIONSHIP_SCHEMA_VERSION,
-                RELATIONSHIP_ALGORITHM_VERSION,
-                RELATIONSHIP_SCORING_REVISION,
-                str(uuid.uuid4()),
-            ),
+            (catalog_instance_id, *versions, str(uuid.uuid4())),
+        )
+        # A new version marks the results stale; an unpublished row takes it.
+        cur.execute(
+            f"""
+            UPDATE {t("relationship_state")} SET
+                relationship_schema_version=CASE WHEN result_generation = 0
+                    THEN %s ELSE relationship_schema_version END,
+                algorithm_version=CASE WHEN result_generation = 0
+                    THEN %s ELSE algorithm_version END,
+                scoring_revision=CASE WHEN result_generation = 0
+                    THEN %s ELSE scoring_revision END,
+                status='stale', updated_at=now()
+             WHERE catalog_instance_id=%s
+               AND (relationship_schema_version <> %s OR algorithm_version <> %s
+                    OR scoring_revision <> %s)
+            """,
+            (*versions, catalog_instance_id, *versions),
         )
     cur.close()
 
@@ -1830,7 +1812,10 @@ def _load_relationship_inputs(cur, source):
         )
         SELECT tr.track_id, tr.album_id, al.name, al.album_artist_display,
                tr.artist_display, tr.disc_number, tr.track_number, tr.cover_art_id,
-               tr.payload,
+               -- Only the two members read below, not the provider's whole payload.
+               jsonb_build_object('_lumae', jsonb_strip_nulls(jsonb_build_object(
+                   'album', tr.payload->'_lumae'->'album',
+                   'year', tr.payload->'_lumae'->'year'))),
                ac.cover_art_id,
                ai.scalar_payload,
                ai.musicnn_vector, ai.musicnn_dimensions,
@@ -1952,6 +1937,24 @@ def _ivf_candidate_analysis_ids(query_vectors, per_vector_n):
     ids and not the music server's track ids (``fp_...`` on a fingerprinted
     library), so a caller reads them through ``track_analysis_links``.
     """
+    ivf_manager, index = _ivf_index()
+    try:
+        index_size = len(index)
+    except (TypeError, AttributeError):
+        index_size = int(per_vector_n)
+    if index_size <= 0:
+        raise RelationshipIndexUnavailable(
+            "AudioMuse's MusicNN IVF index is empty"
+        )
+    ids = ivf_manager.multi_query_ids(
+        query_vectors,
+        min(max(1, int(per_vector_n)), index_size),
+    )
+    return [str(item_id) for item_id in ids]
+
+
+def _ivf_index():
+    """AudioMuse's IVF manager and its loaded index, loading it if needed."""
     try:
         from tasks import ivf_manager
     except (AttributeError, ImportError) as exc:
@@ -1972,19 +1975,11 @@ def _ivf_candidate_analysis_ids(query_vectors, per_vector_n):
         raise RelationshipIndexUnavailable(
             "AudioMuse's MusicNN IVF index is not ready"
         )
-    try:
-        index_size = len(index)
-    except (TypeError, AttributeError):
-        index_size = int(per_vector_n)
-    if index_size <= 0:
-        raise RelationshipIndexUnavailable(
-            "AudioMuse's MusicNN IVF index is empty"
-        )
-    ids = ivf_manager.multi_query_ids(
-        query_vectors,
-        min(max(1, int(per_vector_n)), index_size),
-    )
-    return [str(item_id) for item_id in ids]
+    return ivf_manager, index
+
+
+# A relationship build step loads the index before its time budget starts.
+_ivf_candidate_analysis_ids.prepare = _ivf_index
 
 
 def _relationship_candidates(
