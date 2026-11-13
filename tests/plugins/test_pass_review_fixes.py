@@ -5,6 +5,7 @@ cursor stays before a released unit, failure handlers roll back first, a
 failed on-demand serve hands its claims back, a running preparation is not
 finished, relationship ``waiting_for_inputs`` is deferred work, and the
 retention task purges discovery receipts."""
+import os
 import types
 
 import pytest
@@ -294,6 +295,89 @@ def test_without_a_canary_the_provider_ping_decides(monkeypatch):
     Bridge.answers = False
     assert mod._downloads_serving(SOURCE, None, ["t1"]) is False
     assert pinged == ["server-a", "srv"]
+
+
+class _TieredCanaryDb(_CanaryDb):
+    """No track has a published waveform; the catalogue has ``track``."""
+
+    def cursor(self):
+        cursor = super().cursor()
+        execute = cursor.execute
+
+        def tiered(sql, params):
+            execute(sql, params)
+            cursor.published = "published_source_profiles" in sql
+        cursor.execute = tiered
+        fetch = cursor.fetchone
+        cursor.fetchone = lambda: None if cursor.published else fetch()
+        return cursor
+
+
+def _pinging(monkeypatch, mod, pinged):
+    monkeypatch.setattr(mod, "get_core_adapter", lambda: types.SimpleNamespace(active_server_id=lambda: "srv"))
+
+    class Bridge:
+        def __init__(self, adapter=None):
+            pass
+
+        def probe_server_identity(self, server_id, timeout_seconds=5):
+            pinged.append(server_id)
+            return {"server_version": "1"}  # the ping answers whatever the files do
+    monkeypatch.setattr(mod, "ProviderCatalogBridge", Bridge)
+
+
+def test_without_a_published_waveform_a_catalogue_canary_decides(monkeypatch):
+    mod = load_plugin()
+    pinged, loaded = [], []
+    monkeypatch.setattr(mod, "get_db", lambda: _TieredCanaryDb("new"))
+    monkeypatch.setattr(mod, "remove_downloaded_file", lambda path: None)
+    _pinging(monkeypatch, mod, pinged)
+
+    def load(track_id, **_kwargs):
+        loaded.append(track_id)
+        return {"file_path": "/tmp/new", "cleanup_path": "/tmp/new"}
+    monkeypatch.setattr(mod, "load_track_file", load)
+    assert mod._downloads_serving(SOURCE, "server-a", ["t1", "t2", "t3"]) is True
+    assert loaded == ["new"] and pinged == []
+
+    # Storage offline or the API key revoked: the download fails, the ping
+    # would answer, and it is an outage.
+    monkeypatch.setattr(mod, "load_track_file", lambda *a, **k: (_ for _ in ()).throw(
+        mod.MediaDownloadError("down")))
+    assert mod._downloads_serving(SOURCE, "server-a", ["t1", "t2", "t3"]) is False
+    assert pinged == []
+
+
+@pytest.mark.parametrize("works", [True, False])
+def test_the_canary_downloads_into_a_directory_of_its_own(monkeypatch, tmp_path, works):
+    mod = load_plugin()
+    monkeypatch.setattr(mod.config, "TEMP_DIR", str(tmp_path / "host-temp"), raising=False)
+    monkeypatch.setattr(mod.analysis_download, "_root", lambda host_temp_dir=None: str(tmp_path / "downloads"))
+    monkeypatch.setattr(mod, "get_db", lambda: _CanaryDb("busy"))
+    monkeypatch.setattr(mod, "remove_downloaded_file", lambda path: None)
+    pass_directory = mod.analysis_download.task_directory(mod.config.TEMP_DIR)
+    # The pass's own download of the same track, being read by another thread.
+    in_flight = os.path.join(pass_directory, "busy.flac")
+    with open(in_flight, "wb") as out:
+        out.write(b"in flight")
+    used = []
+
+    def load(track_id, directory=None, **_kwargs):
+        used.append(directory)
+        path = os.path.join(directory, f"{track_id}.flac")  # the host names files by track id
+        with open(path, "wb") as out:
+            out.write(b"canary")
+        if not works:
+            raise mod.MediaDownloadError("down")
+        return {"file_path": path, "cleanup_path": path}
+    monkeypatch.setattr(mod, "load_track_file", load)
+    assert mod._downloads_serving(SOURCE, "server-a", ["t1", "t2", "t3"]) is works
+    [directory] = used
+    assert directory and directory not in (pass_directory, mod.config.TEMP_DIR)
+    assert os.path.dirname(directory) == pass_directory  # under the root the pass uses
+    assert not os.path.exists(directory)  # removed with its contents
+    with open(in_flight, "rb") as kept:
+        assert kept.read() == b"in flight"
 
 
 def test_a_breaker_whose_check_raises_treats_it_as_an_outage():

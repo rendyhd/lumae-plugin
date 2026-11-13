@@ -125,6 +125,30 @@ def inspect_track_id_sets(previous_ids: Iterable[str], current_ids: Iterable[str
     )
 
 
+def _ids_reverted_to_legacy(published_ids, scanned_ids) -> bool:
+    """Whether the scan carries published canonical IDs in their legacy form.
+
+    The rekey check run backwards: a scanned legacy ID whose canonical form
+    is published, while that canonical ID is no longer in the scan, is exact
+    codec evidence that the server's IDs changed back (its pre-rekey database
+    restored). One such track is enough; a scan that has both forms of a
+    track is a conflict, not a reversal, and is not counted as one. A
+    binary-only downgrade keeps the canonical IDs and has none.
+    """
+    published = {str(value) for value in published_ids}
+    scanned = {str(value) for value in scanned_ids}
+    reverted = both_forms = 0
+    for scanned_id in scanned - published:
+        converted = canonicalize_navidrome_id(scanned_id)
+        if not (converted.recognized and converted.changed) or converted.value not in published:
+            continue
+        if converted.value in scanned:
+            both_forms += 1
+        else:
+            reverted += 1
+    return reverted > 0 and both_forms == 0
+
+
 def migrate_provider_identity(db):
     cur = db.cursor()
     cur.execute(
@@ -285,15 +309,41 @@ def require_projection_reconcile(db):
     block has sent back to inspection: the inspection restores ``applied``
     (the projection is then owed) or opens the next transition (one extra
     projection check, which is harmless).
+
+    Locks in the order of a refresh: the catalogues' ``catalog_state`` rows
+    first (by ``catalog_instance_id``, as prune_catalog_storage does later in
+    the same install transaction), then their transition rows. A refresh
+    inspecting a transition_pending or blocked row holds ``catalog_state``
+    and waits for the transition row (inspect_catalog_identity,
+    catalog._confirm_catalog_identity); locking the transition row first
+    and then reaching prune_catalog_storage closed a cycle with it. A row
+    that becomes applied after the catalogue rows are locked is not flagged:
+    its own publication leaves AudioMuse health to be checked, and the
+    recheck projects then.
     """
 
     cur = db.cursor()
     cur.execute(
         f"""
+        SELECT c.catalog_instance_id
+          FROM {t('catalog_state')} c
+          JOIN {t('provider_identity_transitions')} p USING (catalog_instance_id)
+         WHERE {_was_applied_sql('p')}
+         ORDER BY c.catalog_instance_id
+           FOR UPDATE OF c
+        """
+    )
+    locked = [str(row[0]) for row in cur.fetchall() or ()]
+    if not locked:
+        cur.close()
+        return 0
+    cur.execute(
+        f"""
         UPDATE {t('provider_identity_transitions')} p
            SET projection_reconcile_required=TRUE, updated_at=now()
-         WHERE {_was_applied_sql('p')}
-        """
+         WHERE p.catalog_instance_id = ANY(%s) AND {_was_applied_sql('p')}
+        """,
+        (locked,),
     )
     changed = max(int(getattr(cur, "rowcount", 0) or 0), 0)
     cur.close()
@@ -1248,7 +1298,21 @@ def inspect_catalog_identity(
         # AudioMuse health it had and the action that health still requires
         # (as refresh_audiomuse_health writes it), so the analysis projection
         # stays held until AudioMuse has migrated.
-        preserve_applied = was_applied
+        #
+        # A pre-canonical version can also mean the server's old database
+        # was restored: the legacy IDs are back. The check above cannot see
+        # that (it looks for legacy IDs that became canonical), and restoring
+        # ``applied`` then held every projection for good: AudioMuse's
+        # mapping is keyed on the legacy IDs again and never matches the
+        # carried canonical links. Such a row goes ``normal`` and drops its
+        # applied identity, as up to 1.10.2, so the ordinary diff and the
+        # projection rebuild from the server's IDs.
+        reverted = (
+            was_applied
+            and is_after_last_known_pre_canonical_version(observed_version) is False
+            and _ids_reverted_to_legacy(previous_ids, current_track_ids)
+        )
+        preserve_applied = was_applied and not reverted
         action = (
             "run_audiomuse_provider_migration"
             if preserve_applied and stored_health != "ready"
@@ -1292,6 +1356,19 @@ def inspect_catalog_identity(
                 catalog_instance_id,
             ),
         )
+        if reverted:
+            # The manifest table keeps the transition (its history).
+            cur.execute(
+                f"""
+                UPDATE {t('provider_identity_transitions')}
+                   SET detection_reason='provider_ids_reverted',
+                       first_seq=NULL, last_seq=NULL,
+                       analysis_baseline='{{}}'::jsonb, baseline_integrity=NULL,
+                       audiomuse_health=NULL, manifest_sha256=NULL, applied_at=NULL
+                 WHERE catalog_instance_id=%s
+                """,
+                (catalog_instance_id,),
+            )
         next_state = "applied" if preserve_applied else "normal"
         stable_scan_count = previous_target_scan_count if preserve_applied else 0
     else:

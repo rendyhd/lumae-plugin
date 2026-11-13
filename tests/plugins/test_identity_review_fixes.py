@@ -197,6 +197,40 @@ def test_which_rows_count_as_applied(state, transition_id, published, was_applie
     assert guard.transition_was_applied(state, transition_id, published) is was_applied
 
 
+LEGACY_A = "e3b7fc2ae9447bbec37a13bf916e3cf6"
+LEGACY_B = "a3b7fc2ae9447bbec37a13bf916e3cf7"
+
+
+@pytest.mark.parametrize(
+    ("scanned", "reverted"),
+    [
+        # Binary-only downgrade: the canonical IDs stay.
+        (["A", "B"], False),
+        # The pre-rekey database restored: legacy forms instead of canonical.
+        ([LEGACY_A, LEGACY_B], True),
+        # One track reverted is exact evidence too.
+        ([LEGACY_A, "B"], True),
+        # Both forms of a track in one scan: a conflict, not a reversal.
+        ([LEGACY_A, "A", LEGACY_B], False),
+        # Ordinary removals and additions are not evidence.
+        (["A", "f" * 32], False),
+    ],
+)
+def test_which_scans_show_ids_reverted_to_legacy(scanned, reverted):
+    load_plugin()
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+    from plugins.LumaeAnalysis.provider_identity import canonicalize_navidrome_id
+
+    canonical = {
+        "A": canonicalize_navidrome_id(LEGACY_A).value,
+        "B": canonicalize_navidrome_id(LEGACY_B).value,
+    }
+    published = list(canonical.values())
+    scan = [canonical.get(value, value) for value in scanned]
+
+    assert guard._ids_reverted_to_legacy(published, scan) is reverted
+
+
 def test_only_a_row_without_a_transition_id_opens_one_on_observation():
     load_plugin()
     from plugins.LumaeAnalysis import provider_identity_guard as guard

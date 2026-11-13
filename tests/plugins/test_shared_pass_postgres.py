@@ -230,7 +230,7 @@ def runners(tick, second_connection, monkeypatch, tmp_path):
     source = _flac(tmp_path / "library", seconds=6.0)
     downloads, lock = [], threading.Lock()
 
-    def load(track_id, catalog_instance_id=None, server_id=None, defer=False):
+    def load(track_id, catalog_instance_id=None, server_id=None, defer=False, **_kwargs):
         with lock:
             downloads.append(track_id)
             copy = tmp_path / "downloads" / f"{track_id}-{len(downloads)}.flac"

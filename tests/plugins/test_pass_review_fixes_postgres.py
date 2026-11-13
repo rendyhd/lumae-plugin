@@ -188,3 +188,87 @@ def test_state_times_are_real_utc_in_a_non_utc_session(source_db):
         cur.execute(f"UPDATE {P}profile_backfill_state SET updated_at=now() - interval '3 hours'")
     db.commit()
     assert not mod.profile_backfill_is_active(mod.profile_backfill_state(SOURCE, db=db))
+
+
+# --- the download breaker's canary and back-off ----------------------------------
+
+def _published(db, track):
+    with db.cursor() as cur:
+        cur.execute(f"INSERT INTO {P}published_source_profiles (catalog_instance_id, track_id, sample_rate, "
+                    "duration_ms, ref_lufs, start_ramp, end_ramp, analyzer_ver, profile_schema_ver, "
+                    "media_signature, analyzed_at) "
+                    "VALUES (%s, %s, 44100, 240000, -14, '\\x00', '\\x00', 1, 1, 'sig', now())",
+                    (SOURCE, track))
+    db.commit()
+
+
+def _canaries(mod, db, exclude, times=40):
+    found = {mod._canary_track(db, SOURCE, exclude) for _ in range(times)}
+    db.commit()
+    return found
+
+
+def test_the_canary_is_a_track_with_a_published_waveform_never_a_held_one(source_db):
+    mod, db = source_db
+    # Ids spread over the random start's hex range, so both are drawn.
+    for track in ("2a", "8a", "4b", "c4"):
+        _track(db, track)
+    _published(db, "4b")
+    _published(db, "c4")
+    assert _canaries(mod, db, ["2a"]) == {"4b", "c4"}  # a published one first, from a random start
+    assert _canaries(mod, db, ["4b"]) == {"c4"}
+
+
+def test_without_a_published_waveform_the_canary_comes_from_the_catalogue(source_db):
+    mod, db = source_db
+    for track in ("t1", "t2", "t3", "t4"):
+        _track(db, track)
+    with db.cursor() as cur:
+        cur.execute(f"UPDATE {P}catalog_tracks SET available=FALSE WHERE track_id='t3'")
+        # Another generation's row is not the published catalogue.
+        cur.execute(f"UPDATE {P}catalog_tracks SET published_generation=2 WHERE track_id='t4'")
+    db.commit()
+    assert _canaries(mod, db, ["t1"]) == {"t2"}
+
+
+def test_a_catalogue_of_only_held_tracks_has_no_canary(source_db):
+    mod, db = source_db
+    for track in ("t1", "t2", "t3"):
+        _track(db, track)
+    _published(db, "t2")
+    assert _canaries(mod, db, ["t1", "t2", "t3"], times=3) == {None}
+
+
+def _pass_state(db, state_table, retry_sql):
+    with db.cursor() as cur:
+        cur.execute(f"DELETE FROM {P}{state_table}")
+        cur.execute(f"INSERT INTO {P}{state_table} (catalog_instance_id, status, next_retry_at) "
+                    f"VALUES (%s, 'running', {retry_sql})", (SOURCE,))
+    db.commit()
+
+
+def _retry_in(db, state_table):
+    with db.cursor() as cur:
+        cur.execute(f"SELECT status, next_retry_at = 'infinity', "
+                    f"CASE WHEN next_retry_at <> 'infinity' "
+                    f"THEN EXTRACT(EPOCH FROM next_retry_at - LOCALTIMESTAMP) END FROM {P}{state_table}")
+        row = cur.fetchone()
+    db.commit()
+    return row
+
+
+@pytest.mark.parametrize("state_table", ["loudness_backfill_state", "edge_backfill_state"])
+def test_a_tripped_pass_backs_off_a_minute_and_keeps_a_later_retry(source_db, state_table):
+    mod, db = source_db
+    limit = mod.BACKFILL_ABORT_RETRY_SECONDS
+    _pass_state(db, state_table, "NULL")
+    mod._back_off_pass(db, state_table, SOURCE)
+    status, infinite, seconds = _retry_in(db, state_table)
+    assert status == "running" and not infinite and limit - 5 < float(seconds) <= limit
+    _pass_state(db, state_table, "LOCALTIMESTAMP + interval '1 hour'")
+    mod._back_off_pass(db, state_table, SOURCE)
+    status, infinite, seconds = _retry_in(db, state_table)
+    assert status == "running" and 3500 < float(seconds) <= 3600
+    _pass_state(db, state_table, "'infinity'")
+    mod._back_off_pass(db, state_table, SOURCE)
+    assert _retry_in(db, state_table)[:2] == ("running", True)

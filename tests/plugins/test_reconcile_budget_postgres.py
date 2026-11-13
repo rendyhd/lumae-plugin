@@ -172,7 +172,8 @@ def _edge_library(db, tracks):
 def _slow_edges(mod, monkeypatch, seconds):
     runs = []
 
-    def analyse(jobs, source, server, priority="background", budget_seconds=None):
+    def analyse(jobs, source, server, priority="background", budget_seconds=None,
+                breaker=None):
         runs.append(([job["track_id"] for job in jobs], budget_seconds))
         time.sleep(seconds)
         return [{"track_id": job["track_id"], "status": "ready"} for job in jobs]

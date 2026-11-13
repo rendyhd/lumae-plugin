@@ -10028,7 +10028,8 @@ def test_install_cleanup_prunes_backup_generations_and_bounds_core_journals():
 
         def execute(self, sql, params=None):
             self.executed.append((sql, params))
-            if "SELECT c.catalog_instance_id" in sql:
+            # prune_catalog_storage locks catalog_state, then analysis_state.
+            if "SELECT catalog_instance_id, published_generation" in sql:
                 self.rows = [
                     (
                         "catalog-a",
@@ -10036,13 +10037,10 @@ def test_install_cleanup_prunes_backup_generations_and_bounds_core_journals():
                         "catalog-epoch",
                         0,
                         {"library": 2, "artist": 3478, "album": 1328, "track": 21569},
-                        10,
-                        "analysis-epoch",
-                        212_002,
-                        20_630,
-                        21_569,
                     )
                 ]
+            elif "SELECT catalog_instance_id, COALESCE(projection_generation" in sql:
+                self.rows = [("catalog-a", 10, "analysis-epoch", 212_002, 20_630, 21_569)]
             else:
                 self.rows = []
 

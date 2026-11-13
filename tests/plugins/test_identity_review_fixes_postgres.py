@@ -12,6 +12,7 @@
 import json
 from datetime import datetime, timedelta, timezone
 
+import psycopg2.errors
 import psycopg2.extensions
 import pytest
 
@@ -345,6 +346,83 @@ def test_an_upgrade_requests_the_projection_check_for_every_applied_transition(
     assert guard.transition_was_applied(
         row["state"], row["transition_id"],
         row["applied_at"] is not None and row["manifest_sha256"] is not None) is flagged
+
+
+def test_the_upgrade_request_locks_the_catalogue_before_the_transition_row(
+    migrated_db, second_connection
+):
+    """A refresh holds catalog_state and waits for the transition row; the
+    install must take them in the same order, or the two deadlock."""
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    db = migrated_db
+    bridge, _source, _transition_id = _applied_transition(db)
+    bridge.version = "0.64.1"
+    guard.observe_provider_version(db, bridge, "server-a")
+    assert _transition(db)["state"] == "transition_pending"
+
+    # A refresh's inspection has locked the catalogue row.
+    with second_connection.cursor() as other:
+        other.execute(f"SELECT 1 FROM {P}catalog_state FOR UPDATE")
+    with db.cursor() as cur:
+        cur.execute("SET LOCAL lock_timeout = '300ms'")
+    with pytest.raises(psycopg2.errors.LockNotAvailable):
+        guard.require_projection_reconcile(db)
+    # The install waited on the catalogue row without holding the transition row.
+    with second_connection.cursor() as other:
+        other.execute(f"SELECT 1 FROM {P}provider_identity_transitions FOR UPDATE NOWAIT")
+    second_connection.rollback()
+    db.rollback()
+
+    assert guard.require_projection_reconcile(db) == 1
+    db.commit()
+    assert _transition(db)["projection_reconcile_required"] is True
+
+
+def _restored_legacy_database(db, version):
+    """Applied, then Navidrome reports ``version`` with its pre-rekey IDs."""
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+
+    bridge, source, transition_id = _applied_transition(db)
+    bridge.version = version
+    bridge.payload = _catalog([TRACK_A, TRACK_B], ALBUM, ARTIST)
+    assert guard.observe_provider_version(db, bridge, "server-a")["state"] == "transition_pending"
+    return bridge, source, transition_id
+
+
+def test_a_restored_pre_rekey_database_returns_the_catalogue_to_normal(migrated_db):
+    from plugins.LumaeAnalysis import provider_identity_guard as guard
+    from plugins.LumaeAnalysis.provider_identity_rekey import read_transition_manifest
+
+    db = migrated_db
+    bridge, source, transition_id = _restored_legacy_database(db, "0.63.2")
+
+    _refresh(db, bridge)
+
+    row = _transition(db)
+    assert (row["state"], row["detection_reason"], row["required_action"]) == (
+        "normal", "provider_ids_reverted", None)
+    for key in ("transition_id", "applied_at", "manifest_sha256", "audiomuse_health",
+                "first_seq", "last_seq", "baseline_integrity"):
+        assert row[key] is None, key
+    assert row["last_checked_provider_version"] == "0.63.2"
+    assert _published_tracks(db) == {TRACK_A, TRACK_B}
+    # The transition stays in the history; nothing holds the projection.
+    assert read_transition_manifest(db, transition_id=transition_id)
+    assert guard.observe_provider_version(db, bridge, "server-a")["state"] == "normal"
+    assert guard.assert_analysis_projection_allowed(db, bridge, "server-a")["state"] == "normal"
+
+
+def test_legacy_ids_after_a_post_boundary_version_still_restore_applied(migrated_db):
+    # Only a pre-canonical version is read as a restored database; the
+    # version-change path is as it was.
+    db = migrated_db
+    bridge, _source, transition_id = _restored_legacy_database(db, "0.64.1")
+
+    _refresh(db, bridge)
+
+    row = _transition(db)
+    assert (row["state"], row["transition_id"]) == ("applied", transition_id)
 
 
 def test_a_jellyfin_transition_blocked_after_it_was_applied_is_restored(migrated_db):

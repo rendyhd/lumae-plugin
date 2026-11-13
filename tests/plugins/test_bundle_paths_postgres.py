@@ -43,7 +43,7 @@ def library(tick, monkeypatch, tmp_path):
     state = types.SimpleNamespace(mod=mod, db=db, downloads=[], tags=[], tmp=tmp_path,
                                   source=_write(tmp_path / "song.flac", seconds=8.0))
 
-    def load(track_id, catalog_instance_id=None, server_id=None, defer=False):
+    def load(track_id, catalog_instance_id=None, server_id=None, defer=False, **_kwargs):
         state.downloads.append(track_id)
         copy = tmp_path / "downloads" / f"{track_id}-{len(state.downloads)}.flac"
         copy.parent.mkdir(exist_ok=True)

@@ -4,7 +4,9 @@ import importlib
 import json
 import os
 import re
+import shutil
 import socket
+import tempfile
 import time
 from contextlib import contextmanager, nullcontext
 from datetime import datetime, timezone
@@ -2609,7 +2611,7 @@ def rewait_interactive_profiles(db, catalog_instance_id, ids):
         cur.close()
 
 
-def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=False):
+def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=False, directory=None):
     """The track's file for analysis: ``{track_id, file_path, media_signature,
     cleanup_path}``, or None when it is not in the published catalogue.
 
@@ -2617,6 +2619,8 @@ def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=Fa
     the host's download when that is not possible. ``defer``: a parallel
     pass's turn thread resolves the download here and an analysis thread
     fetches it (``fetch_track_file``); the host's download never defers.
+    ``directory``: where either download writes the file instead of the
+    task's directory (the download canary's own, ``_downloads_serving``).
     """
     db = get_db()
     adapter = get_core_adapter()
@@ -2679,14 +2683,15 @@ def load_track_file(track_id, catalog_instance_id=None, server_id=None, defer=Fa
     provider_type = str(row[5] or "").lower() if len(row) > 5 else None
     source_catalog = row[6] if len(row) > 6 else catalog_instance_id
     if media_fp and provider_type:
-        own = _own_download(item_id, source_catalog, source_server_id, provider_type, media_fp, defer)
+        own = _own_download(item_id, source_catalog, source_server_id, provider_type, media_fp, defer,
+                            directory=directory)
         if own is not None:
             return own
 
     try:
         item = media_server_item(item_id, None, title, author)
         downloaded_path = ProviderCatalogBridge(adapter).download_track(
-            source_server_id, _host_download_directory(), item
+            source_server_id, directory or _host_download_directory(), item
         )
     except Exception as exc:
         logger.warning("lumae_analysis could not download %s for analysis: %s", track_id, exc)
@@ -2735,7 +2740,7 @@ def _own_download_refused_now(catalog_instance_id):
     return True
 
 
-def _own_download(item_id, catalog_instance_id, server_id, provider_type, media_fp, defer):
+def _own_download(item_id, catalog_instance_id, server_id, provider_type, media_fp, defer, directory=None):
     """The original file through Lumae's own stream target (WP2), or None
     for the host's download.
 
@@ -2755,7 +2760,7 @@ def _own_download(item_id, catalog_instance_id, server_id, provider_type, media_
             target, error = collection_library._resolve_stream_target(str(item_id), provider_type, module)
         if not target:
             raise ValueError((error or ("no stream target",))[0])
-        directory = analysis_download.task_directory(getattr(config, "TEMP_DIR", None))
+        directory = directory or analysis_download.task_directory(getattr(config, "TEMP_DIR", None))
         resolved = analysis_download.resolve(target, provider_type, str(item_id), directory)
     except Exception as exc:
         _refuse_own_download(catalog_instance_id, f"no original-file stream ({type(exc).__name__}: {exc})")
@@ -5925,11 +5930,16 @@ def _downloads_serving(catalog_instance_id, server_id, held_track_ids):
     """Whether the source's media server still serves files although
     DOWNLOAD_BREAKER_LIMIT downloads failed in a row (``_DownloadBreaker``).
 
-    A canary: a track of the source that downloaded before (it has a
-    published waveform), not among ``held_track_ids`` and a different one on
-    each check, downloaded the way a pass downloads and removed at once. No
-    canary (nothing published yet, or it left the catalogue): the provider's
-    bounded ping answers. Never raises; an error means an outage."""
+    A canary (``_canary_track``): a track of the source that downloaded
+    before (it has a published waveform), else any available track of its
+    published catalogue, not among ``held_track_ids`` and a different one on
+    each check, downloaded the way a pass downloads and removed at once. It
+    goes to a fresh directory of its own (``_canary_directory``): the host's
+    download names a file by track id, and the canary may be a track another
+    analysis thread is reading. Only with no canary (a catalogue of nothing
+    but the held tracks) does the provider's bounded ping answer: it answers
+    with the library's storage offline or the API key revoked. Never raises;
+    an error means an outage."""
     db, track_id = None, None
     try:
         db = get_db()
@@ -5938,9 +5948,11 @@ def _downloads_serving(catalog_instance_id, server_id, held_track_ids):
         _rollback_if_possible(db)
         logger.warning("lumae_analysis could not choose a download canary", exc_info=True)
     if track_id is not None:
-        info = None
+        info, directory = None, None
         try:
-            info = load_track_file(track_id, catalog_instance_id=catalog_instance_id, server_id=server_id)
+            directory = _canary_directory()
+            info = load_track_file(track_id, catalog_instance_id=catalog_instance_id, server_id=server_id,
+                                   directory=directory)
         except Exception:
             return False
         finally:
@@ -5950,6 +5962,8 @@ def _downloads_serving(catalog_instance_id, server_id, held_track_ids):
                     remove_downloaded_file(info.get("cleanup_path"))
                 except Exception:
                     logger.warning("lumae_analysis could not remove a canary download", exc_info=True)
+            if directory:
+                shutil.rmtree(directory, ignore_errors=True)
         if info:
             return True
     try:
@@ -5961,22 +5975,42 @@ def _downloads_serving(catalog_instance_id, server_id, held_track_ids):
 
 
 def _canary_track(db, catalog_instance_id, exclude):
-    """A published track of the source outside ``exclude``, from a random
-    point of its ids, so repeated checks try different files."""
+    """A track of the source outside ``exclude`` that ``load_track_file``
+    resolves (available in the published generation): one with a published
+    waveform first (it downloaded before), else any; each from a random
+    point of the ids, so repeated checks try different files."""
     if not catalog_instance_id:
         return None
     start = os.urandom(8).hex()
+    excluded = [str(item) for item in exclude]
+    published = f"""AND EXISTS (SELECT 1 FROM {table('published_source_profiles')} p
+                                 WHERE p.catalog_instance_id=t.catalog_instance_id
+                                   AND p.track_id=t.track_id)"""
     with db.cursor() as cur:
-        for bound in ("AND track_id >= %s", ""):
-            cur.execute(
-                f"""SELECT track_id FROM {table('published_source_profiles')}
-                     WHERE catalog_instance_id=%s AND NOT (track_id = ANY(%s)) {bound}
-                     ORDER BY track_id LIMIT 1""",
-                (catalog_instance_id, [str(item) for item in exclude], *((start,) if bound else ())))
-            row = cur.fetchone()
-            if row:
-                return row[0]
+        for tier in (published, ""):
+            for bound in ("AND t.track_id >= %s", ""):
+                cur.execute(
+                    f"""SELECT t.track_id
+                          FROM {table('catalog_tracks')} t
+                          JOIN {table('catalog_state')} c
+                            ON c.catalog_instance_id=t.catalog_instance_id
+                           AND c.published_generation=t.published_generation
+                         WHERE t.catalog_instance_id=%s AND t.available=TRUE
+                           AND NOT (t.track_id = ANY(%s)) {tier} {bound}
+                         ORDER BY t.track_id LIMIT 1""",
+                    (catalog_instance_id, excluded, *((start,) if bound else ())))
+                row = cur.fetchone()
+                if row:
+                    return row[0]
     return None
+
+
+def _canary_directory():
+    """A fresh directory for one canary download, inside the runner's
+    download directory (where a pass's host download goes, R5) and never
+    ``TEMP_DIR`` itself, which an analysis run empties at its start."""
+    return tempfile.mkdtemp(prefix="canary-",
+                            dir=analysis_download.task_directory(getattr(config, "TEMP_DIR", None)))
 
 
 def _serving_check(catalog_instance_id, server_id):

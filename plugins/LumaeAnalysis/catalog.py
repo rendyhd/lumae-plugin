@@ -48,9 +48,17 @@ BOOTSTRAP_PRINCIPAL_LOCK = "lumae.bootstrap_principal"
 # How long a post-publication journal compaction waits for the catalog_state
 # row before it leaves the journal to the next publication or to maintenance.
 CATALOG_COMPACTION_LOCK_TIMEOUT = "1s"
+# Journal events one post-publication compaction transaction may delete while
+# it holds catalog_state, and how many such transactions one publication runs;
+# the next publication or prune_catalog_storage continues a larger backlog.
+CATALOG_COMPACTION_MAX_ADVANCE = 5_000
+CATALOG_COMPACTION_MAX_BATCHES = 20
 # How long an analysis bootstrap session creation waits for the analysis_state
 # row a running projection holds before it answers "busy, retry".
 ANALYSIS_LEASE_LOCK_TIMEOUT = "3s"
+# How long a bootstrap session creation waits for another creation of the
+# same principal (BOOTSTRAP_PRINCIPAL_LOCK) before it answers "retry shortly".
+BOOTSTRAP_PRINCIPAL_LOCK_TIMEOUT = "3s"
 # SQLSTATEs of a lock wait given up: lock_timeout, and deadlock victim.
 LOCK_NOT_AVAILABLE = "55P03"
 DEADLOCK_DETECTED = "40P01"
@@ -203,30 +211,50 @@ def prune_snapshot_generations(cur, catalog_instance_id, stream, active_generati
 def prune_catalog_storage(db, catalog_instance_id=None, cursor=None):
     """Run idempotent install-time cleanup for snapshots and core change journals.
 
-    Locks the catalog_state rows first (FOR UPDATE OF c), before it deletes
-    expired sessions or journal rows: the order of a catalogue lease
-    (catalog_state, then sessions) and of the post-publication compaction
-    (catalog_state, then catalog_changes). Deleting journal rows first and
-    then waiting for catalog_state for the floor update deadlocked with a
-    compaction holding catalog_state and waiting for those rows.
+    Before it deletes any session, snapshot or journal row, it locks the
+    catalog_state rows and then the analysis_state rows (FOR UPDATE, each in
+    catalog_instance_id order; catalog_state before analysis_state as
+    relationship_build takes them). That is the order of every other writer:
+    a catalogue lease (catalog_state, then sessions), the post-publication
+    compaction (catalog_state, then catalog_changes), and the projection and
+    an analysis lease (analysis_state, then sessions and analysis rows). None
+    of them takes analysis_state before catalog_state. Deleting first and then
+    waiting for a state row for the floor update deadlocked with a writer that
+    held that row and waited for the deleted rows.
+
+    The analysis values are read by the locking statement, so they are those
+    of the last projection that committed, not of a snapshot taken before it.
     """
     cur = cursor or db.cursor()
     cur.execute(
         f"""
-        SELECT c.catalog_instance_id, c.published_generation, c.catalog_epoch,
-               c.catalog_head_seq, c.entity_counts,
-               COALESCE(a.projection_generation, 0), COALESCE(a.analysis_epoch, ''),
-               COALESCE(a.analysis_head_seq, 0), COALESCE(a.item_count, 0),
-               COALESCE(a.mapped_track_count, 0)
-          FROM {t('catalog_state')} AS c
-          LEFT JOIN {t('analysis_state')} AS a USING (catalog_instance_id)
-         WHERE %s IS NULL OR c.catalog_instance_id=%s
-         ORDER BY c.catalog_instance_id
-           FOR UPDATE OF c
+        SELECT catalog_instance_id, published_generation, catalog_epoch,
+               catalog_head_seq, entity_counts
+          FROM {t('catalog_state')}
+         WHERE %s IS NULL OR catalog_instance_id=%s
+         ORDER BY catalog_instance_id
+           FOR UPDATE
         """,
         (catalog_instance_id, catalog_instance_id),
     )
-    rows = cur.fetchall()
+    catalog_rows = cur.fetchall()
+    cur.execute(
+        f"""
+        SELECT catalog_instance_id, COALESCE(projection_generation, 0),
+               COALESCE(analysis_epoch, ''), COALESCE(analysis_head_seq, 0),
+               COALESCE(item_count, 0), COALESCE(mapped_track_count, 0)
+          FROM {t('analysis_state')}
+         WHERE %s IS NULL OR catalog_instance_id=%s
+         ORDER BY catalog_instance_id
+           FOR UPDATE
+        """,
+        (catalog_instance_id, catalog_instance_id),
+    )
+    analysis = {str(row[0]): row[1:] for row in cur.fetchall()}
+    rows = [
+        tuple(row) + tuple(analysis.get(str(row[0])) or (0, "", 0, 0, 0))
+        for row in catalog_rows
+    ]
     for row in rows:
         source_id = str(row[0])
         catalog_generation = int(row[1] or 0)
@@ -1906,6 +1934,13 @@ def _compact_catalog_journal(cur, catalog_instance_id, retention_limit):
     within CATALOG_COMPACTION_LOCK_TIMEOUT (an install migrating), or the wait
     is chosen as a deadlock victim, this one skips: that publication compacts,
     or the next one, or maintenance (prune_catalog_storage).
+
+    One call moves the floor at most CATALOG_COMPACTION_MAX_ADVANCE seqs, so
+    the catalog_state row (which admissions, completions and catalogue leases
+    wait for) is held for a bounded delete. ``max_advance`` only lowers the
+    target floor, never below the locked one, so at least ``retention_limit``
+    events stay. Returns True when the batch was full and more may have
+    expired (_after_publication then runs another, in a new transaction).
     """
     cur.execute(
         "SELECT pg_try_advisory_xact_lock(hashtext(%s), hashtext(%s))",
@@ -1913,7 +1948,7 @@ def _compact_catalog_journal(cur, catalog_instance_id, retention_limit):
     )
     locked = cur.fetchone()
     if not (locked and locked[0]):
-        return
+        return False
     # The savepoint scopes the lock_timeout and, on a give-up, undoes the
     # partial work; the caller commits this transaction right after.
     cur.execute("SAVEPOINT lumae_catalog_compaction")
@@ -1927,8 +1962,10 @@ def _compact_catalog_journal(cur, catalog_instance_id, retention_limit):
             (catalog_instance_id,),
         )
         state = cur.fetchone()
+        more = False
         if state is not None:
-            compact_change_journal(
+            current_floor = int(state[2] or 0)
+            floor = compact_change_journal(
                 cur,
                 catalog_instance_id=catalog_instance_id,
                 state_table="catalog_state",
@@ -1938,8 +1975,10 @@ def _compact_catalog_journal(cur, catalog_instance_id, retention_limit):
                 epoch=state[0],
                 head_seq=state[1],
                 retention_limit=retention_limit,
-                current_floor=state[2],
+                current_floor=current_floor,
+                max_advance=CATALOG_COMPACTION_MAX_ADVANCE,
             )
+            more = floor >= current_floor + CATALOG_COMPACTION_MAX_ADVANCE
     except Exception as exc:
         if getattr(exc, "pgcode", None) not in (LOCK_NOT_AVAILABLE, DEADLOCK_DETECTED):
             raise
@@ -1951,15 +1990,18 @@ def _compact_catalog_journal(cur, catalog_instance_id, retention_limit):
             "catalog_state is busy (%s)",
             catalog_instance_id, exc.pgcode,
         )
-        return
+        return False
     cur.execute("RELEASE SAVEPOINT lumae_catalog_compaction")
+    return more
 
 
 def _after_publication(db, catalog_instance_id, generation, journal_retention=None):
     """Storage work of a publication, after it commits (P2-3).
 
-    Each step is its own short transaction, so catalog_state is not held while
-    old rows are deleted:
+    Each step is its own short transaction, after the publication released
+    catalog_state. The first two never take catalog_state; the journal
+    compaction holds it, in batches of at most CATALOG_COMPACTION_MAX_ADVANCE
+    events per transaction:
 
     * edge payloads that no published profile reaches, for the whole source:
       those of the profiles this publication withdrew, and any an earlier
@@ -1969,8 +2011,10 @@ def _after_publication(db, catalog_instance_id, generation, journal_retention=No
       before the publication took that lock, and later leases pin the new
       generation;
     * catalogue journal events past ``journal_retention``, when it is given
-      (see _compact_catalog_journal). This step does take catalog_state,
-      first and with a short lock_timeout, for the floor it moves.
+      (see _compact_catalog_journal). Each batch locks catalog_state first,
+      with a short lock_timeout, and holds it across its delete and the floor
+      it moves; up to CATALOG_COMPACTION_MAX_BATCHES batches run, and the
+      next publication or prune_catalog_storage continues the rest.
 
     Best effort, like the status summary. What a failure leaves goes with the
     next publication, or with maintenance: compact_enrichment_storage sweeps
@@ -1988,10 +2032,12 @@ def _after_publication(db, catalog_instance_id, generation, journal_retention=No
         (
             "purge unpublished edge payloads",
             lambda cur: purge_withdrawn_edges(cur, catalog_instance_id),
+            1,
         ),
         (
             "prune superseded catalogue generations",
             lambda cur: prune_snapshot_generations(cur, catalog_instance_id, "catalog", generation),
+            1,
         ),
     )
     if journal_retention is not None:
@@ -1999,16 +2045,22 @@ def _after_publication(db, catalog_instance_id, generation, journal_retention=No
             (
                 "compact the catalogue journal",
                 lambda cur: _compact_catalog_journal(cur, catalog_instance_id, journal_retention),
+                CATALOG_COMPACTION_MAX_BATCHES,
             ),
         )
-    for label, step in steps:
+    for label, step, rounds in steps:
         try:
-            cur = db.cursor()
-            try:
-                step(cur)
-            finally:
-                cur.close()
-            db.commit()
+            # A step that returns True has more to do: it runs again, in a
+            # new transaction, up to ``rounds`` times.
+            for _round in range(rounds):
+                cur = db.cursor()
+                try:
+                    more = step(cur)
+                finally:
+                    cur.close()
+                db.commit()
+                if more is not True:
+                    break
         except Exception:
             try:
                 rollback = getattr(db, "rollback", None)
@@ -3352,6 +3404,23 @@ def bootstrap_session_limit(principal_key):
     return MAX_PRINCIPAL_BOOTSTRAP_SESSIONS
 
 
+def _execute_with_lock_timeout(cur, timeout, sql, params):
+    """Run one locking statement under ``timeout`` and return its first row.
+
+    The previous lock_timeout is restored after it, so later statements of
+    the transaction are unaffected. On timeout the database error (pgcode
+    55P03) propagates with the transaction aborted; the caller rolls back,
+    which also ends the transaction-local setting.
+    """
+    cur.execute("SELECT current_setting('lock_timeout')")
+    previous_timeout = cur.fetchone()[0]
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (timeout,))
+    cur.execute(sql, params)
+    row = cur.fetchone()
+    cur.execute("SELECT set_config('lock_timeout', %s, true)", (previous_timeout,))
+    return row
+
+
 def _locked_analysis_state(cur, catalog_instance_id):
     """Share-lock the analysis_state row and return what it publishes now.
 
@@ -3370,19 +3439,14 @@ def _locked_analysis_state(cur, catalog_instance_id):
     the transaction aborted; the caller rolls back. Otherwise the previous
     lock_timeout is restored, so later statements are unaffected.
     """
-    cur.execute("SELECT current_setting('lock_timeout')")
-    previous_timeout = cur.fetchone()[0]
-    cur.execute(
-        "SELECT set_config('lock_timeout', %s, true)", (ANALYSIS_LEASE_LOCK_TIMEOUT,)
-    )
-    cur.execute(
+    row = _execute_with_lock_timeout(
+        cur,
+        ANALYSIS_LEASE_LOCK_TIMEOUT,
         f"SELECT projection_generation, analysis_epoch, analysis_head_seq, "
         f"item_count, mapped_track_count FROM {t('analysis_state')} "
         "WHERE catalog_instance_id=%s FOR SHARE",
         (catalog_instance_id,),
-    )
-    row = cur.fetchone() or (0, "", 0, 0, 0)
-    cur.execute("SELECT set_config('lock_timeout', %s, true)", (previous_timeout,))
+    ) or (0, "", 0, 0, 0)
     return {
         "generation": int(row[0] or 0),
         "epoch": str(row[1] or ""),
@@ -3423,11 +3487,30 @@ def _create_bootstrap_session(
     # serializes one principal's creations (the count and the insert below are
     # then one step, for both streams) and cannot invert against the state
     # row locks that follow, which the publication and projection also take.
+    #
+    # A holder may wait for a state row: up to ANALYSIS_LEASE_LOCK_TIMEOUT for
+    # analysis_state, or, for a catalogue lease, untimed for catalog_state as
+    # before 7298d61 (a publication holds it only to publish; an install for
+    # longer, and the lease then pins what the install leaves). So the wait
+    # for this lock is bounded by BOOTSTRAP_PRINCIPAL_LOCK_TIMEOUT: the
+    # principal's other creates answer "retry shortly" instead of queueing
+    # behind each other's waits.
     lock_cur = db.cursor()
-    lock_cur.execute(
-        "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
-        (BOOTSTRAP_PRINCIPAL_LOCK, str(principal_key)),
-    )
+    try:
+        _execute_with_lock_timeout(
+            lock_cur,
+            BOOTSTRAP_PRINCIPAL_LOCK_TIMEOUT,
+            "SELECT pg_advisory_xact_lock(hashtext(%s), hashtext(%s))",
+            (BOOTSTRAP_PRINCIPAL_LOCK, str(principal_key)),
+        )
+    except Exception as exc:
+        if getattr(exc, "pgcode", None) != LOCK_NOT_AVAILABLE:
+            raise
+        lock_cur.close()
+        db.rollback()  # also ends the transaction-local lock_timeout
+        raise CatalogScanError(
+            "Another bootstrap session of this client is being created, retry shortly"
+        ) from exc
     lock_cur.close()
     # A lease is created under the row lock its stream's publisher holds
     # when it prunes superseded generations: catalog_state for the catalogue,
