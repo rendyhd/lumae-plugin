@@ -331,12 +331,15 @@ def test_a_cached_album_still_publishes_after_its_deadline(credits_db, monkeypat
 
 def test_the_credits_share_is_measured_from_the_end_of_a_turn(credits_db, monkeypatch):
     db = credits_db
-    claimed = []
+    claimed, ended = [], []
 
     def resolve(_album, _client):
         claimed.append(_rows(db, f"SELECT lease_until - interval '20 minutes' "
                                  f"FROM {P}credits_jobs WHERE album_id='a'")[0][0])
-        time.sleep(1.1)
+        time.sleep(0.3)
+        # The end of the work on the database's clock, which stamps the turn. This
+        # machine's clock is no measure of it: a container's can run 10% slower.
+        ended.append(_rows(db, "SELECT clock_timestamp()")[0][0])
         return {"status": "unresolved", "evidence": {}}
 
     monkeypatch.setattr(service, "resolve", resolve)
@@ -347,4 +350,4 @@ def test_the_credits_share_is_measured_from_the_end_of_a_turn(credits_db, monkey
 
     [(last_work_at,)] = _rows(
         db, f"SELECT last_work_at FROM {P}credits_stream WHERE catalog_instance_id='c'")
-    assert (last_work_at - claimed[0]).total_seconds() >= 1.0
+    assert claimed[0] < ended[0] <= last_work_at
