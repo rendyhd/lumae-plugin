@@ -87,6 +87,8 @@ from .catalog import (
 from .catalog_analysis import (
     AnalysisProjectionDeferred,
     GenerationExpired,
+    chromaprint_batch,
+    chromaprint_capability,
     dedup_policy,
     project_analysis,
     read_analysis_changes,
@@ -3317,6 +3319,7 @@ def health():
                 "transport": {"gzip": True},
                 "profile_stream": {"edge_refs": True},
                 "analysis_vectors": {"generation_fallback": True, "missing": True, "strict_generation": True},
+                "analysis_chromaprints": chromaprint_capability(compatibility.adapter),
             },
             "integrity": integrity_status(),
             "status": "ok" if compatibility.supported else compatibility.status,
@@ -3935,6 +3938,25 @@ def analysis_scalars_api():
             {
                 "catalog_instance_id": catalog_instance_id,
                 "items": scalar_batch(get_db(), catalog_instance_id, ids),
+            }
+        )
+    except (KeyError, ValueError) as exc:
+        return _catalog_error("invalid_batch", str(exc), 400)
+
+
+@bp.post("/api/catalog/analysis/chromaprints")
+def analysis_chromaprints_api():
+    try:
+        body = _json_body(max_bytes=64_000)
+        catalog_instance_id = str(body.get("catalog_instance_id") or "")
+        ids = body.get("provider_track_ids") or []
+        if not catalog_instance_id or not isinstance(ids, list):
+            raise ValueError("catalog_instance_id and provider_track_ids are required")
+        return _private_json(
+            {
+                "catalog_instance_id": catalog_instance_id,
+                "encoding": "u32le-base64",
+                "items": chromaprint_batch(get_db(), catalog_instance_id, ids),
             }
         )
     except (KeyError, ValueError) as exc:

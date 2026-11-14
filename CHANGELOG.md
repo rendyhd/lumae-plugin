@@ -7,6 +7,15 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
+## Unreleased
+
+- New route `POST /api/catalog/analysis/chromaprints`: the raw Chromaprints
+  AudioMuse keeps for up to 100 of a catalogue's tracks, so a client can pass
+  them on. Lumae sends them to Lumae Explore with an album's bundle and stores
+  none. Health lists it as `capabilities.analysis_chromaprints`; only
+  AudioMuse 3 has prints. Nothing else changes, and older phones never call it.
+  Contract §3.8a.
+
 ## 1.11.0 (2026-11-13)
 
 The findings of the 2026-11-13 bug and performance review, and of a second

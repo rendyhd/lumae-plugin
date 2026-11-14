@@ -4,6 +4,8 @@ The catalogue owns music identity.  AudioMuse canonical rows are reusable
 analysis assets only, linked explicitly to every provider occurrence.
 """
 
+from array import array
+import base64
 from collections import defaultdict
 from contextlib import contextmanager
 import gc
@@ -11,6 +13,8 @@ import hashlib
 import json
 from operator import itemgetter
 import struct
+import sys
+import zlib
 
 import psycopg2.errors
 from psycopg2.extras import execute_values
@@ -1226,6 +1230,85 @@ def scalar_batch(db, catalog_instance_id, provider_track_ids):
         }
         for row in rows
     ]
+
+
+# Chromaprints for clients that pass them on (Lumae Explore, BK.2). A print is
+# fpcalc's raw items for the first 120 s, about 950 of them; one four times
+# that long is cut to its start, which is a print of the same audio.
+CHROMAPRINT_BATCH_MAX = 100
+CHROMAPRINT_MAX_ITEMS = 4096
+
+
+def chromaprint_capability(adapter_name):
+    """Health ``capabilities.analysis_chromaprints``.
+
+    Only AudioMuse 3's registry keeps a ``chromaprint`` table, and only while
+    the host collects prints does a newly analysed track get one. ``available``
+    says the route can answer with prints; it never says every track has one.
+    """
+    collecting = getattr(config, "CHROMAPRINT_COLLECTION_ENABLED", None)
+    return {
+        "version": 1,
+        "available": adapter_name == "v3_registry" and collecting is not False,
+        "max_ids": CHROMAPRINT_BATCH_MAX,
+        "max_items": CHROMAPRINT_MAX_ITEMS,
+        "encoding": "u32le-base64",
+    }
+
+
+def raw_chromaprint(blob):
+    """A stored print as little-endian uint32 bytes, or None.
+
+    AudioMuse keeps ``zlib.compress(uint32 array.tobytes())`` in the host's
+    byte order (``tasks/chromaprint.py``). The inflate is bounded, so a blob
+    that isn't a print can't grow past the cap.
+    """
+    data = _bytes(blob)
+    if not data:
+        return None
+    try:
+        raw = zlib.decompressobj().decompress(data, CHROMAPRINT_MAX_ITEMS * 4)
+    except zlib.error:
+        return None
+    raw = raw[: len(raw) - len(raw) % 4]
+    if not raw:
+        return None
+    if sys.byteorder == "big":
+        items = array("I", raw) if array("I").itemsize == 4 else array("L", raw)
+        items.byteswap()
+        raw = items.tobytes()
+    return raw
+
+
+def chromaprint_batch(db, catalog_instance_id, provider_track_ids, adapter=None):
+    """Chromaprints of a catalogue's tracks: ``[{provider_track_id, chromaprint}]``.
+
+    Only tracks that have a print are listed. A host without the table (the
+    v2 adapter) lists none.
+    """
+    ids = list(dict.fromkeys(str(value) for value in provider_track_ids))
+    if len(ids) > CHROMAPRINT_BATCH_MAX:
+        raise ValueError(f"At most {CHROMAPRINT_BATCH_MAX} provider track IDs are allowed")
+    source = resolve_catalog_source(db, catalog_instance_id=catalog_instance_id)[0]
+    if not ids or not source.get("server_id"):
+        return []
+    adapter = adapter or get_core_adapter()
+    cur = db.cursor()
+    try:
+        prints = _analysis_chromaprints(cur, adapter, source["server_id"], ids) or {}
+    finally:
+        cur.close()
+    items = []
+    for track_id in ids:
+        raw = raw_chromaprint(prints.get(track_id))
+        if raw:
+            items.append(
+                {
+                    "provider_track_id": track_id,
+                    "chromaprint": base64.b64encode(raw).decode("ascii"),
+                }
+            )
+    return items
 
 
 class GenerationExpired(ValueError):

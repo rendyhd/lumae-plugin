@@ -249,6 +249,14 @@ def test_health_endpoint_reports_schema_and_analyzer_versions(monkeypatch):
             "transport": {"gzip": True},
             "profile_stream": {"edge_refs": True},
             "analysis_vectors": {"generation_fallback": True, "missing": True, "strict_generation": True},
+            # A v2 host has no chromaprint table.
+            "analysis_chromaprints": {
+                "version": 1,
+                "available": False,
+                "max_ids": 100,
+                "max_items": 4096,
+                "encoding": "u32le-base64",
+            },
         },
         # The host stub has no database, so the invariants are unknown.
         "integrity": {
