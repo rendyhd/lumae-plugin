@@ -7,7 +7,13 @@ file gives the human-readable story, oldest detail first collapsed to what
 still matters. Exact, code-verified wire behaviour for every version lives in
 [`docs/contracts/LUMAE_SYNC_CONTRACT.md`](docs/contracts/LUMAE_SYNC_CONTRACT.md).
 
-## Unreleased
+## 1.11.0 (2026-11-13)
+
+The findings of the 2026-11-13 bug and performance review, and of a second
+read of those fixes, plus Chromaprints for Lumae Explore. AudioMuse 3.2.0 is
+still the minimum, and phones need no update.
+
+Chromaprints for Lumae Explore
 
 - New route `POST /api/catalog/analysis/chromaprints`: the raw Chromaprints
   AudioMuse keeps for up to 100 of a catalogue's tracks, so a client can pass
@@ -15,12 +21,6 @@ still matters. Exact, code-verified wire behaviour for every version lives in
   none. Health lists it as `capabilities.analysis_chromaprints`; only
   AudioMuse 3 has prints. Nothing else changes, and older phones never call it.
   Contract §3.8a.
-
-## 1.11.0 (2026-11-13)
-
-The findings of the 2026-11-13 bug and performance review, and of a second
-read of those fixes. AudioMuse 3.2.0 is still the minimum, and phones need no
-update.
 
 A media server that stops handing over files no longer spends the library's
 retries.
